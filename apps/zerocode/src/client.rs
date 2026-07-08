@@ -2020,10 +2020,10 @@ pub enum SopStepKind {
     Checkpoint,
 }
 
-// SOP graph wire types are re-exported from `zeroclaw-sop-graph`; only the
-// trigger-registry view types below remain zerocode-local.
+// SOP graph wire types are re-exported from the neutral `sop-graph-wire`
+// crate; zerocode stays off backend crates while sharing one graph schema.
 
-pub use zeroclaw_sop_graph::{
+pub use sop_graph_wire::{
     FlowRole, GraphLayout, GraphNode, GraphPin, GraphWire, NodeKind, NodeRunState, PinClass,
     SopGraph as SopGraphView,
 };
@@ -2810,7 +2810,7 @@ mod sop_method_tests {
         assert_eq!(view.wires[1].from_pin.as_deref(), Some("pr"));
         assert_eq!(
             view.diagnostics[0].severity,
-            zeroclaw_sop_graph::GraphSeverity::Error
+            sop_graph_wire::GraphSeverity::Error
         );
         assert_eq!(view.layout.columns, 2);
     }

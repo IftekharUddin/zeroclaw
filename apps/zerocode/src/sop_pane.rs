@@ -2206,7 +2206,7 @@ mod tests {
     use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, layout_slots, trigger_source_walk};
     use crate::client::{BoundTriggerSourceView, GraphLayout, TriggerSourceRegistryView};
     use ratatui::layout::Rect;
-    use zeroclaw_sop_graph::NodePosition;
+    use sop_graph_wire::NodePosition;
 
     #[test]
     fn honored_toml_coords_land_on_matching_slot() {

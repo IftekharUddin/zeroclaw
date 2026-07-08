@@ -19,7 +19,7 @@ zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.2" }
 zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.2" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.2", default-features = false }
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.2" }
-zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.2", default-features = false }
+sop-graph-wire = { path = "crates/zeroclaw-sop-graph", version = "0.8.2", default-features = false }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.2", default-features = false }
 zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.2" }
 zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.2" }

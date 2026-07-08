@@ -9255,6 +9255,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sop-graph-wire"
+version = "0.8.2"
+dependencies = [
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "strum_macros 0.28.0",
+]
+
+[[package]]
 name = "soup3"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13530,6 +13541,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
+ "sop-graph-wire",
  "strum 0.28.0",
  "strum_macros 0.28.0",
  "sys-locale",
@@ -13558,22 +13570,10 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
- "zeroclaw-sop-graph",
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
  "zip",
-]
-
-[[package]]
-name = "zeroclaw-sop-graph"
-version = "0.8.2"
-dependencies = [
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "strum 0.28.0",
- "strum_macros 0.28.0",
 ]
 
 [[package]]
@@ -13765,6 +13765,7 @@ dependencies = [
  "serde_json",
  "shellexpand",
  "similar",
+ "sop-graph-wire",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -13772,7 +13773,6 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
- "zeroclaw-sop-graph",
 ]
 
 [[package]]
