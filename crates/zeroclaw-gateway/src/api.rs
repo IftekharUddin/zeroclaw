@@ -2289,6 +2289,9 @@ pub(crate) mod tests {
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,

@@ -337,6 +337,18 @@ async fn handle_socket(
             None
         }
     };
+    // Snapshot the session's turn-completion version *before* loading
+    // history below. This connection holds no `session_queue` permit yet,
+    // so this read and the `backend.load` below are not atomic with any
+    // other connection's turn — but `bump_turn_version` only ever runs
+    // *after* that turn's messages are fully persisted (see its call sites
+    // in `process_chat_message`), on every completion path. So a version
+    // this read can observe is always already reflected in whatever
+    // `backend.load` returns: the ordering below can only make our loaded
+    // messages as-new-as-or-newer-than `seen_version` implies, never
+    // staler. Worst case a redundant rehydrate on the first prompt; never a
+    // wrongly-skipped one.
+    let mut seen_version: u64 = current_turn_version(&state.session_turn_versions, &session_key);
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
@@ -540,6 +552,15 @@ async fn handle_socket(
             if parsed["type"].as_str() == Some("message") {
                 let content = parsed["content"].as_str().unwrap_or("").to_string();
                 if !content.is_empty() {
+                    // Acquire the permit *first*: only once we hold it is it
+                    // guaranteed that any other connection's turn for this
+                    // session has fully finished (cancel token removed,
+                    // version bumped, messages persisted — see the bump
+                    // site in `process_chat_message`). A liveness snapshot
+                    // taken before the acquire (the previous approach) is
+                    // TOCTOU-prone: it can read "not live" because A hasn't
+                    // registered its cancel token yet, even though A holds
+                    // the permit and will complete before we get it.
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -552,6 +573,29 @@ async fn handle_socket(
                             return;
                         }
                     };
+                    // Rehydrate iff a turn (this connection's own earlier
+                    // one, or a different connection's) has completed since
+                    // our `Agent` was last known current. The `seen_version`
+                    // update that matters lives after `process_chat_message`
+                    // below, unconditionally: it always re-derives the
+                    // correct value (whether or not we rehydrated here, and
+                    // even on `process_chat_message`'s early-return path,
+                    // where no bump happens and it just re-reads the
+                    // unchanged version), so there is nothing to track in
+                    // between.
+                    if current_turn_version(&state.session_turn_versions, &session_key)
+                        != seen_version
+                        && let Some(ref backend) = state.session_backend
+                        && let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns,
+                            reason,
+                        }) =
+                            rehydrate_agent_from_backend(backend.as_ref(), &mut agent, &session_key)
+                    {
+                        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    }
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -566,6 +610,10 @@ async fn handle_socket(
                         auth_subject.as_deref(),
                     )
                     .await;
+                    // This connection's own turn just bumped the version;
+                    // track it so the next prompt on this connection does
+                    // not redundantly rehydrate.
+                    seen_version = current_turn_version(&state.session_turn_versions, &session_key);
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
@@ -697,7 +745,11 @@ async fn handle_socket(
                     continue;
                 }
 
-                // Acquire session lock to serialize concurrent turns
+                // Acquire the permit *first* — see the comment at the other
+                // `session_queue.acquire` call site above (the first-message
+                // path) for why a pre-acquire liveness snapshot is TOCTOU-prone
+                // and why checking the turn-completion version under the
+                // permit closes that window.
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
                     Ok(guard) => guard,
                     Err(e) => {
@@ -710,6 +762,22 @@ async fn handle_socket(
                         continue;
                     }
                 };
+                // Rehydrate iff a turn has completed since our `Agent` was
+                // last known current. See the matching comment at the other
+                // `session_queue.acquire` call site for why the
+                // `seen_version` update that matters is the unconditional
+                // one after `process_chat_message` below, not here.
+                if current_turn_version(&state.session_turn_versions, &session_key) != seen_version
+                    && let Some(ref backend) = state.session_backend
+                    && let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        dropped_messages,
+                        kept_turns,
+                        reason,
+                    }) = rehydrate_agent_from_backend(backend.as_ref(), &mut agent, &session_key)
+                {
+                    let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                }
 
                 process_chat_message(
                     &state,
@@ -725,6 +793,10 @@ async fn handle_socket(
                         auth_subject.as_deref(),
                 )
                 .await;
+                // This connection's own turn just bumped the version; track
+                // it so the next prompt on this connection does not
+                // redundantly rehydrate.
+                seen_version = current_turn_version(&state.session_turn_versions, &session_key);
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -899,6 +971,70 @@ fn register_cancel_token(
     }
 }
 
+/// Rehydrate a connection-scoped `Agent`'s history from the session backend.
+///
+/// Called under the `session_queue` permit, once this connection has
+/// observed (via `AppState::session_turn_versions`) that some turn — its own
+/// earlier one, or a different connection's — has completed since this
+/// `Agent`'s history was last known current. `process_chat_message` bumps
+/// the version, removes the cancel token, and persists the turn's messages
+/// all before it returns and releases the permit its caller holds, so by the
+/// time this runs, `backend.load` is guaranteed to be the authoritative,
+/// up-to-date transcript. Clearing and reseeding (rather than appending)
+/// avoids duplicating whatever this connection's `Agent` already held and
+/// guarantees the next turn runs against post-turn history, never a stale
+/// snapshot captured earlier (at connect time, or after this connection's
+/// own last turn).
+fn rehydrate_agent_from_backend(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    session_key: &str,
+) -> Option<zeroclaw_api::agent::TurnEvent> {
+    let messages = backend.load(session_key);
+    agent.clear_history();
+    agent.seed_history_with_event(&messages)
+}
+
+/// Read `session_key`'s current turn-completion version — 0 if no turn has
+/// ever completed for this session. See `AppState::session_turn_versions`
+/// for the bump site and the invariant this backs.
+fn current_turn_version(
+    session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    session_key: &str,
+) -> u64 {
+    session_turn_versions
+        .lock()
+        .expect("session_turn_versions lock poisoned")
+        .get(session_key)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Bump `session_key`'s turn-completion version by one.
+///
+/// Must be called on every `process_chat_message` completion path — but
+/// only *after* that path's backend persistence (if any) has finished, never
+/// before. A connection's connect-time `current_turn_version` read (see
+/// `handle_socket`) happens without holding the `session_queue` permit, so
+/// it can race an in-flight turn's completion; the only thing that keeps
+/// that race safe is the invariant "a version this bumps to is never
+/// observable before the messages behind it are persisted". Bumping before
+/// persistence would let a new connection read the bumped version, then
+/// load history that doesn't include this turn yet, and be indistinguishable
+/// from a connection that *did* rehydrate onto current history even though
+/// its seed is stale — silently resurrecting the pre-A-history bug this
+/// version scheme exists to close.
+fn bump_turn_version(
+    session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    session_key: &str,
+) {
+    let mut versions = session_turn_versions
+        .lock()
+        .expect("session_turn_versions lock poisoned");
+    let next = versions.get(session_key).copied().unwrap_or(0) + 1;
+    versions.insert(session_key.to_string(), next);
+}
+
 fn history_trimmed_ws_frame(
     dropped_messages: usize,
     kept_turns: usize,
@@ -947,12 +1083,19 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
+// Generic over the transport halves (rather than tied to axum's concrete
+// `SplitSink<WebSocket, _>` / `SplitStream<WebSocket>`) so the two production
+// call sites in `handle_socket` are unaffected, but the session-queue /
+// cancel-token / rehydration logic below can be driven directly by tests with
+// in-process fakes — a real two-socket regression needs two independent
+// `process_chat_message` calls racing on the same `AppState`, which a real
+// WebSocket transport cannot orchestrate deterministically.
 #[allow(clippy::too_many_arguments)]
-async fn process_chat_message(
+async fn process_chat_message<Snk, Rcv, RcvErr>(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    sender: &mut Snk,
+    receiver: &mut Rcv,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
@@ -962,7 +1105,10 @@ async fn process_chat_message(
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
-) {
+) where
+    Snk: futures_util::Sink<Message> + Unpin,
+    Rcv: futures_util::Stream<Item = Result<Message, RcvErr>> + Unpin,
+{
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
@@ -1314,6 +1460,15 @@ async fn process_chat_message(
             .remove(session_key);
     }
 
+    // The turn-completion version (`AppState::session_turn_versions`) is
+    // bumped once on each completion path below (cancelled / success /
+    // error), but only *after* that path's backend persistence — a
+    // connection's connect-time version read does not hold the
+    // `session_queue` permit (see `handle_socket`), so it can race an
+    // in-flight turn; bumping before persistence would let it observe the
+    // new version while the messages behind it are still unpersisted. See
+    // `bump_turn_version`'s doc comment for the full invariant.
+
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
     let was_cancelled = match &result {
@@ -1369,6 +1524,8 @@ async fn process_chat_message(
                 }
             }
         }
+        // Persistence above (if any) is done — safe to bump now.
+        bump_turn_version(&state.session_turn_versions, session_key);
 
         // Inform the client the turn was aborted
         let aborted = serde_json::json!({ "type": "aborted" });
@@ -1412,6 +1569,8 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend {
                 persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
             }
+            // Persistence above (if any) is done — safe to bump now.
+            bump_turn_version(&state.session_turn_versions, session_key);
 
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
@@ -1520,6 +1679,8 @@ async fn process_chat_message(
             {
                 persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
             }
+            // Persistence above (if any) is done — safe to bump now.
+            bump_turn_version(&state.session_turn_versions, session_key);
 
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
@@ -1585,6 +1746,7 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+    use zeroclaw_infra::session_backend::SessionBackend as _;
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {
@@ -2281,6 +2443,888 @@ mod tests {
             run_status(&state).as_deref(),
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
+        );
+    }
+
+    // ── Production-boundary two-socket regression ────────────────────────
+    //
+    // Reviewer's blocking ask: a prompt B arriving while turn A is live must
+    // (1) be queued/attached rather than run concurrently with A, (2) run
+    // against A's completed history once it does run — never the pre-A
+    // snapshot its connection-scoped `Agent` was seeded with at connect
+    // time — and (3) never displace A's cancel token as the session's abort
+    // authority while A is still live. Unlike the `register_cancel_token`
+    // map-helper tests above, this drives the real `process_chat_message`
+    // (the same function both `handle_socket` call sites use), the real
+    // `AppState::session_queue` / `cancel_tokens` / `session_turn_versions`,
+    // and the real `current_turn_version` / `bump_turn_version` /
+    // `rehydrate_agent_from_backend` added for this fix, from two
+    // independent tasks racing on one shared session — the interleaving a
+    // real two-socket reconnect produces, driven deterministically instead
+    // of by timing.
+
+    /// In-memory `SessionBackend` that also tracks which sessions have a
+    /// `set_session_state` (turn started) or `append` call, mirroring the
+    /// SQLite backend's `session_metadata` row: a session can be "known" —
+    /// and therefore eligible for `persist_conversation_messages` — before
+    /// its first message is appended.
+    #[derive(Default)]
+    struct QueueTestSessionBackend {
+        messages: std::sync::Mutex<
+            std::collections::HashMap<String, Vec<zeroclaw_providers::ChatMessage>>,
+        >,
+        known: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for QueueTestSessionBackend {
+        fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap()
+                .get(session_key)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap()
+                .entry(session_key.to_string())
+                .or_default()
+                .push(message.clone());
+            self.known.lock().unwrap().insert(session_key.to_string());
+            Ok(())
+        }
+        fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .get_mut(session_key)
+                .is_some_and(|v| v.pop().is_some()))
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.messages.lock().unwrap().keys().cloned().collect()
+        }
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.known.lock().unwrap().contains(session_key)
+        }
+        fn set_session_state(
+            &self,
+            session_key: &str,
+            _state: &str,
+            _turn_id: Option<&str>,
+        ) -> std::io::Result<()> {
+            self.known.lock().unwrap().insert(session_key.to_string());
+            Ok(())
+        }
+    }
+
+    /// Stands in for turn A: its reply never arrives on its own, so the test
+    /// can hold A "mid-turn" deterministically and then interrupt it with a
+    /// real abort rather than guessing at timing.
+    struct StuckModelProvider;
+
+    #[async_trait::async_trait]
+    impl zeroclaw_providers::ModelProvider for StuckModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            std::future::pending::<()>().await;
+            unreachable!("this future is only ever dropped via cancellation")
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for StuckModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StuckModelProvider"
+        }
+    }
+
+    /// Stands in for turn B: replies immediately, so any delay it observes
+    /// comes entirely from `session_queue` contention, not the model call.
+    struct ImmediateModelProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl zeroclaw_providers::ModelProvider for ImmediateModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ImmediateModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ImmediateModelProvider"
+        }
+    }
+
+    /// A connection-scoped `Agent`, built the way each WebSocket builds its
+    /// own — fresh, empty history — but with an in-process model_provider
+    /// instead of a live-config-resolved HTTP one, so the turn itself is
+    /// deterministic and network-free.
+    fn queue_test_agent(
+        model_provider: Box<dyn zeroclaw_providers::ModelProvider>,
+    ) -> zeroclaw_runtime::agent::Agent {
+        zeroclaw_runtime::agent::Agent::builder()
+            .model_provider(model_provider)
+            .tools(Vec::new())
+            .memory(std::sync::Arc::new(zeroclaw_memory::NoneMemory::new(
+                "none",
+            )))
+            .observer(std::sync::Arc::new(
+                zeroclaw_runtime::observability::NoopObserver,
+            ))
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("test agent builds with a minimal in-process model_provider")
+    }
+
+    async fn queue_test_response_json(response: axum::response::Response) -> serde_json::Value {
+        use http_body_util::BodyExt as _;
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    /// Common post-conditions for both two-socket regressions below: A's
+    /// abort lands on the exact token A registered, B rehydrates onto A's
+    /// completed history (never the pre-A snapshot), the persisted
+    /// transcript orders A's turn before B's, both turns release their
+    /// cancel token, and B's own turn still runs to completion.
+    fn assert_b_rehydrated_after_a_aborted(
+        state: &AppState,
+        backend: &QueueTestSessionBackend,
+        session_key: &str,
+        agent_b: &zeroclaw_runtime::agent::Agent,
+        sender_b: &CollectSink,
+    ) {
+        let agent_b_saw_prompt_a = agent_b.history().iter().any(|m| {
+            matches!(
+                m,
+                zeroclaw_providers::ConversationMessage::Chat(c) if c.content.contains("prompt-A")
+            )
+        });
+        assert!(
+            agent_b_saw_prompt_a,
+            "B's rehydrated Agent must carry turn A's completed history: {:?}",
+            agent_b.history()
+        );
+
+        let persisted = backend.load(session_key);
+        let persisted_text: Vec<&str> = persisted.iter().map(|m| m.content.as_str()).collect();
+        let a_index = persisted_text
+            .iter()
+            .position(|c| c.contains("prompt-A"))
+            .expect("backend must hold A's prompt");
+        let b_index = persisted_text
+            .iter()
+            .position(|c| c.contains("prompt-B"))
+            .expect("backend must hold B's prompt");
+        assert!(
+            a_index < b_index,
+            "A's turn must precede B's in the persisted transcript: {persisted_text:?}"
+        );
+
+        assert!(
+            state.cancel_tokens.lock().unwrap().is_empty(),
+            "both turns must release their cancel token on completion"
+        );
+
+        let b_completed = sender_b.0.iter().any(|frame| {
+            serde_json::from_str::<serde_json::Value>(frame)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("done")
+        });
+        assert!(
+            b_completed,
+            "B's own turn must still run to completion after rehydration: {:?}",
+            sender_b.0
+        );
+    }
+
+    /// Benign interleaving: B does not arrive until A has already registered
+    /// as the session's live turn (mirrors a straightforward "second prompt
+    /// while the first is running" reconnect).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn queued_prompt_rehydrates_from_post_turn_a_history_and_keeps_a_abort_authority() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(QueueTestSessionBackend::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "shared-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent_a = queue_test_agent(Box::new(StuckModelProvider));
+        let mut agent_b = queue_test_agent(Box::new(ImmediateModelProvider("B-reply")));
+
+        // ── Turn A: the first prompt for this session, seeded before it existed ──
+        let state_a = state.clone();
+        let session_key_a = session_key.clone();
+        let turn_a_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            assert!(
+                !state_a
+                    .cancel_tokens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&session_key_a),
+                "turn A is the first prompt for this session"
+            );
+            let _guard = state_a
+                .session_queue
+                .acquire(&session_key_a)
+                .await
+                .expect("A acquires the session lock uncontested");
+
+            process_chat_message(
+                &state_a,
+                &mut agent_a,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &None,
+                "prompt-A",
+                &session_key_a,
+                "shared-session",
+                None,
+            )
+            .await;
+
+            (agent_a, sender)
+        });
+
+        // Wait for A to register as live: its `chat_with_system` call is now
+        // parked mid-turn (it never resolves on its own). This spin is only
+        // ever used to make the *benign* ordering deterministic (B arrives
+        // strictly after A is live) — the racy-interleaving test below
+        // deliberately does not use anything like it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .contains_key(&session_key)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn A never registered as live"
+            );
+            tokio::task::yield_now().await;
+        }
+        let token_during_a = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get(&session_key)
+            .cloned()
+            .expect("A's cancel token is registered while A is live");
+        assert!(!token_during_a.is_cancelled(), "A has not been aborted yet");
+
+        // ── Prompt B arrives while A is live ──
+        let state_b = state.clone();
+        let session_key_b = session_key.clone();
+        let turn_b_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            // Connect-time snapshot: this connection has never seen a turn
+            // complete for this session.
+            let seen_version_b =
+                current_turn_version(&state_b.session_turn_versions, &session_key_b);
+
+            let _guard = state_b
+                .session_queue
+                .acquire(&session_key_b)
+                .await
+                .expect("B eventually acquires the lock once A releases it");
+
+            let rehydrated = current_turn_version(&state_b.session_turn_versions, &session_key_b)
+                != seen_version_b;
+            if rehydrated && let Some(ref backend) = state_b.session_backend {
+                rehydrate_agent_from_backend(backend.as_ref(), &mut agent_b, &session_key_b);
+            }
+
+            process_chat_message(
+                &state_b,
+                &mut agent_b,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &None,
+                "prompt-B",
+                &session_key_b,
+                "shared-session",
+                None,
+            )
+            .await;
+
+            (agent_b, sender, rehydrated)
+        });
+
+        // ── Property 1: B is queued/attached behind A, never run concurrently ──
+        // `queue_depth` counts every live `acquire` attempt, including the one
+        // currently holding the permit: 1 == only A (holding); 2 == A holding
+        // + B waiting behind it. It can never observe B running concurrently
+        // with A, since B's own `acquire` has not yet resolved.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "B never reached the session queue"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state.session_queue.queue_depth(&session_key).await,
+            2,
+            "B must be queued behind A (A holding + B waiting), not running concurrently with it"
+        );
+        assert_eq!(
+            state.cancel_tokens.lock().unwrap().len(),
+            1,
+            "only A's turn may hold registered abort authority while B is queued"
+        );
+
+        // ── Property 3: B cannot displace A's abort authority ──
+        // B is still queued and has registered no token of its own, so an
+        // abort issued right now can only ever land on A's token — there is
+        // categorically nothing for B to have displaced.
+        let abort_response = crate::api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let abort_json = queue_test_response_json(abort_response).await;
+        assert_eq!(abort_json["status"], "aborted");
+        assert!(
+            token_during_a.is_cancelled(),
+            "the abort must cancel the exact token instance A registered"
+        );
+
+        // A's turn now unwinds via cancellation and releases the session
+        // permit; B's queued acquire can proceed.
+        let (_agent_a, _sender_a) = turn_a_handle.await.expect("turn A task does not panic");
+        let (agent_b, sender_b, rehydrated) =
+            turn_b_handle.await.expect("turn B task does not panic");
+        assert!(
+            rehydrated,
+            "B must have rehydrated after observing a turn complete while it waited"
+        );
+
+        // ── Property 2: B never runs from the pre-A history it was seeded
+        // with at connect time ──
+        assert_b_rehydrated_after_a_aborted(&state, &backend, &session_key, &agent_b, &sender_b);
+    }
+
+    /// Racy interleaving: B's decision to wait behind A is forced by queue
+    /// position alone — B enqueues on `session_queue` *before A has
+    /// registered any cancel token at all* (A is still queued too, behind a
+    /// permit the test primes and holds). This is the TOCTOU the fix
+    /// removes: the old design snapshotted `cancel_tokens` for liveness
+    /// *before* calling `acquire`, so a snapshot taken in this exact window
+    /// (A enqueued but not yet registered) would read "not live" and skip
+    /// rehydration even though A wins the permit and completes before B
+    /// does. The fix makes the rehydrate decision strictly *after*
+    /// `acquire` resolves, comparing a monotonic per-session version — a
+    /// point that cannot be reached until the connection actually holds the
+    /// permit, by which time any prior turn for this session is
+    /// unconditionally finished (see the version bump next to the
+    /// cancel-token removal in `process_chat_message`). So this test
+    /// forces B to enqueue with zero information about A's state, and
+    /// still expects the same three properties.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_prompt_still_rehydrates_from_post_turn_a_history_and_keeps_a_abort_authority() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(QueueTestSessionBackend::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "raced-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent_a = queue_test_agent(Box::new(StuckModelProvider));
+        let mut agent_b = queue_test_agent(Box::new(ImmediateModelProvider("B-reply")));
+
+        // Prime the session's one permit so neither A nor B can win the
+        // `acquire` race until the test releases it below. `Semaphore` is
+        // documented FIFO, so this lets the test control *queue order*
+        // deterministically (A enqueues first, B second) without ever
+        // consulting `cancel_tokens` — the one piece of state the old,
+        // buggy design leaned on and that this test must not depend on.
+        let priming_guard = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("test primes the session permit");
+
+        let state_a = state.clone();
+        let session_key_a = session_key.clone();
+        let turn_a_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            // No pre-acquire check of any kind — the fix removed the last
+            // one (`session_turn_is_live`). A just enqueues.
+            let _guard = state_a
+                .session_queue
+                .acquire(&session_key_a)
+                .await
+                .expect("A eventually wins the primed permit");
+
+            process_chat_message(
+                &state_a,
+                &mut agent_a,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &None,
+                "prompt-A",
+                &session_key_a,
+                "raced-session",
+                None,
+            )
+            .await;
+
+            (agent_a, sender)
+        });
+
+        // Wait for A to actually enqueue behind the primed permit (2 ==
+        // priming guard holding + A waiting). Purely a `session_queue`
+        // accounting check — nothing here touches `cancel_tokens`.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A never enqueued behind the primed permit"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Spawn B *immediately* — no wait for A's cancel token, because
+        // there isn't one: A is still queued behind the priming guard,
+        // nowhere near `register_cancel_token`. This is the racy
+        // interleaving: B's `acquire` call is issued while A has registered
+        // nothing at all.
+        let state_b = state.clone();
+        let session_key_b = session_key.clone();
+        let turn_b_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            let seen_version_b =
+                current_turn_version(&state_b.session_turn_versions, &session_key_b);
+
+            let _guard = state_b
+                .session_queue
+                .acquire(&session_key_b)
+                .await
+                .expect("B eventually wins the permit after A");
+
+            let rehydrated = current_turn_version(&state_b.session_turn_versions, &session_key_b)
+                != seen_version_b;
+            if rehydrated && let Some(ref backend) = state_b.session_backend {
+                rehydrate_agent_from_backend(backend.as_ref(), &mut agent_b, &session_key_b);
+            }
+
+            process_chat_message(
+                &state_b,
+                &mut agent_b,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &None,
+                "prompt-B",
+                &session_key_b,
+                "raced-session",
+                None,
+            )
+            .await;
+
+            (agent_b, sender, rehydrated)
+        });
+
+        // Wait for both A and B to be enqueued behind the priming guard
+        // (3 == priming holding + A waiting + B waiting) — B has issued its
+        // `acquire` call while A is nowhere near registering a cancel
+        // token (A hasn't even won the permit yet).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "B never enqueued behind A"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state.cancel_tokens.lock().unwrap().is_empty(),
+            "neither A nor B has registered a cancel token yet — both are still queued \
+             behind the primed permit, which is exactly the window the old \
+             pre-acquire liveness snapshot got wrong"
+        );
+
+        // Release the primed permit: FIFO means A (enqueued first) wins it,
+        // not B — this is the only ordering guarantee the test relies on,
+        // and it comes from `session_queue`'s documented fairness, not from
+        // observing A's internal state.
+        drop(priming_guard);
+
+        // A wins the race and registers legitimately (a consequence of the
+        // race resolving, not something the test orchestrates).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.cancel_tokens.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A never won the primed permit and registered"
+            );
+            tokio::task::yield_now().await;
+        }
+        let token_during_a = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get(&session_key)
+            .cloned()
+            .expect("A's cancel token is registered once A wins the permit");
+        assert!(!token_during_a.is_cancelled(), "A has not been aborted yet");
+
+        // ── Property 1: B is queued/attached behind A, never run concurrently ──
+        assert_eq!(
+            state.session_queue.queue_depth(&session_key).await,
+            2,
+            "B must be queued behind A (A holding + B waiting), not running concurrently with it"
+        );
+        assert_eq!(
+            state.cancel_tokens.lock().unwrap().len(),
+            1,
+            "only A's turn may hold registered abort authority while B is queued"
+        );
+
+        // ── Property 3: B cannot displace A's abort authority ──
+        let abort_response = crate::api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let abort_json = queue_test_response_json(abort_response).await;
+        assert_eq!(abort_json["status"], "aborted");
+        assert!(
+            token_during_a.is_cancelled(),
+            "the abort must cancel the exact token instance A registered"
+        );
+
+        let (_agent_a, _sender_a) = turn_a_handle.await.expect("turn A task does not panic");
+        let (agent_b, sender_b, rehydrated) =
+            turn_b_handle.await.expect("turn B task does not panic");
+        assert!(
+            rehydrated,
+            "B must rehydrate even though its own pre-acquire state (none) said nothing \
+             about A — the version check under the permit must catch what a pre-acquire \
+             liveness snapshot would have missed"
+        );
+
+        // ── Property 2: B never runs from the pre-A history it was seeded
+        // with at connect time ──
+        assert_b_rehydrated_after_a_aborted(&state, &backend, &session_key, &agent_b, &sender_b);
+    }
+
+    /// Connect-time variant of the same TOCTOU: a *new* connection's
+    /// connect-time snapshot (`seen_version` read, then `backend.load` —
+    /// mirrored here exactly as `handle_socket` does it, ws.rs:~345/~351)
+    /// happens without holding the `session_queue` permit, so it can race a
+    /// concurrently-completing turn. The bug this closes: bumping the
+    /// version *before* persisting would let this snapshot observe the new
+    /// version while the messages behind it are not yet in the backend —
+    /// then load stale (pre-turn) history and seed an `Agent` that looks
+    /// exactly as current as a correctly-rehydrated one, permanently.
+    ///
+    /// The fix makes that ordering structurally impossible rather than just
+    /// less likely: `bump_turn_version` runs strictly after that path's
+    /// persistence, on the same synchronous call path with no `.await`
+    /// between them (see the three call sites in `process_chat_message`),
+    /// so any observer's happens-before chain through the `session_backend`
+    /// lock and the `session_turn_versions` lock can only ever see
+    /// messages-before-version, never the reverse. There is no `.await`
+    /// point between persist and bump to pin a test to without
+    /// instrumenting production code (out of scope here), so this test
+    /// does not force the exact instruction-level interleaving; instead,
+    /// per the documented fallback for that case, it:
+    /// (1) runs an independent sampler that polls (version, backend
+    ///     content) many times on a real multi-thread runtime throughout
+    ///     turn A's completion and asserts the dangerous order — version
+    ///     bumped, A's message not yet in the backend — is never observed;
+    /// (2) has a connection C perform the exact connect-time two-step
+    ///     concurrently with A's completion, with nothing pinning it to any
+    ///     particular instant, and proves C's first prompt still lands on
+    ///     A's fully-persisted history regardless of what that snapshot
+    ///     caught — the post-acquire version compare is the safety net for
+    ///     whatever the connect-time snapshot missed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_time_snapshot_never_outraces_persistence_before_version_bump() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(QueueTestSessionBackend::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "connect-race-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent_a = queue_test_agent(Box::new(StuckModelProvider));
+
+        // ── Turn A: registers, then sits parked mid-turn until aborted. ──
+        let state_a = state.clone();
+        let session_key_a = session_key.clone();
+        let turn_a_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+            let _guard = state_a
+                .session_queue
+                .acquire(&session_key_a)
+                .await
+                .expect("A acquires the session lock uncontested");
+            process_chat_message(
+                &state_a,
+                &mut agent_a,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &None,
+                "prompt-A",
+                &session_key_a,
+                "connect-race-session",
+                None,
+            )
+            .await;
+            (agent_a, sender)
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .contains_key(&session_key)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn A never registered as live"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // ── (1) Independent sampler: polls (version, backend content) many
+        // times across A's completion and keeps every distinct pair. ──
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler_state = state.clone();
+        let sampler_session_key = session_key.clone();
+        let sampler_backend = backend.clone();
+        let sampler_stop = stop.clone();
+        let sampler_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut samples: Vec<(u64, bool)> = Vec::new();
+            let sampler_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Not an unconditional spin: stops a little after the caller
+            // signals turn A is done (or the deadline trips), so samples
+            // span before/during/after completion without running forever.
+            let mut extra_after_stop = 50;
+            loop {
+                let version = current_turn_version(
+                    &sampler_state.session_turn_versions,
+                    &sampler_session_key,
+                );
+                let has_prompt_a = sampler_backend
+                    .load(&sampler_session_key)
+                    .iter()
+                    .any(|m| m.content.contains("prompt-A"));
+                samples.push((version, has_prompt_a));
+                if sampler_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    extra_after_stop -= 1;
+                    if extra_after_stop == 0 {
+                        break;
+                    }
+                }
+                if tokio::time::Instant::now() >= sampler_deadline {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            samples
+        });
+
+        // ── (2) Connection C performs the exact connect-time two-step,
+        // concurrently with A's completion, with nothing pinning it to any
+        // particular instant relative to A's persist/bump. ──
+        let state_c = state.clone();
+        let session_key_c = session_key.clone();
+        let connect_handle = ::zeroclaw_spawn::spawn!(async move {
+            // Mirrors ws.rs:~345 / ~351 exactly: read the version, *then*
+            // load history — this connection holds no permit at this point.
+            let seen_version_c =
+                current_turn_version(&state_c.session_turn_versions, &session_key_c);
+            let stored_messages_c = state_c
+                .session_backend
+                .as_ref()
+                .expect("backend configured")
+                .load(&session_key_c);
+            (seen_version_c, stored_messages_c)
+        });
+
+        // Abort A while the sampler and C's connect-time snapshot are
+        // racing its completion.
+        let abort_response = crate::api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let abort_json = queue_test_response_json(abort_response).await;
+        assert_eq!(abort_json["status"], "aborted");
+
+        let (_agent_a, _sender_a) = turn_a_handle.await.expect("turn A task does not panic");
+        let (seen_version_c, stored_messages_c) = connect_handle
+            .await
+            .expect("C's connect-time snapshot task does not panic");
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let samples = sampler_handle.await.expect("sampler task does not panic");
+
+        // ── Assertion (1): the dangerous ordering is never observed —
+        // version bumped without A's message yet visible in the backend.
+        // Fold C's own snapshot in too: it is just one more
+        // (version, backend-content) pair, taken at a real, uncontrolled
+        // instant during A's completion. ──
+        let stored_c_has_prompt_a = stored_messages_c
+            .iter()
+            .any(|m| m.content.contains("prompt-A"));
+        let all_samples: Vec<(u64, bool)> = samples
+            .iter()
+            .copied()
+            .chain(std::iter::once((seen_version_c, stored_c_has_prompt_a)))
+            .collect();
+        let violations: Vec<&(u64, bool)> = all_samples
+            .iter()
+            .filter(|&&(version, has_prompt_a)| version > 0 && !has_prompt_a)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "observed the session's turn-completion version bumped before A's \
+             message was visible in the backend: {violations:?} (out of {} samples)",
+            all_samples.len()
+        );
+        assert!(
+            all_samples.iter().any(|&(v, _)| v > 0),
+            "the sampler never observed the post-bump state at all in this run — \
+             widen its window; this run did not actually exercise the invariant"
+        );
+
+        // ── Assertion (2): C's own first prompt still lands on A's complete
+        // history, regardless of what its connect-time snapshot caught. ──
+        let mut agent_c = queue_test_agent(Box::new(ImmediateModelProvider("C-reply")));
+        if !stored_messages_c.is_empty() {
+            agent_c.seed_history_with_event(&stored_messages_c);
+        }
+        let mut sender_c = CollectSink(Vec::new());
+        let mut receiver_c =
+            futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+        let (_approval_tx, mut approval_rx_c) = tokio::sync::mpsc::channel(4);
+        let pending_c = new_pending_approvals();
+        let _guard_c = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("C acquires the session lock once A has fully released it");
+        if current_turn_version(&state.session_turn_versions, &session_key) != seen_version_c
+            && let Some(ref backend_ref) = state.session_backend
+        {
+            rehydrate_agent_from_backend(backend_ref.as_ref(), &mut agent_c, &session_key);
+        }
+        process_chat_message(
+            &state,
+            &mut agent_c,
+            &mut sender_c,
+            &mut receiver_c,
+            &mut approval_rx_c,
+            &pending_c,
+            &None,
+            "prompt-C",
+            &session_key,
+            "connect-race-session",
+            None,
+        )
+        .await;
+
+        let agent_c_saw_prompt_a = agent_c.history().iter().any(|m| {
+            matches!(
+                m,
+                zeroclaw_providers::ConversationMessage::Chat(c) if c.content.contains("prompt-A")
+            )
+        });
+        assert!(
+            agent_c_saw_prompt_a,
+            "C's Agent must reflect turn A's completed history before C's own \
+             prompt runs, regardless of what C's connect-time snapshot caught: {:?}",
+            agent_c.history()
         );
     }
 }
