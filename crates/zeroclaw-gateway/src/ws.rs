@@ -1130,7 +1130,7 @@ fn current_turn_version(
 /// from a connection that *did* rehydrate onto current history even though
 /// its seed is stale — silently resurrecting the pre-A-history bug this
 /// version scheme exists to close.
-fn bump_turn_version(
+pub(crate) fn bump_turn_version(
     session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
     session_key: &str,
 ) {

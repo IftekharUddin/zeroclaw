@@ -1807,6 +1807,15 @@ pub async fn handle_api_session_message_post(
             .into_response();
     }
 
+    // This append mutated the persisted transcript, so any connection-scoped
+    // `Agent` still holding the pre-append history is now stale. Bump the same
+    // epoch `process_chat_message` bumps on turn completion so that connection
+    // rehydrates before its next turn instead of running from history that is
+    // missing this message. Ordering matters: the bump follows the successful
+    // `append` above, preserving `bump_turn_version`'s invariant that a version
+    // is never observable before the messages behind it are persisted.
+    crate::ws::bump_turn_version(&state.session_turn_versions, &session_key);
+
     // Use the raw dashboard session ID here to match the WS `?session_id=`
     // query parameter; the `gw_` storage key is only for persistence.
     let event = serde_json::json!({
@@ -3449,6 +3458,116 @@ pub(crate) mod tests {
         let mut state = test_state(config);
         state.session_backend = Some(backend);
         state
+    }
+
+    /// Reviewer 🟡: `session_turn_versions` must be updated on *every*
+    /// transcript mutation path, not just turn completion. This handler
+    /// appends an operator message to the persisted transcript, so a
+    /// connection-scoped `Agent` holding the pre-append history is now
+    /// stale. Without a version bump it never rehydrates, and its next
+    /// turn runs from history missing this message.
+    #[tokio::test]
+    async fn session_message_post_bumps_turn_version_so_stale_agents_rehydrate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-2",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let version_before = state
+            .session_turn_versions
+            .lock()
+            .expect("session_turn_versions lock poisoned")
+            .get("gw_operator-2")
+            .copied()
+            .unwrap_or(0);
+
+        let response = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-2".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "operator note"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let version_after = state
+            .session_turn_versions
+            .lock()
+            .expect("session_turn_versions lock poisoned")
+            .get("gw_operator-2")
+            .copied()
+            .unwrap_or(0);
+
+        assert!(
+            version_after > version_before,
+            "appending to the transcript must bump the turn version so a \
+             connection holding pre-append history rehydrates before its next \
+             turn; got {version_before} -> {version_after}"
+        );
+    }
+
+    /// A rejected append must not certify history that was never written:
+    /// the version bump has to follow the successful `append`, not precede it.
+    #[tokio::test]
+    async fn session_message_post_does_not_bump_turn_version_for_rejected_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-3",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        // Empty content is rejected before any append happens.
+        let response = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-3".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "   "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert!(
+            state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .get("gw_operator-3")
+                .is_none(),
+            "a rejected message must not bump the turn version"
+        );
     }
 
     #[tokio::test]
