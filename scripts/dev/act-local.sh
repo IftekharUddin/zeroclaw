@@ -52,8 +52,8 @@ ACT_CACHE_DIR="${HOME}/.cache/act"
 # tell users to install. It encodes that no verified act release is known
 # to round-trip the pinned upload/download-artifact protocol. It must
 # ONLY be lowered to a real version number in the same change that
-# records a passing, real artifact round-trip against that release (see
-# #9095 and the follow-up PR that supplies that evidence). Until then,
+# records a passing, real artifact round-trip against that release, with
+# that evidence attached to the change itself. Until then,
 # every released act version — including any that happen to sort above
 # this sentinel numerically — fails the preflight below and the
 # GitHub-hosted workflow is the fallback. Keep this policy independent
