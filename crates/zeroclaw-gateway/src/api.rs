@@ -1836,7 +1836,20 @@ pub async fn handle_api_session_delete(
     }
 
     match backend.delete_session(&session_key) {
-        Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
+        Ok(true) => {
+            // Evict the epoch this session accumulated in
+            // `session_turn_versions` — it otherwise retains a completed
+            // session's key forever. A prompt already queued behind the
+            // cancelled turn above is separately rejected before it can run
+            // (see `session_deleted_while_queued`), so this is pure cleanup,
+            // not a correctness dependency.
+            state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .remove(&session_key);
+            Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1966,9 +1979,30 @@ pub async fn handle_api_session_state(
 
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
+            // The persisted row is a best-effort mirror written by
+            // `process_chat_message`'s `running` / `idle` `set_session_state`
+            // calls, whose errors are intentionally swallowed (a turn must
+            // not fail because a state write did). That means it can lag or
+            // go stale in both directions: a failed `running` write can leave
+            // it reporting `idle` while a token is still live (the dashboard
+            // would then unlock and recycle its socket mid-turn), and a
+            // failed `idle` write can leave it reporting `running` forever
+            // after the token is gone (the dashboard would then poll
+            // forever). `turn_is_live` — read straight from the in-process
+            // cancellation-token map — is reconciled against the persisted
+            // row rather than trusted blindly: a live token always wins, and
+            // a persisted `running` row backed by no live token is
+            // downgraded to `idle` instead of taken at face value.
+            let effective_state = if turn_is_live {
+                "running".to_string()
+            } else if ss.state == "running" {
+                "idle".to_string()
+            } else {
+                ss.state.clone()
+            };
             let mut resp = serde_json::json!({
                 "session_id": id,
-                "state": ss.state,
+                "state": effective_state,
                 "session_persistence": true,
             });
             if let Some(turn_id) = ss.turn_id {
@@ -2352,6 +2386,116 @@ pub(crate) mod tests {
         let running = response_json(running).await;
         assert_eq!(running["state"], "running");
         assert_eq!(running["session_persistence"], false);
+    }
+
+    /// A `SessionBackend` whose `get_session_state` always returns a fixed
+    /// row, standing in for a real backend after a best-effort
+    /// `set_session_state` write silently failed (see `process_chat_message`,
+    /// whose `running` / `idle` writes discard their own errors).
+    struct StaleStateBackend {
+        state: zeroclaw_infra::session_backend::SessionState,
+    }
+
+    impl SessionBackend for StaleStateBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+        fn get_session_state(
+            &self,
+            _session_key: &str,
+        ) -> std::io::Result<Option<zeroclaw_infra::session_backend::SessionState>> {
+            Ok(Some(zeroclaw_infra::session_backend::SessionState {
+                state: self.state.state.clone(),
+                turn_id: self.state.turn_id.clone(),
+                turn_started_at: self.state.turn_started_at,
+            }))
+        }
+    }
+
+    /// Reviewer-blocking regression: a failed best-effort `running` write in
+    /// `process_chat_message` (its error is intentionally swallowed) must
+    /// not make the session-state endpoint report a live turn as idle — the
+    /// dashboard would otherwise unlock and let the operator submit into a
+    /// turn that is still running. The live cancellation-token map must win
+    /// over the stale persisted row.
+    #[tokio::test]
+    async fn handle_api_session_state_trusts_live_token_over_stale_persisted_idle() {
+        let backend = Arc::new(StaleStateBackend {
+            state: zeroclaw_infra::session_backend::SessionState {
+                state: "idle".to_string(),
+                turn_id: None,
+                turn_started_at: None,
+            },
+        });
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend);
+        let session_id = "stale-idle-live-turn";
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(
+                format!("gw_{session_id}"),
+                tokio_util::sync::CancellationToken::new(),
+            );
+
+        let response =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(
+            response["state"], "running",
+            "a live cancel token must override a stale persisted \"idle\" row: {response:?}"
+        );
+    }
+
+    /// Reviewer-blocking regression: a failed best-effort `idle` write must
+    /// not make the session-state endpoint report `running` forever once the
+    /// live token is gone — the dashboard's recovery loop would otherwise
+    /// poll forever waiting for a turn that already finished.
+    #[tokio::test]
+    async fn handle_api_session_state_does_not_poll_forever_after_failed_idle_write() {
+        let backend = Arc::new(StaleStateBackend {
+            state: zeroclaw_infra::session_backend::SessionState {
+                state: "running".to_string(),
+                turn_id: Some("stale-turn".to_string()),
+                turn_started_at: None,
+            },
+        });
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend);
+        let session_id = "stale-running-no-live-turn";
+        // No entry in `cancel_tokens`: the turn this persisted row describes
+        // has already finished in this process.
+
+        let response =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(
+            response["state"], "idle",
+            "a stale persisted \"running\" row with no live token must not poll forever: {response:?}"
+        );
     }
 
     #[tokio::test]
