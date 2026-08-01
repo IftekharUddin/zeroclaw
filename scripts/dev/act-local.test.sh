@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
 # Shell-level regression tests for act-local artifact compatibility policy.
+#
+# ACT_ARTIFACT_MIN_VERSION is an unreachable sentinel ("999.0.0" as of this
+# writing) — no released act version is verified to round-trip the pinned
+# artifact protocol, so the integration cases below assert fail-closed for
+# every real-world-shaped version, including ones that used to be (or look
+# like they could plausibly become) the accepted floor. The one exception is
+# a synthetic control that feeds the exact sentinel value back in: that case
+# proves the comparison logic itself still opens the path when its condition
+# is met, so "everything fails" is because no real release meets the bar, not
+# because the comparison is silently broken. Numeric version-ordering and
+# parsing behavior is additionally exercised directly against the script's
+# pure helper functions, decoupled from whether any given version happens to
+# clear the current sentinel.
 
 set -euo pipefail
 
@@ -196,19 +209,85 @@ expect_log_count() {
   fi
 }
 
+# ── Direct unit tests for the pure version helpers ─────────────────
+#
+# Extract parse_released_act_version and version_at_least verbatim from
+# the script under test and source them into this shell. This exercises
+# numeric-ordering and v-prefix-parsing behavior directly, independent of
+# whatever ACT_ARTIFACT_MIN_VERSION currently is — so these assertions
+# stay meaningful even though the sentinel makes every integration case
+# below fail closed.
+version_funcs="$tmp/version_funcs.sh"
+awk '
+  /^parse_released_act_version\(\) \{/ { grab = 1 }
+  /^version_at_least\(\) \{/ { grab = 1 }
+  grab { print }
+  grab && /^}/ { grab = 0 }
+' "$script_under_test" >"$version_funcs"
+# shellcheck source=/dev/null
+. "$version_funcs"
+
+assert_version_at_least() {
+  local name="$1" current="$2" minimum="$3" expected="$4" actual
+  if version_at_least "$current" "$minimum"; then actual=0; else actual=1; fi
+  if [[ "$actual" -eq "$expected" ]]; then
+    record_pass
+  else
+    record_fail "$name: version_at_least('$current', '$minimum') expected exit $expected, got $actual"
+  fi
+}
+
+assert_parsed_version() {
+  local name="$1" version_output="$2" expected="$3" actual
+  actual="$(printf '%s\n' "$version_output" | parse_released_act_version)"
+  if [[ "$actual" == "$expected" ]]; then
+    record_pass
+  else
+    record_fail "$name: expected parsed version '$expected', got '$actual'"
+  fi
+}
+
+# Numeric, not lexicographic: "0.10.0" sorts before "0.2.90" as strings
+# (the character '1' < '2'), but 0.10.0 is the newer release (minor 10 >
+# minor 2). A lexicographic-comparison bug would get this backwards.
+assert_version_at_least 'minor version compares numerically, not lexicographically' '0.10.0' '0.2.90' 0
+assert_version_at_least 'numeric minor comparison is not symmetric' '0.2.90' '0.10.0' 1
+assert_version_at_least 'equal versions satisfy at-least' '1.2.3' '1.2.3' 0
+assert_version_at_least 'lower patch fails at-least' '1.2.2' '1.2.3' 1
+assert_version_at_least 'higher major overrides lower minor/patch' '2.0.0' '1.9.9' 0
+
+assert_parsed_version 'v-prefix is stripped' 'act version v1.0.0' '1.0.0'
+assert_parsed_version 'unprefixed version passes through' 'act version 0.2.89' '0.2.89'
+assert_parsed_version 'prerelease suffix is rejected (empty parse)' 'act version 0.2.90-rc.1' ''
+assert_parsed_version 'unparseable version-output line is rejected' 'act development build' ''
+
 run_case 'act version 0.2.89' release-stable-manual:web
 expect_status 'unsupported explicit artifact job' 1
 expect_output 'unsupported policy' 'not yet satisfied by any release'
 expect_output 'hosted fallback' 'Use GitHub-hosted Actions as the fallback'
 expect_log_empty 'unsupported explicit artifact job'
 
+# 0.2.90 was the previous (pre-sentinel) accepted floor and is a
+# plausible near-future real act release. If upstream ever publishes it,
+# the helper must still refuse to run artifact jobs against it — the
+# sentinel is unreachable until a specific release passes a real
+# round-trip, so no numbered release, however close, opens the path on
+# its own. This is the regression guard for the latent auto-open
+# condition the sentinel fix closes.
 run_case 'act version 0.2.90' release-stable-manual:web
-expect_status 'minimum supported version' 0
-expect_log_count 'minimum supported version' 1
+expect_status 'unverified 0.2.90 still fails closed' 1
+expect_output 'unverified 0.2.90 fail message' 'not yet satisfied by any release'
+expect_output 'unverified 0.2.90 hosted fallback' 'Use GitHub-hosted Actions as the fallback'
+expect_log_empty 'unverified 0.2.90 still fails closed'
 
+# A high major version with a "v" prefix must still fail closed against
+# the sentinel — but it must fail via the version-comparison "does not
+# support" message, not the "could not parse" message, proving the
+# v-prefix was stripped and parsed correctly before being compared.
 run_case 'act version v1.0.0' release-stable-manual:web
-expect_status 'supported major version with v prefix' 0
-expect_log_count 'supported major version with v prefix' 1
+expect_status 'high major version with v prefix still fails closed' 1
+expect_output 'v-prefix parsed before comparison' 'act 1.0.0 does not support'
+expect_log_empty 'high major version with v prefix still fails closed'
 
 run_case $'act version 0.2.90-rc.1\nruntime version 1.25.0' release-stable-manual:web
 expect_status 'prerelease fails closed' 1
@@ -248,13 +327,38 @@ expect_status 'unsupported all sweep' 1
 expect_output 'all policy context' 'error: --all requires the pinned artifact actions'
 expect_log_empty 'all preflight runs before every job'
 
+# Same latent-auto-open guard as above, but for --all: a plausible
+# near-future release must not let the atomic preflight open the sweep.
 run_case 'act version 0.2.90' --all
-expect_status 'supported all sweep' 0
-expect_log_count 'supported all sweep' 2
+expect_status 'unverified 0.2.90 still fails closed for --all' 1
+expect_output 'all policy context (unverified 0.2.90)' 'error: --all requires the pinned artifact actions'
+expect_log_empty 'unverified 0.2.90 still fails closed for --all'
 
+# A "higher-looking" minor version (10 > 2 in the second component) must
+# still fail closed against the sentinel — numeric ordering is exercised
+# directly against version_at_least above; this integration case confirms
+# the full --all path applies the same fail-closed policy regardless of
+# how a version happens to sort relative to the old, no-longer-relevant
+# 0.2.90 floor.
 run_case 'act version 0.10.0' --all
-expect_status 'minor versions compare numerically' 0
-expect_log_count 'minor versions compare numerically' 2
+expect_status 'higher minor version still fails closed for --all' 1
+expect_log_empty 'higher minor version still fails closed for --all'
+
+# Synthetic control: feed the exact sentinel value back in. This proves
+# the comparison logic itself still opens the path when its condition is
+# genuinely met — i.e. every case above fails because no real act release
+# meets the bar, not because version_at_least or the preflight wiring is
+# silently broken and would refuse every input regardless of value.
+# "999.0.0" is not a real, installable, or recommended act version; it
+# exists only to keep this test suite honest about *why* everything else
+# fails closed. Do not read this as install guidance.
+run_case 'act version 999.0.0' release-stable-manual:web
+expect_status 'sentinel exactly met opens the path (synthetic control)' 0
+expect_log_count 'sentinel exactly met opens the path (synthetic control)' 1
+
+run_case 'act version 999.0.0' --all
+expect_status 'sentinel exactly met opens --all (synthetic control)' 0
+expect_log_count 'sentinel exactly met opens --all (synthetic control)' 2
 
 printf 'passed: %d\n' "$pass"
 printf 'failed: %d\n' "$fail"

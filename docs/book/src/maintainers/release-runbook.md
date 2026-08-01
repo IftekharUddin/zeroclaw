@@ -263,13 +263,13 @@ the flag soup.
 
 Before any artifact-producing or artifact-consuming job starts, the helper
 checks the resolved standalone `act` or `gh act` version against an internal
-compatibility threshold (`act` >= 0.2.90). That threshold is **not** a
-version to go install; it is the floor a future `act` release must clear,
-and it only moves once a real artifact round-trip has been verified against
-that release. No currently released `act` version meets it, so every
-release fails the preflight before the build starts and points to
-GitHub-hosted Actions; do not downgrade the pinned artifact actions to make
-a local runner pass.
+compatibility threshold (`act` >= an unreachable sentinel, currently
+`999.0.0`). That threshold is **not** a version to go install; no released
+`act` version satisfies it, and it only moves to a real, specific version
+once a real artifact round-trip has been verified against that release. Every
+currently released `act` version fails the preflight before the build starts
+and points to GitHub-hosted Actions; do not downgrade the pinned artifact
+actions to make a local runner pass.
 
 For `--all`, compatibility is checked across the complete selected job set
 before the first job starts. If any selected job needs the artifact service,

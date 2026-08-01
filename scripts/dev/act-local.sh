@@ -48,14 +48,18 @@ ACT_CACHE_DIR="${HOME}/.cache/act"
 # actions/upload-artifact v7 and actions/download-artifact v8 need an
 # artifact-service protocol that no currently released act version
 # implements (checked through the latest release as of this writing).
-# ACT_ARTIFACT_MIN_VERSION is NOT a version to tell users to install — it is
-# the floor a future act release must clear, and it must only move after an
-# actual artifact round-trip has been verified against that release. Until
-# then every released act version fails the preflight below and the
-# GitHub-hosted workflow is the fallback. Keep this policy independent from
-# the pinned action refs: the GitHub-hosted workflow remains canonical and
-# must not be downgraded for a local runner.
-ACT_ARTIFACT_MIN_VERSION="0.2.90"
+# ACT_ARTIFACT_MIN_VERSION is an unreachable sentinel, not a version to
+# tell users to install. It encodes that no verified act release is known
+# to round-trip the pinned upload/download-artifact protocol. It must
+# ONLY be lowered to a real version number in the same change that
+# records a passing, real artifact round-trip against that release (see
+# #9095 and the follow-up PR that supplies that evidence). Until then,
+# every released act version — including any that happen to sort above
+# this sentinel numerically — fails the preflight below and the
+# GitHub-hosted workflow is the fallback. Keep this policy independent
+# from the pinned action refs: the GitHub-hosted workflow remains
+# canonical and must not be downgraded for a local runner.
+ACT_ARTIFACT_MIN_VERSION="999.0.0"
 NO_ALLOWLIST=false
 # Resolved at setup time. Prefers a standalone `act` on PATH, falls
 # back to `gh act` (the gh-act extension) — that's the install path
