@@ -49,6 +49,11 @@ pub(crate) struct SopPane {
     /// and rendered as the leading icon on each list row.
     run_status: std::collections::HashMap<String, SopRunStatusView>,
     last_runs_poll: Option<std::time::Instant>,
+    /// Gates every mutating surface (run, create, edit, delete, checkpoint
+    /// decisions) while leaving selection, graph viewing, run overlays, and
+    /// panning live. The TUI ships as a status view first; authoring and run
+    /// controls stay behind this flag until they are green-lit.
+    read_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -408,6 +413,17 @@ fn trigger_source_walk(registry: &crate::client::TriggerSourceRegistryView) -> V
     sources
 }
 
+/// Actions gated off while the pane is a read-only status view. Everything
+/// that mutates SOPs or run state (run, authoring, checkpoint decisions) is
+/// blocked; selection, graph viewing, run watching, and panning stay live.
+fn blocked_when_read_only(action: crate::keymap::SopTabAction) -> bool {
+    use crate::keymap::SopTabAction as S;
+    matches!(
+        action,
+        S::Run | S::New | S::Edit | S::Delete | S::Approve | S::Deny
+    )
+}
+
 fn failure_label(f: &StepFailure) -> String {
     match f {
         StepFailure::Fail => "fail".to_string(),
@@ -499,6 +515,7 @@ impl SopPane {
             pan_drag: None,
             run_status: std::collections::HashMap::new(),
             last_runs_poll: None,
+            read_only: true,
         }
     }
 
@@ -691,6 +708,9 @@ impl SopPane {
             Some(SopTabAction::Up) => self.select_prev(),
             Some(SopTabAction::Down) => self.select_next(),
             Some(SopTabAction::Enter) => self.load_selected_graph().await,
+            // Mutating actions are inert while the pane is a read-only status
+            // view; Watch stays live because it only loads a run overlay.
+            Some(action) if self.read_only && blocked_when_read_only(action) => {}
             Some(SopTabAction::Run) => self.start_run_payload().await,
             Some(SopTabAction::Watch) => self.run_input = Some(String::new()),
             Some(SopTabAction::New) => {
@@ -776,7 +796,9 @@ impl SopPane {
                 {
                     if self.editor.is_some() {
                         self.focus_editor_step(step);
-                    } else {
+                    } else if !self.read_only {
+                        // Node clicks open the step editor, a mutating
+                        // surface — inert in the read-only status view.
                         self.open_editor_for_step(step).await;
                     }
                     return;
@@ -1407,6 +1429,21 @@ impl SopPane {
 
     pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::SopTabAction as S;
+        if self.read_only {
+            // Advertise only the surfaces that are live in the read-only
+            // status view; mutating chords are inert and stay out of help.
+            return crate::widgets::HelpNode::entries(crate::help::entries_for([
+                S::Up,
+                S::Down,
+                S::Enter,
+                S::Watch,
+                S::Toggle,
+                S::PanLeft,
+                S::PanRight,
+                S::PanUp,
+                S::PanDown,
+            ]));
+        }
         crate::widgets::HelpNode::entries(crate::help::entries_for([
             S::Up,
             S::Down,
@@ -1537,6 +1574,10 @@ impl SopPane {
         if empty {
             let msg = if editor.is_some() {
                 "(no steps; Ctrl+n to add, then click handles to wire)"
+            } else if self.read_only {
+                // Authoring keys are inert in the read-only status view;
+                // don't advertise them.
+                "(no nodes)"
             } else {
                 "(no nodes; press n to author, e to edit)"
             };
@@ -2333,6 +2374,29 @@ mod tests {
     use crate::client::NodePosition;
     use crate::client::{BoundTriggerSourceView, GraphLayout, TriggerSourceRegistryView};
     use ratatui::layout::Rect;
+
+    #[test]
+    fn read_only_gate_blocks_exactly_the_mutating_actions() {
+        use crate::keymap::SopTabAction as S;
+        // Mutating surfaces stay inert in the status view.
+        for action in [S::Run, S::New, S::Edit, S::Delete, S::Approve, S::Deny] {
+            assert!(super::blocked_when_read_only(action), "{action:?}");
+        }
+        // Selection, viewing, watching, and panning stay live.
+        for action in [
+            S::Up,
+            S::Down,
+            S::Enter,
+            S::Watch,
+            S::Toggle,
+            S::PanLeft,
+            S::PanRight,
+            S::PanUp,
+            S::PanDown,
+        ] {
+            assert!(!super::blocked_when_read_only(action), "{action:?}");
+        }
+    }
 
     #[test]
     fn honored_toml_coords_land_on_matching_slot() {
