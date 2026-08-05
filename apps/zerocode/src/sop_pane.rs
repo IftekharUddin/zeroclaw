@@ -2205,12 +2205,14 @@ fn wire_color(w: &GraphWire) -> Color {
     }
 }
 
+/// Node borders follow the run-status palette: green in flight, red failed,
+/// white ended cleanly, dark gray skipped or no run state.
 fn node_border_color(state: Option<NodeRunState>) -> Color {
     match state {
-        Some(NodeRunState::Active) => Color::Magenta,
-        Some(NodeRunState::Completed) => Color::Green,
+        Some(NodeRunState::Active) => Color::Green,
+        Some(NodeRunState::Completed) => Color::White,
         Some(NodeRunState::Failed) => Color::Red,
-        Some(NodeRunState::Skipped) => Color::Yellow,
+        Some(NodeRunState::Skipped) => Color::DarkGray,
         _ => Color::Gray,
     }
 }
@@ -2448,16 +2450,16 @@ fn aggregate_sop_status(runs: &[SopRunSummaryView]) -> Option<SopRunStatusView> 
         .map(|r| r.status)
 }
 
-/// Row icon for an aggregated status. Green done, yellow in flight, blue
-/// waiting on a human, red bad end, white "this daemon knows something we
-/// don't".
+/// Row icon for an aggregated status. Green in flight, yellow waiting on a
+/// human, red failed, white ended cleanly (completed or cancelled), black
+/// "this daemon knows something we don't".
 fn status_icon(status: SopRunStatusView) -> &'static str {
     match status {
-        SopRunStatusView::Completed => "🟢",
-        SopRunStatusView::Pending | SopRunStatusView::Running => "🟡",
-        SopRunStatusView::WaitingApproval | SopRunStatusView::PausedCheckpoint => "🔵",
-        SopRunStatusView::Failed | SopRunStatusView::Cancelled => "🔴",
-        SopRunStatusView::Unknown => "⚪",
+        SopRunStatusView::Pending | SopRunStatusView::Running => "🟢",
+        SopRunStatusView::WaitingApproval | SopRunStatusView::PausedCheckpoint => "🟡",
+        SopRunStatusView::Failed => "🔴",
+        SopRunStatusView::Completed | SopRunStatusView::Cancelled => "⚪",
+        SopRunStatusView::Unknown => "⚫",
     }
 }
 
@@ -2812,14 +2814,14 @@ mod status_agg_tests {
 
     #[test]
     fn icon_mapping_covers_every_status() {
-        assert_eq!(status_icon(SopRunStatusView::Completed), "🟢");
-        assert_eq!(status_icon(SopRunStatusView::Pending), "🟡");
-        assert_eq!(status_icon(SopRunStatusView::Running), "🟡");
-        assert_eq!(status_icon(SopRunStatusView::WaitingApproval), "🔵");
-        assert_eq!(status_icon(SopRunStatusView::PausedCheckpoint), "🔵");
+        assert_eq!(status_icon(SopRunStatusView::Pending), "🟢");
+        assert_eq!(status_icon(SopRunStatusView::Running), "🟢");
+        assert_eq!(status_icon(SopRunStatusView::WaitingApproval), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::PausedCheckpoint), "🟡");
         assert_eq!(status_icon(SopRunStatusView::Failed), "🔴");
-        assert_eq!(status_icon(SopRunStatusView::Cancelled), "🔴");
-        assert_eq!(status_icon(SopRunStatusView::Unknown), "⚪");
+        assert_eq!(status_icon(SopRunStatusView::Completed), "⚪");
+        assert_eq!(status_icon(SopRunStatusView::Cancelled), "⚪");
+        assert_eq!(status_icon(SopRunStatusView::Unknown), "⚫");
     }
 }
 
