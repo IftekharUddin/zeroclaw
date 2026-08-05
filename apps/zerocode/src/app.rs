@@ -505,9 +505,7 @@ pub async fn run(
                         }
                     }
                 }
-                crate::agent_sidebar::SidebarEvent::OpenQuickstart
-                    if mode != Mode::Quickstart =>
-                {
+                crate::agent_sidebar::SidebarEvent::OpenQuickstart if mode != Mode::Quickstart => {
                     quickstart_return = mode;
                     switch_mode(
                         &mut mode,
