@@ -20,9 +20,16 @@ and ZeroClaw only accepts the ones addressed back to the configured
 ignored. Because the sender of a Note-to-Self message is the account
 itself, that number must also be listed in the `external_peers` of a
 `[peer_groups.<name>]` block with `channel = "signal"` for these messages
-to reach the agent. ZeroClaw's own Note-to-Self replies (which also echo
-back as sync events) are recognized and not re-ingested as new inbound
-messages.
+to reach the agent. When signal-cli reports a ZeroClaw self-send on the
+sync stream, ZeroClaw correlates it with the exact timestamp returned by
+the send RPC and does not re-ingest it. An event that arrives before the
+RPC response waits for that timestamp; an equal body with a different
+timestamp remains a genuine note.
+
+If the daemon accepts a self-send but the HTTP response is lost or cannot
+be parsed, ZeroClaw cannot recover the canonical timestamp safely. It then
+fails Note-to-Self closed until the channel restarts rather than risk an
+agent replying to its own output. Ordinary Signal messages are unaffected.
 
 ## Prerequisites
 
