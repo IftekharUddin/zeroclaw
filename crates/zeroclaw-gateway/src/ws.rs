@@ -610,6 +610,16 @@ async fn handle_socket(
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
                         return;
                     }
+                    if reject_prompt_after_failed_persistence(&state, &mut agent, &session_key) {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": "A previous turn on this session could not be saved; \
+                                        its transcript is incomplete. Retry your message.",
+                            "code": "SESSION_PERSISTENCE_FAILED"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        return;
+                    }
                     // Rehydrate iff a turn (this connection's own earlier
                     // one, or a different connection's) has completed since
                     // our `Agent` was last known current. The `seen_version`
@@ -818,6 +828,16 @@ async fn handle_socket(
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
                     continue;
                 }
+                if reject_prompt_after_failed_persistence(&state, &mut agent, &session_key) {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "A previous turn on this session could not be saved; \
+                                    its transcript is incomplete. Retry your message.",
+                        "code": "SESSION_PERSISTENCE_FAILED"
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
                 // Rehydrate iff a turn has completed since our `Agent` was
                 // last known current. See the matching comment at the other
                 // `session_queue.acquire` call site for why the
@@ -1007,10 +1027,16 @@ fn bump_turn_version_after_persistence(
     session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
     session_key: &str,
     persisted_ok: bool,
+    lifecycle: &crate::session_lifecycle::SessionLifecycle,
 ) {
     if persisted_ok {
         bump_turn_version(session_turn_versions, session_key);
     } else {
+        // Record the failure as well as withholding the bump. An unchanged
+        // version reads to a queued connection as "no turn completed", so it
+        // would skip rehydration and run against history the failed append
+        // was meant to extend.
+        lifecycle.record_persistence_failure(session_key);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1090,6 +1116,42 @@ fn session_deleted_while_queued(
     captured: crate::session_lifecycle::DeletionGeneration,
 ) -> bool {
     state.session_lifecycle.deleted_since(session_key, captured)
+}
+
+/// Reject a queued prompt whose session has a turn that failed to persist.
+///
+/// Withholding the turn-version bump on a failed append keeps a queued
+/// connection from *believing* a turn completed, but that is not by itself
+/// protective: with the version unchanged, the queued connection's
+/// `seen_version` comparison comes out equal, so it skips rehydration and
+/// runs its prompt against pre-turn history — precisely the transcript the
+/// failed append was supposed to extend. The result would be a silently
+/// divergent conversation rather than a visible error.
+///
+/// The gateway cannot repair the backend, so it does the next best thing:
+/// fail this prompt loudly, and re-seed the connection's `Agent` from
+/// whatever the backend actually holds. That re-establishes agreement
+/// between memory and storage, so the session is usable again on the next
+/// prompt instead of being wedged for the life of the connection. Returns
+/// `true` when the caller should reject the prompt.
+fn reject_prompt_after_failed_persistence(
+    state: &AppState,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    session_key: &str,
+) -> bool {
+    if !state.session_lifecycle.persistence_failed(session_key) {
+        return false;
+    }
+    // Re-seed from storage before clearing the flag: the in-memory history
+    // is known to disagree with the backend, and only a successful reload
+    // makes it safe to accept another prompt on this session.
+    if let Some(ref backend) = state.session_backend {
+        let _ = rehydrate_agent_from_backend(backend.as_ref(), agent, session_key);
+    }
+    state
+        .session_lifecycle
+        .clear_persistence_failure(session_key);
+    true
 }
 
 /// Rehydrate a connection-scoped `Agent`'s history from the session backend.
@@ -1731,6 +1793,7 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
             &state.session_turn_versions,
             session_key,
             persisted_ok,
+            state.session_lifecycle.as_ref(),
         );
 
         // Inform the client the turn was aborted
@@ -1780,6 +1843,7 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                 &state.session_turn_versions,
                 session_key,
                 persisted_ok,
+                state.session_lifecycle.as_ref(),
             );
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1896,6 +1960,7 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                 &state.session_turn_versions,
                 session_key,
                 persisted_ok,
+                state.session_lifecycle.as_ref(),
             );
 
             // Set session state to error
@@ -2768,6 +2833,63 @@ mod tests {
                 .get(&session_key)
                 .is_none(),
             "the turn must still release its cancel token even though persistence failed"
+        );
+        assert!(
+            state.session_lifecycle.persistence_failed(&session_key),
+            "the failed append must be recorded so the next writer can be stopped"
+        );
+    }
+
+    /// The withheld version bump alone does not protect the next writer: an
+    /// unchanged version reads to a queued connection as "no turn
+    /// completed", so it skips rehydration and would run against the
+    /// pre-turn history the failed append was meant to extend. The next
+    /// prompt must instead be rejected, and the connection's `Agent`
+    /// re-seeded from what the backend actually holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_prompt_is_rejected_after_failed_persistence() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(PartiallyFailingAppendBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_at_call: 1,
+        });
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "reject-after-failed-persistence";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        // Socket A's turn fails to persist fully.
+        state
+            .session_lifecycle
+            .record_persistence_failure(&session_key);
+
+        // Socket B is a *different* connection whose `seen_version` matches
+        // the (correctly un-bumped) current version, so the rehydrate check
+        // below would not fire on its own.
+        let seen_version_b = current_turn_version(&state.session_turn_versions, &session_key);
+        assert_eq!(
+            seen_version_b, 0,
+            "precondition: the failed append must not have bumped the version"
+        );
+
+        let mut agent_b = queue_test_agent(Box::new(ImmediateModelProvider("b-reply")));
+        let rejected = reject_prompt_after_failed_persistence(&state, &mut agent_b, &session_key);
+
+        assert!(
+            rejected,
+            "a prompt queued behind a turn that failed to persist must be rejected, \
+             not silently run against stale history"
+        );
+        assert!(
+            !state.session_lifecycle.persistence_failed(&session_key),
+            "the flag must clear once the agent has been re-seeded, so the session \
+             recovers instead of staying wedged for the life of the connection"
+        );
+        assert!(
+            !reject_prompt_after_failed_persistence(&state, &mut agent_b, &session_key),
+            "a second prompt must be accepted once storage and memory agree again"
         );
     }
 

@@ -48,6 +48,7 @@ pub struct DeletionGeneration(u64);
 pub struct SessionLifecycle {
     deletions: Mutex<HashMap<String, u64>>,
     finalizing: Mutex<HashMap<String, u64>>,
+    persistence_failures: Mutex<std::collections::HashSet<String>>,
 }
 
 impl SessionLifecycle {
@@ -120,6 +121,48 @@ impl SessionLifecycle {
     pub fn forget_finalizing(&self, session_key: &str) {
         let mut finalizing = self.finalizing.lock().expect("finalizing lock poisoned");
         finalizing.remove(session_key);
+    }
+
+    /// Record that a turn's messages could not be fully persisted.
+    ///
+    /// Suppressing the turn-version bump alone is not enough to protect the
+    /// next writer: with the version unchanged, a queued connection compares
+    /// equal to its `seen_version`, concludes nothing has completed, skips
+    /// rehydration, and runs against its pre-turn history — the transcript
+    /// the failed append was supposed to extend. The gateway cannot repair
+    /// the backend, so it records the damage explicitly and lets the next
+    /// writer fail loudly instead of silently continuing from history known
+    /// to be wrong.
+    pub fn record_persistence_failure(&self, session_key: &str) {
+        let mut failures = self
+            .persistence_failures
+            .lock()
+            .expect("persistence failures lock poisoned");
+        failures.insert(session_key.to_string());
+    }
+
+    /// True when a turn for `session_key` failed to persist and the session's
+    /// transcript has not been re-read since.
+    #[must_use]
+    pub fn persistence_failed(&self, session_key: &str) -> bool {
+        let failures = self
+            .persistence_failures
+            .lock()
+            .expect("persistence failures lock poisoned");
+        failures.contains(session_key)
+    }
+
+    /// Clear a recorded persistence failure.
+    ///
+    /// Called once a writer has successfully reloaded the session's history
+    /// from the backend, which re-establishes agreement between the in-memory
+    /// `Agent` and what is actually stored.
+    pub fn clear_persistence_failure(&self, session_key: &str) {
+        let mut failures = self
+            .persistence_failures
+            .lock()
+            .expect("persistence failures lock poisoned");
+        failures.remove(session_key);
     }
 }
 
