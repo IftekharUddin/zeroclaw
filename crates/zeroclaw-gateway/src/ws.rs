@@ -2669,7 +2669,7 @@ mod tests {
         }
     }
 
-    /// Reviewer-blocking regression: `persist_conversation_messages` must
+    /// `persist_conversation_messages` must
     /// report a partial write instead of silently discarding the `append()`
     /// error, so its caller can gate the turn-completion version bump on it.
     #[test]
@@ -2698,7 +2698,7 @@ mod tests {
         );
     }
 
-    /// Reviewer-blocking regression: a partial/failed `append()` during
+    /// A partial/failed `append()` during
     /// turn completion must not advance `session_turn_versions` — otherwise
     /// a queued or reconnecting connection can observe the bumped version,
     /// clear its `Agent` history, and rehydrate onto a transcript that is
@@ -2859,7 +2859,7 @@ mod tests {
 
     // ── Production-boundary two-socket regression ────────────────────────
     //
-    // Reviewer's blocking ask: a prompt B arriving while turn A is live must
+    // A prompt B arriving while turn A is live must
     // (1) be queued/attached rather than run concurrently with A, (2) run
     // against A's completed history once it does run — never the pre-A
     // snapshot its connection-scoped `Agent` was seeded with at connect
@@ -3279,7 +3279,7 @@ mod tests {
         assert_b_rehydrated_after_a_aborted(&state, &backend, &session_key, &agent_b, &sender_b);
     }
 
-    /// Reviewer-blocking regression: the gateway shutdown watch channel
+    /// The gateway shutdown watch channel
     /// (`AppState::shutdown_tx`, observed by `run_gateway`'s accept loop) was
     /// not observed anywhere inside a live turn, so a detached turn (viewer
     /// already gone) would keep running provider/tool calls straight through
@@ -3301,8 +3301,8 @@ mod tests {
             let mut sender = CollectSink(Vec::new());
             // Already-empty stream: the very first `receiver.next()` poll
             // resolves to `None`, exactly like a viewer that disconnected
-            // before this turn even started — the detached-turn case the
-            // reviewer's shutdown concern is about.
+            // before this turn even started — the detached-turn case
+            // shutdown cancellation has to cover.
             let mut receiver =
                 futures_util::stream::empty::<Result<Message, std::convert::Infallible>>();
             let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
@@ -3377,7 +3377,7 @@ mod tests {
         );
     }
 
-    /// Reviewer-blocking regression: `DELETE /api/sessions/{id}` cancels the
+    /// `DELETE /api/sessions/{id}` cancels the
     /// *currently registered* live token, but a prompt already queued behind
     /// that turn on `session_queue` has not registered a token of its own
     /// yet. Without an explicit check, that queued prompt is free to acquire
@@ -4034,7 +4034,10 @@ mod tests {
         )
         .await
         .into_response();
-        assert_eq!(queue_test_response_json(delete_response).await["deleted"], true);
+        assert_eq!(
+            queue_test_response_json(delete_response).await["deleted"],
+            true
+        );
 
         // Recreate it, so a file-presence probe would report the session as
         // perfectly healthy.

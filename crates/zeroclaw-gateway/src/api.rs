@@ -2516,7 +2516,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Reviewer-blocking regression: a failed best-effort `running` write in
+    /// A failed best-effort `running` write in
     /// `process_chat_message` (its error is intentionally swallowed) must
     /// not make the session-state endpoint report a live turn as idle — the
     /// dashboard would otherwise unlock and let the operator submit into a
@@ -2555,7 +2555,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Reviewer-blocking regression: a failed best-effort `idle` write must
+    /// A failed best-effort `idle` write must
     /// not make the session-state endpoint report `running` forever once the
     /// live token is gone — the dashboard's recovery loop would otherwise
     /// poll forever waiting for a turn that already finished.
@@ -3503,7 +3503,7 @@ pub(crate) mod tests {
         state
     }
 
-    /// Reviewer 🟡: `session_turn_versions` must be updated on *every*
+    /// `session_turn_versions` must be updated on *every*
     /// transcript mutation path, not just turn completion. This handler
     /// appends an operator message to the persisted transcript, so a
     /// connection-scoped `Agent` holding the pre-append history is now
@@ -5578,5 +5578,4 @@ pub(crate) mod tests {
             "the evicted epoch entry must not be resurrected by a queued append"
         );
     }
-
 }
