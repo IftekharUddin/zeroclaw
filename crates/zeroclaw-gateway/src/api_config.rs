@@ -2670,6 +2670,7 @@ mod tests {
             session_turn_versions: Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

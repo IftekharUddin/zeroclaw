@@ -14,6 +14,12 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import {
+  recoveryFailureOutcome,
+  recoveryMessageKey,
+  shouldBlockSending,
+  shouldOfferRecoveryAction,
+} from '@/contexts/sessionRecovery.logic';
+import {
   loadChatHistory,
   mapServerMessagesToPersisted,
   persistedToUiMessages,
@@ -80,6 +86,14 @@ interface AgentContextValue {
   // Context window tracking (from "done" WS frames). See #7311.
   contextMaxTokens: number | null;
   contextInputTokens: number | null;
+  /**
+   * Label for the recovery affordance shown when detached-turn recovery gives
+   * up, or null when recovery succeeded. Non-null means the composer is
+   * blocked and only this action can unblock it.
+   */
+  recoveryActionLabel: string | null;
+  /** Re-run detached-turn recovery after it failed. */
+  retryRecovery: () => void;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -104,15 +118,6 @@ function sessionRecoveryStatus(error: unknown): number | null {
     return error.status;
   }
   return null;
-}
-
-function isTerminalSessionRecoveryError(error: unknown): boolean {
-  const status = sessionRecoveryStatus(error);
-  return status !== null
-    && status >= 400
-    && status < 500
-    && status !== 408
-    && status !== 429;
 }
 
 function friendlyAgentError(message?: string): string {
@@ -147,6 +152,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
+  // Set when detached-turn recovery gives up. Sending stays blocked, so this
+  // is the only affordance that can return the session to a usable state —
+  // without it the composer is locked until the page is reloaded.
+  const [recoveryAction, setRecoveryAction] = useState<
+    { label: string; wsVersion: number } | null
+  >(null);
   const [streamingContent, setStreamingContent] = useState('');
   const [streamingThinking, setStreamingThinking] = useState('');
   const [currentModel, setCurrentModel] = useState<string | null>(null);
@@ -525,6 +536,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // from onOpen, so a freshly remounted chat never exposes a writable input
     // while its session-state request is still in flight.
     setTyping(true);
+    // Any prior lockout affordance belongs to a superseded attempt.
+    setRecoveryAction(null);
 
     let recoveryFailures = 0;
     let recoveryDelayMs = SESSION_RECOVERY_POLL_MS;
@@ -537,14 +550,27 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           return state;
         } catch (recoveryError) {
           recoveryFailures += 1;
-          if (
-            isTerminalSessionRecoveryError(recoveryError)
-            || recoveryFailures >= SESSION_RECOVERY_MAX_FAILURES
-          ) {
-            // Lifecycle uncertainty remains fail-closed: surface the failure,
-            // but leave typing=true so another prompt cannot start while the
-            // canonical turn state is unknown.
-            if (isCurrent()) setError(t('agent.session_recovery_error'));
+          const outcome = recoveryFailureOutcome({
+            status: sessionRecoveryStatus(recoveryError),
+            failures: recoveryFailures,
+            maxFailures: SESSION_RECOVERY_MAX_FAILURES,
+          });
+          if (outcome) {
+            if (isCurrent()) {
+              setError(t(recoveryMessageKey(outcome.reason)));
+              // Sending stays fail-closed while lifecycle state is unknown,
+              // but the block must not be a dead end: no frame will ever
+              // arrive on this socket to clear it, because the replacement
+              // socket was never attached to the detached turn. Pair the
+              // block with an explicit retry so the session is recoverable
+              // without a page reload.
+              setTyping(shouldBlockSending(outcome));
+              setRecoveryAction(
+                shouldOfferRecoveryAction(outcome)
+                  ? { label: t('agent.session_recovery_retry'), wsVersion }
+                  : null,
+              );
+            }
             return null;
           }
           await new Promise<void>((resolve) => {
@@ -1015,6 +1041,15 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // Context window tracking (from "done" WS frames). See #7311.
     contextMaxTokens,
     contextInputTokens,
+    recoveryActionLabel: recoveryAction?.label ?? null,
+    retryRecovery: () => {
+      // Re-run recovery against the live socket. `recoverDetachedTurn` bumps
+      // the recovery generation, so a stale attempt cannot resurrect the
+      // lockout after this one supersedes it.
+      setError(null);
+      setRecoveryAction(null);
+      void recoverDetachedTurn(wsVersionRef.current);
+    },
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

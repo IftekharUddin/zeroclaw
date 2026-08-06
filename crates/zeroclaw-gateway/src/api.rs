@@ -1785,6 +1785,11 @@ pub async fn handle_api_session_message_post(
             .into_response();
     }
 
+    // Capture the deletion generation before waiting on the permit. The
+    // existence check above happens *before* the wait, so on its own it says
+    // nothing about whether the session survived the wait.
+    let deletion_generation = state.session_lifecycle.deletion_generation(&session_key);
+
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
         Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
@@ -1802,6 +1807,20 @@ pub async fn handle_api_session_message_post(
                 .into_response();
         }
     };
+
+    // DELETE may have landed while this request sat behind another turn.
+    // Appending now would recreate the transcript an operator just removed
+    // and, via the bump below, resurrect the evicted epoch entry.
+    if state
+        .session_lifecycle
+        .deleted_since(&session_key, deletion_generation)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session was deleted while this request was queued"})),
+        )
+            .into_response();
+    }
 
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
     if let Err(e) = backend.append(&session_key, &message) {
@@ -1887,6 +1906,13 @@ pub async fn handle_api_session_delete(
 
     match backend.delete_session(&session_key) {
         Ok(true) => {
+            // Record the deletion before touching anything else: writers
+            // already queued on the `session_queue` permit compare against
+            // the generation they captured before waiting, so this is what
+            // makes the delete visible to them. It must be recorded even
+            // though the epoch entry is evicted below, because a turn still
+            // unwinding can re-insert that entry.
+            state.session_lifecycle.record_deletion(&session_key);
             // Evict the epoch this session accumulated in
             // `session_turn_versions` — it otherwise retains a completed
             // session's key forever. A prompt already queued behind the
@@ -1898,6 +1924,9 @@ pub async fn handle_api_session_delete(
                 .lock()
                 .expect("session_turn_versions lock poisoned")
                 .remove(&session_key);
+            // Finalization holds belong to the session that just went away.
+            // The deletion generation is deliberately retained.
+            state.session_lifecycle.forget_finalizing(&session_key);
             Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
         }
         Ok(false) => (
@@ -2008,11 +2037,18 @@ pub async fn handle_api_session_state(
     }
 
     let session_key = format!("gw_{id}");
+    // A turn is authoritative from the moment it registers a cancel token
+    // until its messages are persisted and its turn version is resolved.
+    // Those two phases are disjoint: the token is dropped as soon as the
+    // stream ends, while persistence runs after. Treating only the token as
+    // "running" exposes an `idle` window over a transcript that is still
+    // mid-write, which is exactly when a reconnecting dashboard hydrates.
     let turn_is_live = state
         .cancel_tokens
         .lock()
         .expect("cancel_tokens lock poisoned")
-        .contains_key(&session_key);
+        .contains_key(&session_key)
+        || state.session_lifecycle.is_finalizing(&session_key);
 
     // Without a durable session backend, the existing cancellation-token map
     // is still the process-local authority for whether a turn is live. Return
@@ -2377,6 +2413,7 @@ pub(crate) mod tests {
             session_turn_versions: Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
@@ -5451,4 +5488,95 @@ pub(crate) mod tests {
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
     }
+
+    /// A REST message append that queued behind a turn must not resurrect a
+    /// session deleted during that wait.
+    ///
+    /// The endpoint's existence check runs *before* it waits on the session
+    /// permit, so on its own it says nothing about what happened during the
+    /// wait. Appending anyway recreates the transcript an operator removed
+    /// and, through the turn-version bump that follows, restores the epoch
+    /// entry `handle_api_session_delete` evicted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_rest_append_does_not_resurrect_a_deleted_session() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_id = "rest-queued-delete";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(&session_key, &zeroclaw_providers::ChatMessage::user("seed"))
+            .expect("seed append");
+
+        // Hold the permit so the append below must queue, then delete the
+        // session while it waits — the exact interleaving the guard covers.
+        let held = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("test primes the permit");
+
+        let state_writer = state.clone();
+        let writer = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_message_post(
+                State(state_writer),
+                HeaderMap::new(),
+                axum::extract::Path("rest-queued-delete".to_string()),
+                Json(SessionMessagePostBody {
+                    content: "appended after delete".to_string(),
+                }),
+            )
+            .await
+            .into_response()
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the REST append never reached the session queue"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let delete_response = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            delete_response.status(),
+            StatusCode::OK,
+            "the delete itself must succeed"
+        );
+
+        drop(held);
+        let response = writer.await.expect("writer task does not panic");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an append that queued across a delete must be rejected"
+        );
+        assert!(
+            store.load(&session_key).is_empty(),
+            "the deleted transcript must not be recreated by a queued append"
+        );
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "the evicted epoch entry must not be resurrected by a queued append"
+        );
+    }
+
 }

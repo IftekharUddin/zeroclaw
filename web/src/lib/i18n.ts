@@ -1450,6 +1450,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.unknown_error': 'Unknown error',
     'agent.send_error': 'Failed to send message. Please try again.',
     'agent.session_recovery_error': 'Could not verify whether this session still has a running turn. Reconnect after checking authentication and gateway availability.',
+    'agent.session_recovery_rejected': 'This session could not be verified — it may have been deleted, or your session may have expired. Reload the page or start a new chat.',
+    'agent.session_recovery_retry': 'Retry',
     'agent.copy_message': 'Copy message',
     'agent.connected_status': 'Connected',
     'agent.disconnected_status': 'Disconnected',

@@ -570,6 +570,12 @@ async fn handle_socket(
             if parsed["type"].as_str() == Some("message") {
                 let content = parsed["content"].as_str().unwrap_or("").to_string();
                 if !content.is_empty() {
+                    // Capture the deletion generation *before* awaiting the
+                    // permit: the comparison after acquisition is what
+                    // distinguishes "deleted while I queued" from "this
+                    // session has simply never been written to disk yet".
+                    let deletion_generation =
+                        state.session_lifecycle.deletion_generation(&session_key);
                     // Acquire the permit *first*: only once we hold it is it
                     // guaranteed that any other connection's turn for this
                     // session has fully finished (cancel token removed,
@@ -595,7 +601,7 @@ async fn handle_socket(
                     // sat behind another turn on the permit above. Reject it
                     // rather than starting provider/tool execution for a
                     // session that no longer exists.
-                    if session_deleted_while_queued(&state, &session_key) {
+                    if session_deleted_while_queued(&state, &session_key, deletion_generation) {
                         let err = serde_json::json!({
                             "type": "error",
                             "message": "Session was deleted while this prompt was queued",
@@ -776,6 +782,12 @@ async fn handle_socket(
                     continue;
                 }
 
+                // Capture the deletion generation *before* awaiting the
+                // permit — see the first-message path for why comparing
+                // generations, not probing existence, is what separates a
+                // deleted session from a not-yet-written one.
+                let deletion_generation =
+                    state.session_lifecycle.deletion_generation(&session_key);
                 // Acquire the permit *first* — see the comment at the other
                 // `session_queue.acquire` call site above (the first-message
                 // path) for why a pre-acquire liveness snapshot is TOCTOU-prone
@@ -797,7 +809,7 @@ async fn handle_socket(
                 // behind another turn on the permit above. Reject it rather
                 // than starting provider/tool execution for a session that
                 // no longer exists.
-                if session_deleted_while_queued(&state, &session_key) {
+                if session_deleted_while_queued(&state, &session_key, deletion_generation) {
                     let err = serde_json::json!({
                         "type": "error",
                         "message": "Session was deleted while this prompt was queued",
@@ -1060,21 +1072,24 @@ fn register_cancel_token(
     }
 }
 
-/// True when persistence is enabled and `DELETE /api/sessions/{id}` has
-/// already removed this session's row — e.g. while a prompt sat queued
-/// behind another turn on the `session_queue` permit. `handle_socket` must
-/// check this immediately after acquiring the permit and before calling
-/// `process_chat_message`: `handle_api_session_delete` cancels the *current*
-/// live token, but a queued prompt has not registered one yet, so it would
-/// otherwise be free to acquire the permit A just released and start
-/// provider/tool execution for a session an operator just deleted. Reuses
-/// the same `session_exists` check `persist_conversation_messages` already
-/// relies on, rather than adding a second "is this session gone" store.
-fn session_deleted_while_queued(state: &AppState, session_key: &str) -> bool {
-    state
-        .session_backend
-        .as_ref()
-        .is_some_and(|backend| !backend.session_exists(session_key))
+/// True when `DELETE /api/sessions/{id}` removed this session while the
+/// caller sat queued on the `session_queue` permit.
+///
+/// Compares the deletion generation captured *before* the wait against the
+/// current one, rather than probing the backend for existence. An existence
+/// probe cannot express this: `SessionStore::session_exists` is a file-presence
+/// check and a JSONL session file is not created until its first append, so
+/// "absent" covers both *deleted* and *never written yet*. Probing therefore
+/// rejected the first prompt of every new session as `SESSION_DELETED`.
+///
+/// Generation comparison also catches delete-then-recreate, where the session
+/// exists at both ends of the wait but the caller's history is stale anyway.
+fn session_deleted_while_queued(
+    state: &AppState,
+    session_key: &str,
+    captured: crate::session_lifecycle::DeletionGeneration,
+) -> bool {
+    state.session_lifecycle.deleted_since(session_key, captured)
 }
 
 /// Rehydrate a connection-scoped `Agent`'s history from the session backend.
@@ -1590,6 +1605,17 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
     };
 
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
+
+    // Enter the finalizing state *before* dropping the cancel token, so the
+    // session is continuously authoritative: the token covers streaming, this
+    // guard covers persistence and turn-version disposition, and they overlap
+    // rather than leaving an `idle` gap for the session-state endpoint to
+    // expose. The guard releases on drop, so every early return and error
+    // path below still clears it.
+    let _finalizing = crate::session_lifecycle::FinalizingGuard::new(
+        state.session_lifecycle.as_ref(),
+        session_key,
+    );
 
     // ── Remove cancel token (turn finished) ──────────────────────
     {
@@ -3422,13 +3448,15 @@ mod tests {
         // `handle_socket` runs right after its own `acquire()` resolves ──
         let state_b = state.clone();
         let session_key_b = session_key.clone();
+        // Captured before B starts waiting, matching `handle_socket`.
+        let generation_b = state.session_lifecycle.deletion_generation(&session_key);
         let b_handle = ::zeroclaw_spawn::spawn!(async move {
             let _guard = state_b
                 .session_queue
                 .acquire(&session_key_b)
                 .await
                 .expect("B eventually acquires the lock once A releases it");
-            session_deleted_while_queued(&state_b, &session_key_b)
+            session_deleted_while_queued(&state_b, &session_key_b, generation_b)
         });
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3929,6 +3957,145 @@ mod tests {
             "C's Agent must reflect turn A's completed history before C's own \
              prompt runs, regardless of what C's connect-time snapshot caught: {:?}",
             agent_c.history()
+        );
+    }
+
+    /// A brand-new JSONL-backed session must be able to run its first prompt.
+    ///
+    /// `SessionStore::session_exists` is a file-presence check and the session
+    /// file is not created until the first append, so a guard built on that
+    /// probe reports "absent" for a session that was never deleted — rejecting
+    /// the opening prompt of every new session as `SESSION_DELETED`. The
+    /// production JSONL backend is used deliberately: a custom test backend
+    /// that pre-creates its sessions cannot express this state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_prompt_on_a_new_jsonl_session_is_not_treated_as_deleted() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_key = format!("{GW_SESSION_PREFIX}brand-new-session");
+
+        // Mirror the handshake: the alias write is a no-op for this backend,
+        // so no file exists yet.
+        let _ = store.set_session_agent_alias(&session_key, "default");
+        assert!(
+            !store.session_exists(&session_key),
+            "precondition: a new JSONL session has no file until its first append; \
+             if this ever becomes false the bug this test guards is unreachable \
+             and the test is no longer meaningful"
+        );
+
+        // Exactly what `handle_socket` does: capture before waiting, compare
+        // after acquiring.
+        let generation = state.session_lifecycle.deletion_generation(&session_key);
+        let _guard = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("uncontended acquire");
+
+        assert!(
+            !session_deleted_while_queued(&state, &session_key, generation),
+            "a session that was never deleted must not be reported as deleted just \
+             because its backing file has not been written yet"
+        );
+    }
+
+    /// A queued writer must still observe a deletion when the session is
+    /// recreated before it wakes: existence is restored, but the writer's
+    /// view of history is stale either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_then_recreate_still_rejects_the_queued_prompt() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_id = "recycled-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        store
+            .append(&session_key, &zeroclaw_providers::ChatMessage::user("seed"))
+            .expect("seed append");
+
+        let generation = state.session_lifecycle.deletion_generation(&session_key);
+
+        let delete_response = crate::api::handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(queue_test_response_json(delete_response).await["deleted"], true);
+
+        // Recreate it, so a file-presence probe would report the session as
+        // perfectly healthy.
+        store
+            .append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage::user("recreated"),
+            )
+            .expect("recreate append");
+        assert!(store.session_exists(&session_key));
+
+        assert!(
+            session_deleted_while_queued(&state, &session_key, generation),
+            "delete-then-recreate must invalidate a writer that queued before the \
+             delete, even though the session exists again"
+        );
+    }
+
+    /// The session must not read as `idle` between the end of streaming and
+    /// the completion of persistence: that is precisely the window a
+    /// reconnecting dashboard uses to hydrate its transcript.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_state_reports_running_while_a_turn_is_finalizing() {
+        let state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let session_id = "finalizing-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        // No cancel token is registered — the stream has ended. Only the
+        // finalizing hold stands between the client and a premature `idle`.
+        let finalizing = crate::session_lifecycle::FinalizingGuard::new(
+            state.session_lifecycle.as_ref(),
+            &session_key,
+        );
+
+        let response = crate::api::handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let json = queue_test_response_json(response).await;
+        assert_eq!(
+            json["state"], "running",
+            "a turn that has stopped streaming but not finished persisting must not \
+             be advertised as idle: {json:?}"
+        );
+
+        drop(finalizing);
+
+        let response = crate::api::handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let json = queue_test_response_json(response).await;
+        assert_eq!(
+            json["state"], "idle",
+            "once persistence settles the session must become idle again: {json:?}"
         );
     }
 }
