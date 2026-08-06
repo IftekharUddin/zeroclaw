@@ -42,7 +42,25 @@ export type RecoveryFailureReason =
   /** A 4xx that will not improve on retry — typically auth or a missing session. */
   | 'rejected'
   /** Repeated transport/5xx failures exhausted the retry budget. */
-  | 'exhausted';
+  | 'exhausted'
+  /**
+   * The transcript could not be re-fetched after the turn completed. The
+   * local copy is missing whatever the detached turn produced, so it is
+   * stale rather than merely incomplete.
+   */
+  | 'hydration';
+
+/**
+ * Decide the disposition of a failed transcript hydration.
+ *
+ * Accepting this failure silently is what makes it dangerous: the turn has
+ * already completed, so the local transcript is missing the answer, and the
+ * user cannot tell. A follow-up prompt would then be composed against history
+ * the operator never saw. Surface it as retryable instead of continuing.
+ */
+export function hydrationFailureOutcome(): UnrecoverableOutcome {
+  return { kind: 'unrecoverable', reason: 'hydration', retryable: true };
+}
 
 /**
  * Classify a session-state error as terminal or worth retrying.
@@ -104,7 +122,7 @@ export function shouldOfferRecoveryAction(outcome: RecoveryOutcome): boolean {
 
 /** i18n key for the message shown for a terminal recovery outcome. */
 export function recoveryMessageKey(reason: RecoveryFailureReason): string {
-  return reason === 'rejected'
-    ? 'agent.session_recovery_rejected'
-    : 'agent.session_recovery_error';
+  if (reason === 'rejected') return 'agent.session_recovery_rejected';
+  if (reason === 'hydration') return 'agent.session_recovery_hydration';
+  return 'agent.session_recovery_error';
 }

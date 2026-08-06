@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  hydrationFailureOutcome,
   isTerminalRecoveryStatus,
   recoveryFailureOutcome,
   shouldBlockSending,
@@ -88,4 +89,29 @@ test('a rejection is distinguished from an exhausted retry budget', () => {
   // the other at gateway availability.
   assert.equal(recoveryMessageKey('rejected'), 'agent.session_recovery_rejected');
   assert.equal(recoveryMessageKey('exhausted'), 'agent.session_recovery_error');
+});
+
+test('failed transcript hydration is not silently accepted', () => {
+  // The turn already completed, so the local transcript is missing its
+  // output. Continuing quietly would let the next prompt be composed against
+  // history the operator never saw.
+  const outcome = hydrationFailureOutcome();
+  assert.equal(outcome.kind, 'unrecoverable');
+  assert.equal(
+    shouldBlockSending(outcome),
+    true,
+    'a known-stale transcript must not accept a new prompt',
+  );
+  assert.equal(
+    shouldOfferRecoveryAction(outcome),
+    true,
+    'blocking on stale history still has to offer a way out',
+  );
+});
+
+test('stale history is reported distinctly from an unreachable gateway', () => {
+  // Both block the composer, but only this one means "what you are reading
+  // is incomplete", so it cannot reuse the connectivity message.
+  assert.equal(recoveryMessageKey('hydration'), 'agent.session_recovery_hydration');
+  assert.notEqual(recoveryMessageKey('hydration'), recoveryMessageKey('exhausted'));
 });

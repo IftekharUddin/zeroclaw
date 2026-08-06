@@ -14,6 +14,7 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import {
+  hydrationFailureOutcome,
   recoveryFailureOutcome,
   recoveryMessageKey,
   shouldBlockSending,
@@ -609,9 +610,21 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
       }
     } catch {
-      // The turn is already complete. Keep the local transcript if history
-      // hydration is unavailable; the rebuilt socket still avoids sending a
-      // new prompt through the stale connection-scoped Agent.
+      // The turn is already complete, so the local transcript is missing
+      // whatever it produced — stale, not merely incomplete. Accepting that
+      // silently would let a follow-up prompt be composed against history
+      // the operator never saw, so surface it as a retryable recovery state.
+      if (isCurrent()) {
+        const outcome = hydrationFailureOutcome();
+        setError(t(recoveryMessageKey(outcome.reason)));
+        setTyping(shouldBlockSending(outcome));
+        setRecoveryAction(
+          shouldOfferRecoveryAction(outcome)
+            ? { label: t('agent.session_recovery_retry'), wsVersion }
+            : null,
+        );
+      }
+      return;
     }
 
     // Route the recovery cleanup through the canonical reducer instead of
