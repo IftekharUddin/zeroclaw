@@ -473,14 +473,49 @@ impl fmt::Display for DaemonInitializeTimeout {
 impl std::error::Error for DaemonInitializeTimeout {}
 
 #[derive(Debug)]
-struct InitializeResponse {
+pub(crate) struct InitializeResponse {
     server_version: String,
     server_pid: Option<u32>,
     tui_id: Option<String>,
     tui_sig: Option<String>,
+    pub(crate) commands: Vec<crate::wire::CommandDescriptor>,
 }
 
-fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+/// One-release fallback for daemons from the pre-catalogue 0.8.x line, which
+/// share the current package and protocol versions but omit `commands`.
+///
+/// These descriptors preserve the shared tokens ZeroCode accepted before the
+/// RPC catalogue existed. New daemons remain authoritative, including when
+/// they explicitly advertise an empty catalogue.
+fn legacy_tui_command_descriptors() -> Vec<crate::wire::CommandDescriptor> {
+    vec![
+        crate::wire::CommandDescriptor {
+            id: "help".into(),
+            name: "help".into(),
+            aliases: Vec::new(),
+        },
+        crate::wire::CommandDescriptor {
+            id: "new".into(),
+            name: "new".into(),
+            aliases: vec!["new-session".into()],
+        },
+        crate::wire::CommandDescriptor {
+            id: "model".into(),
+            name: "model".into(),
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn parse_initialize_commands(resp: &Value) -> Result<Vec<crate::wire::CommandDescriptor>> {
+    match resp.get("commands") {
+        Some(commands) => serde_json::from_value(commands.clone())
+            .context("invalid command descriptors in initialize response"),
+        None => Ok(legacy_tui_command_descriptors()),
+    }
+}
+
+pub(crate) fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
     let server_version = resp
         .get("server_version")
         .and_then(Value::as_str)
@@ -501,6 +536,7 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
             .get("tui_sig")
             .and_then(Value::as_str)
             .map(String::from),
+        commands: parse_initialize_commands(resp)?,
     })
 }
 
@@ -595,6 +631,9 @@ pub struct RpcClient {
     pub tui_sig: Option<String>,
     /// Transport protocol of this connection.
     transport: Transport,
+    /// Shared TUI command metadata received from the daemon's canonical
+    /// command catalogue during initialization.
+    commands: Vec<crate::wire::CommandDescriptor>,
 }
 
 impl RpcClient {
@@ -710,7 +749,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -727,6 +765,7 @@ impl RpcClient {
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Local,
+            commands: init.commands,
         })
     }
 
@@ -859,7 +898,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -876,6 +914,7 @@ impl RpcClient {
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Wss,
+            commands: init.commands,
         })
     }
 
@@ -1680,6 +1719,10 @@ impl RpcClient {
         self.tui_sig.as_deref()
     }
 
+    pub fn commands(&self) -> &[crate::wire::CommandDescriptor] {
+        &self.commands
+    }
+
     /// List all connected TUI sessions from the daemon registry.
     pub async fn tui_list(&self) -> Result<TuiListResult> {
         self.call(method::TUI_LIST, serde_json::json!({})).await
@@ -1721,6 +1764,7 @@ impl RpcClient {
             tui_id: None,
             tui_sig: None,
             transport: Transport::Local,
+            commands: Vec::new(),
         }
     }
 
@@ -1761,6 +1805,40 @@ mod initialize_version_tests {
         assert_eq!(parsed.server_pid, Some(42));
         assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
         assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+        assert_eq!(parsed.commands, legacy_tui_command_descriptors());
+    }
+
+    #[test]
+    fn initialize_response_parses_command_descriptors() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": [{
+                "id": "new",
+                "name": "new",
+                "aliases": ["new-session"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            parsed.commands,
+            vec![crate::wire::CommandDescriptor {
+                id: "new".into(),
+                name: "new".into(),
+                aliases: vec!["new-session".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn initialize_response_preserves_present_empty_command_catalogue() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        }))
+        .unwrap();
+
+        assert!(parsed.commands.is_empty());
     }
 
     #[test]
