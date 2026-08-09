@@ -31,8 +31,36 @@ type MediaGroupKey = (i64, String);
 #[derive(Debug)]
 struct PendingMediaGroup {
     updates: Vec<serde_json::Value>,
+    /// Caption/mention context from album members we will never materialize
+    /// (for example a video in a photo/video album). These are deliberately
+    /// kept out of `updates` so they cannot drive downloads or image markers,
+    /// but their captions still participate in aggregation and the mention
+    /// gate -- otherwise an album can lose the user's only caption, or be
+    /// silently rejected under `mention_only`.
+    unsupported: Vec<UnsupportedMember>,
     last_seen: Instant,
     last_seen_poll_generation: u64,
+}
+
+/// The text-only residue of an album member that will never be downloaded.
+///
+/// Only what caption aggregation and the mention gate need is retained; the
+/// full `message` object is intentionally dropped so this can never reach
+/// `parse_attachment_metadata()` or `getFile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsupportedMember {
+    /// Kept so unsupported captions interleave with supported ones in the
+    /// album's real `message_id` order rather than being appended at the end.
+    message_id: i64,
+    caption: Option<String>,
+}
+
+/// One settled album ready for dispatch: the materializable updates plus the
+/// text-only context of its unsupported members.
+#[derive(Debug, Clone, Default)]
+struct MediaGroupBatch {
+    updates: Vec<serde_json::Value>,
+    unsupported: Vec<UnsupportedMember>,
 }
 
 /// Metadata for an incoming document or photo attachment.
@@ -946,6 +974,43 @@ impl TelegramChannel {
         same_update_id || same_message_id
     }
 
+    /// Record the caption context of an album member that will never be
+    /// downloaded. Deduplicated by `message_id` so a member repeated across
+    /// polls cannot duplicate its caption in the aggregate.
+    fn retain_unsupported_member(group: &mut PendingMediaGroup, update: &serde_json::Value) {
+        let Some(message_id) = Self::update_message_id(update) else {
+            return;
+        };
+        if group
+            .unsupported
+            .iter()
+            .any(|member| member.message_id == message_id)
+        {
+            return;
+        }
+        // A member already retained as materializable must never be
+        // double-counted as text-only.
+        if group
+            .updates
+            .iter()
+            .any(|existing| Self::is_duplicate_media_group_member(existing, update))
+        {
+            return;
+        }
+        let caption = update
+            .get("message")
+            .and_then(|message| message.get("caption"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if caption.is_none() {
+            return;
+        }
+        group.unsupported.push(UnsupportedMember {
+            message_id,
+            caption,
+        });
+    }
+
     fn buffer_media_group_update(
         pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         update: &serde_json::Value,
@@ -960,17 +1025,20 @@ impl TelegramChannel {
         // are not materialized, but they still belong to the album. When a
         // supported sibling is already pending, treat the unsupported member
         // as activity so the quiet-period flush cannot split later supported
-        // siblings into another turn.
+        // siblings into another turn, and retain its caption so aggregation
+        // and the mention gate see the whole album.
         if !Self::is_supported_media_group_update(update) {
             if let Some(group) = pending.get_mut(&key) {
                 group.last_seen = now;
                 group.last_seen_poll_generation = poll_generation;
+                Self::retain_unsupported_member(group, update);
             }
             return true;
         }
 
         let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
             updates: Vec::new(),
+            unsupported: Vec::new(),
             last_seen: now,
             last_seen_poll_generation: poll_generation,
         });
@@ -992,7 +1060,7 @@ impl TelegramChannel {
         pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         now: Instant,
         completed_poll_generation: u64,
-    ) -> Vec<Vec<serde_json::Value>> {
+    ) -> Vec<MediaGroupBatch> {
         Self::take_media_groups_matching(pending, |_, group| {
             now.saturating_duration_since(group.last_seen) >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
                 && group.last_seen_poll_generation < completed_poll_generation
@@ -1002,7 +1070,7 @@ impl TelegramChannel {
     fn take_prior_media_groups_for_update(
         pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         update: &serde_json::Value,
-    ) -> Vec<Vec<serde_json::Value>> {
+    ) -> Vec<MediaGroupBatch> {
         let Some(message) = update.get("message") else {
             return Vec::new();
         };
@@ -1036,7 +1104,7 @@ impl TelegramChannel {
     fn take_media_groups_matching(
         pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         mut should_take: impl FnMut(&MediaGroupKey, &PendingMediaGroup) -> bool,
-    ) -> Vec<Vec<serde_json::Value>> {
+    ) -> Vec<MediaGroupBatch> {
         let mut matching_keys: Vec<(MediaGroupKey, i64)> = pending
             .iter()
             .filter(|(key, group)| should_take(key, group))
@@ -1061,7 +1129,10 @@ impl TelegramChannel {
                 group
                     .updates
                     .sort_by_key(|update| Self::update_message_id(update).unwrap_or(i64::MAX));
-                group.updates
+                MediaGroupBatch {
+                    updates: group.updates,
+                    unsupported: group.unsupported,
+                }
             })
             .collect()
     }
@@ -2297,9 +2368,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// any file download. Individual attachment failures do not discard
     /// successfully materialized siblings.
     async fn try_parse_media_group(&self, updates: &[serde_json::Value]) -> Option<ChannelMessage> {
+        self.try_parse_media_group_with_unsupported(updates, &[])
+            .await
+    }
+
+    /// Album parsing with the text-only context of unsupported members.
+    ///
+    /// `unsupported` never reaches `parse_attachment_metadata()` or `getFile`;
+    /// it only widens caption aggregation and the mention gate so a caption or
+    /// mention carried by a member we cannot download is not silently dropped.
+    async fn try_parse_media_group_with_unsupported(
+        &self,
+        updates: &[serde_json::Value],
+        unsupported: &[UnsupportedMember],
+    ) -> Option<ChannelMessage> {
         let mut ordered: Vec<&serde_json::Value> = updates.iter().collect();
         ordered.sort_by_key(|update| Self::update_message_id(update).unwrap_or(i64::MAX));
 
+        // An album with no materializable members must dispatch nothing and
+        // download nothing, exactly as before -- unsupported context alone can
+        // never produce a turn.
         let anchor_update = *ordered.first()?;
         let anchor_message = anchor_update.get("message")?;
         if !ordered.iter().all(|update| {
@@ -2317,16 +2405,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let sender_identity = self.allowed_attachment_sender(anchor_message)?;
-        let mut seen_captions = std::collections::HashSet::new();
-        let shared_caption = ordered
+
+        // Caption aggregation spans the whole album -- materialized members and
+        // text-only ones -- merged in `message_id` order before dedup + join.
+        let mut captioned: Vec<(i64, &str)> = ordered
             .iter()
             .filter_map(|update| {
-                update
+                let message_id = Self::update_message_id(update)?;
+                let caption = update
                     .get("message")
                     .and_then(|message| message.get("caption"))
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|caption| !caption.trim().is_empty())
+                    .and_then(serde_json::Value::as_str)?;
+                Some((message_id, caption))
             })
+            .collect();
+        captioned.extend(
+            unsupported
+                .iter()
+                .filter_map(|member| Some((member.message_id, member.caption.as_deref()?))),
+        );
+        captioned.sort_by_key(|(message_id, _)| *message_id);
+
+        let mut seen_captions = std::collections::HashSet::new();
+        let shared_caption = captioned
+            .into_iter()
+            .map(|(_, caption)| caption)
+            .filter(|caption| !caption.trim().is_empty())
             .filter(|caption| seen_captions.insert((*caption).to_string()))
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -3689,13 +3793,16 @@ impl TelegramChannel {
     async fn dispatch_media_group_batches(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-        batches: Vec<Vec<serde_json::Value>>,
+        batches: Vec<MediaGroupBatch>,
     ) -> bool {
-        for updates in batches {
-            let Some(anchor_update) = updates.first() else {
+        for batch in batches {
+            let Some(anchor_update) = batch.updates.first() else {
                 continue;
             };
-            let Some(msg) = self.try_parse_media_group(&updates).await else {
+            let Some(msg) = self
+                .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+                .await
+            else {
                 Box::pin(self.handle_unauthorized_message(anchor_update)).await;
                 continue;
             };
@@ -5125,6 +5232,7 @@ mod tests {
             3,
         );
         let ids: Vec<i64> = batches[0]
+            .updates
             .iter()
             .filter_map(TelegramChannel::update_message_id)
             .collect();
@@ -5229,8 +5337,8 @@ mod tests {
             started + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
             2,
         );
-        assert_eq!(TelegramChannel::update_id(&batches[0][0]), Some(10));
-        assert_eq!(TelegramChannel::update_id(&batches[1][0]), Some(20));
+        assert_eq!(TelegramChannel::update_id(&batches[0].updates[0]), Some(10));
+        assert_eq!(TelegramChannel::update_id(&batches[1].updates[0]), Some(20));
         assert_eq!(
             TelegramChannel::media_group_poll_timeout_secs(&pending),
             TELEGRAM_IDLE_POLL_TIMEOUT_SECS
@@ -5263,6 +5371,7 @@ mod tests {
         let batches = TelegramChannel::take_prior_media_groups_for_update(&mut pending, &ordinary);
         assert_eq!(batches.len(), 1);
         let ids: Vec<i64> = batches[0]
+            .updates
             .iter()
             .filter_map(TelegramChannel::update_message_id)
             .collect();
