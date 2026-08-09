@@ -2367,11 +2367,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Group scope, authorization, and mention gating are validated before
     /// any file download. Individual attachment failures do not discard
     /// successfully materialized siblings.
-    async fn try_parse_media_group(&self, updates: &[serde_json::Value]) -> Option<ChannelMessage> {
-        self.try_parse_media_group_with_unsupported(updates, &[])
-            .await
-    }
-
     /// Album parsing with the text-only context of unsupported members.
     ///
     /// `unsupported` never reaches `parse_attachment_metadata()` or `getFile`;
@@ -8453,7 +8448,7 @@ mod tests {
         });
 
         let msg = channel
-            .try_parse_media_group(&[oversized, second, first])
+            .try_parse_media_group_with_unsupported(&[oversized, second, first], &[])
             .await
             .expect("valid siblings should survive one failed member");
 
@@ -8535,10 +8530,13 @@ mod tests {
         };
 
         let msg = channel
-            .try_parse_media_group(&[
-                document_update(10, "doc-one"),
-                document_update(11, "doc-two"),
-            ])
+            .try_parse_media_group_with_unsupported(
+                &[
+                    document_update(10, "doc-one"),
+                    document_update(11, "doc-two"),
+                ],
+                &[],
+            )
             .await
             .expect("both documents should materialize");
 
@@ -8572,7 +8570,7 @@ mod tests {
 
         assert!(
             channel
-                .try_parse_media_group(&[first, second])
+                .try_parse_media_group_with_unsupported(&[first, second], &[])
                 .await
                 .is_none(),
             "mixed sender album must fail closed"
