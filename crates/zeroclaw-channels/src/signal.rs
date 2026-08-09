@@ -71,11 +71,6 @@ struct SelfSendTicket {
 }
 
 impl SelfSendTicket {
-    #[cfg(test)]
-    fn token(&self) -> u64 {
-        self.token
-    }
-
     /// A completed send: record the canonical signal-cli timestamp.
     fn confirm(mut self, timestamp: u64) {
         self.armed = false;
@@ -2999,7 +2994,7 @@ mod tests {
 
         // Drive a real self-send, then abort it mid-RPC.
         let sender = Arc::clone(&ch);
-        let send_task = tokio::spawn(async move {
+        let send_task = zeroclaw_spawn::spawn!(async move {
             sender
                 .send(&SendMessage::new("wedge me", "+1234567890"))
                 .await
@@ -3219,8 +3214,9 @@ mod tests {
         let ticket = guard.begin("same body".to_string()).unwrap();
 
         let waiter_guard = Arc::clone(&guard);
-        let waiter =
-            tokio::spawn(async move { waiter_guard.is_echo(1_700_000_000_000, "same body").await });
+        let waiter = zeroclaw_spawn::spawn!(async move {
+            waiter_guard.is_echo(1_700_000_000_000, "same body").await
+        });
 
         // Let the waiter observe the pending token and park on the watch.
         tokio::task::yield_now().await;
