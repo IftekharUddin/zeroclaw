@@ -50,6 +50,68 @@ enum EchoDecision {
     Pending,
 }
 
+/// Owned, armed registration for one in-flight Note-to-Self send.
+///
+/// The three explicit resolutions (confirmed / rejected / indeterminate) all
+/// live on the happy control flow of `send`, so cancellation -- an aborted
+/// task, a losing `select!` branch, a shutdown, a timeout wrapper -- would
+/// otherwise bypass every one of them and leave the token pending with no
+/// owner that will ever classify it. A later sync event with the same body
+/// then parks in `is_echo` forever, and because the SSE listener awaits
+/// `process_envelope_async` inline, the whole inbound stream stops.
+///
+/// Making the registration an RAII value turns cancellation into a
+/// resolution path: whatever happens to the future, the token is resolved
+/// and every waiter is woken.
+#[derive(Debug)]
+struct SelfSendTicket {
+    guard: Arc<SelfSendGuard>,
+    token: u64,
+    armed: bool,
+}
+
+impl SelfSendTicket {
+    #[cfg(test)]
+    fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// A completed send: record the canonical signal-cli timestamp.
+    fn confirm(mut self, timestamp: u64) {
+        self.armed = false;
+        self.guard.confirm(self.token, timestamp);
+    }
+
+    /// A definitely-refused send: the message never reached signal-cli, so
+    /// no echo can exist and the token can simply be dropped from the set.
+    fn reject(mut self) {
+        self.armed = false;
+        self.guard.reject(self.token);
+    }
+
+    /// The send may or may not have happened. Correlation can no longer be
+    /// trusted, so the guard fails closed.
+    fn mark_indeterminate(mut self) {
+        self.armed = false;
+        self.guard.mark_indeterminate(self.token);
+    }
+}
+
+impl Drop for SelfSendTicket {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancelled mid-flight. The request may already have reached
+        // signal-cli, so this must never be recorded as a rejection --
+        // an echo may still arrive and must stay suppressible. Resolving
+        // as indeterminate also bumps the watch version, which wakes any
+        // waiter parked on this token inside `is_echo` instead of leaving
+        // it (and the SSE listener behind it) blocked forever.
+        self.guard.mark_indeterminate(self.token);
+    }
+}
+
 impl SelfSendGuard {
     fn new() -> Self {
         let (version, _) = tokio::sync::watch::channel(0);
@@ -60,7 +122,7 @@ impl SelfSendGuard {
         }
     }
 
-    fn begin(&self, content: String) -> anyhow::Result<u64> {
+    fn begin(self: &Arc<Self>, content: String) -> anyhow::Result<SelfSendTicket> {
         let mut state = self.state.lock();
         if state.indeterminate {
             anyhow::bail!(
@@ -74,7 +136,12 @@ impl SelfSendGuard {
         }
         let token = self.sequence.fetch_add(1, Ordering::Relaxed);
         state.pending.insert(token, PendingSelfSend { content });
-        Ok(token)
+        drop(state);
+        Ok(SelfSendTicket {
+            guard: Arc::clone(self),
+            token,
+            armed: true,
+        })
     }
 
     fn confirm(&self, token: u64, timestamp: u64) {
@@ -944,7 +1011,10 @@ impl Channel for SignalChannel {
         // can arrive first. The pending body only identifies which event
         // must wait; the RPC result timestamp is the completed send's
         // canonical correlation identity.
-        let self_send_token = match &target {
+        // The ticket is owned and armed: if this future is cancelled at any
+        // await point below, its `Drop` resolves the token as indeterminate
+        // and wakes any waiter, instead of leaving it pending forever.
+        let self_send_ticket = match &target {
             RecipientTarget::Direct(number) if *number == self.account => {
                 Some(self.self_send_guard.begin(message.content.clone())?)
             }
@@ -954,30 +1024,28 @@ impl Channel for SignalChannel {
         let result = match self.rpc_request_classified("send", params).await {
             Ok(result) => result,
             Err(failure) => {
-                if let Some(token) = self_send_token {
+                if let Some(ticket) = self_send_ticket {
                     match failure.kind {
-                        RpcFailureKind::Rejected => self.self_send_guard.reject(token),
-                        RpcFailureKind::Unknown => {
-                            self.self_send_guard.mark_indeterminate(token);
-                        }
+                        RpcFailureKind::Rejected => ticket.reject(),
+                        RpcFailureKind::Unknown => ticket.mark_indeterminate(),
                     }
                 }
                 return Err(anyhow::Error::new(failure));
             }
         };
 
-        if let Some(token) = self_send_token {
+        if let Some(ticket) = self_send_ticket {
             let Some(timestamp) = result
                 .as_ref()
                 .and_then(|value| value.get("timestamp"))
                 .and_then(serde_json::Value::as_u64)
             else {
-                self.self_send_guard.mark_indeterminate(token);
+                ticket.mark_indeterminate();
                 anyhow::bail!(
                     "Signal send response omitted the timestamp required for Note-to-Self echo correlation"
                 );
             };
-            self.self_send_guard.confirm(token, timestamp);
+            ticket.confirm(timestamp);
         }
 
         Ok(())
@@ -2779,11 +2847,11 @@ mod tests {
     #[test]
     fn process_envelope_note_to_self_echo_guard_consumes_once() {
         let ch = make_self_allowed_channel(false);
-        let token = ch
+        let ticket = ch
             .self_send_guard
             .begin("already sent this".to_string())
             .unwrap();
-        ch.self_send_guard.confirm(token, 1_700_000_000_000);
+        ticket.confirm(1_700_000_000_000);
         let env = make_sent_sync_envelope(
             Some("+1234567890"),
             Some("+1234567890"),
@@ -2921,12 +2989,12 @@ mod tests {
 
     #[tokio::test]
     async fn echo_before_send_response_waits_for_canonical_timestamp() {
-        let guard = SelfSendGuard::new();
-        let token = guard.begin("early".to_string()).unwrap();
+        let guard = Arc::new(SelfSendGuard::new());
+        let ticket = guard.begin("early".to_string()).unwrap();
         let event = guard.is_echo(42, "early");
         let response = async {
             tokio::task::yield_now().await;
-            guard.confirm(token, 42);
+            ticket.confirm(42);
         };
         let (is_echo, ()) = tokio::join!(event, response);
         assert!(is_echo);
@@ -2935,12 +3003,12 @@ mod tests {
 
     #[tokio::test]
     async fn equal_body_with_different_timestamp_is_not_an_echo() {
-        let guard = SelfSendGuard::new();
-        let token = guard.begin("same text".to_string()).unwrap();
+        let guard = Arc::new(SelfSendGuard::new());
+        let ticket = guard.begin("same text".to_string()).unwrap();
         let event = guard.is_echo(99, "same text");
         let response = async {
             tokio::task::yield_now().await;
-            guard.confirm(token, 100);
+            ticket.confirm(100);
         };
         let (is_echo, ()) = tokio::join!(event, response);
         assert!(!is_echo);
@@ -2949,12 +3017,12 @@ mod tests {
 
     #[tokio::test]
     async fn explicitly_rejected_send_releases_an_early_equal_body_note() {
-        let guard = SelfSendGuard::new();
-        let token = guard.begin("not sent".to_string()).unwrap();
+        let guard = Arc::new(SelfSendGuard::new());
+        let ticket = guard.begin("not sent".to_string()).unwrap();
         let event = guard.is_echo(55, "not sent");
         let response = async {
             tokio::task::yield_now().await;
-            guard.reject(token);
+            ticket.reject();
         };
         let (is_echo, ()) = tokio::join!(event, response);
         assert!(!is_echo);
@@ -2963,12 +3031,12 @@ mod tests {
 
     #[tokio::test]
     async fn response_loss_after_acceptance_fails_note_to_self_closed() {
-        let guard = SelfSendGuard::new();
-        let token = guard.begin("unknown".to_string()).unwrap();
+        let guard = Arc::new(SelfSendGuard::new());
+        let ticket = guard.begin("unknown".to_string()).unwrap();
         let event = guard.is_echo(7, "unknown");
         let response = async {
             tokio::task::yield_now().await;
-            guard.mark_indeterminate(token);
+            ticket.mark_indeterminate();
         };
         let (is_echo, ()) = tokio::join!(event, response);
         assert!(is_echo);
@@ -2979,14 +3047,14 @@ mod tests {
 
     #[tokio::test]
     async fn reordered_identical_sends_use_token_and_timestamp_identity() {
-        let guard = SelfSendGuard::new();
+        let guard = Arc::new(SelfSendGuard::new());
         let failed = guard.begin("duplicate".to_string()).unwrap();
         let succeeded = guard.begin("duplicate".to_string()).unwrap();
         let event = guard.is_echo(22, "duplicate");
         let responses = async {
             tokio::task::yield_now().await;
-            guard.reject(failed);
-            guard.confirm(succeeded, 22);
+            failed.reject();
+            succeeded.confirm(22);
         };
         let (is_echo, ()) = tokio::join!(event, responses);
         assert!(is_echo);
@@ -2995,10 +3063,10 @@ mod tests {
 
     #[test]
     fn self_send_guard_refuses_capacity_instead_of_evicting() {
-        let guard = SelfSendGuard::new();
+        let guard = Arc::new(SelfSendGuard::new());
         for i in 0..SELF_SEND_GUARD_CAPACITY {
-            let token = guard.begin(format!("note {i}")).unwrap();
-            guard.confirm(token, i as u64);
+            let ticket = guard.begin(format!("note {i}")).unwrap();
+            ticket.confirm(i as u64);
         }
         assert!(guard.begin("one too many".to_string()).is_err());
         assert!(
@@ -3014,8 +3082,8 @@ mod tests {
     #[test]
     fn denied_sync_envelope_cannot_consume_confirmed_echo() {
         let ch = make_self_allowed_channel(false);
-        let token = ch.self_send_guard.begin("guarded".to_string()).unwrap();
-        ch.self_send_guard.confirm(token, 1_700_000_000_000);
+        let ticket = ch.self_send_guard.begin("guarded".to_string()).unwrap();
+        ticket.confirm(1_700_000_000_000);
 
         let denied = make_sent_sync_envelope(
             Some("+19999999999"),
