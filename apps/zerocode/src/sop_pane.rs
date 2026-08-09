@@ -2679,6 +2679,47 @@ mod status_agg_tests {
         );
     }
 
+    /// The 🟡 responsiveness warning: a slow or hung daemon must not make the
+    /// pane feel frozen. The poll runs off the event loop, so many `tick()`
+    /// calls with a response that never arrives must all return promptly, must
+    /// not queue a second request, and must leave rendering working.
+    #[tokio::test]
+    async fn repeated_slow_polls_never_block_input_or_rendering() {
+        let (mut pane, outbound, mut write_rx) = polling_pane();
+        pane.names = vec!["deploy".to_string()];
+
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+
+        // The response deliberately never arrives: simulate a hung transport.
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        for _ in 0..200 {
+            let started = Instant::now();
+            make_poll_due(&mut pane);
+            pane.tick();
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "a tick with a poll still in flight must return immediately"
+            );
+            assert!(
+                write_rx.try_recv().is_err(),
+                "a pending poll must suppress new requests, not queue a backlog"
+            );
+            terminal
+                .draw(|frame| pane.render(frame, frame.area()))
+                .expect("rendering must keep working while a poll is hung");
+        }
+
+        // Once the slow response finally lands it is still applied normally.
+        outbound.dispatch_response(&request_id, Some(runs_response("running")), None);
+        drain_poll(&mut pane).await;
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running)
+        );
+    }
+
     #[test]
     fn no_runs_yields_no_status() {
         assert_eq!(
@@ -2840,5 +2881,43 @@ mod status_agg_tests {
         assert_eq!(status_icon(SopRunStatusView::Completed), "🟢");
         assert_eq!(status_icon(SopRunStatusView::Cancelled), "🔴");
         assert_eq!(status_icon(SopRunStatusView::Unknown), "⚪");
+    }
+
+    /// The specific regression the review named: under the previous palette a
+    /// cancelled run rendered the same glyph as a clean completion, so an
+    /// operator could not tell an aborted run from a successful one. These
+    /// two must never collapse to the same glyph again.
+    #[test]
+    fn cancelled_is_visually_distinct_from_completed() {
+        assert_ne!(
+            status_icon(SopRunStatusView::Cancelled),
+            status_icon(SopRunStatusView::Completed),
+            "a cancelled run must not look like a clean completion"
+        );
+    }
+
+    /// An unrecognised status from a newer daemon must still occupy a cell.
+    /// An empty glyph would shift the row text and break the mouse hit-test
+    /// alignment that `list_row_rects` depends on.
+    #[test]
+    fn every_status_icon_is_non_empty_and_single_width() {
+        for status in [
+            SopRunStatusView::Pending,
+            SopRunStatusView::Running,
+            SopRunStatusView::WaitingApproval,
+            SopRunStatusView::PausedCheckpoint,
+            SopRunStatusView::Completed,
+            SopRunStatusView::Failed,
+            SopRunStatusView::Cancelled,
+            SopRunStatusView::Unknown,
+        ] {
+            let icon = status_icon(status);
+            assert!(!icon.is_empty(), "{status:?} must render a visible glyph");
+            assert_eq!(
+                icon.chars().count(),
+                1,
+                "{status:?} must be one glyph so every row keeps the same width"
+            );
+        }
     }
 }
