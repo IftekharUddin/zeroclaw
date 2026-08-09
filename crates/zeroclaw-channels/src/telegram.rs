@@ -8075,6 +8075,296 @@ mod tests {
         assert!(poll_timeouts.starts_with(&[30, 1, 1, 1]));
     }
 
+    /// B1: a caption carried by an album member we never download (a video)
+    /// must still reach the model, and must not trigger a download for that
+    /// member's file.
+    #[tokio::test]
+    async fn media_group_unsupported_member_caption_participates_in_group() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (file_id, file_path, bytes) in [
+            ("photo-a", "photos/a.jpg", b"aaa".as_slice()),
+            ("photo-b", "photos/b.jpg", b"bbb".as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["alice".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        *channel.bot_username.lock() = Some("mybot".to_string());
+
+        let photo = |update_id: i64, message_id: i64, file_id: &str| {
+            serde_json::json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": message_id,
+                    "media_group_id": "album-mixed",
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": -100, "type": "group" },
+                    "photo": [{ "file_id": file_id, "file_size": 3 }]
+                }
+            })
+        };
+        // The video sits between the two photos and carries the only caption.
+        let video = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 11,
+                "media_group_id": "album-mixed",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "video": { "file_id": "video-file" },
+                "caption": "@mybot compare these"
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &photo(10, 10, "photo-a"),
+            now,
+            1
+        ));
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &video,
+            now,
+            1
+        ));
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &photo(12, 12, "photo-b"),
+            now,
+            1
+        ));
+
+        let group = pending.values().next().unwrap();
+        assert_eq!(
+            group.updates.len(),
+            2,
+            "only the two photos are materializable"
+        );
+        assert_eq!(
+            group.unsupported,
+            vec![UnsupportedMember {
+                message_id: 11,
+                caption: Some("@mybot compare these".to_string()),
+            }],
+            "the video's caption must be retained as text-only context"
+        );
+
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        let msg = channel
+            .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+            .await
+            .expect("album with a captioned unsupported member must be admitted");
+
+        assert_eq!(
+            msg.content.matches("[IMAGE:").count(),
+            2,
+            "both supported image markers must be present"
+        );
+        let first_marker = msg
+            .content
+            .find("photo_-100_10")
+            .expect("first photo marker");
+        let second_marker = msg
+            .content
+            .find("photo_-100_12")
+            .expect("second photo marker");
+        assert!(
+            first_marker < second_marker,
+            "image markers must stay in message_id order"
+        );
+        assert_eq!(
+            msg.content.matches("@mybot compare these").count(),
+            1,
+            "the video's caption must appear exactly once in dispatched content"
+        );
+
+        // The unsupported member must never have been downloaded.
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.as_str().contains("video-file")),
+            "no getFile/download request may be issued for the unsupported member"
+        );
+    }
+
+    /// B1: under `mention_only`, a mention carried only by an unsupported
+    /// member must still admit the album. Before the fix the whole turn was
+    /// silently dropped.
+    #[tokio::test]
+    async fn media_group_mention_only_admits_on_unsupported_member_mention() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "only-photo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/only.jpg" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/botfake-token/photos/only.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"only".as_slice()))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        // mention_only = true -- this is the gate that used to reject the album.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["alice".into()]),
+            true,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        *channel.bot_username.lock() = Some("mybot".to_string());
+
+        // The photo has NO caption; the mention lives only on the video.
+        let photo = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 10,
+                "media_group_id": "album-mention",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "photo": [{ "file_id": "only-photo", "file_size": 4 }]
+            }
+        });
+        let video = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 11,
+                "media_group_id": "album-mention",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "video": { "file_id": "video-file" },
+                "caption": "@mybot look at this"
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        TelegramChannel::buffer_media_group_update(&mut pending, &photo, now, 1);
+        TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
+
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        let msg = channel
+            .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+            .await
+            .expect(
+                "mention_only album whose only mention is on an unsupported member \
+                 must still be admitted",
+            );
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "the supported sibling must still be dispatched"
+        );
+    }
+
+    /// B1 guard (item 4): an album with zero materializable members must still
+    /// produce no dispatch and download nothing, even though its captions are
+    /// now retained.
+    #[tokio::test]
+    async fn media_group_unsupported_only_group_still_produces_no_dispatch() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let video = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 10,
+                "media_group_id": "album-video-only",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "video": { "file_id": "video-file" },
+                "caption": "just a video"
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
+        assert!(
+            pending.is_empty(),
+            "an unsupported member with no supported sibling must not create a group"
+        );
+
+        // Even if such a batch is constructed directly, it must dispatch nothing.
+        let unsupported = vec![UnsupportedMember {
+            message_id: 10,
+            caption: Some("just a video".to_string()),
+        }];
+        assert!(
+            channel
+                .try_parse_media_group_with_unsupported(&[], &unsupported)
+                .await
+                .is_none(),
+            "unsupported-only album must produce no dispatch"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "unsupported-only album must not download anything"
+        );
+    }
+
     #[tokio::test]
     async fn media_group_materializes_once_in_message_order_with_shared_context() {
         use wiremock::matchers::{method, path, query_param};
