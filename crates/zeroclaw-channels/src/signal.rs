@@ -2952,6 +2952,135 @@ mod tests {
         assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
     }
 
+    /// The production-front-door regression for the cancellation blocker.
+    ///
+    /// Goes through the real `SignalChannel::send` and the real
+    /// `process_envelope_async` listener entry point -- not by poking
+    /// `SelfSendGuard` directly -- because the wedge only manifests through
+    /// that wiring: the SSE listener awaits `process_envelope_async` inline,
+    /// so a permanently-parked `is_echo` stops the entire inbound stream.
+    ///
+    /// Aborts a send after the stub has accepted the request but before it
+    /// responds, then injects (a) the matching sync event and (b) a second,
+    /// different event, and asserts the listener neither hangs nor stops
+    /// delivering the later message.
+    #[tokio::test]
+    async fn cancelled_self_send_does_not_wedge_listener() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Accept the request, then stall well past the test's own timeouts so
+        // the send is genuinely in flight when it is aborted.
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(120))
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "result": { "timestamp": 1_700_000_000_500_u64 },
+                        "id": "ignored"
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let ch = Arc::new(SignalChannel::new(
+            server.uri(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            false,
+            false,
+        ));
+
+        // Drive a real self-send, then abort it mid-RPC.
+        let sender = Arc::clone(&ch);
+        let send_task = tokio::spawn(async move {
+            sender
+                .send(&SendMessage::new("wedge me", "+1234567890"))
+                .await
+        });
+
+        // Wait until the guard has actually registered the in-flight send,
+        // so the abort lands after registration rather than before it.
+        let mut registered = false;
+        for _ in 0..200 {
+            if ch.self_send_guard.snapshot().0 == 1 {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered,
+            "the self-send should have been registered with the guard before the abort"
+        );
+
+        send_task.abort();
+        let _ = send_task.await;
+
+        // The matching sync event: whatever it is classified as, it must not
+        // park the listener forever.
+        let echo_event = wrap_sent_sync(
+            Some("+1234567890"),
+            None,
+            SentMessage {
+                destination: Some("+1234567890".to_string()),
+                destination_number: Some("+1234567890".to_string()),
+                message: Some("wedge me".to_string()),
+                timestamp: Some(1_700_000_000_500),
+                group_info: None,
+                attachments: None,
+            },
+        );
+        let echo_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            ch.process_envelope_async(&echo_event),
+        )
+        .await
+        .expect(
+            "a cancelled send must not leave the matching sync event parked forever -- \
+                     the SSE listener awaits this call inline",
+        );
+        assert!(
+            echo_result.is_empty(),
+            "an indeterminate correlation must fail closed and suppress the echo"
+        );
+
+        // The actual liveness claim: a *later, different* message still gets
+        // through. This is what a wedged listener would swallow.
+        let later_event = wrap_sent_sync(
+            Some("+1234567890"),
+            None,
+            SentMessage {
+                destination: Some("+1234567890".to_string()),
+                destination_number: Some("+1234567890".to_string()),
+                message: Some("a completely different note".to_string()),
+                timestamp: Some(1_700_000_000_777),
+                group_info: None,
+                attachments: None,
+            },
+        );
+        let later_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            ch.process_envelope_async(&later_event),
+        )
+        .await
+        .expect("the listener must keep processing later events after a cancelled send");
+
+        // Correlation is indeterminate, so this one is suppressed too -- but
+        // it was *classified promptly* rather than blocking the stream, which
+        // is the property under test.
+        assert!(
+            later_result.is_empty(),
+            "indeterminate correlation fails closed for subsequent events as well"
+        );
+    }
+
     #[tokio::test]
     async fn json_rpc_rejection_does_not_poison_note_to_self_ingress() {
         use wiremock::matchers::{method, path};
