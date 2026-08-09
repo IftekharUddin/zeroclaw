@@ -526,6 +526,40 @@ impl SopPane {
             .map(String::as_str)
     }
 
+    /// Whether the pane currently owns a text prompt.
+    ///
+    /// The read-only surface keeps Watch available, so its run-id prompt must
+    /// suppress global text chords just like the other zerocode inputs. Keep
+    /// this derived from the prompt buffers rather than introducing parallel
+    /// focus state.
+    pub(crate) fn wants_text_input(&self) -> bool {
+        self.run_input.is_some() || self.run_payload_input.is_some()
+    }
+
+    /// Let an active, non-empty prompt keep word-navigation chords that would
+    /// otherwise switch the global pane.
+    pub(crate) fn claims_pane_navigation(&self, key: &crossterm::event::KeyEvent) -> bool {
+        let has_text = self
+            .run_input
+            .as_ref()
+            .or(self.run_payload_input.as_ref())
+            .is_some_and(|buffer| !buffer.is_empty());
+        has_text && crate::keymap::input_bar_claims_pane_navigation(key)
+    }
+
+    /// Route bracketed paste into whichever SOP prompt is active.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if let Some(buffer) = self.run_input.as_mut() {
+            // Run IDs are single-line identifiers. Ignore terminal control
+            // characters rather than letting pasted newlines corrupt the RPC
+            // argument or trigger unrelated global handling.
+            buffer.extend(text.chars().filter(|character| !character.is_control()));
+        } else if let Some(buffer) = self.run_payload_input.as_mut() {
+            // JSON permits insignificant whitespace, including newlines.
+            buffer.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        }
+    }
+
     /// Called on every event-loop tick while the SOP pane is focused.
     /// Throttled to one `sops/runs` call every
     /// [`RUNS_POLL_INTERVAL_SECS`]; a single unfiltered call covers every
@@ -1573,13 +1607,13 @@ impl SopPane {
         };
         if empty {
             let msg = if editor.is_some() {
-                "(no steps; Ctrl+n to add, then click handles to wire)"
+                "(no steps; Ctrl+n to add, then click handles to wire)".to_string()
             } else if self.read_only {
                 // Authoring keys are inert in the read-only status view;
                 // don't advertise them.
-                "(no nodes)"
+                crate::i18n::t("zc-sop-empty-read-only")
             } else {
-                "(no nodes; press n to author, e to edit)"
+                "(no nodes; press n to author, e to edit)".to_string()
             };
             f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), inner);
             return;
@@ -2370,10 +2404,21 @@ fn render_node_card(
 
 #[cfg(test)]
 mod tests {
-    use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, layout_slots, trigger_source_walk};
-    use crate::client::NodePosition;
-    use crate::client::{BoundTriggerSourceView, GraphLayout, TriggerSourceRegistryView};
+    use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, SopPane, layout_slots, trigger_source_walk};
+    use crate::client::{
+        BoundTriggerSourceView, GraphLayout, NodePosition, RpcClient, TriggerSourceRegistryView,
+    };
+    use crate::jsonrpc::RpcOutbound;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn test_pane() -> SopPane {
+        let (tx, _rx) = mpsc::channel::<String>(4);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        SopPane::new(Arc::new(RpcClient::with_rpc(rpc)))
+    }
 
     #[test]
     fn read_only_gate_blocks_exactly_the_mutating_actions() {
@@ -2396,6 +2441,25 @@ mod tests {
         ] {
             assert!(!super::blocked_when_read_only(action), "{action:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn watch_prompt_owns_text_navigation_and_bracketed_paste() {
+        let mut pane = test_pane();
+        assert!(!pane.wants_text_input());
+
+        pane.run_input = Some(String::new());
+        assert!(pane.wants_text_input());
+        assert!(!pane.claims_pane_navigation(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT,)));
+
+        pane.handle_paste("run-123\r\n");
+        assert_eq!(pane.run_input.as_deref(), Some("run-123"));
+        assert!(pane.claims_pane_navigation(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT,)));
+    }
+
+    #[test]
+    fn read_only_empty_state_comes_from_fluent_catalogue() {
+        assert_eq!(crate::i18n::t("zc-sop-empty-read-only"), "(no nodes)");
     }
 
     #[test]

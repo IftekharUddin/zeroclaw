@@ -6,6 +6,7 @@ zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
 zc-pane-sop = SOPs
+zc-sop-empty-read-only = (no nodes)
 zc-chrome-summary-sessions = sessions
 zc-chrome-summary-ram = ram
 zc-chrome-summary-cpu = cpu
