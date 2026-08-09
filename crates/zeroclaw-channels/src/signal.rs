@@ -3061,6 +3061,78 @@ mod tests {
         assert!(!guard.is_echo(23, "duplicate").await);
     }
 
+    /// A dropped, unresolved ticket must resolve as indeterminate -- never as
+    /// a rejection, since the request may already have reached signal-cli and
+    /// a real echo may still arrive.
+    #[tokio::test]
+    async fn drop_of_pending_self_send_marks_indeterminate() {
+        let guard = Arc::new(SelfSendGuard::new());
+        let ticket = guard.begin("cancelled".to_string()).unwrap();
+        assert_eq!(guard.snapshot(), (1, 0, false));
+
+        drop(ticket);
+
+        // Not still pending, and not silently discarded as a rejection:
+        // the guard fails closed.
+        assert_eq!(
+            guard.snapshot(),
+            (0, 0, true),
+            "a dropped in-flight ticket must leave no pending token and mark the guard indeterminate"
+        );
+    }
+
+    /// The liveness core of the blocker: a waiter parked on a pending token
+    /// must be woken by the drop rather than awaiting a notification that can
+    /// never arrive.
+    #[tokio::test]
+    async fn is_echo_waiter_wakes_on_drop_resolution() {
+        let guard = Arc::new(SelfSendGuard::new());
+        let ticket = guard.begin("same body".to_string()).unwrap();
+
+        let waiter_guard = Arc::clone(&guard);
+        let waiter =
+            tokio::spawn(async move { waiter_guard.is_echo(1_700_000_000_000, "same body").await });
+
+        // Let the waiter observe the pending token and park on the watch.
+        tokio::task::yield_now().await;
+        drop(ticket);
+
+        let decision = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must wake on the drop resolution, not hang forever")
+            .expect("waiter task must not panic");
+
+        // Indeterminate correlation fails closed: suppress rather than risk
+        // re-ingesting the agent's own message.
+        assert!(
+            decision,
+            "an indeterminate outcome must suppress the echo rather than ingest it"
+        );
+    }
+
+    /// A cancelled send must not stop the guard from classifying *later*
+    /// traffic -- the listener has to keep making progress.
+    #[tokio::test]
+    async fn cancelled_send_does_not_block_subsequent_envelope_classification() {
+        let guard = Arc::new(SelfSendGuard::new());
+        let ticket = guard.begin("wedge me".to_string()).unwrap();
+        drop(ticket);
+
+        // A later, entirely unrelated event must still be classified promptly
+        // instead of parking on the abandoned token.
+        let later = tokio::time::timeout(
+            Duration::from_secs(5),
+            guard.is_echo(1_700_000_000_001, "a different message"),
+        )
+        .await
+        .expect("classification after a cancelled send must not block the listener");
+
+        assert!(
+            later,
+            "the guard fails closed once correlation is indeterminate"
+        );
+    }
+
     #[test]
     fn self_send_guard_refuses_capacity_instead_of_evicting() {
         let guard = Arc::new(SelfSendGuard::new());
