@@ -1888,12 +1888,36 @@ pub async fn handle_api_session_delete(
         format!("gw_{id}")
     };
 
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(&session_key)
-        .cloned();
+    // Take the cancel-token lock and record the deletion under it, then
+    // evict the token — all in one critical section. `register_turn_if_current`
+    // re-checks the deletion generation inside this same lock, so a prompt
+    // that passed its post-acquire check can no longer slip in and register a
+    // token after DELETE has looked for one: either it registers first (and we
+    // cancel it below) or it observes the bumped generation and refuses.
+    // Lock order is `cancel_tokens` then `SessionLifecycle::deletions`; the
+    // registration path uses the same order.
+    //
+    // The bump necessarily precedes `backend.delete_session` — it is what
+    // closes the race, so it cannot wait for the backend result. That means a
+    // backend delete that then fails (or finds nothing) leaves the generation
+    // advanced and queued writers rejected. That is deliberate and matches
+    // what this handler already did with the cancellation token, which was
+    // likewise cancelled before the backend call: once the live turn has been
+    // killed on the operator's behalf, admitting a queued writer as if
+    // nothing happened is the worse failure.
+    let token = {
+        let mut tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        // Record the deletion before releasing the lock: writers already
+        // queued on the `session_queue` permit compare against the generation
+        // they captured before waiting, so this is what makes the delete
+        // visible to them. It must be recorded even though the epoch entry is
+        // evicted below, because a turn still unwinding can re-insert it.
+        state.session_lifecycle.record_deletion(&session_key);
+        tokens.remove(&session_key)
+    };
     if let Some(token) = token {
         token.cancel();
         ::zeroclaw_log::record!(
@@ -1906,13 +1930,6 @@ pub async fn handle_api_session_delete(
 
     match backend.delete_session(&session_key) {
         Ok(true) => {
-            // Record the deletion before touching anything else: writers
-            // already queued on the `session_queue` permit compare against
-            // the generation they captured before waiting, so this is what
-            // makes the delete visible to them. It must be recorded even
-            // though the epoch entry is evicted below, because a turn still
-            // unwinding can re-insert that entry.
-            state.session_lifecycle.record_deletion(&session_key);
             // Evict the epoch this session accumulated in
             // `session_turn_versions` — it otherwise retains a completed
             // session's key forever. A prompt already queued behind the
