@@ -31,6 +31,22 @@ be parsed, ZeroClaw cannot recover the canonical timestamp safely. It then
 fails Note-to-Self closed until the channel restarts rather than risk an
 agent replying to its own output. Ordinary Signal messages are unaffected.
 
+Echo correlation is tracked per Signal endpoint and account, so every
+outbound surface bound to the same account -- the supervised listener, the
+tool-facing channel handle used by the gateway, and the SOP adapter --
+shares one record. A self-send performed by any of them is recognized and
+suppressed by the listener, instead of returning as a new turn.
+
+A confirmed self-send is cleared when its own echo arrives on the sync
+stream. ZeroClaw tracks at most 128 unresolved self-sends and never evicts
+them, because dropping one would let a late echo be replayed as a genuine
+note. If 128 self-sends accumulate whose echoes never arrive -- a sustained
+sync-stream outage while sending continues -- further Note-to-Self sends are
+refused before the RPC with an error naming the 128-message safety limit,
+until the channel restarts. Restarting the channel clears the record and
+restores Note-to-Self sending. Inbound Signal traffic and all other outbound
+targets keep working throughout; only self-sends are refused.
+
 ## Prerequisites
 
 - A Signal account linked or registered in `signal-cli`.

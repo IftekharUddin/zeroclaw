@@ -107,6 +107,26 @@ impl Drop for SelfSendTicket {
     }
 }
 
+/// Canonical `SelfSendGuard` per Signal endpoint/account.
+///
+/// Echo correlation is a property of the *account*, not of a handle: a send
+/// recorded by one handle must be recognizable as an echo by whichever handle
+/// is running the listener. `SignalChannel` is constructed independently by
+/// several live outbound surfaces (the supervised listener, the tool-facing
+/// channel map used by the gateway WebSocket session, and the SOP adapter's
+/// own channel map), so a per-instance guard would let a send from one handle
+/// arrive at the listener as an unmatched sent-sync event and be replayed as a
+/// fresh inbound turn -- exactly the self-reply loop this feature must prevent.
+///
+/// Keying by `(http_url, account)` makes correlation canonical for the
+/// endpoint/account pair that signal-cli itself correlates on, so all handles
+/// for one account share one guard while distinct accounts stay isolated.
+/// Registry of canonical self-send guards, keyed by `(http_url, account)`.
+type SelfSendGuardRegistry = SyncMutex<HashMap<(String, String), Arc<SelfSendGuard>>>;
+
+static SELF_SEND_GUARDS: std::sync::LazyLock<SelfSendGuardRegistry> =
+    std::sync::LazyLock::new(|| SyncMutex::new(HashMap::new()));
+
 impl SelfSendGuard {
     fn new() -> Self {
         let (version, _) = tokio::sync::watch::channel(0);
@@ -115,6 +135,19 @@ impl SelfSendGuard {
             sequence: AtomicU64::new(0),
             version,
         }
+    }
+
+    /// Return the shared guard for one Signal endpoint/account, creating it on
+    /// first use. Every `SignalChannel` built for the same pair -- listener,
+    /// tool handle, SOP adapter handle -- receives the same `Arc`.
+    fn shared_for(http_url: &str, account: &str) -> Arc<Self> {
+        let key = (http_url.to_string(), account.to_string());
+        let mut guards = SELF_SEND_GUARDS.lock();
+        Arc::clone(
+            guards
+                .entry(key)
+                .or_insert_with(|| Arc::new(SelfSendGuard::new())),
+        )
     }
 
     fn begin(self: &Arc<Self>, content: String) -> anyhow::Result<SelfSendTicket> {
@@ -408,6 +441,7 @@ impl SignalChannel {
         ignore_stories: bool,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
+        let self_send_guard = SelfSendGuard::shared_for(&http_url, &account);
         Self {
             http_url,
             account,
@@ -424,7 +458,7 @@ impl SignalChannel {
                 NonZeroUsize::new(RECENT_TARGETS_CAPACITY)
                     .expect("RECENT_TARGETS_CAPACITY is a non-zero constant"),
             ))),
-            self_send_guard: Arc::new(SelfSendGuard::new()),
+            self_send_guard,
         }
     }
 
@@ -2885,16 +2919,16 @@ mod tests {
         // never happened can't swallow a later genuine Note-to-Self.
         let ch = SignalChannel::new(
             "http://127.0.0.1:9".to_string(),
-            "+1234567890".to_string(),
+            "+15550000001".to_string(),
             Vec::new(),
             false,
             "signal_test_alias",
-            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(|| vec!["+15550000001".into()]),
             false,
             false,
         );
         let result = ch
-            .send(&SendMessage::new("doomed note", "+1234567890"))
+            .send(&SendMessage::new("doomed note", "+15550000001"))
             .await;
         assert!(result.is_err());
         assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
@@ -2918,25 +2952,25 @@ mod tests {
             .await;
         let ch = SignalChannel::new(
             server.uri(),
-            "+1234567890".to_string(),
+            "+15550000002".to_string(),
             Vec::new(),
             false,
             "signal_test_alias",
-            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(|| vec!["+15550000002".into()]),
             false,
             false,
         );
 
-        ch.send(&SendMessage::new("timestamped", "+1234567890"))
+        ch.send(&SendMessage::new("timestamped", "+15550000002"))
             .await
             .unwrap();
         assert_eq!(ch.self_send_guard.snapshot(), (0, 1, false));
         let event = wrap_sent_sync(
-            Some("+1234567890"),
+            Some("+15550000002"),
             None,
             SentMessage {
-                destination: Some("+1234567890".to_string()),
-                destination_number: Some("+1234567890".to_string()),
+                destination: Some("+15550000002".to_string()),
+                destination_number: Some("+15550000002".to_string()),
                 message: Some("timestamped".to_string()),
                 timestamp: Some(1_700_000_000_123),
                 group_info: None,
@@ -2945,6 +2979,130 @@ mod tests {
         );
         assert!(ch.process_envelope_async(&event).await.is_empty());
         assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
+    }
+
+    /// The ownership regression for the multi-handle topology.
+    ///
+    /// Echo correlation must be canonical for the configured endpoint/account,
+    /// not private to whichever handle happened to perform the send. Live
+    /// outbound surfaces build their own `SignalChannel` instances (the
+    /// tool-facing channel map behind the gateway WebSocket session, and the
+    /// SOP adapter's independent map), while the supervised listener owns a
+    /// different instance. With a per-instance guard the listener has no
+    /// timestamp for a sibling handle's send, so signal-cli's sent-sync event
+    /// is accepted as a fresh allowlisted turn and the agent replays its own
+    /// output -- the self-reply loop this feature exists to prevent.
+    ///
+    /// Sends through one handle and listens on a *separate* handle built for
+    /// the same account, so it fails against the per-instance topology.
+    #[tokio::test]
+    async fn self_send_correlation_is_shared_across_handles_for_one_account() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": { "timestamp": 1_700_000_000_456_u64 },
+                "id": "ignored"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let account = "+15550000003".to_string();
+        let new_handle = || {
+            SignalChannel::new(
+                server.uri(),
+                account.clone(),
+                Vec::new(),
+                false,
+                "signal_test_alias",
+                Arc::new(|| vec!["+15550000003".into()]),
+                false,
+                false,
+            )
+        };
+
+        // Two independently constructed handles, exactly as the orchestrator's
+        // tool registration and the supervised listener build them.
+        let sender = new_handle();
+        let listener = new_handle();
+
+        sender
+            .send(&SendMessage::new("cross handle note", "+15550000003"))
+            .await
+            .unwrap();
+
+        // The send was recorded by `sender`, but the guard is canonical for the
+        // endpoint/account, so the listener observes the same confirmed entry.
+        assert_eq!(
+            listener.self_send_guard.snapshot(),
+            (0, 1, false),
+            "listener handle must observe the sibling handle's confirmed send"
+        );
+
+        let event = wrap_sent_sync(
+            Some("+15550000003"),
+            None,
+            SentMessage {
+                destination: Some("+15550000003".to_string()),
+                destination_number: Some("+15550000003".to_string()),
+                message: Some("cross handle note".to_string()),
+                timestamp: Some(1_700_000_000_456),
+                group_info: None,
+                attachments: None,
+            },
+        );
+
+        // The listener must suppress the echo of a send it did not perform.
+        assert!(
+            listener.process_envelope_async(&event).await.is_empty(),
+            "a sibling handle's send must not surface as an inbound turn"
+        );
+        assert_eq!(listener.self_send_guard.snapshot(), (0, 0, false));
+    }
+
+    /// A genuine phone-authored Note to Self must still reach the agent after
+    /// correlation is shared: the canonical guard suppresses only real echoes,
+    /// it does not blanket-suppress the account's own sync messages.
+    #[tokio::test]
+    async fn shared_correlation_still_admits_a_genuine_note_to_self() {
+        let account = "+1234567890".to_string();
+        let listener = SignalChannel::new(
+            "http://127.0.0.1:1".to_string(),
+            account,
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            false,
+            false,
+        );
+
+        // Nothing was sent by any handle, so no timestamp can match.
+        let event = wrap_sent_sync(
+            Some("+1234567890"),
+            None,
+            SentMessage {
+                destination: Some("+1234567890".to_string()),
+                destination_number: Some("+1234567890".to_string()),
+                message: Some("typed on my phone".to_string()),
+                timestamp: Some(1_700_000_999_999),
+                group_info: None,
+                attachments: None,
+            },
+        );
+
+        let out = listener.process_envelope_async(&event).await;
+        assert_eq!(
+            out.len(),
+            1,
+            "a phone-authored Note to Self must still produce exactly one turn"
+        );
+        assert_eq!(out[0].content, "typed on my phone");
     }
 
     /// The production-front-door regression for the cancellation blocker.
@@ -2983,11 +3141,11 @@ mod tests {
 
         let ch = Arc::new(SignalChannel::new(
             server.uri(),
-            "+1234567890".to_string(),
+            "+15550000004".to_string(),
             Vec::new(),
             false,
             "signal_test_alias",
-            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(|| vec!["+15550000004".into()]),
             false,
             false,
         ));
@@ -2996,7 +3154,7 @@ mod tests {
         let sender = Arc::clone(&ch);
         let send_task = zeroclaw_spawn::spawn!(async move {
             sender
-                .send(&SendMessage::new("wedge me", "+1234567890"))
+                .send(&SendMessage::new("wedge me", "+15550000004"))
                 .await
         });
 
@@ -3021,11 +3179,11 @@ mod tests {
         // The matching sync event: whatever it is classified as, it must not
         // park the listener forever.
         let echo_event = wrap_sent_sync(
-            Some("+1234567890"),
+            Some("+15550000004"),
             None,
             SentMessage {
-                destination: Some("+1234567890".to_string()),
-                destination_number: Some("+1234567890".to_string()),
+                destination: Some("+15550000004".to_string()),
+                destination_number: Some("+15550000004".to_string()),
                 message: Some("wedge me".to_string()),
                 timestamp: Some(1_700_000_000_500),
                 group_info: None,
@@ -3049,11 +3207,11 @@ mod tests {
         // The actual liveness claim: a *later, different* message still gets
         // through. This is what a wedged listener would swallow.
         let later_event = wrap_sent_sync(
-            Some("+1234567890"),
+            Some("+15550000004"),
             None,
             SentMessage {
-                destination: Some("+1234567890".to_string()),
-                destination_number: Some("+1234567890".to_string()),
+                destination: Some("+15550000004".to_string()),
+                destination_number: Some("+15550000004".to_string()),
                 message: Some("a completely different note".to_string()),
                 timestamp: Some(1_700_000_000_777),
                 group_info: None,
@@ -3094,17 +3252,17 @@ mod tests {
             .await;
         let ch = SignalChannel::new(
             server.uri(),
-            "+1234567890".to_string(),
+            "+15550000005".to_string(),
             Vec::new(),
             false,
             "signal_test_alias",
-            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(|| vec!["+15550000005".into()]),
             false,
             false,
         );
 
         assert!(
-            ch.send(&SendMessage::new("not sent", "+1234567890"))
+            ch.send(&SendMessage::new("not sent", "+15550000005"))
                 .await
                 .is_err()
         );
