@@ -362,6 +362,89 @@ fn path_contains(parent: &Path, child: &Path) -> bool {
     canonical_child.starts_with(&canonical_parent) || child.starts_with(parent)
 }
 
+/// Depth, in normal path components, of `prefix` when `target` starts with it.
+/// Returns `None` when `prefix` is not a prefix of `target`.
+///
+/// Used to rank competing allow/deny matches by specificity so the most
+/// specific rule wins: an explicit `forbidden_paths` entry nested under a
+/// broad `allowed_roots` entry denies, while an `allowed_roots` entry nested
+/// under a broad default forbidden root (e.g. `/home`) still allows.
+fn prefix_match_depth(prefix: &Path, target: &Path) -> Option<usize> {
+    if target.starts_with(prefix) {
+        Some(
+            prefix
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Deepest (most specific) allow-root match depth for `expanded`, considering
+/// the workspace directory and every provided allow-root list. `None` when no
+/// allow rule matches. Each root is compared both as-configured and
+/// canonicalized so entries with symlinks or `..` still line up with the
+/// incoming path.
+fn deepest_allow_depth(
+    workspace_dir: &Path,
+    root_lists: &[&[PathBuf]],
+    expanded: &Path,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut consider = |root: &Path| {
+        if let Some(depth) = prefix_match_depth(root, expanded) {
+            best = Some(best.map_or(depth, |b| b.max(depth)));
+        }
+    };
+    consider(workspace_dir);
+    let canonical_workspace = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    if canonical_workspace != *workspace_dir {
+        consider(&canonical_workspace);
+    }
+    for list in root_lists {
+        for root in *list {
+            consider(root);
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if canonical != *root {
+                consider(&canonical);
+            }
+        }
+    }
+    best
+}
+
+/// Deepest (most specific) forbidden match depth for `expanded`. `None` when no
+/// forbidden entry matches.
+fn deepest_forbidden_depth(forbidden_paths: &[String], expanded: &Path) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for forbidden in forbidden_paths {
+        let forbidden_path = expand_user_path(forbidden);
+        if let Some(depth) = prefix_match_depth(&forbidden_path, expanded) {
+            best = Some(best.map_or(depth, |b| b.max(depth)));
+        }
+    }
+    best
+}
+
+/// Decide whether a `forbidden_paths` entry should deny a path even though an
+/// allow rule also matches. Deny wins when the most specific forbidden prefix
+/// is at least as deep as the most specific allowing prefix, so an explicit
+/// forbidden path nested under an allowed root takes effect, while a broad
+/// default forbidden root (e.g. `/home`) does not override an operator's more
+/// specific `allowed_roots` entry. A tie resolves to deny — an explicit "no"
+/// at the same boundary as the allow should hold.
+fn forbidden_overrides_allow(forbidden_depth: Option<usize>, allow_depth: Option<usize>) -> bool {
+    match (forbidden_depth, allow_depth) {
+        (Some(f), Some(a)) => f >= a,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// Specific kind of escalation violation returned by
 /// [`SecurityPolicy::ensure_no_escalation_beyond`]. Each variant names
 /// the field that violated subset semantics so the SubAgent spawn path
@@ -2011,6 +2094,25 @@ impl SecurityPolicy {
                 .any(|root| expanded_path.starts_with(root));
 
             if in_workspace || in_allowed_root || in_read_only_root || in_write_only_root {
+                // Deny-before-allow when a `forbidden_paths` entry is at least
+                // as specific as the allowing root, so an explicit forbidden
+                // path nested under an allowed root (or the workspace) still
+                // blocks. A broad default forbidden root (e.g. `/home`) does
+                // not override a more specific operator allowlist entry.
+                let allow_depth = deepest_allow_depth(
+                    &self.workspace_dir,
+                    &[
+                        &self.allowed_roots,
+                        &self.allowed_roots_read_only,
+                        &self.allowed_roots_write_only,
+                    ],
+                    &expanded_path,
+                );
+                let forbidden_depth =
+                    deepest_forbidden_depth(&self.forbidden_paths, &expanded_path);
+                if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                    return false;
+                }
                 return true;
             }
 
@@ -2053,21 +2155,34 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
+
+        let in_workspace = resolved.starts_with(&workspace_root);
+        let in_allowed_root = self.allowed_roots.iter().any(|root| {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            resolved.starts_with(&canonical)
+        });
+        let in_read_only_root = self.allowed_roots_read_only.iter().any(|root| {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            resolved.starts_with(&canonical)
+        });
+
+        if in_workspace || in_allowed_root || in_read_only_root {
+            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
+            // specific as the allowing root denies reads even inside the
+            // workspace or a read allowlist. A broad default forbidden root
+            // (e.g. `/home`) does not override a more specific allowlist entry.
+            let allow_depth = deepest_allow_depth(
+                &workspace_root,
+                &[&self.allowed_roots, &self.allowed_roots_read_only],
+                resolved,
+            );
+            let forbidden_depth = deepest_forbidden_depth(&self.forbidden_paths, resolved);
+            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                return false;
+            }
             return true;
         }
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-        for root in &self.allowed_roots_read_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
+
         for root in &self.allowed_roots_write_only {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
             if resolved.starts_with(&canonical) {
@@ -2131,28 +2246,37 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
+
+        let in_workspace = resolved.starts_with(&workspace_root);
+        // Extra allowed roots (e.g. shared skills directories).
+        let in_allowed_root = self.allowed_roots.iter().any(|root| {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            resolved.starts_with(&canonical)
+        });
+        // Write-only cross-agent grants land here. The bot can write under
+        // these paths but `is_resolved_path_readable` does not see them —
+        // `AccessMode::Write` is one-way by design.
+        let in_write_only_root = self.allowed_roots_write_only.iter().any(|root| {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            resolved.starts_with(&canonical)
+        });
+
+        if in_workspace || in_allowed_root || in_write_only_root {
+            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
+            // specific as the allowing root denies even inside the workspace or
+            // an allowed root, preventing symlink escapes and sensitive-directory
+            // access. A broad default forbidden root (e.g. `/home`) does not
+            // override a more specific operator allowlist entry.
+            let allow_depth = deepest_allow_depth(
+                &workspace_root,
+                &[&self.allowed_roots, &self.allowed_roots_write_only],
+                resolved,
+            );
+            let forbidden_depth = deepest_forbidden_depth(&self.forbidden_paths, resolved);
+            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                return false;
+            }
             return true;
-        }
-
-        // Check extra allowed roots (e.g. shared skills directories) before
-        // forbidden checks so explicit allowlists can coexist with broad
-        // default forbidden roots such as `/home` and `/tmp`.
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-
-        // Write-only cross-agent grants land here. The bot can write
-        // under these paths but `is_resolved_path_readable` does not
-        // see them — `AccessMode::Write` is one-way by design.
-        for root in &self.allowed_roots_write_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
         }
 
         // For paths outside workspace/allowlist, block forbidden roots to
@@ -3494,6 +3618,132 @@ mod tests {
         assert!(!p.is_path_allowed(&tp_sys_sub("root/.bashrc")));
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
+    }
+
+    // ── #9815: deny-before-allow with most-specific-match wins ──────────
+    //
+    // `forbidden_paths` must apply even when a path also falls under the
+    // workspace or an allowed root. Specificity (matched path-component
+    // depth) breaks ties so a narrow explicit forbidden entry beats a broad
+    // allowed root, while a narrow allowed root still beats a broad *default*
+    // forbidden root such as `/home`.
+
+    #[test]
+    fn forbidden_overrides_allow_specificity_rules() {
+        // Forbidden deeper than allow => deny.
+        assert!(forbidden_overrides_allow(Some(4), Some(3)));
+        // Equal depth => deny (explicit forbidden at the allow boundary wins).
+        assert!(forbidden_overrides_allow(Some(3), Some(3)));
+        // Broad forbidden shallower than a specific allow => allow.
+        assert!(!forbidden_overrides_allow(Some(1), Some(3)));
+        // Forbidden with no competing allow => deny.
+        assert!(forbidden_overrides_allow(Some(2), None));
+        // No forbidden match => allow.
+        assert!(!forbidden_overrides_allow(None, Some(3)));
+        assert!(!forbidden_overrides_allow(None, None));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn forbidden_path_nested_under_allowed_root_is_denied() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        // The allowed root itself and non-forbidden children remain allowed.
+        assert!(p.is_path_allowed("/home/me/project/main.rs"));
+        // The explicit, more-specific forbidden subtree is denied even though
+        // it falls under an allowed_roots entry (the reported repro).
+        assert!(!p.is_path_allowed("/home/me/project/secrets/key.txt"));
+        assert!(!p.is_path_allowed("/home/me/project/secrets"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn allowed_root_more_specific_than_broad_default_forbidden_still_allows() {
+        // Default forbidden paths include broad roots like `/home`. An operator
+        // allowlist that is more specific than that broad root must still work.
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_path_allowed("/home/me/project/main.rs"));
+        // A sibling under the broad forbidden `/home` that is NOT under the
+        // allowlist is still denied.
+        assert!(!p.is_path_allowed("/home/me/other/file.txt"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn forbidden_path_nested_in_workspace_is_denied() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: true,
+            forbidden_paths: vec!["/srv/ws/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_path_allowed("/srv/ws/notes.md"));
+        assert!(!p.is_path_allowed("/srv/ws/secrets/token"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_allowed_honors_forbidden_under_allowed_root() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_allowed(Path::new("/home/me/project/main.rs")));
+        assert!(!p.is_resolved_path_allowed(Path::new("/home/me/project/secrets/key.txt")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_allowed_narrow_allow_beats_broad_default_forbidden() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_allowed(Path::new("/home/me/project/main.rs")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_readable_honors_forbidden_under_allowed_root() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_readable(Path::new("/home/me/project/main.rs")));
+        assert!(!p.is_resolved_path_readable(Path::new("/home/me/project/secrets/key.txt")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_readable_narrow_allow_beats_broad_default_forbidden() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_readable(Path::new("/home/me/project/main.rs")));
     }
 
     #[test]
