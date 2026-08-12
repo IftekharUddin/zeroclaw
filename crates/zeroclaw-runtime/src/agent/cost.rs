@@ -234,7 +234,7 @@ fn merge_config_and_live_rates(
 /// A model whose usage was recorded with tokens but zero cost — i.e. no
 /// pricing resolved (config, live snapshot, or global catalog all missed).
 /// Its spend is invisible in the ledger and daily/monthly caps cannot fire
-/// against it (#9816).
+/// against it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnpricedModel {
     pub model: String,
@@ -449,7 +449,7 @@ mod tests {
         }
     }
 
-    /// #9816: models with recorded tokens but $0 cost are unpriced and must be
+    /// Models with recorded tokens but $0 cost are unpriced and must be
     /// flagged — this is the signal `zeroclaw status` uses to warn that caps
     /// cannot be enforced. Priced models and zero-token rows must not be.
     #[test]
@@ -497,7 +497,7 @@ mod tests {
         assert!(unpriced_models_in_summary(&by_model).is_empty());
     }
 
-    /// #9816 part 1: routing Anthropic through the existing global catalog
+    /// Routing Anthropic through the existing global catalog
     /// (rather than a bespoke hand-maintained table) prices a direct-provider
     /// Anthropic model by its bare model id. This is the drift-free path — the
     /// same catalog that prices every other provider.

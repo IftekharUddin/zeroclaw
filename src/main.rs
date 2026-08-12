@@ -4752,7 +4752,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
-                            // #9816: a model with recorded tokens but zero cost
+                            // A model with recorded tokens but zero cost
                             // is unpriced — its spend is invisible and the
                             // daily/monthly caps cannot fire for it. Surface
                             // this loudly rather than let $0.0000 reassure the
