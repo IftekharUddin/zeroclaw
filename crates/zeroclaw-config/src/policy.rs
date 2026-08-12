@@ -3620,7 +3620,7 @@ mod tests {
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
     }
 
-    // ── #9815: deny-before-allow with most-specific-match wins ──────────
+    // ── deny-before-allow with most-specific-match wins ─────────────────
     //
     // `forbidden_paths` must apply even when a path also falls under the
     // workspace or an allowed root. Specificity (matched path-component
