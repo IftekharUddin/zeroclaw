@@ -771,6 +771,7 @@ cli-status-max-cost-day = {"  "}Max cost/day:      ${$v}
 cli-status-max-cost-month = {"  "}Max cost/month:    ${$v}
 cli-status-spent-today = {"  "}Spent today:       ${$spent} / ${$limit}
 cli-status-spent-month = {"  "}Spent this month:  ${$spent} / ${$limit}
+cli-status-pricing-unavailable = {"  "}⚠ Pricing unavailable for {$count} model(s) ({$tokens} tokens uncosted): {$models}. Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. Add a `pricing` table under `[providers.models."<type>"]` or ship a catalog entry.
 cli-status-otp = {"  "}OTP enabled:       {$v}
 cli-status-estop = {"  "}E-stop enabled:    {$v}
 cli-status-peripherals-enabled = {"  "}Enabled:   {$v}

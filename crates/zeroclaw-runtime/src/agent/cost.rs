@@ -231,6 +231,36 @@ fn merge_config_and_live_rates(
     )
 }
 
+/// A model whose usage was recorded with tokens but zero cost — i.e. no
+/// pricing resolved (config, live snapshot, or global catalog all missed).
+/// Its spend is invisible in the ledger and daily/monthly caps cannot fire
+/// against it (#9816).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpricedModel {
+    pub model: String,
+    pub total_tokens: u64,
+}
+
+/// Scan a cost summary's per-model rollup for unpriced models: any model with
+/// recorded tokens but `cost_usd == 0`. Returned sorted by model id for stable
+/// output. Provider-agnostic — flags Anthropic today and any future provider
+/// that returns no pricing metadata. Extracted as a pure function so the
+/// `zeroclaw status` safety warning can be unit-tested without a live ledger.
+pub fn unpriced_models_in_summary(
+    by_model: &HashMap<String, zeroclaw_config::cost::ModelStats>,
+) -> Vec<UnpricedModel> {
+    let mut out: Vec<UnpricedModel> = by_model
+        .values()
+        .filter(|m| m.total_tokens > 0 && m.cost_usd == 0.0)
+        .map(|m| UnpricedModel {
+            model: m.model.clone(),
+            total_tokens: m.total_tokens,
+        })
+        .collect();
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    out
+}
+
 /// Record token usage from an LLM response via the task-local cost tracker.
 /// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
 pub fn record_tool_loop_cost_usage(
@@ -401,6 +431,95 @@ mod tests {
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    fn model_stats(
+        model: &str,
+        total_tokens: u64,
+        cost_usd: f64,
+    ) -> zeroclaw_config::cost::ModelStats {
+        zeroclaw_config::cost::ModelStats {
+            model: model.to_string(),
+            cost_usd,
+            input_tokens: total_tokens,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens,
+            request_count: 1,
+        }
+    }
+
+    /// #9816: models with recorded tokens but $0 cost are unpriced and must be
+    /// flagged — this is the signal `zeroclaw status` uses to warn that caps
+    /// cannot be enforced. Priced models and zero-token rows must not be.
+    #[test]
+    fn unpriced_models_flags_tokens_with_zero_cost_only() {
+        let mut by_model = HashMap::new();
+        // Unpriced: real tokens, zero cost (the Anthropic-direct symptom).
+        by_model.insert(
+            "claude-haiku-4-5-20251001".to_string(),
+            model_stats("claude-haiku-4-5-20251001", 9420, 0.0),
+        );
+        // Priced: has cost — must NOT be flagged.
+        by_model.insert("gpt-4o".to_string(), model_stats("gpt-4o", 1000, 0.05));
+        // Zero tokens: nothing spent — must NOT be flagged.
+        by_model.insert("idle-model".to_string(), model_stats("idle-model", 0, 0.0));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        assert_eq!(
+            unpriced.len(),
+            1,
+            "only the token-bearing $0 model is unpriced"
+        );
+        assert_eq!(unpriced[0].model, "claude-haiku-4-5-20251001");
+        assert_eq!(unpriced[0].total_tokens, 9420);
+    }
+
+    /// Output is sorted by model id for stable, deterministic status output.
+    #[test]
+    fn unpriced_models_are_sorted_by_id() {
+        let mut by_model = HashMap::new();
+        by_model.insert("zeta".to_string(), model_stats("zeta", 10, 0.0));
+        by_model.insert("alpha".to_string(), model_stats("alpha", 20, 0.0));
+        by_model.insert("mike".to_string(), model_stats("mike", 30, 0.0));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        let ids: Vec<&str> = unpriced.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mike", "zeta"]);
+    }
+
+    /// A fully-priced ledger produces no warning — the common healthy case.
+    #[test]
+    fn unpriced_models_empty_when_all_priced() {
+        let mut by_model = HashMap::new();
+        by_model.insert("gpt-4o".to_string(), model_stats("gpt-4o", 1000, 0.05));
+        by_model.insert("claude".to_string(), model_stats("claude", 2000, 0.10));
+        assert!(unpriced_models_in_summary(&by_model).is_empty());
+    }
+
+    /// #9816 part 1: routing Anthropic through the existing global catalog
+    /// (rather than a bespoke hand-maintained table) prices a direct-provider
+    /// Anthropic model by its bare model id. This is the drift-free path — the
+    /// same catalog that prices every other provider.
+    #[test]
+    fn global_catalog_prices_anthropic_model_by_id() {
+        use crate::agent::pricing_catalog::{GlobalPricingCatalog, set_global_pricing_catalog};
+        let catalog: GlobalPricingCatalog = serde_json::from_str(
+            r#"{"models":{"claude-haiku-4-5-20251001":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0,"cache_read_usd_per_mtok":0.1}}}"#,
+        )
+        .expect("catalog json parses");
+        set_global_pricing_catalog(catalog);
+
+        let rates =
+            crate::agent::pricing_catalog::global_pricing_rates("claude-haiku-4-5-20251001");
+        assert_eq!(
+            rates,
+            Some((1.0, 5.0, 0.1)),
+            "catalog must price the direct Anthropic model by its bare id"
+        );
+
+        // Reset the process-global catalog so we don't leak into other tests.
+        set_global_pricing_catalog(GlobalPricingCatalog::default());
     }
 
     #[test]
