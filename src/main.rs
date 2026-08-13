@@ -4766,7 +4766,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 );
                             if !unpriced.is_empty() {
                                 let uncosted_tokens: u64 =
-                                    unpriced.iter().map(|m| m.total_tokens).sum();
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
                                 let count = unpriced.len().to_string();
                                 let tokens = uncosted_tokens.to_string();
                                 let models = unpriced
