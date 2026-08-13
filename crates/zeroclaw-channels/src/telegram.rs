@@ -44,15 +44,28 @@ struct PendingMediaGroup {
 
 /// The text-only residue of an album member that will never be downloaded.
 ///
-/// Only what caption aggregation and the mention gate need is retained; the
-/// full `message` object is intentionally dropped so this can never reach
-/// `parse_attachment_metadata()` or `getFile`.
+/// Only what caption aggregation, the mention gate, and album scope validation
+/// need is retained; the full `message` object is intentionally dropped so
+/// this can never reach `parse_attachment_metadata()` or `getFile`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnsupportedMember {
     /// Kept so unsupported captions interleave with supported ones in the
     /// album's real `message_id` order rather than being appended at the end.
     message_id: i64,
     caption: Option<String>,
+    scope: MediaGroupScope,
+}
+
+/// Security-relevant scope shared by every member of one Telegram album.
+///
+/// Optional fields are retained instead of dropping malformed members so the
+/// settled batch can fail closed before any attachment download.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MediaGroupScope {
+    chat_id: Option<i64>,
+    media_group_id: Option<String>,
+    thread_id: Option<i64>,
+    sender: Option<String>,
 }
 
 /// One settled album ready for dispatch: the materializable updates plus the
@@ -951,6 +964,13 @@ impl TelegramChannel {
             .is_some()
     }
 
+    fn is_context_only_media_group_update(update: &serde_json::Value) -> bool {
+        update
+            .get("message")
+            .and_then(|message| message.get("video"))
+            .is_some()
+    }
+
     fn should_defer_media_group_update(
         pending: &std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         update: &serde_json::Value,
@@ -974,9 +994,9 @@ impl TelegramChannel {
         same_update_id || same_message_id
     }
 
-    /// Record the caption context of an album member that will never be
-    /// downloaded. Deduplicated by `message_id` so a member repeated across
-    /// polls cannot duplicate its caption in the aggregate.
+    /// Record the caption and security scope of an album member that will
+    /// never be downloaded. Deduplicated by `message_id` so a member repeated
+    /// across polls cannot duplicate its context in the aggregate.
     fn retain_unsupported_member(group: &mut PendingMediaGroup, update: &serde_json::Value) {
         let Some(message_id) = Self::update_message_id(update) else {
             return;
@@ -1002,12 +1022,14 @@ impl TelegramChannel {
             .and_then(|message| message.get("caption"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        if caption.is_none() {
-            return;
-        }
+        let scope = update
+            .get("message")
+            .map(Self::media_group_scope)
+            .unwrap_or_default();
         group.unsupported.push(UnsupportedMember {
             message_id,
             caption,
+            scope,
         });
     }
 
@@ -1021,18 +1043,24 @@ impl TelegramChannel {
             return false;
         };
 
-        // Unsupported members (for example, videos in a photo/video album)
-        // are not materialized, but they still belong to the album. When a
-        // supported sibling is already pending, treat the unsupported member
-        // as activity so the quiet-period flush cannot split later supported
-        // siblings into another turn, and retain its caption so aggregation
-        // and the mention gate see the whole album.
+        // Videos are context-only members of photo/video albums: retain them
+        // even when one arrives before the first materializable sibling. The
+        // existing listener-local map remains the single owner of transient
+        // album state. Grouped audio keeps its independent parser behavior.
         if !Self::is_supported_media_group_update(update) {
-            if let Some(group) = pending.get_mut(&key) {
-                group.last_seen = now;
-                group.last_seen_poll_generation = poll_generation;
-                Self::retain_unsupported_member(group, update);
+            if !Self::is_context_only_media_group_update(update) {
+                return true;
             }
+
+            let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
+                updates: Vec::new(),
+                unsupported: Vec::new(),
+                last_seen: now,
+                last_seen_poll_generation: poll_generation,
+            });
+            Self::retain_unsupported_member(group, update);
+            group.last_seen = now;
+            group.last_seen_poll_generation = poll_generation;
             return true;
         }
 
@@ -1171,39 +1199,38 @@ impl TelegramChannel {
             .map(|username| format!("username:{username}"))
     }
 
+    fn media_group_scope(message: &serde_json::Value) -> MediaGroupScope {
+        MediaGroupScope {
+            chat_id: message
+                .get("chat")
+                .and_then(|chat| chat.get("id"))
+                .and_then(serde_json::Value::as_i64),
+            media_group_id: message
+                .get("media_group_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            thread_id: message
+                .get("message_thread_id")
+                .and_then(serde_json::Value::as_i64),
+            sender: Self::media_group_sender_scope(message),
+        }
+    }
+
+    fn media_group_scopes_match(anchor: &MediaGroupScope, candidate: &MediaGroupScope) -> bool {
+        anchor.chat_id.is_some()
+            && anchor.media_group_id.is_some()
+            && anchor.sender.is_some()
+            && anchor == candidate
+    }
+
     fn media_group_members_share_scope(
         anchor: &serde_json::Value,
         candidate: &serde_json::Value,
     ) -> bool {
-        let anchor_chat_id = anchor
-            .get("chat")
-            .and_then(|chat| chat.get("id"))
-            .and_then(serde_json::Value::as_i64);
-        let candidate_chat_id = candidate
-            .get("chat")
-            .and_then(|chat| chat.get("id"))
-            .and_then(serde_json::Value::as_i64);
-        let anchor_group_id = anchor
-            .get("media_group_id")
-            .and_then(serde_json::Value::as_str);
-        let candidate_group_id = candidate
-            .get("media_group_id")
-            .and_then(serde_json::Value::as_str);
-        let anchor_thread_id = anchor
-            .get("message_thread_id")
-            .and_then(serde_json::Value::as_i64);
-        let candidate_thread_id = candidate
-            .get("message_thread_id")
-            .and_then(serde_json::Value::as_i64);
-
-        anchor_chat_id == candidate_chat_id
-            && anchor_chat_id.is_some()
-            && anchor_group_id == candidate_group_id
-            && anchor_group_id.is_some()
-            && anchor_thread_id == candidate_thread_id
-            && Self::media_group_sender_scope(anchor)
-                .zip(Self::media_group_sender_scope(candidate))
-                .is_some_and(|(anchor, candidate)| anchor == candidate)
+        Self::media_group_scopes_match(
+            &Self::media_group_scope(anchor),
+            &Self::media_group_scope(candidate),
+        )
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
@@ -2385,11 +2412,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // never produce a turn.
         let anchor_update = *ordered.first()?;
         let anchor_message = anchor_update.get("message")?;
-        if !ordered.iter().all(|update| {
+        let anchor_scope = Self::media_group_scope(anchor_message);
+        let supported_share_scope = ordered.iter().all(|update| {
             update.get("message").is_some_and(|message| {
                 Self::media_group_members_share_scope(anchor_message, message)
             })
-        }) {
+        });
+        let unsupported_share_scope = unsupported
+            .iter()
+            .all(|member| Self::media_group_scopes_match(&anchor_scope, &member.scope));
+        if !supported_share_scope || !unsupported_share_scope {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5235,7 +5267,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_media_group_member_refreshes_existing_group_without_being_stored() {
+    fn unsupported_media_group_member_starts_or_refreshes_context_without_download_state() {
         let mut pending = std::collections::HashMap::new();
         let started = Instant::now();
         let photo = media_group_update(1, 10, 100, "album");
@@ -5292,9 +5324,12 @@ mod tests {
             started,
             1
         ));
-        assert!(
-            unsupported_only.is_empty(),
-            "unsupported-only albums should not allocate pending state"
+        let context_only = unsupported_only.values().next().unwrap();
+        assert!(context_only.updates.is_empty());
+        assert_eq!(context_only.unsupported.len(), 1);
+        assert_eq!(
+            TelegramChannel::media_group_poll_timeout_secs(&unsupported_only),
+            TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS
         );
 
         let grouped_audio = serde_json::json!({
@@ -7900,21 +7935,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_group_listener_ignores_unsupported_member_without_splitting_album() {
+    async fn media_group_listener_retains_video_context_before_photos_across_polls() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let first = media_group_update(10, 100, 100, "album");
+        let first = media_group_update(11, 101, 100, "album");
         let unsupported_video = serde_json::json!({
-            "update_id": 11,
+            "update_id": 10,
             "message": {
-                "message_id": 101,
+                "message_id": 100,
                 "media_group_id": "album",
                 "from": { "id": 7, "username": "alice" },
                 "chat": { "id": 100, "type": "private" },
-                "video": { "file_id": "unsupported-video" }
+                "video": { "file_id": "unsupported-video" },
+                "caption": "compare these"
             }
         });
         let second = media_group_update(12, 102, 100, "album");
@@ -7939,8 +7975,8 @@ mod tests {
                 }
 
                 let result = match responder_index.fetch_add(1, Ordering::SeqCst) {
-                    0 => vec![first.clone()],
-                    1 => vec![unsupported_video.clone()],
+                    0 => vec![unsupported_video.clone()],
+                    1 => vec![first.clone()],
                     2 => vec![second.clone()],
                     3 => vec![follow_up.clone()],
                     _ => Vec::new(),
@@ -7980,7 +8016,7 @@ mod tests {
             .mount(&server)
             .await;
         for (file_id, file_path) in [
-            ("file-100", "photos/first.jpg"),
+            ("file-101", "photos/first.jpg"),
             ("file-102", "photos/second.jpg"),
         ] {
             Mock::given(method("GET"))
@@ -8025,8 +8061,9 @@ mod tests {
             .await
             .expect("follow-up should dispatch")
             .expect("listener should remain connected");
-        assert_eq!(album.id, "telegram_100_100");
+        assert_eq!(album.id, "telegram_100_101");
         assert_eq!(album.content.matches("[IMAGE:").count(), 2);
+        assert!(album.content.contains("compare these"));
         assert_eq!(follow_up.content, "after album");
         assert!(rx.try_recv().is_err(), "album must dispatch exactly once");
 
@@ -8058,7 +8095,7 @@ mod tests {
             .collect();
         assert_eq!(
             reaction_message_ids,
-            std::collections::HashSet::from([100, 103])
+            std::collections::HashSet::from([101, 103])
         );
         let poll_timeouts: Vec<u64> = requests
             .iter()
@@ -8139,15 +8176,17 @@ mod tests {
 
         let mut pending = std::collections::HashMap::new();
         let now = Instant::now();
+        // Match one getUpdates response whose first album member is the
+        // unsupported video. Context must survive until the photos are seen.
         assert!(TelegramChannel::buffer_media_group_update(
             &mut pending,
-            &photo(10, 10, "photo-a"),
+            &video,
             now,
             1
         ));
         assert!(TelegramChannel::buffer_media_group_update(
             &mut pending,
-            &video,
+            &photo(10, 10, "photo-a"),
             now,
             1
         ));
@@ -8169,6 +8208,12 @@ mod tests {
             vec![UnsupportedMember {
                 message_id: 11,
                 caption: Some("@mybot compare these".to_string()),
+                scope: MediaGroupScope {
+                    chat_id: Some(-100),
+                    media_group_id: Some("album-mixed".to_string()),
+                    thread_id: None,
+                    sender: Some("user:7".to_string()),
+                },
             }],
             "the video's caption must be retained as text-only context"
         );
@@ -8280,8 +8325,8 @@ mod tests {
 
         let mut pending = std::collections::HashMap::new();
         let now = Instant::now();
-        TelegramChannel::buffer_media_group_update(&mut pending, &photo, now, 1);
         TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
+        TelegramChannel::buffer_media_group_update(&mut pending, &photo, now, 1);
 
         let batches = TelegramChannel::take_settled_media_groups(
             &mut pending,
@@ -8337,15 +8382,25 @@ mod tests {
         let mut pending = std::collections::HashMap::new();
         let now = Instant::now();
         TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
-        assert!(
-            pending.is_empty(),
-            "an unsupported member with no supported sibling must not create a group"
+        assert_eq!(pending.len(), 1, "context waits for a supported sibling");
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
         );
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].updates.is_empty());
 
         // Even if such a batch is constructed directly, it must dispatch nothing.
         let unsupported = vec![UnsupportedMember {
             message_id: 10,
             caption: Some("just a video".to_string()),
+            scope: MediaGroupScope {
+                chat_id: Some(100),
+                media_group_id: Some("album-video-only".to_string()),
+                thread_id: None,
+                sender: Some("user:7".to_string()),
+            },
         }];
         assert!(
             channel
@@ -8578,6 +8633,75 @@ mod tests {
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "scope validation must happen before any file request"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_group_rejects_captionless_video_with_mixed_sender_or_thread_before_download() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        for mismatch in ["sender", "thread"] {
+            let mut video = serde_json::json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 1,
+                    "media_group_id": "album",
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" },
+                    "video": { "file_id": "unsupported-video" }
+                }
+            });
+            let mut photo = media_group_update(2, 2, 100, "album");
+            match mismatch {
+                "sender" => video["message"]["from"]["id"] = serde_json::json!(8),
+                "thread" => {
+                    video["message"]["message_thread_id"] = serde_json::json!(50);
+                    photo["message"]["message_thread_id"] = serde_json::json!(51);
+                }
+                _ => unreachable!(),
+            }
+
+            let mut pending = std::collections::HashMap::new();
+            let now = Instant::now();
+            TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
+            TelegramChannel::buffer_media_group_update(&mut pending, &photo, now, 1);
+            let batches = TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+                2,
+            );
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].unsupported.len(), 1);
+            assert_eq!(
+                batches[0].unsupported[0].caption, None,
+                "captionless context must still be retained for scope validation"
+            );
+            assert!(
+                channel
+                    .try_parse_media_group_with_unsupported(
+                        &batches[0].updates,
+                        &batches[0].unsupported,
+                    )
+                    .await
+                    .is_none(),
+                "mixed {mismatch} album must fail closed"
+            );
+        }
+
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "unsupported scope validation must happen before any file request"
         );
     }
 
