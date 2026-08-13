@@ -120,7 +120,11 @@ impl Drop for SelfSendTicket {
 ///
 /// Keying by `(http_url, account)` makes correlation canonical for the
 /// endpoint/account pair that signal-cli itself correlates on, so all handles
-/// for one account share one guard while distinct accounts stay isolated.
+/// for one account share one guard while distinct accounts stay isolated. The
+/// registry deliberately owns a strong reference for the process lifetime:
+/// rebuilding a channel must not forget an unresolved send whose late echo can
+/// still arrive on the replacement listener. Only restarting the ZeroClaw
+/// daemon clears fail-closed or capacity-exhausted correlation state.
 /// Registry of canonical self-send guards, keyed by `(http_url, account)`.
 type SelfSendGuardRegistry = SyncMutex<HashMap<(String, String), Arc<SelfSendGuard>>>;
 
@@ -154,12 +158,12 @@ impl SelfSendGuard {
         let mut state = self.state.lock();
         if state.indeterminate {
             anyhow::bail!(
-                "Signal Note-to-Self echo correlation is indeterminate; restart the channel before sending another self-reply"
+                "Signal Note-to-Self echo correlation is indeterminate; restart the ZeroClaw daemon before sending another self-reply"
             );
         }
         if state.pending.len() + state.confirmed.len() >= SELF_SEND_GUARD_CAPACITY {
             anyhow::bail!(
-                "Signal Note-to-Self echo guard reached its {SELF_SEND_GUARD_CAPACITY}-message safety limit without observing all echoes"
+                "Signal Note-to-Self echo guard reached its {SELF_SEND_GUARD_CAPACITY}-message safety limit without observing all echoes; restart the ZeroClaw daemon to clear correlation state"
             );
         }
         let token = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -1071,7 +1075,7 @@ impl Channel for SignalChannel {
             else {
                 ticket.mark_indeterminate();
                 anyhow::bail!(
-                    "Signal send response omitted the timestamp required for Note-to-Self echo correlation"
+                    "Signal send response omitted the timestamp required for Note-to-Self echo correlation; restart the ZeroClaw daemon before another Note-to-Self send"
                 );
             };
             ticket.confirm(timestamp);
@@ -3105,6 +3109,52 @@ mod tests {
         assert_eq!(out[0].content, "typed on my phone");
     }
 
+    /// Recovery is process-scoped, not channel-handle-scoped. A late echo may
+    /// arrive after an in-process listener restart, so rebuilding every handle
+    /// for an endpoint/account must retain fail-closed correlation state. This
+    /// pins the runtime error's instruction to restart the full daemon.
+    #[test]
+    fn channel_rebuild_retains_indeterminate_guard_until_daemon_restart() {
+        let endpoint = format!("http://signal-lifecycle-{}", Uuid::new_v4());
+        let account = "+15550000999".to_string();
+        let new_handle = || {
+            SignalChannel::new(
+                endpoint.clone(),
+                account.clone(),
+                Vec::new(),
+                false,
+                "signal_test_alias",
+                Arc::new(Vec::<String>::new),
+                false,
+                false,
+            )
+        };
+
+        let first = new_handle();
+        let ticket = first
+            .self_send_guard
+            .begin("unknown outcome".to_string())
+            .unwrap();
+        ticket.mark_indeterminate();
+        let original_guard = Arc::clone(&first.self_send_guard);
+        drop(first);
+
+        let rebuilt = new_handle();
+        assert!(
+            Arc::ptr_eq(&original_guard, &rebuilt.self_send_guard),
+            "an in-process channel rebuild must retain the canonical guard"
+        );
+        let error = rebuilt
+            .self_send_guard
+            .begin("another self-send".to_string())
+            .expect_err("indeterminate state must survive a channel rebuild")
+            .to_string();
+        assert!(
+            error.contains("restart the ZeroClaw daemon"),
+            "recovery must name the process-lifetime boundary: {error}"
+        );
+    }
+
     /// The production-front-door regression for the cancellation blocker.
     ///
     /// Goes through the real `SignalChannel::send` and the real
@@ -3423,7 +3473,14 @@ mod tests {
             let ticket = guard.begin(format!("note {i}")).unwrap();
             ticket.confirm(i as u64);
         }
-        assert!(guard.begin("one too many".to_string()).is_err());
+        let error = guard
+            .begin("one too many".to_string())
+            .expect_err("capacity exhaustion must refuse rather than evict")
+            .to_string();
+        assert!(
+            error.contains("restart the ZeroClaw daemon"),
+            "capacity recovery must name the process-lifetime boundary: {error}"
+        );
         assert!(
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

@@ -28,8 +28,10 @@ timestamp remains a genuine note.
 
 If the daemon accepts a self-send but the HTTP response is lost or cannot
 be parsed, ZeroClaw cannot recover the canonical timestamp safely. It then
-fails Note-to-Self closed until the channel restarts rather than risk an
-agent replying to its own output. Ordinary Signal messages are unaffected.
+fails Note-to-Self closed until the ZeroClaw daemon restarts rather than risk
+an agent replying to its own output. Restarting only the Signal channel does
+not clear this process-wide safety state. Ordinary Signal messages are
+unaffected.
 
 Echo correlation is tracked per Signal endpoint and account, so every
 outbound surface bound to the same account -- the supervised listener, the
@@ -43,9 +45,12 @@ them, because dropping one would let a late echo be replayed as a genuine
 note. If 128 self-sends accumulate whose echoes never arrive -- a sustained
 sync-stream outage while sending continues -- further Note-to-Self sends are
 refused before the RPC with an error naming the 128-message safety limit,
-until the channel restarts. Restarting the channel clears the record and
-restores Note-to-Self sending. Inbound Signal traffic and all other outbound
-targets keep working throughout; only self-sends are refused.
+until the ZeroClaw daemon restarts. Restarting only the Signal channel or
+reloading its config intentionally keeps the process-wide correlation record,
+because a late echo may still arrive on a rebuilt listener. Restart the full
+ZeroClaw daemon to clear the record and restore Note-to-Self sending. Inbound
+Signal traffic and all other outbound targets keep working throughout; only
+self-sends are refused.
 
 ## Prerequisites
 
