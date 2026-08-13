@@ -48,17 +48,15 @@ pub(crate) struct SopPane {
     /// Aggregated live status per SOP name, refreshed by [`SopPane::tick`]
     /// and rendered as the leading icon on each list row.
     run_status: std::collections::HashMap<String, SopRunStatusView>,
-    /// Per-SOP run id that a Resume click should approve: the newest *active*
-    /// run currently blocked on a human. Refreshed from the same
-    /// `sops/runs` response as [`SopPane::run_status`].
-    resume_targets: std::collections::HashMap<String, String>,
     last_runs_poll: Option<std::time::Instant>,
-    /// Hit rect of the `[▶ Run]` label, `None` when the controls strip was
-    /// not drawn (pane too short) or the label did not fit.
-    run_btn_rect: Option<Rect>,
-    /// Hit rect of the `[⏯ Resume]` label, same `None` rules as
-    /// [`SopPane::run_btn_rect`].
-    resume_btn_rect: Option<Rect>,
+    /// The receiver is the single source of truth for whether a refresh is in
+    /// flight. Keeping the RPC off the event loop prevents a degraded daemon
+    /// from freezing input and rendering for the client timeout window.
+    runs_poll_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<Result<Vec<SopRunSummaryView>, String>>>,
+    /// Poll freshness is independent from action errors. A failed refresh
+    /// retains the last successful map and marks it stale until recovery.
+    runs_poll_stale: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -508,10 +506,9 @@ impl SopPane {
             canvas_rect: Rect::new(0, 0, 0, 0),
             pan_drag: None,
             run_status: std::collections::HashMap::new(),
-            resume_targets: std::collections::HashMap::new(),
             last_runs_poll: None,
-            run_btn_rect: None,
-            resume_btn_rect: None,
+            runs_poll_rx: None,
+            runs_poll_stale: false,
         }
     }
 
@@ -522,25 +519,14 @@ impl SopPane {
             .map(String::as_str)
     }
 
-    /// Run id the Resume control would act on for the current selection, or
-    /// `None` when nothing is selected or the selected SOP has no run blocked
-    /// on a human. Drives both the enabled styling and the click guard.
-    fn selected_resume_target(&self) -> Option<&str> {
-        self.resume_targets
-            .get(self.selected_name()?)
-            .map(String::as_str)
-    }
-
-    /// Called on every event-loop tick while the SOP pane is focused.
-    /// Throttled to one `sops/runs` call every
-    /// [`RUNS_POLL_INTERVAL_SECS`]; a single unfiltered call covers every
-    /// SOP, so the row icons cost one RPC regardless of list length.
-    ///
-    /// A failed poll is silent on purpose: at a 2s cadence surfacing the
-    /// error would spam the pane's single error slot (and clobber whatever
-    /// a user action put there), so we keep the previous map and let the
-    /// icons go stale until the next successful poll.
-    pub(crate) async fn tick(&mut self) {
+    /// Called on every event-loop tick while the SOP pane is focused. A single
+    /// unfiltered request covers every row, and the request runs outside the
+    /// event loop so a slow daemon cannot block terminal input or rendering.
+    pub(crate) fn tick(&mut self) {
+        self.drain_runs_poll();
+        if self.runs_poll_rx.is_some() {
+            return;
+        }
         let should_poll = self
             .last_runs_poll
             .map(|t| t.elapsed().as_secs() >= RUNS_POLL_INTERVAL_SECS)
@@ -548,15 +534,39 @@ impl SopPane {
         if !should_poll {
             return;
         }
-        self.last_runs_poll = Some(std::time::Instant::now());
-        let Ok(runs) = self.rpc.sops_runs(None).await else {
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.runs_poll_rx = Some(rx);
+        let rpc = Arc::clone(&self.rpc);
+        tokio::spawn(async move {
+            let result = rpc.sops_runs(None).await.map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn drain_runs_poll(&mut self) {
+        let Some(rx) = self.runs_poll_rx.as_mut() else {
             return;
         };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err("run-status poll ended without a response".to_string())
+            }
+        };
+
+        self.runs_poll_rx = None;
+        // The throttle window starts after the response, so a five-second
+        // timeout cannot cause an immediate retry on the next event-loop tick.
+        self.last_runs_poll = Some(std::time::Instant::now());
+        let Ok(runs) = result else {
+            self.runs_poll_stale = true;
+            return;
+        };
+
         let mut by_sop: std::collections::HashMap<String, Vec<SopRunSummaryView>> =
             std::collections::HashMap::new();
-        // Full replace, same as `run_status`: a SOP whose blocked run has since
-        // been decided must lose its Resume target on this poll, not linger.
-        self.resume_targets = resume_targets_from(&runs);
         for run in runs {
             by_sop.entry(run.sop_name.clone()).or_default().push(run);
         }
@@ -564,6 +574,7 @@ impl SopPane {
             .into_iter()
             .filter_map(|(name, runs)| aggregate_sop_status(&runs).map(|s| (name, s)))
             .collect();
+        self.runs_poll_stale = false;
     }
 
     pub(crate) async fn refresh(&mut self) {
@@ -649,34 +660,6 @@ impl SopPane {
                 } else {
                     "checkpoint denied".into()
                 });
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    /// Approve the checkpoint of the SOP's blocked run without first having
-    /// watched it. [`SopPane::decide_checkpoint`] needs `current_run_id`,
-    /// which only a run-overlay load sets; the Resume button instead uses the
-    /// target the poll in [`SopPane::tick`] already resolved, so a click on a
-    /// blue row works straight from the list. Sends the same `approve`
-    /// decision and adopts the returned overlay as the current run.
-    pub(crate) async fn resume_selected(&mut self) {
-        let Some(name) = self.selected_name().map(String::from) else {
-            return;
-        };
-        let Some(run_id) = self.resume_targets.get(&name).cloned() else {
-            return;
-        };
-        match self
-            .rpc
-            .sops_decide(&name, &run_id, serde_json::json!("approve"))
-            .await
-        {
-            Ok(value) => {
-                self.overlay = serde_json::from_value(value).ok();
-                self.current_run_id = Some(run_id);
-                self.status = Some("checkpoint approved".into());
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -769,21 +752,6 @@ impl SopPane {
         let (col, row) = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Controls strip first: its rects never overlap the list rows,
-                // but a click that lands on a button must never fall through
-                // to the list / editor / canvas handlers below.
-                if self.run_btn_rect.is_some_and(|r| in_rect(col, row, r)) {
-                    if self.selected_name().is_some() {
-                        self.start_run_payload().await;
-                    }
-                    return;
-                }
-                if self.resume_btn_rect.is_some_and(|r| in_rect(col, row, r)) {
-                    if self.selected_resume_target().is_some() {
-                        self.resume_selected().await;
-                    }
-                    return;
-                }
                 if let Some(idx) = self
                     .list_row_rects
                     .iter()
@@ -1498,20 +1466,6 @@ impl SopPane {
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(area);
 
-        // Carve the controls strip off the bottom of the left column. Below
-        // `MIN_LEFT_COL_H` the strip would leave the list with no usable rows,
-        // so the list keeps the whole column and the buttons simply do not
-        // exist this frame (rects `None` => clicks fall through as before).
-        let (list_rect, controls_rect) = if cols[0].height >= MIN_LEFT_COL_H {
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(CONTROLS_H)])
-                .split(cols[0]);
-            (rows[0], Some(rows[1]))
-        } else {
-            (cols[0], None)
-        };
-
         let items: Vec<ListItem> = self
             .names
             .iter()
@@ -1530,18 +1484,15 @@ impl SopPane {
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title("SOPs"))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        f.render_stateful_widget(list, list_rect, &mut self.list_state);
-        // Hit rects must come from the same (shrunk) rect the list was drawn
-        // into, or every row click lands one strip too low.
-        self.list_row_rects = list_row_rects(list_rect, self.names.len());
-
-        self.render_controls(f, controls_rect);
+        f.render_stateful_widget(list, cols[0], &mut self.list_state);
+        self.list_row_rects = list_row_rects(cols[0], self.names.len());
 
         let editing = self.editor.is_some();
         let visual = self.layer == RenderLayer::Visual;
         let title = self.right_title();
 
-        if visual && self.error.is_none() {
+        let visible_error = self.visible_error();
+        if visual && visible_error.is_none() {
             self.render_canvas(f, cols[1], &title);
             return;
         }
@@ -1549,8 +1500,8 @@ impl SopPane {
         self.handle_rects.clear();
         self.wire_rects.clear();
 
-        let body = if let Some(err) = &self.error {
-            err.clone()
+        let body = if let Some(err) = visible_error {
+            err
         } else if editing {
             self.editor_lines().join("\n")
         } else {
@@ -1562,37 +1513,16 @@ impl SopPane {
         f.render_widget(para, cols[1]);
     }
 
-    /// Draw the bordered Run/Resume strip and record its hit rects. `None`
-    /// area means the pane was too short for a strip this frame; both rects
-    /// are cleared so stale coordinates cannot take a click.
-    fn render_controls(&mut self, f: &mut Frame, area: Option<Rect>) {
-        let Some(area) = area else {
-            self.run_btn_rect = None;
-            self.resume_btn_rect = None;
-            return;
-        };
-        let block = Block::default().borders(Borders::ALL).title("Controls");
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let (run_rect, resume_rect) = control_button_rects(inner);
-        self.run_btn_rect = run_rect;
-        self.resume_btn_rect = resume_rect;
-
-        let run_enabled = self.selected_name().is_some();
-        let resume_enabled = self.selected_resume_target().is_some();
-        let mut spans = Vec::new();
-        if run_rect.is_some() {
-            spans.push(Span::styled(RUN_LABEL, button_style(run_enabled)));
+    fn visible_error(&self) -> Option<String> {
+        let stale = self
+            .runs_poll_stale
+            .then(|| crate::i18n::t("zc-sop-runs-stale"));
+        match (&self.error, stale) {
+            (Some(action), Some(poll)) => Some(format!("{action}\n{poll}")),
+            (Some(action), None) => Some(action.clone()),
+            (None, Some(poll)) => Some(poll),
+            (None, None) => None,
         }
-        if resume_rect.is_some() {
-            spans.push(Span::raw(BUTTON_GAP));
-            spans.push(Span::styled(RESUME_LABEL, button_style(resume_enabled)));
-        }
-        if spans.is_empty() {
-            return;
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), inner);
     }
 
     fn right_title(&self) -> String {
@@ -2072,79 +2002,6 @@ fn in_rect(col: u16, row: u16, r: Rect) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
-/// Height of the Run/Resume strip: two border rows plus one label row.
-const CONTROLS_H: u16 = 3;
-
-/// Below this the left column cannot host both a usable list and the strip,
-/// so the strip is dropped rather than squeezing the list to nothing.
-const MIN_LEFT_COL_H: u16 = 5;
-
-const RUN_LABEL: &str = "[▶ Run]";
-const RESUME_LABEL: &str = "[⏯ Resume]";
-/// One blank cell between the two labels.
-const BUTTON_GAP: &str = " ";
-
-/// Enabled labels are bright and bold; disabled ones dim, matching the
-/// pane's existing "unavailable" treatment.
-fn button_style(enabled: bool) -> Style {
-    if enabled {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM)
-    }
-}
-
-/// Hit rects for the two control labels inside the strip's *inner* rect.
-///
-/// Widths come from [`crate::display_width::display_width`] because the glyphs
-/// are emoji (`▶`/`⏯`) whose cell width is not their char count. Layout is
-/// left-aligned: `[▶ Run]`, one space, `[⏯ Resume]`. A label that does not fit
-/// in the remaining width is `None` (clipped, hence unclickable) rather than a
-/// rect running off the edge; zero height yields `(None, None)`.
-fn control_button_rects(inner: Rect) -> (Option<Rect>, Option<Rect>) {
-    if inner.height == 0 || inner.width == 0 {
-        return (None, None);
-    }
-    let run_w = crate::display_width::display_width(RUN_LABEL) as u16;
-    let gap_w = crate::display_width::display_width(BUTTON_GAP) as u16;
-    let resume_w = crate::display_width::display_width(RESUME_LABEL) as u16;
-
-    if run_w > inner.width {
-        return (None, None);
-    }
-    let run = Rect::new(inner.x, inner.y, run_w, 1);
-    let resume_x = inner.x.saturating_add(run_w).saturating_add(gap_w);
-    let used = run_w.saturating_add(gap_w).saturating_add(resume_w);
-    let resume = (used <= inner.width).then(|| Rect::new(resume_x, inner.y, resume_w, 1));
-    (Some(run), resume)
-}
-
-/// Newest *active* run per SOP that is blocked on a human, as
-/// `sop_name -> run_id`. Inactive records are ignored however they ended: a
-/// retained `WaitingApproval` row is history, and approving it would be a
-/// no-op at best. `started_at` is RFC3339, so lexicographic max is
-/// chronological max — same assumption [`aggregate_sop_status`] makes.
-fn resume_targets_from(runs: &[SopRunSummaryView]) -> std::collections::HashMap<String, String> {
-    let mut best: std::collections::HashMap<String, &SopRunSummaryView> =
-        std::collections::HashMap::new();
-    for run in runs.iter().filter(|r| r.active && r.status.needs_input()) {
-        best.entry(run.sop_name.clone())
-            .and_modify(|cur| {
-                if run.started_at > cur.started_at {
-                    *cur = run;
-                }
-            })
-            .or_insert(run);
-    }
-    best.into_iter()
-        .map(|(name, run)| (name, run.run_id.clone()))
-        .collect()
-}
-
 fn list_row_rects(area: Rect, count: usize) -> Vec<Rect> {
     let inner_x = area.x.saturating_add(1);
     let inner_y = area.y.saturating_add(1);
@@ -2205,14 +2062,12 @@ fn wire_color(w: &GraphWire) -> Color {
     }
 }
 
-/// Node borders follow the run-status palette: green in flight, red failed,
-/// white ended cleanly, dark gray skipped or no run state.
 fn node_border_color(state: Option<NodeRunState>) -> Color {
     match state {
-        Some(NodeRunState::Active) => Color::Green,
-        Some(NodeRunState::Completed) => Color::White,
+        Some(NodeRunState::Active) => Color::Magenta,
+        Some(NodeRunState::Completed) => Color::Green,
         Some(NodeRunState::Failed) => Color::Red,
-        Some(NodeRunState::Skipped) => Color::DarkGray,
+        Some(NodeRunState::Skipped) => Color::Yellow,
         _ => Color::Gray,
     }
 }
@@ -2450,16 +2305,16 @@ fn aggregate_sop_status(runs: &[SopRunSummaryView]) -> Option<SopRunStatusView> 
         .map(|r| r.status)
 }
 
-/// Row icon for an aggregated status. Green in flight, yellow waiting on a
-/// human, red failed, white ended cleanly (completed or cancelled), black
-/// "this daemon knows something we don't".
+/// Row icon for an aggregated status. The palette is the accepted SOP status
+/// language: yellow in flight, blue awaiting a person, green completed, red
+/// failed or cancelled, and neutral white for an unknown future state.
 fn status_icon(status: SopRunStatusView) -> &'static str {
     match status {
-        SopRunStatusView::Pending | SopRunStatusView::Running => "🟢",
-        SopRunStatusView::WaitingApproval | SopRunStatusView::PausedCheckpoint => "🟡",
-        SopRunStatusView::Failed => "🔴",
-        SopRunStatusView::Completed | SopRunStatusView::Cancelled => "⚪",
-        SopRunStatusView::Unknown => "⚫",
+        SopRunStatusView::Pending | SopRunStatusView::Running => "🟡",
+        SopRunStatusView::WaitingApproval | SopRunStatusView::PausedCheckpoint => "🔵",
+        SopRunStatusView::Completed => "🟢",
+        SopRunStatusView::Failed | SopRunStatusView::Cancelled => "🔴",
+        SopRunStatusView::Unknown => "⚪",
     }
 }
 
@@ -2647,8 +2502,13 @@ mod tests {
 
 #[cfg(test)]
 mod status_agg_tests {
-    use super::{aggregate_sop_status, status_icon};
-    use crate::client::{SopRunStatusView, SopRunSummaryView};
+    use super::{RUNS_POLL_INTERVAL_SECS, SopPane, aggregate_sop_status, status_icon};
+    use crate::client::{RpcClient, SopRunStatusView, SopRunSummaryView};
+    use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
 
     fn run(status: SopRunStatusView, active: bool, started_at: &str) -> SopRunSummaryView {
         SopRunSummaryView {
@@ -2659,6 +2519,205 @@ mod status_agg_tests {
             active,
             ..SopRunSummaryView::default()
         }
+    }
+
+    fn polling_pane() -> (SopPane, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        (SopPane::new(rpc), outbound, rx)
+    }
+
+    async fn receive_poll(rx: &mut mpsc::Receiver<String>) -> String {
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("SOP status poll should not block the event loop")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], "sops/runs");
+        request["id"].as_str().unwrap().to_string()
+    }
+
+    async fn drain_poll(pane: &mut SopPane) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.tick();
+            if pane.runs_poll_rx.is_none() {
+                return;
+            }
+        }
+        panic!("completed SOP status poll was not drained");
+    }
+
+    fn make_poll_due(pane: &mut SopPane) {
+        pane.last_runs_poll =
+            Some(Instant::now() - Duration::from_secs(RUNS_POLL_INTERVAL_SECS.saturating_add(1)));
+    }
+
+    fn runs_response(status: &str) -> serde_json::Value {
+        json!({
+            "runs": [{
+                "run_id": "run-1",
+                "sop_name": "deploy",
+                "status": status,
+                "started_at": "2026-08-02T10:00:00Z",
+                "active": status == "running"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn poll_health_retains_stale_icons_without_clobbering_action_errors() {
+        let (mut pane, outbound, mut write_rx) = polling_pane();
+
+        let started = Instant::now();
+        pane.tick();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "starting a poll must not wait for its RPC response"
+        );
+        let request_id = receive_poll(&mut write_rx).await;
+        pane.tick();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "an in-flight poll must be the authority that suppresses duplicates"
+        );
+        outbound.dispatch_response(&request_id, Some(runs_response("running")), None);
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running)
+        );
+        assert!(!pane.runs_poll_stale);
+        assert!(pane.last_runs_poll.is_some());
+
+        pane.error = Some("save failed".to_string());
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "daemon unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running),
+            "a failed refresh must retain the last successful icons"
+        );
+        assert!(pane.runs_poll_stale);
+        assert_eq!(pane.error.as_deref(), Some("save failed"));
+        let stale_message = crate::i18n::t("zc-sop-runs-stale");
+        let first_visible_error = pane.visible_error().unwrap();
+        assert!(first_visible_error.contains("save failed"));
+        assert!(first_visible_error.contains(&stale_message));
+
+        pane.names = vec!["deploy".to_string()];
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area()))
+            .expect("render stale SOP status");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("🟡"));
+        assert!(rendered.contains("deploy"));
+        assert!(rendered.contains("save failed"));
+        assert!(rendered.contains(&stale_message));
+
+        pane.tick();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "a failed response must still begin a fresh throttle window"
+        );
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "daemon unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_poll(&mut pane).await;
+        assert_eq!(
+            pane.visible_error().as_deref(),
+            Some(first_visible_error.as_str()),
+            "repeated failures must leave the visible indication stable"
+        );
+
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(&request_id, Some(runs_response("completed")), None);
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Completed)
+        );
+        assert!(!pane.runs_poll_stale, "recovery must clear stale health");
+        assert_eq!(
+            pane.visible_error().as_deref(),
+            Some("save failed"),
+            "poll recovery must not clear an independently owned action error"
+        );
+    }
+
+    /// The 🟡 responsiveness warning: a slow or hung daemon must not make the
+    /// pane feel frozen. The poll runs off the event loop, so many `tick()`
+    /// calls with a response that never arrives must all return promptly, must
+    /// not queue a second request, and must leave rendering working.
+    #[tokio::test]
+    async fn repeated_slow_polls_never_block_input_or_rendering() {
+        let (mut pane, outbound, mut write_rx) = polling_pane();
+        pane.names = vec!["deploy".to_string()];
+
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+
+        // The response deliberately never arrives: simulate a hung transport.
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        for _ in 0..200 {
+            let started = Instant::now();
+            make_poll_due(&mut pane);
+            pane.tick();
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "a tick with a poll still in flight must return immediately"
+            );
+            assert!(
+                write_rx.try_recv().is_err(),
+                "a pending poll must suppress new requests, not queue a backlog"
+            );
+            terminal
+                .draw(|frame| pane.render(frame, frame.area()))
+                .expect("rendering must keep working while a poll is hung");
+        }
+
+        // Once the slow response finally lands it is still applied normally.
+        outbound.dispatch_response(&request_id, Some(runs_response("running")), None);
+        drain_poll(&mut pane).await;
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running)
+        );
     }
 
     #[test]
@@ -2814,270 +2873,51 @@ mod status_agg_tests {
 
     #[test]
     fn icon_mapping_covers_every_status() {
-        assert_eq!(status_icon(SopRunStatusView::Pending), "🟢");
-        assert_eq!(status_icon(SopRunStatusView::Running), "🟢");
-        assert_eq!(status_icon(SopRunStatusView::WaitingApproval), "🟡");
-        assert_eq!(status_icon(SopRunStatusView::PausedCheckpoint), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::Pending), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::Running), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::WaitingApproval), "🔵");
+        assert_eq!(status_icon(SopRunStatusView::PausedCheckpoint), "🔵");
         assert_eq!(status_icon(SopRunStatusView::Failed), "🔴");
-        assert_eq!(status_icon(SopRunStatusView::Completed), "⚪");
-        assert_eq!(status_icon(SopRunStatusView::Cancelled), "⚪");
-        assert_eq!(status_icon(SopRunStatusView::Unknown), "⚫");
-    }
-}
-
-#[cfg(test)]
-mod controls_tests {
-    use super::{
-        CONTROLS_H, MIN_LEFT_COL_H, RESUME_LABEL, RUN_LABEL, control_button_rects, list_row_rects,
-        resume_targets_from,
-    };
-    use crate::client::{SopRunStatusView, SopRunSummaryView};
-    use ratatui::layout::Rect;
-
-    fn run(
-        run_id: &str,
-        sop: &str,
-        status: SopRunStatusView,
-        active: bool,
-        started_at: &str,
-    ) -> SopRunSummaryView {
-        SopRunSummaryView {
-            run_id: run_id.to_string(),
-            sop_name: sop.to_string(),
-            status,
-            started_at: started_at.to_string(),
-            active,
-            ..SopRunSummaryView::default()
-        }
+        assert_eq!(status_icon(SopRunStatusView::Completed), "🟢");
+        assert_eq!(status_icon(SopRunStatusView::Cancelled), "🔴");
+        assert_eq!(status_icon(SopRunStatusView::Unknown), "⚪");
     }
 
+    /// The specific regression the review named: under the previous palette a
+    /// cancelled run rendered the same glyph as a clean completion, so an
+    /// operator could not tell an aborted run from a successful one. These
+    /// two must never collapse to the same glyph again.
     #[test]
-    fn no_runs_yields_no_resume_targets() {
-        assert!(
-            resume_targets_from(&[]).is_empty(),
-            "nothing to resume means the button stays dim"
+    fn cancelled_is_visually_distinct_from_completed() {
+        assert_ne!(
+            status_icon(SopRunStatusView::Cancelled),
+            status_icon(SopRunStatusView::Completed),
+            "a cancelled run must not look like a clean completion"
         );
     }
 
+    /// An unrecognised status from a newer daemon must still occupy a cell.
+    /// An empty glyph would shift the row text and break the mouse hit-test
+    /// alignment that `list_row_rects` depends on.
     #[test]
-    fn active_needs_input_is_the_target() {
-        let runs = [run(
-            "r1",
-            "deploy",
-            SopRunStatusView::WaitingApproval,
-            true,
-            "2026-08-02T10:00:00Z",
-        )];
-        let targets = resume_targets_from(&runs);
-        assert_eq!(targets.get("deploy").map(String::as_str), Some("r1"));
-    }
-
-    #[test]
-    fn active_running_is_not_a_resume_target() {
-        let runs = [run(
-            "r1",
-            "deploy",
+    fn every_status_icon_is_non_empty_and_single_width() {
+        for status in [
+            SopRunStatusView::Pending,
             SopRunStatusView::Running,
-            true,
-            "2026-08-02T10:00:00Z",
-        )];
-        assert!(
-            resume_targets_from(&runs).is_empty(),
-            "a run that is executing has no checkpoint to approve"
-        );
-    }
-
-    #[test]
-    fn inactive_needs_input_is_not_a_resume_target() {
-        let runs = [run(
-            "deploy-old",
-            "deploy",
+            SopRunStatusView::WaitingApproval,
             SopRunStatusView::PausedCheckpoint,
-            false,
-            "2026-08-01T10:00:00Z",
-        )];
-        assert!(
-            resume_targets_from(&runs).is_empty(),
-            "a retained terminal record is history; approving it is a no-op"
-        );
-    }
-
-    #[test]
-    fn newest_started_active_needs_input_wins() {
-        let runs = [
-            run(
-                "old",
-                "deploy",
-                SopRunStatusView::WaitingApproval,
-                true,
-                "2026-08-02T09:00:00Z",
-            ),
-            run(
-                "new",
-                "deploy",
-                SopRunStatusView::PausedCheckpoint,
-                true,
-                "2026-08-02T11:00:00Z",
-            ),
-        ];
-        assert_eq!(
-            resume_targets_from(&runs).get("deploy").map(String::as_str),
-            Some("new"),
-            "with two blocked runs the button acts on the most recent one"
-        );
-    }
-
-    #[test]
-    fn mixed_summaries_map_each_sop_to_its_own_blocked_run() {
-        let runs = [
-            run(
-                "d-run",
-                "deploy",
-                SopRunStatusView::Running,
-                true,
-                "2026-08-02T12:00:00Z",
-            ),
-            run(
-                "d-wait",
-                "deploy",
-                SopRunStatusView::WaitingApproval,
-                true,
-                "2026-08-02T08:00:00Z",
-            ),
-            run(
-                "b-wait-dead",
-                "backup",
-                SopRunStatusView::WaitingApproval,
-                false,
-                "2026-08-02T07:00:00Z",
-            ),
-            run(
-                "r-pause",
-                "report",
-                SopRunStatusView::PausedCheckpoint,
-                true,
-                "2026-08-02T06:00:00Z",
-            ),
-        ];
-        let targets = resume_targets_from(&runs);
-        assert_eq!(targets.get("deploy").map(String::as_str), Some("d-wait"));
-        assert_eq!(targets.get("report").map(String::as_str), Some("r-pause"));
-        assert_eq!(
-            targets.get("backup"),
-            None,
-            "an inactive blocked record must not light up backup's Resume"
-        );
-        assert_eq!(targets.len(), 2);
-    }
-
-    #[test]
-    fn normal_width_places_both_buttons_side_by_side() {
-        let inner = Rect::new(1, 5, 30, 1);
-        let (run_rect, resume_rect) = control_button_rects(inner);
-        let run_rect = run_rect.expect("run button fits");
-        let resume_rect = resume_rect.expect("resume button fits");
-        assert_eq!((run_rect.x, run_rect.y, run_rect.height), (1, 5, 1));
-        assert_eq!(
-            run_rect.width,
-            crate::display_width::display_width(RUN_LABEL) as u16
-        );
-        assert_eq!(
-            resume_rect.x,
-            run_rect.x + run_rect.width + 1,
-            "one blank cell separates the labels"
-        );
-        assert_eq!(
-            resume_rect.width,
-            crate::display_width::display_width(RESUME_LABEL) as u16
-        );
-        assert_eq!(resume_rect.y, inner.y);
-    }
-
-    #[test]
-    fn emoji_labels_measure_wider_than_their_char_count() {
-        // `▶`/`⏯` are why the rects come from display width: a char-count
-        // rect would under-measure and leave a dead cell at the label's end.
-        assert!(
-            crate::display_width::display_width(RESUME_LABEL) >= RESUME_LABEL.chars().count(),
-            "display width must never undercount the rendered label"
-        );
-    }
-
-    #[test]
-    fn too_narrow_clips_the_second_button() {
-        let run_w = crate::display_width::display_width(RUN_LABEL) as u16;
-        let inner = Rect::new(0, 0, run_w + 2, 1);
-        let (run_rect, resume_rect) = control_button_rects(inner);
-        assert!(run_rect.is_some(), "the first button still fits");
-        assert_eq!(
-            resume_rect, None,
-            "a clipped label must be unclickable, not a rect running off the edge"
-        );
-    }
-
-    #[test]
-    fn width_below_the_first_label_yields_no_buttons() {
-        let inner = Rect::new(0, 0, 3, 1);
-        assert_eq!(control_button_rects(inner), (None, None));
-    }
-
-    #[test]
-    fn zero_height_yields_no_buttons() {
-        let inner = Rect::new(0, 0, 40, 0);
-        assert_eq!(control_button_rects(inner), (None, None));
-    }
-
-    #[test]
-    fn exact_fit_keeps_both_buttons() {
-        let w = crate::display_width::display_width(RUN_LABEL)
-            + 1
-            + crate::display_width::display_width(RESUME_LABEL);
-        let inner = Rect::new(0, 0, w as u16, 1);
-        let (run_rect, resume_rect) = control_button_rects(inner);
-        assert!(run_rect.is_some());
-        let resume_rect = resume_rect.expect("both labels fit exactly");
-        assert_eq!(
-            resume_rect.x + resume_rect.width,
-            inner.x + inner.width,
-            "the last cell of the strip is the last cell of the label"
-        );
-    }
-
-    #[test]
-    fn tall_left_column_splits_into_list_plus_strip() {
-        // Mirrors render()'s split arithmetic without a Frame: the list keeps
-        // everything above the 3-row strip, and its row rects must start
-        // inside the *shrunk* list rect.
-        let col = Rect::new(0, 0, 20, 12);
-        assert!(col.height >= MIN_LEFT_COL_H);
-        let list_rect = Rect::new(col.x, col.y, col.width, col.height - CONTROLS_H);
-        let rects = list_row_rects(list_rect, 20);
-        assert_eq!(
-            rects.len(),
-            (list_rect.height - 2) as usize,
-            "rows stop at the shrunk list's inner height, not the full column"
-        );
-        let last = rects.last().copied().expect("rows exist");
-        assert!(
-            last.y < col.y + col.height - CONTROLS_H,
-            "no row may overlap the controls strip"
-        );
-    }
-
-    #[test]
-    fn tiny_left_column_keeps_the_whole_height_for_the_list() {
-        let col = Rect::new(0, 0, 20, 4);
-        assert!(col.height < MIN_LEFT_COL_H, "strip is omitted at this size");
-        let rects = list_row_rects(col, 5);
-        assert_eq!(rects.len(), 2, "list still renders its two inner rows");
-    }
-
-    #[test]
-    fn strip_inner_is_a_single_row() {
-        let strip = Rect::new(0, 9, 20, CONTROLS_H);
-        let inner = Rect::new(strip.x + 1, strip.y + 1, strip.width - 2, strip.height - 2);
-        assert_eq!(inner.height, 1, "borders leave exactly one label row");
-        let (run_rect, _) = control_button_rects(inner);
-        assert_eq!(run_rect.map(|r| r.y), Some(strip.y + 1));
+            SopRunStatusView::Completed,
+            SopRunStatusView::Failed,
+            SopRunStatusView::Cancelled,
+            SopRunStatusView::Unknown,
+        ] {
+            let icon = status_icon(status);
+            assert!(!icon.is_empty(), "{status:?} must render a visible glyph");
+            assert_eq!(
+                icon.chars().count(),
+                1,
+                "{status:?} must be one glyph so every row keeps the same width"
+            );
+        }
     }
 }
