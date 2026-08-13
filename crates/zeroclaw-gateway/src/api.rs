@@ -1810,6 +1810,7 @@ pub async fn handle_api_session_message_post(
     // existence check above happens *before* the wait, so on its own it says
     // nothing about whether the session survived the wait.
     let deletion_generation = state.session_lifecycle.deletion_generation(&session_key);
+    let persistence_generation = state.session_lifecycle.persistence_generation(&session_key);
 
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
@@ -1829,37 +1830,54 @@ pub async fn handle_api_session_message_post(
         }
     };
 
-    // DELETE may have landed while this request sat behind another turn.
-    // Appending now would recreate the transcript an operator just removed
-    // and, via the bump below, resurrect the evicted epoch entry.
-    if state
-        .session_lifecycle
-        .deleted_since(&session_key, deletion_generation)
-    {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session was deleted while this request was queued"})),
-        )
-            .into_response();
-    }
-
+    // Validate both lifecycle generations under the authority retained
+    // through append and version publication. DELETE and a prior turn's
+    // failed-persistence disposition cannot land between this check and the
+    // mutation below.
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
-    if let Err(e) = backend.append(&session_key, &message) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to append session message: {e}")})),
-        )
-            .into_response();
-    }
+    let mutation = state.session_lifecycle.with_write(
+        &session_key,
+        deletion_generation,
+        persistence_generation,
+        || {
+            backend.append(&session_key, &message)?;
 
-    // This append mutated the persisted transcript, so any connection-scoped
-    // `Agent` still holding the pre-append history is now stale. Bump the same
-    // epoch `process_chat_message` bumps on turn completion so that connection
-    // rehydrates before its next turn instead of running from history that is
-    // missing this message. Ordering matters: the bump follows the successful
-    // `append` above, preserving `bump_turn_version`'s invariant that a version
-    // is never observable before the messages behind it are persisted.
-    crate::ws::bump_turn_version(&state.session_turn_versions, &session_key);
+            // This append mutated the persisted transcript, so any
+            // connection-scoped `Agent` holding the pre-append history is now
+            // stale. Publish the new epoch under the same lifecycle authority
+            // as the append.
+            crate::ws::bump_turn_version(&state.session_turn_versions, &session_key);
+            Ok::<(), std::io::Error>(())
+        },
+    );
+    match mutation {
+        Err(crate::session_lifecycle::MutationRejection::Deleted) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session was deleted while this request was queued"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_lifecycle::MutationRejection::PersistenceChanged) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "A prior turn failed to persist while this request was queued"
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"error": format!("Failed to append session message: {e}")}),
+                ),
+            )
+                .into_response();
+        }
+        Ok(Ok(())) => {}
+    }
 
     // Match WS `?session_id=` / `event_matches_session` (display id), not the
     // path string — callers that pass the full `session_key` must still notify
@@ -1913,7 +1931,7 @@ pub async fn handle_api_session_delete(
     // that passed its post-acquire check can no longer slip in and register a
     // token after DELETE has looked for one: either it registers first (and we
     // cancel it below) or it observes the bumped generation and refuses.
-    // Lock order is `cancel_tokens` then `SessionLifecycle::deletions`; the
+    // Lock order is `cancel_tokens` then `SessionLifecycle::authority`; the
     // registration path uses the same order.
     //
     // The bump necessarily precedes `backend.delete_session` — it is what
@@ -1924,58 +1942,54 @@ pub async fn handle_api_session_delete(
     // likewise cancelled before the backend call: once the live turn has been
     // killed on the operator's behalf, admitting a queued writer as if
     // nothing happened is the worse failure.
-    let token = {
-        let mut tokens = state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned");
-        // Record the deletion before releasing the lock: writers already
-        // queued on the `session_queue` permit compare against the generation
-        // they captured before waiting, so this is what makes the delete
-        // visible to them. It must be recorded even though the epoch entry is
-        // evicted below, because a turn still unwinding can re-insert it.
-        state.session_lifecycle.record_deletion(&session_key);
-        tokens.remove(&session_key)
-    };
-    if let Some(token) = token {
-        token.cancel();
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
-            "cancelled in-flight turn for deleted session"
-        );
-    }
-
-    match backend.delete_session(&session_key) {
-        Ok(true) => {
-            // Evict the epoch this session accumulated in
-            // `session_turn_versions` — it otherwise retains a completed
-            // session's key forever. A prompt already queued behind the
-            // cancelled turn above is separately rejected before it can run
-            // (see `session_deleted_while_queued`), so this is pure cleanup,
-            // not a correctness dependency.
-            state
-                .session_turn_versions
-                .lock()
-                .expect("session_turn_versions lock poisoned")
-                .remove(&session_key);
-            // Finalization holds belong to the session that just went away.
-            // The deletion generation is deliberately retained.
-            state.session_lifecycle.forget_finalizing(&session_key);
-            Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+    let mut tokens = state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned");
+    state.session_lifecycle.with_deletion(&session_key, || {
+        // Remove the token under the same lock used by registration, then
+        // release that map before cancellation and backend I/O. The
+        // per-session lifecycle authority remains held for the whole closure.
+        let token = tokens.remove(&session_key);
+        drop(tokens);
+        if let Some(token) = token {
+            token.cancel();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"session_key": session_key})),
+                "cancelled in-flight turn for deleted session"
+            );
         }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-        )
-            .into_response(),
-    }
+
+        match backend.delete_session(&session_key) {
+            Ok(true) => {
+                // Evict the epoch this session accumulated in
+                // `session_turn_versions` — it otherwise retains a completed
+                // session's key forever. A queued prompt is independently
+                // rejected before it can run.
+                state
+                    .session_turn_versions
+                    .lock()
+                    .expect("session_turn_versions lock poisoned")
+                    .remove(&session_key);
+                // Finalization holds belong to the session that went away.
+                // The deletion generation is deliberately retained.
+                state.session_lifecycle.forget_finalizing(&session_key);
+                Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+            }
+            Ok(false) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+            )
+                .into_response(),
+        }
+    })
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -6054,6 +6068,223 @@ pub(crate) mod tests {
                 .expect("session_turn_versions lock poisoned")
                 .contains_key(&session_key),
             "the evicted epoch entry must not be resurrected by a queued append"
+        );
+    }
+
+    /// A REST writer prepared before another turn's partial persistence must
+    /// independently reject after it acquires the session permit. A WebSocket
+    /// rehydrating from the same failure cannot consume this evidence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_rest_append_rejects_changed_persistence_generation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_id = "rest-queued-persistence-failure";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(&session_key, &zeroclaw_providers::ChatMessage::user("seed"))
+            .expect("seed append");
+
+        let held = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("test primes the permit");
+        let state_writer = state.clone();
+        let writer = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_message_post(
+                State(state_writer),
+                HeaderMap::new(),
+                axum::extract::Path(session_id.to_string()),
+                Json(SessionMessagePostBody {
+                    content: "must not append".to_string(),
+                }),
+            )
+            .await
+            .into_response()
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the REST append never reached the session queue"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let incarnation = state.session_lifecycle.deletion_generation(&session_key);
+        state
+            .session_lifecycle
+            .with_completion(&session_key, incarnation, |disposition| {
+                disposition.record_persistence_failure();
+            })
+            .expect("session incarnation remains current");
+        drop(held);
+
+        let response = writer.await.expect("writer task does not panic");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let transcript = store.load(&session_key);
+        assert_eq!(transcript.len(), 1, "the stale REST writer must not append");
+        assert_eq!(transcript[0].content, "seed");
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "a rejected stale writer must not publish a turn version"
+        );
+    }
+
+    struct BlockingRestAppendBackend {
+        messages: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+        known: std::sync::atomic::AtomicBool,
+        append_entered: std::sync::atomic::AtomicBool,
+        release_append: std::sync::atomic::AtomicBool,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for BlockingRestAppendBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+
+        fn append(
+            &self,
+            _session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            if message.content == "blocked append" {
+                self.append_entered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                while !self
+                    .release_append
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::thread::yield_now();
+                }
+            }
+            self.known.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.messages.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.messages.lock().unwrap().pop().is_some())
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn session_exists(&self, _session_key: &str) -> bool {
+            self.known.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+            let existed = self.known.swap(false, std::sync::atomic::Ordering::SeqCst);
+            self.messages.lock().unwrap().clear();
+            Ok(existed)
+        }
+    }
+
+    /// DELETE cannot land after the REST writer's lifecycle validation but
+    /// before append/version publication. It waits for that atomic mutation,
+    /// then removes both the transcript and the just-published epoch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_serializes_with_rest_append_and_version_publication() {
+        let backend = std::sync::Arc::new(BlockingRestAppendBackend {
+            messages: std::sync::Mutex::new(vec![zeroclaw_providers::ChatMessage::user("seed")]),
+            known: std::sync::atomic::AtomicBool::new(true),
+            append_entered: std::sync::atomic::AtomicBool::new(false),
+            release_append: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+        let session_id = "rest-delete-authority";
+        let session_key = format!("gw_{session_id}");
+
+        let writer_state = state.clone();
+        let writer = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_message_post(
+                State(writer_state),
+                HeaderMap::new(),
+                axum::extract::Path(session_id.to_string()),
+                Json(SessionMessagePostBody {
+                    content: "blocked append".to_string(),
+                }),
+            )
+            .await
+            .into_response()
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !backend
+            .append_entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "append never started"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let delete_state = state.clone();
+        let delete = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_delete(
+                State(delete_state),
+                HeaderMap::new(),
+                axum::extract::Path(session_id.to_string()),
+            )
+            .await
+            .into_response()
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match state.cancel_tokens.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Ok(tokens) => drop(tokens),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("cancel_tokens lock poisoned")
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "DELETE never reached the lifecycle authority boundary"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !delete.is_finished(),
+            "DELETE must wait for the writer's held lifecycle authority"
+        );
+
+        backend
+            .release_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            writer.await.expect("writer task does not panic").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete.await.expect("delete task does not panic").status(),
+            StatusCode::OK
+        );
+        assert!(!backend.session_exists(&session_key));
+        assert!(backend.load(&session_key).is_empty());
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "DELETE must evict the version published by the serialized writer"
         );
     }
 }

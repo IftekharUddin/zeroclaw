@@ -385,6 +385,8 @@ async fn handle_socket(
     // staler. Worst case a redundant rehydrate on the first prompt; never a
     // wrongly-skipped one.
     let mut seen_version: u64 = current_turn_version(&state.session_turn_versions, &session_key);
+    let mut seen_persistence_generation =
+        state.session_lifecycle.persistence_generation(&session_key);
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
@@ -650,7 +652,12 @@ async fn handle_socket(
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
                         return;
                     }
-                    if reject_prompt_after_failed_persistence(&state, &mut agent, &session_key) {
+                    if reject_prompt_after_failed_persistence(
+                        &state,
+                        &mut agent,
+                        &session_key,
+                        &mut seen_persistence_generation,
+                    ) {
                         let err = serde_json::json!({
                             "type": "error",
                             "message": "A previous turn on this session could not be saved; \
@@ -882,7 +889,12 @@ async fn handle_socket(
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
                     continue;
                 }
-                if reject_prompt_after_failed_persistence(&state, &mut agent, &session_key) {
+                if reject_prompt_after_failed_persistence(
+                    &state,
+                    &mut agent,
+                    &session_key,
+                    &mut seen_persistence_generation,
+                ) {
                     let err = serde_json::json!({
                         "type": "error",
                         "message": "A previous turn on this session could not be saved; \
@@ -1045,8 +1057,11 @@ pub(crate) enum PersistOutcome {
 /// Persist `messages` to `backend`, scoped to the incarnation that started
 /// this turn.
 ///
-/// Deletion is decided by the monotonic deletion generation, never by backend
-/// absence. An existence probe is wrong in both directions here:
+/// The caller holds the session's lifecycle authority through this function
+/// and the matching version/failure disposition.
+/// Deletion is therefore decided atomically by the lifecycle owner before
+/// this helper runs, never by backend absence. An existence probe is wrong in
+/// both directions here:
 ///
 /// * A brand-new JSONL session has no file until its first `append()`, so
 ///   "absent" would classify the very first completed turn of every new
@@ -1057,23 +1072,14 @@ pub(crate) enum PersistOutcome {
 ///   followed by `append()` could also race `DELETE` and recreate the JSONL
 ///   file outright, because `SessionStore::append` opens with `.create(true)`.
 ///
-/// The incarnation is re-checked after the last append as well: `DELETE` can
-/// land mid-loop, and re-checking is what stops a completing turn from
-/// certifying (or resurrecting) storage the operator just destroyed.
+/// DELETE uses the same per-session authority through backend removal and
+/// version eviction, so it cannot land mid-loop or between the append and
+/// version publication.
 fn persist_conversation_messages(
-    lifecycle: &crate::session_lifecycle::SessionLifecycle,
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
-    incarnation: crate::session_lifecycle::DeletionGeneration,
     messages: &[zeroclaw_providers::ConversationMessage],
 ) -> PersistOutcome {
-    // If the user deleted the session between the turn starting and this
-    // post-turn persistence, don't resurrect it. The `aborted` / `done` /
-    // `error` frames are still sent to the client; we just refuse to
-    // re-create what `DELETE /api/sessions/{id}` wiped.
-    if lifecycle.deleted_since(session_key, incarnation) {
-        return PersistOutcome::SkippedDeleted;
-    }
     let mut all_persisted = true;
     for message in messages {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
@@ -1096,11 +1102,6 @@ fn persist_conversation_messages(
             );
         }
     }
-    // DELETE can land mid-loop. Re-check before reporting success so the
-    // caller does not bump the version for a session that no longer exists.
-    if lifecycle.deleted_since(session_key, incarnation) {
-        return PersistOutcome::SkippedDeleted;
-    }
     if all_persisted {
         PersistOutcome::Persisted
     } else {
@@ -1121,7 +1122,7 @@ fn bump_turn_version_after_persistence(
     session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
     session_key: &str,
     outcome: PersistOutcome,
-    lifecycle: &crate::session_lifecycle::SessionLifecycle,
+    disposition: &mut crate::session_lifecycle::SessionDisposition<'_>,
 ) {
     match outcome {
         PersistOutcome::Persisted => {
@@ -1136,7 +1137,7 @@ fn bump_turn_version_after_persistence(
             // version reads to a queued connection as "no turn completed", so it
             // would skip rehydration and run against history the failed append
             // was meant to extend.
-            lifecycle.record_persistence_failure(session_key);
+            disposition.record_persistence_failure();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1146,6 +1147,35 @@ fn bump_turn_version_after_persistence(
             );
         }
     }
+}
+
+/// Hold the session incarnation authoritative through backend persistence and
+/// the matching turn-version/failure disposition.
+///
+/// DELETE uses the same per-session lifecycle mutex through backend removal
+/// and version eviction. It therefore happens wholly before this closure
+/// (which skips the mutation) or wholly after it (which removes the completed
+/// mutation); it cannot recreate storage or an epoch between a generation
+/// check and write.
+fn complete_turn_persistence(
+    lifecycle: &crate::session_lifecycle::SessionLifecycle,
+    session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    session_key: &str,
+    incarnation: crate::session_lifecycle::DeletionGeneration,
+    persist: impl FnOnce() -> PersistOutcome,
+) -> PersistOutcome {
+    lifecycle
+        .with_completion(session_key, incarnation, |disposition| {
+            let outcome = persist();
+            bump_turn_version_after_persistence(
+                session_turn_versions,
+                session_key,
+                outcome,
+                disposition,
+            );
+            outcome
+        })
+        .unwrap_or(PersistOutcome::SkippedDeleted)
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -1203,7 +1233,7 @@ pub(crate) enum TurnRegistration {
 /// session, and leave the socket free to start provider/tool execution for a
 /// session that no longer exists.
 ///
-/// Lock order is `cancel_tokens` then `SessionLifecycle::deletions`, matching
+/// Lock order is `cancel_tokens` then `SessionLifecycle::authority`, matching
 /// `handle_api_session_delete`; both sites must keep that order.
 fn register_turn_if_current(
     cancel_tokens: &std::sync::Mutex<
@@ -1262,29 +1292,28 @@ fn session_deleted_while_queued(
 /// failed append was supposed to extend. The result would be a silently
 /// divergent conversation rather than a visible error.
 ///
-/// The gateway cannot repair the backend, so it does the next best thing:
-/// fail this prompt loudly, and re-seed the connection's `Agent` from
-/// whatever the backend actually holds. That re-establishes agreement
-/// between memory and storage, so the session is usable again on the next
-/// prompt instead of being wedged for the life of the connection. Returns
-/// `true` when the caller should reject the prompt.
+/// The gateway cannot repair the backend, so it fails this prompt loudly and
+/// re-seeds this connection's `Agent` from whatever the backend actually
+/// holds. The monotonic generation is not cleared: every other connection
+/// seeded before the failure must independently rehydrate and reject once.
+/// Returns `true` when the caller should reject the prompt.
 fn reject_prompt_after_failed_persistence(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
+    seen_generation: &mut crate::session_lifecycle::PersistenceGeneration,
 ) -> bool {
-    if !state.session_lifecycle.persistence_failed(session_key) {
+    let current_generation = state.session_lifecycle.persistence_generation(session_key);
+    if current_generation == *seen_generation {
         return false;
     }
-    // Re-seed from storage before clearing the flag: the in-memory history
-    // is known to disagree with the backend, and only a successful reload
-    // makes it safe to accept another prompt on this session.
+    // Re-seed this connection independently. The generation is monotonic and
+    // never consumed, so every other Agent prepared before the same failure
+    // will still observe it and reject its own stale prompt.
     if let Some(ref backend) = state.session_backend {
         let _ = rehydrate_agent_from_backend(backend.as_ref(), agent, session_key);
     }
-    state
-        .session_lifecycle
-        .clear_persistence_failure(session_key);
+    *seen_generation = current_generation;
     true
 }
 
@@ -1430,8 +1459,9 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
     // Deletion generation captured by the caller *before* it awaited the
     // session-queue permit. Re-checked atomically with cancel-token
     // registration so a DELETE landing in that window refuses the turn
-    // instead of letting it start unstoppable, and re-checked again before
-    // persistence so a completing turn cannot recreate deleted storage.
+    // instead of letting it start unstoppable. Completion later acquires the
+    // same lifecycle authority and holds it through persistence plus version
+    // disposition, so a completing turn cannot recreate deleted state.
     incarnation: crate::session_lifecycle::DeletionGeneration,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
@@ -1894,28 +1924,53 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
     };
 
     if was_cancelled {
-        let mut outcome = PersistOutcome::Persisted;
-        if let Some(ref backend) = state.session_backend {
-            // Deletion is decided by the incarnation, not by backend
-            // existence: a new session's file does not exist until its first
-            // append, so an existence gate here would drop a cancelled first
-            // turn's partial output on every new session.
-            let still_live = !state
-                .session_lifecycle
-                .deleted_since(session_key, incarnation);
-            if still_live {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        outcome = persist_conversation_messages(
-                            state.session_lifecycle.as_ref(),
-                            backend.as_ref(),
-                            session_key,
-                            incarnation,
-                            &error.new_messages,
-                        );
-                        if outcome != PersistOutcome::SkippedDeleted
-                            && !has_assistant_chat_message(&error.new_messages)
-                        {
+        complete_turn_persistence(
+            state.session_lifecycle.as_ref(),
+            &state.session_turn_versions,
+            session_key,
+            incarnation,
+            || {
+                let mut outcome = PersistOutcome::Persisted;
+                if let Some(ref backend) = state.session_backend {
+                    match &result {
+                        Err(error) if !error.new_messages.is_empty() => {
+                            outcome = persist_conversation_messages(
+                                backend.as_ref(),
+                                session_key,
+                                &error.new_messages,
+                            );
+                            if !has_assistant_chat_message(&error.new_messages) {
+                                let marker = zeroclaw_runtime::i18n::get_required_cli_string(
+                                    "turn-interrupted-by-user",
+                                );
+                                let truncated = if accumulated_text.is_empty() {
+                                    marker
+                                } else {
+                                    format!("{accumulated_text}\n\n{marker}")
+                                };
+                                let assistant_msg =
+                                    zeroclaw_providers::ChatMessage::assistant(&truncated);
+                                if let Err(e) = backend.append(session_key, &assistant_msg) {
+                                    outcome = PersistOutcome::Failed;
+                                    ::zeroclaw_log::record!(
+                                        ERROR,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "session_key": session_key,
+                                                "error": format!("{e}"),
+                                            })
+                                        ),
+                                        "failed to persist interrupted-turn marker message"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
                                 "turn-interrupted-by-user",
                             );
@@ -1926,16 +1981,7 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                             };
                             let assistant_msg =
                                 zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if state
-                                .session_lifecycle
-                                .deleted_since(session_key, incarnation)
-                            {
-                                outcome = PersistOutcome::SkippedDeleted;
-                            } else if let Err(e) = backend.append(session_key, &assistant_msg) {
+                            if let Err(e) = backend.append(session_key, &assistant_msg) {
                                 outcome = PersistOutcome::Failed;
                                 ::zeroclaw_log::record!(
                                     ERROR,
@@ -1955,49 +2001,9 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                             }
                         }
                     }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if state
-                            .session_lifecycle
-                            .deleted_since(session_key, incarnation)
-                        {
-                            outcome = PersistOutcome::SkippedDeleted;
-                        } else if let Err(e) = backend.append(session_key, &assistant_msg) {
-                            outcome = PersistOutcome::Failed;
-                            ::zeroclaw_log::record!(
-                                ERROR,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "session_key": session_key,
-                                    "error": format!("{e}"),
-                                })),
-                                "failed to persist interrupted-turn marker message"
-                            );
-                        }
-                    }
                 }
-            } else {
-                outcome = PersistOutcome::SkippedDeleted;
-            }
-        }
-        // Persistence above (if any) is done — bump only if it succeeded.
-        bump_turn_version_after_persistence(
-            &state.session_turn_versions,
-            session_key,
-            outcome,
-            state.session_lifecycle.as_ref(),
+                outcome
+            },
         );
 
         // Inform the client the turn was aborted
@@ -2039,25 +2045,23 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
 
     match result {
         Ok(outcome) => {
-            let persist_outcome =
-                state
-                    .session_backend
-                    .as_ref()
-                    .map_or(PersistOutcome::Persisted, |backend| {
-                        persist_conversation_messages(
-                            state.session_lifecycle.as_ref(),
-                            backend.as_ref(),
-                            session_key,
-                            incarnation,
-                            &outcome.new_messages,
-                        )
-                    });
-            // Persistence above (if any) is done — bump only if it succeeded.
-            bump_turn_version_after_persistence(
+            complete_turn_persistence(
+                state.session_lifecycle.as_ref(),
                 &state.session_turn_versions,
                 session_key,
-                persist_outcome,
-                state.session_lifecycle.as_ref(),
+                incarnation,
+                || {
+                    state
+                        .session_backend
+                        .as_ref()
+                        .map_or(PersistOutcome::Persisted, |backend| {
+                            persist_conversation_messages(
+                                backend.as_ref(),
+                                session_key,
+                                &outcome.new_messages,
+                            )
+                        })
+                },
             );
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -2162,28 +2166,27 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
             );
         }
         Err(e) => {
-            let persist_outcome = if e.new_messages.is_empty() {
-                PersistOutcome::Persisted
-            } else {
-                state
-                    .session_backend
-                    .as_ref()
-                    .map_or(PersistOutcome::Persisted, |backend| {
-                        persist_conversation_messages(
-                            state.session_lifecycle.as_ref(),
-                            backend.as_ref(),
-                            session_key,
-                            incarnation,
-                            &e.new_messages,
-                        )
-                    })
-            };
-            // Persistence above (if any) is done — bump only if it succeeded.
-            bump_turn_version_after_persistence(
+            complete_turn_persistence(
+                state.session_lifecycle.as_ref(),
                 &state.session_turn_versions,
                 session_key,
-                persist_outcome,
-                state.session_lifecycle.as_ref(),
+                incarnation,
+                || {
+                    if e.new_messages.is_empty() {
+                        PersistOutcome::Persisted
+                    } else {
+                        state.session_backend.as_ref().map_or(
+                            PersistOutcome::Persisted,
+                            |backend| {
+                                persist_conversation_messages(
+                                    backend.as_ref(),
+                                    session_key,
+                                    &e.new_messages,
+                                )
+                            },
+                        )
+                    }
+                },
             );
 
             // Set session state to error
@@ -2586,6 +2589,7 @@ mod tests {
 
         let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
         let incarnation = lifecycle.deletion_generation(&session_key);
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
 
         // The operator deletes mid-turn: generation bump plus backend wipe.
         lifecycle.record_deletion(&session_key);
@@ -2596,16 +2600,17 @@ mod tests {
         );
 
         // The turn now unwinds and tries to persist.
-        let outcome = persist_conversation_messages(
-            &lifecycle,
-            &store,
-            &session_key,
-            incarnation,
-            &[
-                ConversationMessage::Chat(ChatMessage::user("second turn")),
-                ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
-            ],
-        );
+        let outcome =
+            complete_turn_persistence(&lifecycle, &versions, &session_key, incarnation, || {
+                persist_conversation_messages(
+                    &store,
+                    &session_key,
+                    &[
+                        ConversationMessage::Chat(ChatMessage::user("second turn")),
+                        ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
+                    ],
+                )
+            });
 
         assert_eq!(
             outcome,
@@ -2644,17 +2649,19 @@ mod tests {
 
         let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
         let incarnation = lifecycle.deletion_generation(&session_key);
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
 
-        let outcome = persist_conversation_messages(
-            &lifecycle,
-            &store,
-            &session_key,
-            incarnation,
-            &[
-                ConversationMessage::Chat(ChatMessage::user("hello")),
-                ConversationMessage::Chat(ChatMessage::assistant("hi there")),
-            ],
-        );
+        let outcome =
+            complete_turn_persistence(&lifecycle, &versions, &session_key, incarnation, || {
+                persist_conversation_messages(
+                    &store,
+                    &session_key,
+                    &[
+                        ConversationMessage::Chat(ChatMessage::user("hello")),
+                        ConversationMessage::Chat(ChatMessage::assistant("hi there")),
+                    ],
+                )
+            });
 
         assert_eq!(
             outcome,
@@ -2700,12 +2707,12 @@ mod tests {
             .expect("session_turn_versions lock poisoned")
             .remove(session_key);
 
-        bump_turn_version_after_persistence(
-            &versions,
-            session_key,
-            PersistOutcome::SkippedDeleted,
-            &lifecycle,
-        );
+        let incarnation = lifecycle.deletion_generation(session_key);
+        let persistence_generation = lifecycle.persistence_generation(session_key);
+        lifecycle.record_deletion(session_key);
+        complete_turn_persistence(&lifecycle, &versions, session_key, incarnation, || {
+            PersistOutcome::Persisted
+        });
 
         assert!(
             !versions
@@ -2718,8 +2725,9 @@ mod tests {
 
         // And it must not be mistaken for a persistence failure either: nothing
         // failed, so no queued writer should be told to reseed.
-        assert!(
-            !lifecycle.persistence_failed(session_key),
+        assert_eq!(
+            lifecycle.persistence_generation(session_key),
+            persistence_generation,
             "SkippedDeleted is not a persistence failure and must not record one"
         );
     }
@@ -3287,13 +3295,11 @@ mod tests {
         let incarnation = lifecycle.deletion_generation("gw_deleted");
         lifecycle.record_deletion("gw_deleted");
 
-        let outcome = persist_conversation_messages(
-            &lifecycle,
-            &backend,
-            "gw_deleted",
-            incarnation,
-            &messages,
-        );
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
+        let outcome =
+            complete_turn_persistence(&lifecycle, &versions, "gw_deleted", incarnation, || {
+                persist_conversation_messages(&backend, "gw_deleted", &messages)
+            });
 
         assert_eq!(
             outcome,
@@ -3364,15 +3370,7 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("reply")),
         ];
 
-        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
-        let incarnation = lifecycle.deletion_generation("gw_partial");
-        let outcome = persist_conversation_messages(
-            &lifecycle,
-            &backend,
-            "gw_partial",
-            incarnation,
-            &messages,
-        );
+        let outcome = persist_conversation_messages(&backend, "gw_partial", &messages);
 
         assert_eq!(
             outcome,
@@ -3404,6 +3402,7 @@ mod tests {
 
         let session_id = "partial-append-session";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let persistence_before = state.session_lifecycle.persistence_generation(&session_key);
 
         let mut agent = queue_test_agent(Box::new(ImmediateModelProvider("reply-content")));
         let mut sender = CollectSink(Vec::new());
@@ -3459,8 +3458,9 @@ mod tests {
                 .is_none(),
             "the turn must still release its cancel token even though persistence failed"
         );
-        assert!(
-            state.session_lifecycle.persistence_failed(&session_key),
+        assert_ne!(
+            state.session_lifecycle.persistence_generation(&session_key),
+            persistence_before,
             "the failed append must be recorded so the next writer can be stopped"
         );
     }
@@ -3472,7 +3472,7 @@ mod tests {
     /// prompt must instead be rejected, and the connection's `Agent`
     /// re-seeded from what the backend actually holds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queued_prompt_is_rejected_after_failed_persistence() {
+    async fn queued_prompts_each_reject_after_failed_persistence() {
         let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
         let backend = std::sync::Arc::new(PartiallyFailingAppendBackend {
             appended: std::sync::Mutex::new(Vec::new()),
@@ -3485,10 +3485,17 @@ mod tests {
         let session_id = "reject-after-failed-persistence";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
-        // Socket A's turn fails to persist fully.
+        // Sockets B and C were both seeded before socket A's turn failed to
+        // persist fully. Each retains its own observed generation.
+        let mut seen_generation_b = state.session_lifecycle.persistence_generation(&session_key);
+        let mut seen_generation_c = seen_generation_b;
+        let incarnation = state.session_lifecycle.deletion_generation(&session_key);
         state
             .session_lifecycle
-            .record_persistence_failure(&session_key);
+            .with_completion(&session_key, incarnation, |disposition| {
+                disposition.record_persistence_failure();
+            })
+            .expect("session incarnation should still be current");
 
         // Socket B is a *different* connection whose `seen_version` matches
         // the (correctly un-bumped) current version, so the rehydrate check
@@ -3500,21 +3507,36 @@ mod tests {
         );
 
         let mut agent_b = queue_test_agent(Box::new(ImmediateModelProvider("b-reply")));
-        let rejected = reject_prompt_after_failed_persistence(&state, &mut agent_b, &session_key);
+        let rejected = reject_prompt_after_failed_persistence(
+            &state,
+            &mut agent_b,
+            &session_key,
+            &mut seen_generation_b,
+        );
 
         assert!(
             rejected,
             "a prompt queued behind a turn that failed to persist must be rejected, \
              not silently run against stale history"
         );
+        let mut agent_c = queue_test_agent(Box::new(ImmediateModelProvider("c-reply")));
         assert!(
-            !state.session_lifecycle.persistence_failed(&session_key),
-            "the flag must clear once the agent has been re-seeded, so the session \
-             recovers instead of staying wedged for the life of the connection"
+            reject_prompt_after_failed_persistence(
+                &state,
+                &mut agent_c,
+                &session_key,
+                &mut seen_generation_c,
+            ),
+            "socket C must independently observe the same failure after socket B rehydrates"
         );
         assert!(
-            !reject_prompt_after_failed_persistence(&state, &mut agent_b, &session_key),
-            "a second prompt must be accepted once storage and memory agree again"
+            !reject_prompt_after_failed_persistence(
+                &state,
+                &mut agent_b,
+                &session_key,
+                &mut seen_generation_b,
+            ),
+            "socket B's next prompt may proceed after that Agent independently rehydrates"
         );
     }
 
