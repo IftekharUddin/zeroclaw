@@ -200,6 +200,29 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+fn websocket_ping_interval(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<tokio::time::Interval> {
+    let seconds = config.gateway.websocket_ping_interval_secs;
+    if seconds == 0 {
+        return None;
+    }
+
+    let period = Duration::from_secs(seconds);
+    let start = tokio::time::Instant::now().checked_add(period)?;
+    let mut interval = tokio::time::interval_at(start, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(interval)
+}
+
+async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
+    if let Some(interval) = interval.as_mut() {
+        interval.tick().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn resolve_ws_memory_handle(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -405,10 +428,21 @@ async fn handle_socket(
 
     let mut first_msg_fallback: Option<String> = None;
     let mut requested_cwd = session_cwd;
+    let mut ping_interval = websocket_ping_interval(&config);
 
-    if let Some(first) = receiver.next().await {
+    loop {
+        let first = tokio::select! {
+            first = receiver.next() => first,
+            _ = tick_websocket_ping(&mut ping_interval) => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+
         match first {
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
                     if cp.msg_type == "connect" {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": cp.session_id, "device_name": cp.device_name, "capabilities": cp.capabilities, "cwd": cp.cwd})), "WebSocket connect params received");
@@ -441,9 +475,16 @@ async fn handle_socket(
                     // Not parseable as ConnectParams — fall through
                     first_msg_fallback = Some(text.to_string());
                 }
+                break;
             }
-            Ok(Message::Close(_)) | Err(_) => return,
-            _ => {}
+            Some(Ok(Message::Ping(payload))) => {
+                if sender.send(Message::Pong(payload)).await.is_err() {
+                    return;
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(_)) => {}
         }
     }
 
@@ -568,8 +609,7 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
-                if !content.is_empty() {
+                if let Some(content) = first_chat_message_content(text) {
                     // Capture the deletion generation *before* awaiting the
                     // permit: the comparison after acquisition is what
                     // distinguishes "deleted while I queued" from "this
@@ -650,6 +690,7 @@ async fn handle_socket(
                         &mut receiver,
                         &mut approval_event_rx,
                         &pending_approvals,
+                        &mut ping_interval,
                         &ws_memory,
                         &content,
                         &session_key,
@@ -688,11 +729,23 @@ async fn handle_socket(
 
     loop {
         tokio::select! {
+            // ── Keepalive ─────────────────────────────────────────────
+            _ = tick_websocket_ping(&mut ping_interval) => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+
             // ── Client message ────────────────────────────────────────
             client_msg = receiver.next() => {
                 let Some(msg) = client_msg else { break };
                 let msg = match msg {
                     Ok(Message::Text(text)) => text,
+                    Ok(Message::Ping(payload)) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    Ok(Message::Pong(_)) => continue,
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => continue,
                 };
@@ -863,6 +916,7 @@ async fn handle_socket(
                     &mut receiver,
                     &mut approval_event_rx,
                     &pending_approvals,
+                    &mut ping_interval,
                     &ws_memory,
                     &content,
                     &session_key,
@@ -1325,6 +1379,13 @@ fn needs_onboarding_ws_error(
     }))
 }
 
+fn first_chat_message_content(text: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    (parsed["type"].as_str() == Some("message"))
+        .then(|| parsed["content"].as_str().unwrap_or("").to_string())
+        .filter(|content| !content.is_empty())
+}
+
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     match event.get("session_id").and_then(|value| value.as_str()) {
         Some(event_session_id) => event_session_id == session_id,
@@ -1361,6 +1422,7 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
     receiver: &mut Rcv,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
+    ping_interval: &mut Option<tokio::time::Interval>,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
@@ -1524,7 +1586,6 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
-
     let forward_fut = async {
         let mut cancel_drained = false;
         let mut client_attached = true;
@@ -1570,6 +1631,14 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                     // is drained until the agent finishes naturally.
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                cancel_token.cancel();
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                             let denied =
                                 detach_ws_viewer(&mut client_attached, pending_approvals);
@@ -1695,6 +1764,16 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                         if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
                             detach_ws_viewer(&mut client_attached, pending_approvals);
                         }
+                    }
+                }
+                _ = tick_websocket_ping(ping_interval), if client_attached => {
+                    // Keepalive is a viewer concern, so a failed ping means
+                    // the socket is gone — not that the turn should die. Take
+                    // the same detach path the other send failures in this
+                    // loop take, and disable the arm afterwards so a dead
+                    // sender cannot spin an immediately-ready hot loop.
+                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        detach_ws_viewer(&mut client_attached, pending_approvals);
                     }
                 }
                 event_opt = event_rx.recv() => {
@@ -2172,6 +2251,125 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
     use zeroclaw_infra::session_backend::SessionBackend as _;
+
+    #[tokio::test]
+    async fn websocket_ping_interval_skips_missed_ticks() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.websocket_ping_interval_secs = 1;
+
+        let interval = websocket_ping_interval(&config).expect("enabled ping interval");
+
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
+    }
+
+    #[test]
+    fn websocket_ping_interval_handles_unvalidated_overflow_without_panicking() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.websocket_ping_interval_secs = u64::MAX;
+
+        assert!(websocket_ping_interval(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_chat_route_pings_before_and_preserves_the_first_client_message() {
+        use axum::{Router, routing::get};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+        use zeroclaw_config::{
+            multi_agent::MemoryBackendKind,
+            schema::{AliasedAgentConfig, Config},
+        };
+
+        let tmp = tempfile::TempDir::new().expect("temporary config root");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("test data directory");
+        config.gateway.websocket_ping_interval_secs = 1;
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        config.agents.insert("web".to_string(), agent);
+
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(crate::api::test_state(config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let (mut socket, _) = connect_async(format!(
+            // This URL connects only to the test's loopback listener.
+            "ws://{address}/ws/chat?agent=web&session_id=idle-test" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+
+        let session_start = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+        assert!(matches!(session_start, ClientMessage::Text(_)));
+
+        let ping = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("idle ping timeout")
+            .expect("idle ping frame")
+            .expect("idle ping transport");
+        assert!(matches!(ping, ClientMessage::Ping(_)));
+
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "hello"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("first chat message after idle ping");
+
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .expect("response frame")
+                    .expect("response transport");
+                if let ClientMessage::Text(text) = frame {
+                    break serde_json::from_str::<serde_json::Value>(&text)
+                        .expect("JSON response frame");
+                }
+            }
+        })
+        .await
+        .expect("first chat response timeout");
+
+        assert_eq!(response["code"], "NEEDS_ONBOARDING");
+        server.abort();
+    }
+
+    #[test]
+    fn first_chat_message_content_preserves_the_message_for_dispatch() {
+        let text = serde_json::json!({
+            "type": "message",
+            "content": "hello after an idle keepalive"
+        })
+        .to_string();
+
+        assert_eq!(
+            first_chat_message_content(&text).as_deref(),
+            Some("hello after an idle keepalive")
+        );
+    }
 
     #[test]
     fn ws_turn_has_a_single_channel_identity() {
@@ -3221,6 +3419,7 @@ mod tests {
             &mut receiver,
             &mut approval_rx,
             &pending,
+            &mut None,
             &None,
             "prompt-with-partial-persistence-failure",
             &session_key,
@@ -3687,6 +3886,7 @@ mod tests {
                 &mut receiver,
                 &mut approval_rx,
                 &pending,
+                &mut None,
                 &None,
                 "prompt-A",
                 &session_key_a,
@@ -3762,6 +3962,7 @@ mod tests {
                 &mut receiver,
                 &mut approval_rx,
                 &pending,
+                &mut None,
                 &None,
                 "prompt-B",
                 &session_key_b,
@@ -3869,6 +4070,7 @@ mod tests {
                 &mut receiver,
                 &mut approval_rx,
                 &pending,
+                &mut None,
                 &None,
                 "prompt-detached-then-shutdown",
                 &session_key_for_turn,
@@ -3976,6 +4178,7 @@ mod tests {
                 &mut receiver,
                 &mut approval_rx,
                 &pending,
+                &mut None,
                 &None,
                 "prompt-A",
                 &session_key_a,
@@ -4121,6 +4324,7 @@ mod tests {
                 &mut receiver,
                 &mut approval_rx,
                 &pending,
+                &mut None,
                 &None,
                 "prompt-A",
                 &session_key_a,
@@ -4183,6 +4387,7 @@ mod tests {
                 &mut receiver,
                 &mut approval_rx,
                 &pending,
+                &mut None,
                 &None,
                 "prompt-B",
                 &session_key_b,
@@ -4347,6 +4552,7 @@ mod tests {
                 &mut receiver,
                 &mut approval_rx,
                 &pending,
+                &mut None,
                 &None,
                 "prompt-A",
                 &session_key_a,
@@ -4507,6 +4713,7 @@ mod tests {
             &mut receiver_c,
             &mut approval_rx_c,
             &pending_c,
+            &mut None,
             &None,
             "prompt-C",
             &session_key,
