@@ -6031,13 +6031,12 @@ impl Default for PacingConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions. This legacy behavior remains supported
-    /// when explicitly configured during the deprecation window.
+    /// Default behavior for the v0.8.x line: inline full skill instructions.
+    #[default]
     Full,
-    /// Default behavior: inline compact skill metadata
+    /// Inline compact skill metadata
     /// (name/description/location + callable tool specs) and load instructions
     /// on demand via `read_skill`.
-    #[default]
     Compact,
 }
 
@@ -6158,9 +6157,9 @@ pub struct SkillsConfig {
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_registries: Vec<ExternalRegistry>,
-    /// Controls how skills are injected into the system prompt. Omission now
-    /// defaults to `compact`; explicit `full` remains supported during the
-    /// deprecation window and emits a validation warning before Schema V4.
+    /// Controls how skills are injected into the system prompt. Omission
+    /// defaults to `full` throughout the v0.8.x release line; `compact`
+    /// remains available as an explicit global or runtime-profile setting.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -19215,31 +19214,6 @@ impl Config {
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
-        if matches!(
-            self.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
-        ) {
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "skills_prompt_injection_mode_full_deprecated",
-                "skills.prompt_injection_mode = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.",
-                "skills.prompt_injection_mode",
-            ));
-        }
-        for (profile_alias, profile) in &self.runtime_profiles {
-            if matches!(
-                profile.prompt_injection_mode,
-                Some(SkillsPromptInjectionMode::Full)
-            ) {
-                let path = format!("runtime_profiles.{profile_alias}.prompt_injection_mode");
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "skills_prompt_injection_mode_full_deprecated",
-                    format!(
-                        "{path} = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode."
-                    ),
-                    path,
-                ));
-            }
-        }
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
@@ -24330,17 +24304,39 @@ api_token = "Bearer test-token"
         assert!(!c.skills.allow_scripts);
         assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
+            SkillsPromptInjectionMode::default(),
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Compact
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
+            c.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Full
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
 
     #[test]
+    async fn skills_table_without_prompt_mode_keeps_full_default() {
+        let config = parse_test_config(
+            r#"
+[skills]
+open_skills_enabled = false
+"#,
+        );
+
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
     async fn runtime_profile_prompt_injection_mode_overrides_global() {
         let mut config = Config::default();
-        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
         // A runtime profile that pins compact, and an agent pointing at it.
         config.runtime_profiles.insert(
             "compact_profile".to_string(),
@@ -24372,13 +24368,13 @@ api_token = "Bearer test-token"
             .agents
             .insert("inherit".to_string(), AliasedAgentConfig::default());
 
-        // Profile override to Compact beats the (deprecated) global value.
+        // Profile override to Compact beats the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
         );
         // An unset profile, an agent with no profile, and an unknown alias all
-        // inherit the explicit global Full value during the deprecation window.
+        // inherit the global Full value.
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
             SkillsPromptInjectionMode::Full
@@ -24491,8 +24487,7 @@ runtime_profile = "fast"
             SkillsPromptInjectionMode::Compact
         );
 
-        // Profile-less agent: explicit global `full` remains effective during
-        // the deprecation window.
+        // Profile-less agent: explicit global `full` remains effective.
         let plain = parsed
             .resolved_agent_config("plain")
             .expect("agent plain resolves");
@@ -24507,43 +24502,23 @@ runtime_profile = "fast"
     }
 
     #[test]
-    async fn explicit_global_full_emits_structured_deprecation_warning() {
+    async fn full_modes_do_not_emit_deprecation_warning_before_v09() {
         let mut config = Config::default();
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
-
-        let warning = config
-            .collect_warnings()
-            .into_iter()
-            .find(|warning| warning.code == "skills_prompt_injection_mode_full_deprecated")
-            .expect("explicit global full should emit a deprecation warning");
-
-        assert_eq!(warning.path, "skills.prompt_injection_mode");
-        assert!(warning.message.contains("remains supported"));
-        assert!(!warning.message.contains("ignored"));
-    }
-
-    #[test]
-    async fn runtime_profile_full_emits_structured_deprecation_warning() {
-        let mut config = Config::default();
         config.runtime_profiles.insert(
-            "legacy".to_string(),
+            "full".to_string(),
             RuntimeProfileConfig {
                 prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
                 ..RuntimeProfileConfig::default()
             },
         );
 
-        let warning = config
-            .collect_warnings()
-            .into_iter()
-            .find(|warning| {
-                warning.code == "skills_prompt_injection_mode_full_deprecated"
-                    && warning.path == "runtime_profiles.legacy.prompt_injection_mode"
-            })
-            .expect("runtime-profile full should emit a deprecation warning");
-
-        assert!(warning.message.contains("remains supported"));
-        assert!(!warning.message.contains("ignored"));
+        assert!(
+            config
+                .collect_warnings()
+                .into_iter()
+                .all(|warning| warning.code != "skills_prompt_injection_mode_full_deprecated")
+        );
     }
 
     #[test]

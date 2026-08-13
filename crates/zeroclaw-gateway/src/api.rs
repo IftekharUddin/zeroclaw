@@ -1698,6 +1698,38 @@ pub async fn handle_api_sessions_list(
     Json(serde_json::json!({ "sessions": sessions })).into_response()
 }
 
+/// Resolve a path `{id}` to the persisted session key.
+///
+/// `GET /api/sessions` advertises both a display `session_id` (`gw_` stripped
+/// for gateway sessions) and the full DB `session_key` for API operations.
+/// Accept either form so callers that reuse `session_key` do not get a doubled
+/// `gw_` prefix (`gw_gw_<id>`).
+///
+/// Resolution prefers **key existence** over punctuation heuristics (WebSocket
+/// clients may pick display ids that contain `_`, e.g. `team_alpha` →
+/// `gw_team_alpha`):
+/// 1. exact `id` if it already exists as a session/cancel key
+/// 2. `gw_{id}` if that exists
+/// 3. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise prefix `gw_`
+fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
+    if exists(id) {
+        return id.to_string();
+    }
+    if !id.starts_with("gw_") {
+        let prefixed = format!("gw_{id}");
+        if exists(&prefixed) {
+            return prefixed;
+        }
+        return prefixed;
+    }
+    id.to_string()
+}
+
+/// Display session id used by WebSocket `?session_id=` / event filters.
+fn gateway_display_session_id(session_key: &str) -> &str {
+    session_key.strip_prefix("gw_").unwrap_or(session_key)
+}
+
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
@@ -1717,14 +1749,7 @@ pub async fn handle_api_session_messages(
         .into_response();
     };
 
-    // Accept either the full DB key (channel-driven sessions like
-    // `discord.clamps_…`) or the stripped form (legacy callers that pass
-    // just the UUID for gateway sessions).
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1772,12 +1797,8 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
-    if !backend
-        .list_sessions()
-        .iter()
-        .any(|key| key == &session_key)
-    {
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    if !backend.session_exists(&session_key) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1840,11 +1861,13 @@ pub async fn handle_api_session_message_post(
     // is never observable before the messages behind it are persisted.
     crate::ws::bump_turn_version(&state.session_turn_versions, &session_key);
 
-    // Use the raw dashboard session ID here to match the WS `?session_id=`
-    // query parameter; the `gw_` storage key is only for persistence.
+    // Match WS `?session_id=` / `event_matches_session` (display id), not the
+    // path string — callers that pass the full `session_key` must still notify
+    // the connected WebSocket.
+    let display_session_id = gateway_display_session_id(&session_key);
     let event = serde_json::json!({
         "type": "message",
-        "session_id": id.clone(),
+        "session_id": display_session_id,
         "role": "assistant",
         "content": body.content.clone(),
         "source": "api",
@@ -1854,7 +1877,7 @@ pub async fn handle_api_session_message_post(
 
     Json(serde_json::json!({
         "status": "ok",
-        "session_id": id,
+        "session_id": display_session_id,
         "message": {
             "role": "assistant",
             "content": message.content,
@@ -1882,11 +1905,7 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
     // Take the cancel-token lock and record the deletion under it, then
     // evict the token — all in one critical section. `register_turn_if_current`
@@ -1987,11 +2006,10 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
     // Verify the session exists before renaming
-    let sessions = backend.list_sessions();
-    if !sessions.contains(&session_key) {
+    if !backend.session_exists(&session_key) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -2053,19 +2071,28 @@ pub async fn handle_api_session_state(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
     // A turn is authoritative from the moment it registers a cancel token
     // until its messages are persisted and its turn version is resolved.
     // Those two phases are disjoint: the token is dropped as soon as the
     // stream ends, while persistence runs after. Treating only the token as
     // "running" exposes an `idle` window over a transcript that is still
     // mid-write, which is exactly when a reconnecting dashboard hydrates.
-    let turn_is_live = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .contains_key(&session_key)
-        || state.session_lifecycle.is_finalizing(&session_key);
+    //
+    // The probe is keyed the way `ws.rs` registers turns — always
+    // `gw_{display id}` — which is not always the key the durable row lives
+    // under. `resolve_gateway_session_key` may hand back a bare id when the
+    // backend already stores one, so deriving the token key from the display
+    // id keeps the live-turn lookup aligned with the writer instead of
+    // silently missing a running turn.
+    let turn_is_live = |session_key: &str| {
+        let token_key = format!("gw_{}", gateway_display_session_id(session_key));
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key(&token_key)
+            || state.session_lifecycle.is_finalizing(&token_key)
+    };
 
     // Without a durable session backend, the existing cancellation-token map
     // is still the process-local authority for whether a turn is live. Return
@@ -2074,12 +2101,16 @@ pub async fn handle_api_session_state(
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "session_id": id,
-            "state": if turn_is_live { "running" } else { "idle" },
+            "state": if turn_is_live(&id) { "running" } else { "idle" },
             "session_persistence": false,
         }))
         .into_response();
     };
 
+    // Resolve the durable key the same way the other session endpoints do, so
+    // the persisted row and the live-turn probe describe one session.
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    let turn_is_live = turn_is_live(&session_key);
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             // The persisted row is a best-effort mirror written by
@@ -2146,16 +2177,17 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
-
-    // Look up and cancel the token. Hold the lock only long enough to
-    // clone the token — cancellation itself does not need the lock.
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(&session_key)
-        .cloned();
+    // Resolve + look up under one lock so underscore-bearing display ids
+    // (e.g. `team_alpha`) match the live `gw_{id}` cancel-token key.
+    let (session_key, token) = {
+        let tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        let session_key = resolve_gateway_session_key(&id, |key| tokens.contains_key(key));
+        let token = tokens.get(&session_key).cloned();
+        (session_key, token)
+    };
 
     if let Some(token) = token {
         token.cancel();
@@ -2215,6 +2247,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
@@ -3802,6 +3835,437 @@ pub(crate) mod tests {
         let messages = backend.load("gw_operator-1");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "queued notification");
+    }
+
+    #[test]
+    fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
+        let none = |_key: &str| false;
+        assert_eq!(
+            resolve_gateway_session_key("operator-1", none),
+            "gw_operator-1"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("gw_operator-1", none),
+            "gw_operator-1"
+        );
+        // Underscore-bearing display ids must still map into the gw_ namespace
+        // when no exact key exists (punctuation is not a session namespace).
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", none),
+            "gw_team_alpha"
+        );
+
+        let gateway_only = |key: &str| key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", gateway_only),
+            "gw_team_alpha"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("gw_team_alpha", gateway_only),
+            "gw_team_alpha"
+        );
+
+        let channel_only = |key: &str| key == "discord.clamps_room";
+        assert_eq!(
+            resolve_gateway_session_key("discord.clamps_room", channel_only),
+            "discord.clamps_room"
+        );
+
+        // Exact match wins when both the bare id and gw_ form exist.
+        let both = |key: &str| key == "team_alpha" || key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", both),
+            "team_alpha"
+        );
+    }
+
+    #[test]
+    fn gateway_display_session_id_strips_gw_prefix() {
+        assert_eq!(gateway_display_session_id("gw_operator-1"), "operator-1");
+        assert_eq!(gateway_display_session_id("gw_team_alpha"), "team_alpha");
+        assert_eq!(
+            gateway_display_session_id("discord.clamps_room"),
+            "discord.clamps_room"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_full_session_key_from_sessions_list() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1".to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(session_key.clone(), token.clone());
+
+        // Same id GET /api/sessions advertises as session_key for abort.
+        let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["status"], "aborted",
+            "full session_key must abort; doubled gw_ prefix yields no_active_response"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_still_accepts_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_operator-1".to_string(), token.clone());
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_underscore_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team_alpha".to_string(), token.clone());
+
+        // List contract: session_id=team_alpha, session_key=gw_team_alpha.
+        // Treating "_" as "already a full key" would miss this cancel token.
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["status"], "aborted",
+            "underscore display ids must resolve to gw_ + id, not the bare id"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_message_post_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "via session_key"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(
+            json["session_id"], "operator-1",
+            "API response should use the display session id"
+        );
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "via session_key");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcast event")
+            .expect("broadcast value");
+        assert_eq!(event["type"], "message");
+        assert_eq!(
+            event["session_id"], "operator-1",
+            "broadcast must use display id so the WS filter accepts it"
+        );
+        assert_eq!(event["content"], "via session_key");
+    }
+
+    #[tokio::test]
+    async fn session_message_post_accepts_underscore_display_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "underscore display id"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let messages = backend.load("gw_team_alpha");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "underscore display id");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcast event")
+            .expect("broadcast value");
+        assert_eq!(event["session_id"], "team_alpha");
+    }
+
+    #[tokio::test]
+    async fn session_rename_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(serde_json::json!({ "name": "ops" })),
+        )
+        .await
+        .into_response();
+
+        // Master doubles the prefix (`gw_gw_operator-1`) and returns 404.
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "ops");
+        assert!(
+            backend.list_sessions().iter().any(|k| k == "gw_operator-1"),
+            "rename must target the real session key, not a doubled gw_ prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rename_accepts_underscore_display_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend);
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+            Json(serde_json::json!({ "name": "alpha desk" })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "alpha desk");
+    }
+
+    #[tokio::test]
+    async fn session_state_accepts_full_session_key_and_underscore_display_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        // File SessionStore does not persist turn state; SQLite does.
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        backend
+            .set_session_state("gw_team_alpha", "running", Some("turn-1"))
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend);
+        // A persisted `running` row is only reported as running while a live
+        // turn backs it, so register the cancel token `ws.rs` would hold for
+        // this session. Without it the reconciliation below would correctly
+        // downgrade the row to `idle` and this test would stop exercising key
+        // resolution at all.
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(
+                "gw_team_alpha".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            );
+
+        let full_key_response = handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("gw_team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(full_key_response.status(), StatusCode::OK);
+        let full_key_json = response_json(full_key_response).await;
+        assert_eq!(full_key_json["state"], "running");
+        assert_eq!(full_key_json["turn_id"], "turn-1");
+
+        let display_response = handle_api_session_state(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(display_response.status(), StatusCode::OK);
+        let display_json = response_json(display_response).await;
+        assert_eq!(
+            display_json["state"], "running",
+            "state handler must accept underscore display ids from the sessions list"
+        );
+        assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
+    /// `resolve_gateway_session_key` can return a bare id when the backend
+    /// already stores the session unprefixed, but `ws.rs` always registers its
+    /// cancellation token under `gw_{display id}`. Probing the token map with
+    /// the resolved key would then miss a live turn and report `idle` over a
+    /// transcript that is still mid-write — the exact window this PR closes.
+    #[tokio::test]
+    async fn session_state_finds_live_turn_when_backend_key_is_unprefixed() {
+        struct UnprefixedBackend;
+
+        impl SessionBackend for UnprefixedBackend {
+            fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+                Vec::new()
+            }
+            fn append(
+                &self,
+                _session_key: &str,
+                _message: &zeroclaw_providers::ChatMessage,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            /// Only the unprefixed key exists, so resolution keeps the bare id.
+            fn session_exists(&self, session_key: &str) -> bool {
+                !session_key.starts_with("gw_")
+            }
+            fn get_session_state(
+                &self,
+                _session_key: &str,
+            ) -> std::io::Result<Option<zeroclaw_infra::session_backend::SessionState>>
+            {
+                Ok(Some(zeroclaw_infra::session_backend::SessionState {
+                    state: "idle".to_string(),
+                    turn_id: None,
+                    turn_started_at: None,
+                }))
+            }
+        }
+
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(Arc::new(UnprefixedBackend));
+        let session_id = "unprefixed-live-turn";
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(
+                format!("gw_{session_id}"),
+                tokio_util::sync::CancellationToken::new(),
+            );
+
+        let response =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(
+            response["state"], "running",
+            "live-turn probe must follow the ws token key even when the durable key is unprefixed: {response:?}"
+        );
     }
 
     #[tokio::test]
