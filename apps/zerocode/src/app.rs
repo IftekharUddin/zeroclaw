@@ -703,7 +703,7 @@ pub async fn run(
                     quickstart.tick().await;
                 }
                 if mode == Mode::Sop {
-                    sop_pane.tick().await;
+                    sop_pane.tick();
                 }
                 consume_pending_quickstart_chat(
                     &conn_state,
