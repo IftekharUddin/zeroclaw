@@ -2137,14 +2137,12 @@ fn wire_color(w: &GraphWire) -> Color {
     }
 }
 
-/// Node borders follow the run-status palette: green in flight, red failed,
-/// white ended cleanly, dark gray skipped or no run state.
 fn node_border_color(state: Option<NodeRunState>) -> Color {
     match state {
-        Some(NodeRunState::Active) => Color::Green,
-        Some(NodeRunState::Completed) => Color::White,
+        Some(NodeRunState::Active) => Color::Magenta,
+        Some(NodeRunState::Completed) => Color::Green,
         Some(NodeRunState::Failed) => Color::Red,
-        Some(NodeRunState::Skipped) => Color::DarkGray,
+        Some(NodeRunState::Skipped) => Color::Yellow,
         _ => Color::Gray,
     }
 }
