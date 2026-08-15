@@ -1725,6 +1725,38 @@ fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> Strin
     id.to_string()
 }
 
+/// Resolve one existing REST-write target and capture its lifecycle snapshot
+/// as a single authority operation.
+///
+/// `resolve_gateway_session_key` is appropriate for read-only lookups, but a
+/// writer cannot first observe existence and only later capture a generation:
+/// DELETE could land between those steps. Probe each candidate while holding
+/// that candidate's lifecycle authority, preserving the same exact-key-first
+/// resolution contract without pairing facts from different incarnations.
+fn capture_existing_gateway_writer(
+    state: &AppState,
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    id: &str,
+) -> Option<(
+    String,
+    crate::session_lifecycle::DeletionGeneration,
+    crate::session_lifecycle::PersistenceGeneration,
+)> {
+    let mut candidates = vec![id.to_string()];
+    if !id.starts_with("gw_") {
+        candidates.push(format!("gw_{id}"));
+    }
+    for session_key in candidates {
+        if let Some((deletion, persistence)) = state
+            .session_lifecycle
+            .capture_existing_writer(&session_key, || backend.session_exists(&session_key))
+        {
+            return Some((session_key, deletion, persistence));
+        }
+    }
+    None
+}
+
 /// Display session id used by WebSocket `?session_id=` / event filters.
 fn gateway_display_session_id(session_key: &str) -> &str {
     session_key.strip_prefix("gw_").unwrap_or(session_key)
@@ -1797,20 +1829,15 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    if !backend.session_exists(&session_key) {
+    let Some((session_key, deletion_generation, persistence_generation)) =
+        capture_existing_gateway_writer(&state, backend.as_ref(), &id)
+    else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response();
-    }
-
-    // Capture the deletion generation before waiting on the permit. The
-    // existence check above happens *before* the wait, so on its own it says
-    // nothing about whether the session survived the wait.
-    let deletion_generation = state.session_lifecycle.deletion_generation(&session_key);
-    let persistence_generation = state.session_lifecycle.persistence_generation(&session_key);
+    };
 
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
@@ -1840,14 +1867,39 @@ pub async fn handle_api_session_message_post(
         deletion_generation,
         persistence_generation,
         || {
-            backend.append(&session_key, &message)?;
+            backend
+                .transcript_incomplete(&session_key)
+                .unwrap_or_else(|error| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_key": session_key,
+                                "error": format!("{error}"),
+                            })),
+                        "failed to read transcript intent marker"
+                    );
+                    true
+                })
+        },
+        |disposition| {
+            let mutation = (|| {
+                backend.mark_transcript_incomplete(&session_key)?;
+                backend.append(&session_key, &message)?;
+                backend.clear_transcript_incomplete(&session_key)?;
 
-            // This append mutated the persisted transcript, so any
-            // connection-scoped `Agent` holding the pre-append history is now
-            // stale. Publish the new epoch under the same lifecycle authority
-            // as the append.
-            crate::ws::bump_turn_version(&state.session_turn_versions, &session_key);
-            Ok::<(), std::io::Error>(())
+                // This append mutated the persisted transcript, so any
+                // connection-scoped `Agent` holding the pre-append history is now
+                // stale. Publish the new epoch under the same lifecycle authority
+                // as the append.
+                crate::ws::bump_turn_version(&state.session_turn_versions, &session_key);
+                Ok::<(), std::io::Error>(())
+            })();
+            if mutation.is_err() {
+                disposition.record_persistence_failure();
+            }
+            mutation
         },
     );
     match mutation {
@@ -1863,6 +1915,15 @@ pub async fn handle_api_session_message_post(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "A prior turn failed to persist while this request was queued"
+                })),
+            )
+                .into_response();
+        }
+        Err(crate::session_lifecycle::MutationRejection::PersistencePoisoned) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "This session has an incomplete transcript; delete and recreate it before writing"
                 })),
             )
                 .into_response();
@@ -1946,50 +2007,56 @@ pub async fn handle_api_session_delete(
         .cancel_tokens
         .lock()
         .expect("cancel_tokens lock poisoned");
-    state.session_lifecycle.with_deletion(&session_key, || {
-        // Remove the token under the same lock used by registration, then
-        // release that map before cancellation and backend I/O. The
-        // per-session lifecycle authority remains held for the whole closure.
-        let token = tokens.remove(&session_key);
-        drop(tokens);
-        if let Some(token) = token {
-            token.cancel();
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"session_key": session_key})),
-                "cancelled in-flight turn for deleted session"
-            );
-        }
-
-        match backend.delete_session(&session_key) {
-            Ok(true) => {
-                // Evict the epoch this session accumulated in
-                // `session_turn_versions` — it otherwise retains a completed
-                // session's key forever. A queued prompt is independently
-                // rejected before it can run.
-                state
-                    .session_turn_versions
-                    .lock()
-                    .expect("session_turn_versions lock poisoned")
-                    .remove(&session_key);
-                // Finalization holds belong to the session that went away.
-                // The deletion generation is deliberately retained.
-                state.session_lifecycle.forget_finalizing(&session_key);
-                Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+    state
+        .session_lifecycle
+        .with_deletion(&session_key, |disposition| {
+            // Remove the token under the same lock used by registration, then
+            // release that map before cancellation and backend I/O. The
+            // per-session lifecycle authority remains held for the whole closure.
+            let token = tokens.remove(&session_key);
+            drop(tokens);
+            if let Some(token) = token {
+                token.cancel();
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"session_key": session_key})),
+                    "cancelled in-flight turn for deleted session"
+                );
             }
-            Ok(false) => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-            )
-                .into_response(),
-        }
-    })
+
+            match backend.delete_session(&session_key) {
+                Ok(true) => {
+                    // Durable removal is the only repair operation that proves the
+                    // partial transcript is gone. The next connection therefore
+                    // starts a clean incarnation rather than inheriting poison.
+                    disposition.establish_fresh_incarnation();
+                    // Evict the epoch this session accumulated in
+                    // `session_turn_versions` — it otherwise retains a completed
+                    // session's key forever. A queued prompt is independently
+                    // rejected before it can run.
+                    state
+                        .session_turn_versions
+                        .lock()
+                        .expect("session_turn_versions lock poisoned")
+                        .remove(&session_key);
+                    // Finalization holds belong to the session that went away.
+                    // The deletion generation is deliberately retained.
+                    state.session_lifecycle.forget_finalizing(&session_key);
+                    Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+                }
+                Ok(false) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Session not found"})),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+                )
+                    .into_response(),
+            }
+        })
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -6143,9 +6210,99 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rest_append_prepared_after_failure_still_rejects_poisoned_transcript() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let session_id = "rest-current-persistence-failure";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage::user("partial"),
+            )
+            .expect("seed partial transcript");
+
+        let incarnation = state.session_lifecycle.deletion_generation(&session_key);
+        state
+            .session_lifecycle
+            .with_completion(&session_key, incarnation, |disposition| {
+                disposition.record_persistence_failure();
+            })
+            .expect("session incarnation remains current");
+
+        let response = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+            Json(SessionMessagePostBody {
+                content: "must remain rejected".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            store.load(&session_key).len(),
+            1,
+            "a writer prepared after failure must not extend the poisoned transcript"
+        );
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "a poisoned write must not certify a new transcript version"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_append_rejects_durable_poison_after_lifecycle_restart() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let session_id = "rest-restart-persistence-failure";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage::user("partial"),
+            )
+            .expect("seed partial transcript");
+        store
+            .mark_transcript_incomplete(&session_key)
+            .expect("persist incomplete marker");
+
+        // Fresh lifecycle state represents the daemon after a restart.
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+            Json(SessionMessagePostBody {
+                content: "must remain rejected".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(store.load(&session_key).len(), 1);
+        assert!(store.transcript_incomplete(&session_key).unwrap());
+    }
+
     struct BlockingRestAppendBackend {
         messages: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
         known: std::sync::atomic::AtomicBool,
+        incomplete: std::sync::atomic::AtomicBool,
         append_entered: std::sync::atomic::AtomicBool,
         release_append: std::sync::atomic::AtomicBool,
     }
@@ -6179,6 +6336,22 @@ pub(crate) mod tests {
             Ok(self.messages.lock().unwrap().pop().is_some())
         }
 
+        fn mark_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn transcript_incomplete(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.incomplete.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
         fn list_sessions(&self) -> Vec<String> {
             Vec::new()
         }
@@ -6189,6 +6362,8 @@ pub(crate) mod tests {
 
         fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
             let existed = self.known.swap(false, std::sync::atomic::Ordering::SeqCst);
+            self.incomplete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             self.messages.lock().unwrap().clear();
             Ok(existed)
         }
@@ -6202,6 +6377,7 @@ pub(crate) mod tests {
         let backend = std::sync::Arc::new(BlockingRestAppendBackend {
             messages: std::sync::Mutex::new(vec![zeroclaw_providers::ChatMessage::user("seed")]),
             known: std::sync::atomic::AtomicBool::new(true),
+            incomplete: std::sync::atomic::AtomicBool::new(false),
             append_entered: std::sync::atomic::AtomicBool::new(false),
             release_append: std::sync::atomic::AtomicBool::new(false),
         });

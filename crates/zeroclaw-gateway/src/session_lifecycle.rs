@@ -15,16 +15,20 @@
 //!   turn-version bump happen after the turn's cancel token is dropped, so a
 //!   liveness check alone reports the session idle while the transcript behind
 //!   it is still being written.
-//! * "Was this writer prepared before a partial persistence failure?" A
-//!   consumable boolean lets the first queued socket hide the failure from
-//!   every other stale socket and REST writer. A monotonic generation lets
-//!   each independently reject or rehydrate.
+//! * "Is this incarnation's transcript complete?" A consumable boolean lets
+//!   the first queued socket hide a failure from every other writer, while a
+//!   monotonic generation alone lets writers prepared after the failure
+//!   certify the same partial transcript. A poisoned disposition rejects both
+//!   until durable delete/recreate establishes a fresh incarnation.
 //!
-//! These are lifecycle facts about the gateway's own bookkeeping rather than
-//! facts about bytes on disk, so they are tracked here explicitly.
+//! Deletion and concurrent failure generations are lifecycle facts about the
+//! gateway's own bookkeeping, so they are tracked here explicitly. Durable
+//! transcript completeness belongs to `SessionBackend`: this authority checks
+//! that marker while holding the same lock used for mutation.
 //!
-//! The deletion and persistence counters are monotonic per session key.
-//! Writers capture the deletion counter
+//! The deletion counter is monotonic per session key. The persistence-failure
+//! counter is monotonic within one incarnation and resets only after durable
+//! deletion establishes the next clean incarnation. Writers capture the deletion counter
 //! *before* waiting and compare *after* acquiring. Comparing generations
 //! rather than reading a boolean "is deleted" flag keeps delete/recreate
 //! cycles unambiguous — a session deleted and recreated while a writer queued
@@ -78,6 +82,7 @@ pub struct SessionLifecycle {
 pub enum MutationRejection {
     Deleted,
     PersistenceChanged,
+    PersistencePoisoned,
 }
 
 /// Completion-scoped authority to publish a session's persistence disposition.
@@ -91,6 +96,21 @@ impl SessionDisposition<'_> {
     /// generation will independently observe the increment.
     pub fn record_persistence_failure(&mut self) {
         self.authority.persistence_failure = self.authority.persistence_failure.saturating_add(1);
+    }
+}
+
+/// Deletion-scoped authority to establish the next clean incarnation.
+pub struct DeletionDisposition<'a> {
+    authority: &'a mut SessionAuthority,
+}
+
+impl DeletionDisposition<'_> {
+    /// Clear a poisoned transcript only after durable deletion succeeded.
+    ///
+    /// A failed or no-op delete must leave the poison in place: backend load
+    /// cannot prove a partial transcript was repaired.
+    pub fn establish_fresh_incarnation(&mut self) {
+        self.authority.persistence_failure = 0;
     }
 }
 
@@ -126,7 +146,7 @@ impl SessionLifecycle {
     /// Record that `session_key` was deleted, invalidating every writer that
     /// captured a generation before this call.
     pub fn record_deletion(&self, session_key: &str) {
-        self.with_deletion(session_key, || ());
+        self.with_deletion(session_key, |_| ());
     }
 
     /// True when `session_key` was deleted since `captured` was read.
@@ -144,6 +164,40 @@ impl SessionLifecycle {
         PersistenceGeneration(authority.persistence_failure)
     }
 
+    /// Capture one existing session's writer generations under the same
+    /// authority used by DELETE.
+    ///
+    /// This closes the lookup-to-snapshot race for REST writers: a request
+    /// cannot pair an existence result from the old incarnation with lifecycle
+    /// generations captured after that incarnation was deleted.
+    pub fn capture_existing_writer(
+        &self,
+        session_key: &str,
+        exists: impl FnOnce() -> bool,
+    ) -> Option<(DeletionGeneration, PersistenceGeneration)> {
+        let authority = self.authority_for(session_key);
+        let authority = authority.lock().expect("session authority lock poisoned");
+        if !exists() {
+            return None;
+        }
+        Some((
+            DeletionGeneration(authority.deletion),
+            PersistenceGeneration(authority.persistence_failure),
+        ))
+    }
+
+    /// True when the current incarnation has a partial or failed transcript.
+    ///
+    /// Poison is not consumable and is not repaired by a successful load. It
+    /// remains authoritative until durable deletion establishes a fresh
+    /// incarnation.
+    #[must_use]
+    pub fn persistence_poisoned(&self, session_key: &str) -> bool {
+        let authority = self.authority_for(session_key);
+        let authority = authority.lock().expect("session authority lock poisoned");
+        authority.persistence_failure > 0
+    }
+
     /// Acquire mutation authority for a queued writer.
     ///
     /// Both generations are validated under the same lock the writer retains
@@ -154,17 +208,42 @@ impl SessionLifecycle {
         session_key: &str,
         deletion: DeletionGeneration,
         persistence: PersistenceGeneration,
-        mutate: impl FnOnce() -> R,
+        durable_incomplete: impl FnOnce() -> bool,
+        mutate: impl FnOnce(&mut SessionDisposition<'_>) -> R,
     ) -> Result<R, MutationRejection> {
         let authority = self.authority_for(session_key);
-        let authority = authority.lock().expect("session authority lock poisoned");
+        let mut authority = authority.lock().expect("session authority lock poisoned");
         if DeletionGeneration(authority.deletion) != deletion {
             return Err(MutationRejection::Deleted);
         }
         if PersistenceGeneration(authority.persistence_failure) != persistence {
             return Err(MutationRejection::PersistenceChanged);
         }
-        Ok(mutate())
+        if authority.persistence_failure > 0 || durable_incomplete() {
+            return Err(MutationRejection::PersistencePoisoned);
+        }
+        let mut disposition = SessionDisposition {
+            authority: &mut authority,
+        };
+        Ok(mutate(&mut disposition))
+    }
+
+    /// Run an incarnation-owned mutation only while `deletion` is current.
+    ///
+    /// Turn state and handshake metadata use this seam so an old connection
+    /// cannot recreate or mutate rows belonging to a delete/recreate cycle.
+    pub fn with_incarnation<R>(
+        &self,
+        session_key: &str,
+        deletion: DeletionGeneration,
+        mutate: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let authority = self.authority_for(session_key);
+        let authority = authority.lock().expect("session authority lock poisoned");
+        if DeletionGeneration(authority.deletion) != deletion {
+            return None;
+        }
+        Some(mutate())
     }
 
     /// Acquire completion authority for the turn's original incarnation.
@@ -193,11 +272,18 @@ impl SessionLifecycle {
     ///
     /// DELETE runs backend removal and epoch eviction inside this closure;
     /// writers cannot append or publish a version in the middle.
-    pub fn with_deletion<R>(&self, session_key: &str, delete: impl FnOnce() -> R) -> R {
+    pub fn with_deletion<R>(
+        &self,
+        session_key: &str,
+        delete: impl FnOnce(&mut DeletionDisposition<'_>) -> R,
+    ) -> R {
         let authority = self.authority_for(session_key);
         let mut authority = authority.lock().expect("session authority lock poisoned");
         authority.deletion = authority.deletion.saturating_add(1);
-        delete()
+        let mut disposition = DeletionDisposition {
+            authority: &mut authority,
+        };
+        delete(&mut disposition)
     }
 
     /// Mark a turn as finalizing: it has stopped streaming but its messages
@@ -326,6 +412,27 @@ mod tests {
     }
 
     #[test]
+    fn incarnation_owned_mutations_cannot_cross_delete_recreate() {
+        let lifecycle = SessionLifecycle::new();
+        let old = lifecycle.deletion_generation("recreated");
+        lifecycle.with_deletion("recreated", |disposition| {
+            disposition.establish_fresh_incarnation();
+        });
+
+        assert!(
+            lifecycle
+                .with_incarnation("recreated", old, || panic!("old mutation ran"))
+                .is_none(),
+            "metadata and state prepared for the old incarnation must be rejected"
+        );
+        let fresh = lifecycle.deletion_generation("recreated");
+        assert_eq!(
+            lifecycle.with_incarnation("recreated", fresh, || "fresh"),
+            Some("fresh")
+        );
+    }
+
+    #[test]
     fn persistence_failure_generation_is_monotonic_and_not_consumed() {
         let lifecycle = SessionLifecycle::new();
         let session_key = "damaged";
@@ -340,20 +447,42 @@ mod tests {
             .expect("session incarnation remains current");
 
         assert!(matches!(
-            lifecycle.with_write(session_key, deletion, socket_b, || ()),
+            lifecycle.with_write(session_key, deletion, socket_b, || false, |_| ()),
             Err(MutationRejection::PersistenceChanged)
         ));
         assert!(matches!(
-            lifecycle.with_write(session_key, deletion, socket_c, || ()),
+            lifecycle.with_write(session_key, deletion, socket_c, || false, |_| ()),
             Err(MutationRejection::PersistenceChanged)
         ));
 
-        let rehydrated = lifecycle.persistence_generation(session_key);
+        let prepared_after_failure = lifecycle.persistence_generation(session_key);
+        assert!(matches!(
+            lifecycle.with_write(
+                session_key,
+                deletion,
+                prepared_after_failure,
+                || false,
+                |_| (),
+            ),
+            Err(MutationRejection::PersistencePoisoned)
+        ));
+
+        lifecycle.with_deletion(session_key, |disposition| {
+            disposition.establish_fresh_incarnation();
+        });
+        let fresh_deletion = lifecycle.deletion_generation(session_key);
+        let fresh_persistence = lifecycle.persistence_generation(session_key);
         assert!(
             lifecycle
-                .with_write(session_key, deletion, rehydrated, || ())
+                .with_write(
+                    session_key,
+                    fresh_deletion,
+                    fresh_persistence,
+                    || false,
+                    |_| (),
+                )
                 .is_ok(),
-            "a writer prepared from the current backend disposition may proceed"
+            "successful delete/recreate establishes the only clean disposition"
         );
     }
 
@@ -370,10 +499,16 @@ mod tests {
         let lifecycle_a = Arc::clone(&lifecycle);
         let writer_a = std::thread::spawn(move || {
             lifecycle_a
-                .with_write("a", deletion_a, persistence_a, || {
-                    entered_a_tx.send(()).expect("test receiver remains alive");
-                    release_a_rx.recv().expect("test sender remains alive");
-                })
+                .with_write(
+                    "a",
+                    deletion_a,
+                    persistence_a,
+                    || false,
+                    |_| {
+                        entered_a_tx.send(()).expect("test receiver remains alive");
+                        release_a_rx.recv().expect("test sender remains alive");
+                    },
+                )
                 .expect("session a remains current");
         });
         entered_a_rx
@@ -384,11 +519,17 @@ mod tests {
         let lifecycle_b = Arc::clone(&lifecycle);
         let writer_b = std::thread::spawn(move || {
             lifecycle_b
-                .with_write("b", deletion_b, persistence_b, || {
-                    completed_b_tx
-                        .send(())
-                        .expect("test receiver remains alive");
-                })
+                .with_write(
+                    "b",
+                    deletion_b,
+                    persistence_b,
+                    || false,
+                    |_| {
+                        completed_b_tx
+                            .send(())
+                            .expect("test receiver remains alive");
+                    },
+                )
                 .expect("session b remains current");
         });
         completed_b_rx
@@ -398,6 +539,56 @@ mod tests {
         release_a_tx.send(()).expect("test receiver remains alive");
         writer_a.join().expect("session a writer does not panic");
         writer_b.join().expect("session b writer does not panic");
+    }
+
+    #[test]
+    fn existing_writer_snapshot_is_atomic_with_delete() {
+        let lifecycle = Arc::new(SessionLifecycle::new());
+        let (lookup_entered_tx, lookup_entered_rx) = std::sync::mpsc::channel();
+        let (release_lookup_tx, release_lookup_rx) = std::sync::mpsc::channel();
+
+        let writer_lifecycle = Arc::clone(&lifecycle);
+        let writer = std::thread::spawn(move || {
+            writer_lifecycle
+                .capture_existing_writer("rest", || {
+                    lookup_entered_tx
+                        .send(())
+                        .expect("test receiver remains alive");
+                    release_lookup_rx.recv().expect("test sender remains alive");
+                    true
+                })
+                .expect("session existed during the authoritative snapshot")
+        });
+        lookup_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("writer entered backend existence lookup");
+
+        let (deleted_tx, deleted_rx) = std::sync::mpsc::channel();
+        let delete_lifecycle = Arc::clone(&lifecycle);
+        let delete = std::thread::spawn(move || {
+            delete_lifecycle.record_deletion("rest");
+            deleted_tx.send(()).expect("test receiver remains alive");
+        });
+        assert!(
+            deleted_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "DELETE must not split the existence decision from its generation snapshot"
+        );
+
+        release_lookup_tx
+            .send(())
+            .expect("test receiver remains alive");
+        let (deletion, persistence) = writer.join().expect("writer does not panic");
+        deleted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("DELETE completes after the snapshot releases authority");
+        delete.join().expect("delete does not panic");
+
+        assert!(matches!(
+            lifecycle.with_write("rest", deletion, persistence, || false, |_| ()),
+            Err(MutationRejection::Deleted)
+        ));
     }
 
     #[test]

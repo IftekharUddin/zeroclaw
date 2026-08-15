@@ -350,6 +350,10 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    // The connection-scoped Agent and every mutation it prepares belong to
+    // this one incarnation. A delete requires a fresh connection/Agent rather
+    // than letting the old in-memory history mutate a recreated session.
+    let connection_incarnation = state.session_lifecycle.deletion_generation(&session_key);
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -398,20 +402,25 @@ async fn handle_socket(
             stored_messages = messages;
             resumed = true;
         }
-        // Set session name if provided (non-empty) on connect
-        if let Some(ref name) = session_name
-            && !name.is_empty()
-        {
-            let _ = backend.set_session_name(&session_key, name);
-            effective_name = Some(name.clone());
-        }
+        // Handshake metadata belongs to the connection's incarnation. Keep
+        // both upserts behind lifecycle authority so an old connection cannot
+        // recreate SQLite metadata after DELETE established a new incarnation.
+        let _ =
+            state
+                .session_lifecycle
+                .with_incarnation(&session_key, connection_incarnation, || {
+                    if let Some(ref name) = session_name
+                        && !name.is_empty()
+                    {
+                        let _ = backend.set_session_name(&session_key, name);
+                        effective_name = Some(name.clone());
+                    }
+                    let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+                });
         // If no name was provided via query param, load the stored name
         if effective_name.is_none() {
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
-        // Stamp the agent alias so future /api/sessions queries and
-        // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
     }
 
     // Send session_start message to client
@@ -616,8 +625,7 @@ async fn handle_socket(
                     // permit: the comparison after acquisition is what
                     // distinguishes "deleted while I queued" from "this
                     // session has simply never been written to disk yet".
-                    let deletion_generation =
-                        state.session_lifecycle.deletion_generation(&session_key);
+                    let deletion_generation = connection_incarnation;
                     // Acquire the permit *first*: only once we hold it is it
                     // guaranteed that any other connection's turn for this
                     // session has fully finished (cancel token removed,
@@ -646,7 +654,9 @@ async fn handle_socket(
                     if session_deleted_while_queued(&state, &session_key, deletion_generation) {
                         let err = serde_json::json!({
                             "type": "error",
-                            "message": "Session was deleted while this prompt was queued",
+                            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                                "cli-ws-session-deleted"
+                            ),
                             "code": "SESSION_DELETED"
                         });
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
@@ -660,8 +670,9 @@ async fn handle_socket(
                     ) {
                         let err = serde_json::json!({
                             "type": "error",
-                            "message": "A previous turn on this session could not be saved; \
-                                        its transcript is incomplete. Retry your message.",
+                            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                                "cli-ws-session-persistence-poisoned"
+                            ),
                             "code": "SESSION_PERSISTENCE_FAILED"
                         });
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
@@ -857,8 +868,7 @@ async fn handle_socket(
                 // permit — see the first-message path for why comparing
                 // generations, not probing existence, is what separates a
                 // deleted session from a not-yet-written one.
-                let deletion_generation =
-                    state.session_lifecycle.deletion_generation(&session_key);
+                let deletion_generation = connection_incarnation;
                 // Acquire the permit *first* — see the comment at the other
                 // `session_queue.acquire` call site above (the first-message
                 // path) for why a pre-acquire liveness snapshot is TOCTOU-prone
@@ -883,7 +893,9 @@ async fn handle_socket(
                 if session_deleted_while_queued(&state, &session_key, deletion_generation) {
                     let err = serde_json::json!({
                         "type": "error",
-                        "message": "Session was deleted while this prompt was queued",
+                        "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                            "cli-ws-session-deleted"
+                        ),
                         "code": "SESSION_DELETED"
                     });
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
@@ -897,8 +909,9 @@ async fn handle_socket(
                 ) {
                     let err = serde_json::json!({
                         "type": "error",
-                        "message": "A previous turn on this session could not be saved; \
-                                    its transcript is incomplete. Retry your message.",
+                        "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                            "cli-ws-session-persistence-poisoned"
+                        ),
                         "code": "SESSION_PERSISTENCE_FAILED"
                     });
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
@@ -1109,6 +1122,52 @@ fn persist_conversation_messages(
     }
 }
 
+/// Run a transcript mutation behind a durable intent marker.
+///
+/// The marker is written before the first message can change and cleared only
+/// after the whole mutation reports success. A process crash, partial append,
+/// or marker-clear failure therefore leaves a restart-visible poison marker.
+fn persist_with_transcript_intent(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    persist: impl FnOnce() -> PersistOutcome,
+) -> PersistOutcome {
+    if let Err(error) = backend.mark_transcript_incomplete(session_key) {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "error": format!("{error}"),
+                })),
+            "failed to persist transcript intent marker"
+        );
+        return PersistOutcome::Failed;
+    }
+
+    let outcome = persist();
+    if outcome != PersistOutcome::Persisted {
+        return outcome;
+    }
+
+    if let Err(error) = backend.clear_transcript_incomplete(session_key) {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "error": format!("{error}"),
+                })),
+            "failed to clear transcript intent marker"
+        );
+        return PersistOutcome::Failed;
+    }
+
+    PersistOutcome::Persisted
+}
+
 /// Bump `session_key`'s turn-completion version according to how persistence
 /// actually resolved.
 ///
@@ -1162,11 +1221,19 @@ fn complete_turn_persistence(
     session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
     session_key: &str,
     incarnation: crate::session_lifecycle::DeletionGeneration,
+    backend: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
+    terminal_state: Option<(&str, Option<&str>)>,
     persist: impl FnOnce() -> PersistOutcome,
 ) -> PersistOutcome {
     lifecycle
         .with_completion(session_key, incarnation, |disposition| {
-            let outcome = persist();
+            let outcome = match backend {
+                Some(backend) => persist_with_transcript_intent(backend, session_key, persist),
+                None => persist(),
+            };
+            if let (Some(backend), Some((state, turn_id))) = (backend, terminal_state) {
+                let _ = backend.set_session_state(session_key, state, turn_id);
+            }
             bump_turn_version_after_persistence(
                 session_turn_versions,
                 session_key,
@@ -1292,11 +1359,11 @@ fn session_deleted_while_queued(
 /// failed append was supposed to extend. The result would be a silently
 /// divergent conversation rather than a visible error.
 ///
-/// The gateway cannot repair the backend, so it fails this prompt loudly and
-/// re-seeds this connection's `Agent` from whatever the backend actually
-/// holds. The monotonic generation is not cleared: every other connection
-/// seeded before the failure must independently rehydrate and reject once.
-/// Returns `true` when the caller should reject the prompt.
+/// The gateway cannot prove that a backend load repairs missing messages, so
+/// it fails every prompt for the poisoned incarnation. An Agent that predates
+/// the failure is re-seeded once for display consistency, but old and newly
+/// prepared writers remain rejected until durable delete/recreate. Returns
+/// `true` when the caller should reject the prompt.
 fn reject_prompt_after_failed_persistence(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
@@ -1304,16 +1371,35 @@ fn reject_prompt_after_failed_persistence(
     seen_generation: &mut crate::session_lifecycle::PersistenceGeneration,
 ) -> bool {
     let current_generation = state.session_lifecycle.persistence_generation(session_key);
-    if current_generation == *seen_generation {
+    let durable_incomplete = state.session_backend.as_ref().is_some_and(|backend| {
+        backend
+            .transcript_incomplete(session_key)
+            .unwrap_or_else(|error| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{error}"),
+                        })),
+                    "failed to read transcript intent marker"
+                );
+                true
+            })
+    });
+    if !state.session_lifecycle.persistence_poisoned(session_key) && !durable_incomplete {
         return false;
     }
-    // Re-seed this connection independently. The generation is monotonic and
-    // never consumed, so every other Agent prepared before the same failure
-    // will still observe it and reject its own stale prompt.
-    if let Some(ref backend) = state.session_backend {
-        let _ = rehydrate_agent_from_backend(backend.as_ref(), agent, session_key);
+    // Re-seed an Agent that predates the failure for display consistency, but
+    // never interpret that load as transcript repair. New and old writers both
+    // remain rejected until delete/recreate establishes a fresh incarnation.
+    if current_generation != *seen_generation {
+        if let Some(ref backend) = state.session_backend {
+            let _ = rehydrate_agent_from_backend(backend.as_ref(), agent, session_key);
+        }
+        *seen_generation = current_generation;
     }
-    *seen_generation = current_generation;
     true
 }
 
@@ -1528,7 +1614,9 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
             // tool call runs for a session the operator destroyed.
             let err = serde_json::json!({
                 "type": "error",
-                "message": "Session was deleted while this prompt was queued",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-ws-session-deleted"
+                ),
                 "code": "SESSION_DELETED"
             });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
@@ -1560,9 +1648,13 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
-    if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
-    }
+    let _ = state
+        .session_lifecycle
+        .with_incarnation(session_key, incarnation, || {
+            if let Some(ref backend) = state.session_backend {
+                let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+            }
+        });
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -1929,6 +2021,8 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
             &state.session_turn_versions,
             session_key,
             incarnation,
+            state.session_backend.as_deref(),
+            Some(("idle", None)),
             || {
                 let mut outcome = PersistOutcome::Persisted;
                 if let Some(ref backend) = state.session_backend {
@@ -2010,12 +2104,6 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
         let aborted = serde_json::json!({ "type": "aborted" });
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
 
-        if let Some(ref backend) = state.session_backend
-            && backend.session_exists(session_key)
-        {
-            let _ = backend.set_session_state(session_key, "idle", None);
-        }
-
         // Broadcast agent_end event
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
@@ -2050,6 +2138,8 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                 &state.session_turn_versions,
                 session_key,
                 incarnation,
+                state.session_backend.as_deref(),
+                Some(("idle", None)),
                 || {
                     state
                         .session_backend
@@ -2132,11 +2222,6 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
-            // Set session state to idle
-            if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
-            }
-
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
@@ -2171,6 +2256,8 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                 &state.session_turn_versions,
                 session_key,
                 incarnation,
+                state.session_backend.as_deref(),
+                Some(("error", Some(turn_id.as_str()))),
                 || {
                     if e.new_messages.is_empty() {
                         PersistOutcome::Persisted
@@ -2188,11 +2275,6 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                     }
                 },
             );
-
-            // Set session state to error
-            if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
-            }
 
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2835,8 +2917,14 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
 
         // The turn now unwinds and tries to persist.
-        let outcome =
-            complete_turn_persistence(&lifecycle, &versions, &session_key, incarnation, || {
+        let outcome = complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            &session_key,
+            incarnation,
+            Some(&store),
+            None,
+            || {
                 persist_conversation_messages(
                     &store,
                     &session_key,
@@ -2845,7 +2933,8 @@ data: {\"type\":\"message_stop\"}\n\n",
                         ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
                     ],
                 )
-            });
+            },
+        );
 
         assert_eq!(
             outcome,
@@ -2886,8 +2975,14 @@ data: {\"type\":\"message_stop\"}\n\n",
         let incarnation = lifecycle.deletion_generation(&session_key);
         let versions = std::sync::Mutex::new(std::collections::HashMap::new());
 
-        let outcome =
-            complete_turn_persistence(&lifecycle, &versions, &session_key, incarnation, || {
+        let outcome = complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            &session_key,
+            incarnation,
+            Some(&store),
+            None,
+            || {
                 persist_conversation_messages(
                     &store,
                     &session_key,
@@ -2896,12 +2991,17 @@ data: {\"type\":\"message_stop\"}\n\n",
                         ConversationMessage::Chat(ChatMessage::assistant("hi there")),
                     ],
                 )
-            });
+            },
+        );
 
         assert_eq!(
             outcome,
             PersistOutcome::Persisted,
             "a session that was never deleted must persist its first turn"
+        );
+        assert!(
+            !store.transcript_incomplete(&session_key).unwrap(),
+            "a fully persisted turn must clear its durable intent marker"
         );
 
         let persisted = store.load(&session_key);
@@ -2945,9 +3045,15 @@ data: {\"type\":\"message_stop\"}\n\n",
         let incarnation = lifecycle.deletion_generation(session_key);
         let persistence_generation = lifecycle.persistence_generation(session_key);
         lifecycle.record_deletion(session_key);
-        complete_turn_persistence(&lifecycle, &versions, session_key, incarnation, || {
-            PersistOutcome::Persisted
-        });
+        complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            session_key,
+            incarnation,
+            None,
+            None,
+            || PersistOutcome::Persisted,
+        );
 
         assert!(
             !versions
@@ -2968,14 +3074,16 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
-    fn sop_ws_error_frames_resolve_via_fluent() {
-        // The SOP WebSocket error frames are UI-surfaced and route through the
-        // embedded en/cli.ftl. A renamed/typo'd key would silently ship the
-        // missing-key fallback `{cli-sop-ws-...}` to the browser; guard against it.
+    fn ws_error_frames_resolve_via_fluent() {
+        // WebSocket error frames are UI-surfaced and route through the embedded
+        // en/cli.ftl. A renamed/typo'd key would silently ship the missing-key
+        // fallback to the browser; guard against it.
         for key in [
             "cli-sop-ws-invalid-approval",
             "cli-sop-ws-engine-lock-poisoned",
             "cli-sop-ws-subsystem-disabled",
+            "cli-ws-session-deleted",
+            "cli-ws-session-persistence-poisoned",
         ] {
             let s = zeroclaw_runtime::i18n::get_required_cli_string(key);
             assert!(
@@ -3486,6 +3594,7 @@ data: {\"type\":\"message_stop\"}\n\n",
 
     struct DeletedSessionBackend {
         append_calls: std::sync::Mutex<Vec<String>>,
+        state_calls: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for DeletedSessionBackend {
@@ -3513,6 +3622,19 @@ data: {\"type\":\"message_stop\"}\n\n",
             // The user deleted the session between cancel and append.
             false
         }
+        fn set_session_state(
+            &self,
+            session_key: &str,
+            state: &str,
+            turn_id: Option<&str>,
+        ) -> std::io::Result<()> {
+            self.state_calls.lock().unwrap().push((
+                session_key.to_string(),
+                state.to_string(),
+                turn_id.map(str::to_string),
+            ));
+            Ok(())
+        }
     }
 
     #[test]
@@ -3520,6 +3642,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         use zeroclaw_providers::{ChatMessage, ConversationMessage};
         let backend = DeletedSessionBackend {
             append_calls: std::sync::Mutex::new(Vec::new()),
+            state_calls: std::sync::Mutex::new(Vec::new()),
         };
         let messages = vec![
             ConversationMessage::Chat(ChatMessage::user("hi")),
@@ -3531,10 +3654,15 @@ data: {\"type\":\"message_stop\"}\n\n",
         lifecycle.record_deletion("gw_deleted");
 
         let versions = std::sync::Mutex::new(std::collections::HashMap::new());
-        let outcome =
-            complete_turn_persistence(&lifecycle, &versions, "gw_deleted", incarnation, || {
-                persist_conversation_messages(&backend, "gw_deleted", &messages)
-            });
+        let outcome = complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            "gw_deleted",
+            incarnation,
+            None,
+            None,
+            || persist_conversation_messages(&backend, "gw_deleted", &messages),
+        );
 
         assert_eq!(
             outcome,
@@ -3548,6 +3676,43 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
     }
 
+    #[test]
+    fn deleted_turn_cannot_write_any_terminal_state_into_a_new_incarnation() {
+        let backend = DeletedSessionBackend {
+            append_calls: std::sync::Mutex::new(Vec::new()),
+            state_calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let session_key = "gw_terminal_state_recreated";
+        let old_incarnation = lifecycle.deletion_generation(session_key);
+        lifecycle.record_deletion(session_key);
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        for (state, turn_id) in [
+            ("idle", None),
+            ("idle", Some("cancelled-turn")),
+            ("error", Some("failed-turn")),
+        ] {
+            assert_eq!(
+                complete_turn_persistence(
+                    &lifecycle,
+                    &versions,
+                    session_key,
+                    old_incarnation,
+                    Some(&backend),
+                    Some((state, turn_id)),
+                    || PersistOutcome::Persisted,
+                ),
+                PersistOutcome::SkippedDeleted
+            );
+        }
+
+        assert!(
+            backend.state_calls.lock().unwrap().is_empty(),
+            "cancelled, successful, and failed old turns must not mutate recreated metadata"
+        );
+    }
+
     /// A `SessionBackend` whose `append` fails from a configurable call
     /// index onward, standing in for a real backend that partially writes a
     /// turn's messages before an I/O error (disk full, DB lock timeout, ...).
@@ -3555,6 +3720,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         appended: std::sync::Mutex<Vec<String>>,
         call_count: std::sync::atomic::AtomicUsize,
         fail_at_call: usize,
+        incomplete: std::sync::atomic::AtomicBool,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for PartiallyFailingAppendBackend {
@@ -3581,6 +3747,19 @@ data: {\"type\":\"message_stop\"}\n\n",
         fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
             Ok(false)
         }
+        fn mark_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn clear_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn transcript_incomplete(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.incomplete.load(std::sync::atomic::Ordering::SeqCst))
+        }
         fn list_sessions(&self) -> Vec<String> {
             Vec::new()
         }
@@ -3599,6 +3778,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             appended: std::sync::Mutex::new(Vec::new()),
             call_count: std::sync::atomic::AtomicUsize::new(0),
             fail_at_call: 1, // the user message persists; the assistant reply fails
+            incomplete: std::sync::atomic::AtomicBool::new(false),
         };
         let messages = vec![
             ConversationMessage::Chat(ChatMessage::user("hi")),
@@ -3631,6 +3811,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             appended: std::sync::Mutex::new(Vec::new()),
             call_count: std::sync::atomic::AtomicUsize::new(0),
             fail_at_call: 1, // the user message persists; the assistant reply fails
+            incomplete: std::sync::atomic::AtomicBool::new(false),
         });
         state.session_backend = Some(backend.clone());
         let state = state;
@@ -3698,6 +3879,10 @@ data: {\"type\":\"message_stop\"}\n\n",
             persistence_before,
             "the failed append must be recorded so the next writer can be stopped"
         );
+        assert!(
+            backend.transcript_incomplete(&session_key).unwrap(),
+            "the failure must leave a restart-visible transcript marker"
+        );
     }
 
     /// The withheld version bump alone does not protect the next writer: an
@@ -3713,6 +3898,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             appended: std::sync::Mutex::new(Vec::new()),
             call_count: std::sync::atomic::AtomicUsize::new(0),
             fail_at_call: 1,
+            incomplete: std::sync::atomic::AtomicBool::new(false),
         });
         state.session_backend = Some(backend.clone());
         let state = state;
@@ -3765,14 +3951,53 @@ data: {\"type\":\"message_stop\"}\n\n",
             "socket C must independently observe the same failure after socket B rehydrates"
         );
         assert!(
-            !reject_prompt_after_failed_persistence(
+            reject_prompt_after_failed_persistence(
                 &state,
                 &mut agent_b,
                 &session_key,
                 &mut seen_generation_b,
             ),
-            "socket B's next prompt may proceed after that Agent independently rehydrates"
+            "rehydrating cannot certify that missing messages were repaired"
         );
+
+        let mut prepared_after_failure =
+            state.session_lifecycle.persistence_generation(&session_key);
+        let mut agent_d = queue_test_agent(Box::new(ImmediateModelProvider("d-reply")));
+        assert!(
+            reject_prompt_after_failed_persistence(
+                &state,
+                &mut agent_d,
+                &session_key,
+                &mut prepared_after_failure,
+            ),
+            "a connection prepared after the failure must inherit the poisoned disposition"
+        );
+    }
+
+    #[test]
+    fn durable_marker_rejects_prompt_after_lifecycle_restart() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let backend = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let session_key = "gw_restart_poison";
+        backend
+            .mark_transcript_incomplete(session_key)
+            .expect("persist incomplete marker");
+
+        // A freshly constructed AppState stands in for a daemon restart: its
+        // in-process generation is zero, so only the backend marker can reject.
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend);
+        let mut seen_generation = state.session_lifecycle.persistence_generation(session_key);
+        let mut agent = queue_test_agent(Box::new(ImmediateModelProvider("reply")));
+
+        assert!(reject_prompt_after_failed_persistence(
+            &state,
+            &mut agent,
+            session_key,
+            &mut seen_generation,
+        ));
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler
@@ -3889,6 +4114,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             std::collections::HashMap<String, Vec<zeroclaw_providers::ChatMessage>>,
         >,
         known: std::sync::Mutex<std::collections::HashSet<String>>,
+        incomplete: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for QueueTestSessionBackend {
@@ -3922,6 +4148,21 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .get_mut(session_key)
                 .is_some_and(|v| v.pop().is_some()))
         }
+        fn mark_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .lock()
+                .unwrap()
+                .insert(session_key.to_string());
+            self.known.lock().unwrap().insert(session_key.to_string());
+            Ok(())
+        }
+        fn clear_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+            self.incomplete.lock().unwrap().remove(session_key);
+            Ok(())
+        }
+        fn transcript_incomplete(&self, session_key: &str) -> std::io::Result<bool> {
+            Ok(self.incomplete.lock().unwrap().contains(session_key))
+        }
         fn list_sessions(&self) -> Vec<String> {
             self.messages.lock().unwrap().keys().cloned().collect()
         }
@@ -3939,6 +4180,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         }
         fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
             self.messages.lock().unwrap().remove(session_key);
+            self.incomplete.lock().unwrap().remove(session_key);
             Ok(self.known.lock().unwrap().remove(session_key))
         }
     }

@@ -48,7 +48,8 @@ impl SqliteSessionBackend {
                 created_at   TEXT NOT NULL,
                 last_activity TEXT NOT NULL,
                 message_count INTEGER NOT NULL DEFAULT 0,
-                name         TEXT
+                name         TEXT,
+                transcript_incomplete INTEGER NOT NULL DEFAULT 0
              );
 
              CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -102,6 +103,25 @@ impl SqliteSessionBackend {
                 "ALTER TABLE session_metadata ADD COLUMN turn_started_at TEXT",
                 [],
             );
+        }
+
+        // Migration: add the durable gateway transcript intent marker. The
+        // default is complete so existing sessions remain readable.
+        let has_transcript_incomplete: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') \
+                 WHERE name = 'transcript_incomplete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_transcript_incomplete {
+            conn.execute(
+                "ALTER TABLE session_metadata ADD COLUMN transcript_incomplete \
+                 INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .context("Failed to add transcript intent marker column")?;
         }
 
         // Migration: add agent_alias column for per-agent attribution
@@ -189,6 +209,26 @@ impl SqliteSessionBackend {
                 Ok(n) => n,
                 Err(_) => continue,
             };
+            if let Some(key) = name.strip_suffix(".jsonl.incomplete") {
+                // The paired JSONL branch may already have renamed this
+                // entry even though `read_dir` yielded its old directory
+                // record later in the same iteration.
+                if !entry.path().exists() {
+                    continue;
+                }
+                // A failed first append can leave only the durable intent
+                // marker. If the JSONL file also exists, its branch below
+                // migrates both regardless of directory iteration order.
+                if sessions_dir.join(format!("{key}.jsonl")).exists() {
+                    continue;
+                }
+                if self.mark_transcript_incomplete(key).is_ok() {
+                    let migrated_path = entry.path().with_extension("incomplete.migrated");
+                    let _ = std::fs::rename(entry.path(), migrated_path);
+                    migrated += 1;
+                }
+                continue;
+            }
             let Some(key) = name.strip_suffix(".jsonl") else {
                 continue;
             };
@@ -214,9 +254,16 @@ impl SqliteSessionBackend {
                 }
             }
 
-            if count > 0 {
+            let marker_path = sessions_dir.join(format!("{name}.incomplete"));
+            let incomplete_migrated =
+                !marker_path.exists() || self.mark_transcript_incomplete(key).is_ok();
+            if (count > 0 || marker_path.exists()) && incomplete_migrated {
                 let migrated_path = path.with_extension("jsonl.migrated");
                 let _ = std::fs::rename(&path, &migrated_path);
+                if marker_path.exists() {
+                    let marker_migrated = marker_path.with_extension("incomplete.migrated");
+                    let _ = std::fs::rename(&marker_path, marker_migrated);
+                }
                 migrated += 1;
             }
         }
@@ -304,6 +351,44 @@ impl SessionBackend for SqliteSessionBackend {
         .map_err(std::io::Error::other)?;
 
         Ok(())
+    }
+
+    fn mark_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (
+                session_key, created_at, last_activity, message_count, transcript_incomplete
+             ) VALUES (?1, ?2, ?3, 0, 1)
+             ON CONFLICT(session_key) DO UPDATE SET transcript_incomplete = 1",
+            params![session_key, now, now],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn clear_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE session_metadata SET transcript_incomplete = 0 WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn transcript_incomplete(&self, session_key: &str) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT transcript_incomplete != 0 FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get(0),
+        )
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            other => Err(other),
+        })
+        .map_err(std::io::Error::other)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -1149,6 +1234,36 @@ mod tests {
     }
 
     #[test]
+    fn transcript_intent_marker_survives_restart_until_cleared() {
+        let tmp = TempDir::new().unwrap();
+        let key = "restart_incomplete";
+
+        {
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend.mark_transcript_incomplete(key).unwrap();
+            backend.append(key, &ChatMessage::user("partial")).unwrap();
+            assert!(backend.transcript_incomplete(key).unwrap());
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(backend.transcript_incomplete(key).unwrap());
+        backend.clear_transcript_incomplete(key).unwrap();
+        assert!(!backend.transcript_incomplete(key).unwrap());
+    }
+
+    #[test]
+    fn delete_session_removes_marker_even_without_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "marker_only";
+
+        backend.mark_transcript_incomplete(key).unwrap();
+        assert!(backend.delete_session(key).unwrap());
+        assert!(!backend.transcript_incomplete(key).unwrap());
+        assert!(!backend.delete_session(key).unwrap());
+    }
+
+    #[test]
     fn session_exists_tracks_metadata_row() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -1190,6 +1305,58 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn migrate_from_jsonl_preserves_incomplete_marker() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = tmp
+            .path()
+            .join("sessions")
+            .join("poisoned.jsonl.incomplete");
+        {
+            let store = crate::session_store::SessionStore::new(tmp.path()).unwrap();
+            store
+                .append("poisoned", &ChatMessage::user("partial"))
+                .unwrap();
+            store.mark_transcript_incomplete("poisoned").unwrap();
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        assert!(backend.transcript_incomplete("poisoned").unwrap());
+        assert!(!marker_path.exists());
+        assert!(
+            tmp.path()
+                .join("sessions")
+                .join("poisoned.jsonl.incomplete.migrated")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn transcript_intent_column_migrates_existing_database() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(sessions_dir.join("sessions.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session_metadata (
+                    session_key TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    last_activity TEXT NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    name TEXT
+                 );",
+            )
+            .unwrap();
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(!backend.transcript_incomplete("legacy").unwrap());
+        backend.mark_transcript_incomplete("legacy").unwrap();
+        assert!(backend.transcript_incomplete("legacy").unwrap());
     }
 
     #[test]

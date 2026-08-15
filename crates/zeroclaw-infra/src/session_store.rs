@@ -37,6 +37,50 @@ impl SessionStore {
             .join(format!("{}.jsonl", sanitize_session_key(session_key)))
     }
 
+    fn incomplete_marker_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir.join(format!(
+            "{}.jsonl.incomplete",
+            sanitize_session_key(session_key)
+        ))
+    }
+
+    fn sync_sessions_dir(&self) -> std::io::Result<()> {
+        std::fs::File::open(&self.sessions_dir)?.sync_all()
+    }
+
+    /// Durably record that a transcript mutation is in progress.
+    pub fn mark_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        let _guard = self.mutation_lock.lock();
+        let marker_path = self.incomplete_marker_path(session_key);
+        let mut marker = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(marker_path)?;
+        marker.write_all(b"incomplete\n")?;
+        marker.sync_all()?;
+        self.sync_sessions_dir()
+    }
+
+    /// Clear a completed transcript mutation's durable intent marker.
+    pub fn clear_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        let _guard = self.mutation_lock.lock();
+        match std::fs::remove_file(self.incomplete_marker_path(session_key)) {
+            Ok(()) => self.sync_sessions_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Check whether an earlier transcript mutation left a durable marker.
+    pub fn transcript_incomplete(&self, session_key: &str) -> std::io::Result<bool> {
+        match std::fs::metadata(self.incomplete_marker_path(session_key)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the file does not exist or is unreadable.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
@@ -172,16 +216,28 @@ impl SessionStore {
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_lock.lock();
         let path = self.session_path(session_key);
-        if !path.exists() {
-            return Ok(false);
+        let marker_path = self.incomplete_marker_path(session_key);
+        let mut deleted = false;
+        match std::fs::remove_file(&path) {
+            Ok(()) => deleted = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        std::fs::remove_file(&path)?;
-        Ok(true)
+        match std::fs::remove_file(&marker_path) {
+            Ok(()) => deleted = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if deleted {
+            self.sync_sessions_dir()?;
+        }
+        Ok(deleted)
     }
 
     /// Return the modification time of a session's JSONL file.
     pub fn session_mtime(&self, session_key: &str) -> Option<std::time::SystemTime> {
         std::fs::metadata(self.session_path(session_key))
+            .or_else(|_| std::fs::metadata(self.incomplete_marker_path(session_key)))
             .and_then(|m| m.modified())
             .ok()
     }
@@ -197,8 +253,12 @@ impl SessionStore {
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let name = entry.file_name().into_string().ok()?;
-                name.strip_suffix(".jsonl").map(String::from)
+                name.strip_suffix(".jsonl.incomplete")
+                    .or_else(|| name.strip_suffix(".jsonl"))
+                    .map(String::from)
             })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 }
@@ -225,6 +285,18 @@ impl SessionBackend for SessionStore {
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         self.append(session_key, message)
+    }
+
+    fn mark_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        self.mark_transcript_incomplete(session_key)
+    }
+
+    fn clear_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        self.clear_transcript_incomplete(session_key)
+    }
+
+    fn transcript_incomplete(&self, session_key: &str) -> std::io::Result<bool> {
+        self.transcript_incomplete(session_key)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -279,7 +351,7 @@ impl SessionBackend for SessionStore {
     /// the session is on disk Checking file presence is the same
     /// O(1) `stat` that `delete_session` itself performs.
     fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+        self.session_path(session_key).exists() || self.incomplete_marker_path(session_key).exists()
     }
 }
 
@@ -643,6 +715,38 @@ mod tests {
         assert!(deleted);
         assert!(store.load(key).is_empty());
         assert!(!store.session_path(key).exists());
+    }
+
+    #[test]
+    fn transcript_intent_marker_survives_restart_until_cleared() {
+        let tmp = TempDir::new().unwrap();
+        let key = "restart_incomplete";
+
+        {
+            let store = SessionStore::new(tmp.path()).unwrap();
+            store.mark_transcript_incomplete(key).unwrap();
+            store.append(key, &ChatMessage::user("partial")).unwrap();
+            assert!(store.transcript_incomplete(key).unwrap());
+        }
+
+        let store = SessionStore::new(tmp.path()).unwrap();
+        assert!(store.transcript_incomplete(key).unwrap());
+        store.clear_transcript_incomplete(key).unwrap();
+        assert!(!store.transcript_incomplete(key).unwrap());
+    }
+
+    #[test]
+    fn delete_session_removes_marker_even_without_messages() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "marker_only";
+
+        store.mark_transcript_incomplete(key).unwrap();
+        assert!(store.session_exists(key));
+        assert_eq!(store.list_sessions(), vec![key.to_string()]);
+        assert!(store.delete_session(key).unwrap());
+        assert!(!store.transcript_incomplete(key).unwrap());
+        assert!(!store.delete_session(key).unwrap());
     }
 
     #[test]

@@ -2523,13 +2523,13 @@ impl RpcDispatcher {
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
-        // Remove from persistent backend — try raw id, then prefixed variants.
+        // Runtime RPC owns raw and `rpc_` chat-session keys only. Gateway
+        // `gw_` incarnations are deleted through the gateway lifecycle owner,
+        // which coordinates detached-turn cancellation, persistence, and
+        // version eviction. Deleting that namespace here would bypass every
+        // one of those authority boundaries.
         if let Some(ref backend) = self.ctx.session_backend {
-            for key in &[
-                req.session_id.clone(),
-                format!("rpc_{}", req.session_id),
-                format!("gw_{}", req.session_id),
-            ] {
+            for key in &[req.session_id.clone(), format!("rpc_{}", req.session_id)] {
                 let _ = backend.delete_session(key);
             }
         }
@@ -7718,6 +7718,40 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    #[tokio::test]
+    async fn rpc_session_delete_does_not_bypass_gateway_lifecycle_namespace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let session_id = "shared-delete-boundary";
+        let gateway_key = format!("gw_{session_id}");
+
+        for key in [
+            session_id.to_string(),
+            format!("rpc_{session_id}"),
+            gateway_key.clone(),
+        ] {
+            backend
+                .append(&key, &zeroclaw_providers::ChatMessage::user("seed"))
+                .expect("seed session namespace");
+        }
+
+        dispatcher
+            .handle_session_delete(&serde_json::json!({"session_id": session_id}))
+            .await
+            .expect("RPC delete succeeds");
+
+        assert!(backend.load(session_id).is_empty());
+        assert!(backend.load(&format!("rpc_{session_id}")).is_empty());
+        assert_eq!(
+            backend.load(&gateway_key).len(),
+            1,
+            "runtime RPC must leave gw_ sessions to the gateway lifecycle owner"
+        );
     }
 
     #[tokio::test]
