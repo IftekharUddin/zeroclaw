@@ -414,6 +414,8 @@ mod skills;
 #[cfg(feature = "agent-runtime")]
 mod sop;
 #[cfg(feature = "agent-runtime")]
+mod swarm;
+#[cfg(feature = "agent-runtime")]
 mod tools;
 #[cfg(feature = "agent-runtime")]
 mod trust;
@@ -555,6 +557,26 @@ enum Commands {
         /// Alias for the new agent. Defaults to a sanitized provider name.
         #[arg(long)]
         agent: Option<String>,
+    },
+
+    /// Swarm (experimental) — launch a goal-driven agent swarm TUI.
+    ///
+    /// MVP: opens a minimal wizard that provisions a single "queen"
+    /// orchestrator agent and drops into a live chat with it. Worker
+    /// agents, orchestration, and shared memory land in later iterations.
+    Swarm {
+        /// Reuse an existing agent alias as the queen instead of running
+        /// the creation wizard. Must match a configured `[agents.<alias>]`.
+        #[arg(long)]
+        queen: Option<String>,
+
+        /// Provider type to pre-seed the wizard (anthropic / openai / ...).
+        #[arg(long)]
+        model_provider: Option<String>,
+
+        /// Model id to pre-seed the wizard.
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
@@ -3784,6 +3806,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
             agent,
         } => {
             Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
+            Ok(())
+        }
+
+        Commands::Swarm {
+            queen,
+            model_provider,
+            model,
+        } => {
+            Box::pin(swarm::run(config, queen, model_provider, model)).await?;
             Ok(())
         }
 
