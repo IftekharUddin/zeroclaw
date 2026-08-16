@@ -6,6 +6,28 @@ Legend: 🔴 blocks progress · 🟡 shapes near-term work · 🟢 future-facing
 
 ---
 
+## ✅ DECISIONS (2026-08-16 morning)
+
+- **C1 = (a) Pure LLM orchestrator.** Queen is an agent with the delegate tool + orchestrator prompt; she decides/delegates via tool calls. No runtime task-board infra this phase.
+- **~~A2 = (i) Dashboard-only~~ → SUPERSEDED. A2 = INTERACTIVE (Option B).** Pivoted 2026-08-16 08:42. The TUI is NOT a read-only dashboard. Each worker gets its own **interactive chat pane** with an **editable role/job header** the user can edit ON THE FLY. The TUI owns input (focus/pane-switch/text-edit state machine). This is the "big rearchitecture" we'd deferred — now the primary target.
+- **A1 = inject the observer NOW.** `loop_::run` accepts a caller-supplied observer composed via `MultiObserver`. Still required — the panes render live state from the observer event stream.
+- **B2 = shared personality files + MUTABLE, runtime-read role/job overrides.** Workers keep the SAME personality files as the queen, PLUS two fields — **role** and **job** — editable live in each worker pane's header. CRITICAL: the in-memory prompt-override must be **mutable + read fresh per delegated turn** (not baked once at assembly), so editing the header changes the worker's next turn. Editable TUI header widget writes into this shared mutable state.
+- **E1/E3 = stacked PRs on the new fork.** Stack: launcher → wizard → workers → observer-injection + mutable prompt-override → interactive TUI (input routing) → editable worker panes. Lean toward a `swarm` feature flag.
+
+**Immediate build order (revised for interactive pivot):**
+1. Runtime: caller-injectable observer via `MultiObserver` [A1].
+2. Mutable, per-turn-read role/job prompt-override on the worker agent (in-memory; no disk) [B2 foundation].
+3. `SwarmState` (queen + workers, each with mutable role/job + status) + `SwarmObserver` (Observer impl feeding it).
+4. TUI scaffold: terminal init/restore (panic+signal safe), layout (queen pane + worker pane grid).
+5. **Input routing layer**: focus model (which pane, header-edit vs chat), key handling, text editing of role/job headers → writes into SwarmState's mutable override.
+6. Per-worker chat panes: render each worker's turn I/O (from observer events) + editable role/job header.
+7. Wire queen chat input through the TUI (queen pane is interactive too).
+8. Split into stacked PRs, push fork.
+
+**Scope note:** this is days, not hours. Input routing + per-pane interactive chat is the hard part. Build incrementally; keep each layer testable (pure state/logic tests where possible since ratatui rendering can't be unit-tested easily).
+
+---
+
 ## A. TUI Shell (Option A → B seam) — the active workstream
 
 **A1. 🔴 Where does the observer inject?** B needs `loop_::run` to accept a caller-supplied `SwarmObserver` composed via the existing `MultiObserver`. Do you want me to (a) make that runtime change *now* so A and B share one code path, or (b) build A against a `SwarmState` seeded from the roster and add the injection when we do B? *(My lean: (a) — the injection is small/additive and doing it now means A's panes are already live-capable, no throwaway seeding code.)*

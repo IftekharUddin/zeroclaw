@@ -1067,6 +1067,16 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// Optional caller-supplied observer composed alongside the config-built
+    /// observer. When `Some`, the loop fans every `ObserverEvent`/metric to
+    /// both the standard backend AND this observer via a `MultiObserver`,
+    /// without disturbing the configured observability backend.
+    ///
+    /// Swarm uses this to feed a live `SwarmObserver` that drives the TUI
+    /// panes (queen + workers) from the runtime's event stream. Kept generic
+    /// (`Arc<dyn Observer>`) so it stays a pure runtime seam with no swarm
+    /// coupling in the loop.
+    pub extra_observer: Option<Arc<dyn Observer>>,
 }
 
 fn agent_provider_composite(
@@ -1217,7 +1227,15 @@ pub async fn run(
         let eff_model_context_window = agent.resolved.model_context_window;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
-        let observer: Arc<dyn Observer> = Arc::from(base_observer);
+        let observer: Arc<dyn Observer> = match overrides.extra_observer.clone() {
+            // Fan events to both the configured backend and the caller's
+            // observer (e.g. swarm's SwarmObserver) without disturbing either.
+            Some(extra) => Arc::new(observability::MultiObserver::new(vec![
+                base_observer,
+                Box::new(extra),
+            ])),
+            None => Arc::from(base_observer),
+        };
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
         let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));

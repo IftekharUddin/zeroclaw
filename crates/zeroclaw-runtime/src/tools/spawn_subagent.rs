@@ -189,6 +189,8 @@ impl Tool for SpawnSubagentTool {
             // the correct choice. The daemon heartbeat worker is the
             // only `mcp_registry` supplier.
             mcp_registry: None,
+            // Sub-agents don't drive a swarm TUI; no extra observer.
+            extra_observer: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
