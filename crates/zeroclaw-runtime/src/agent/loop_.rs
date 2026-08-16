@@ -597,6 +597,9 @@ pub(crate) fn build_system_prompt_for_turn(
     inject_memory: bool,
     show_tool_calls: bool,
     thinking_prefix: Option<&str>,
+    // Pre-rendered role/job assignment section (see `PromptAdditions::render`).
+    // Empty string appends nothing.
+    prompt_additions_section: &str,
 ) -> Result<String> {
     let native_tools = model_provider.supports_native_tools();
     let native_tool_specs_present = native_tool_specs_present_for_turn(
@@ -645,6 +648,10 @@ pub(crate) fn build_system_prompt_for_turn(
     if !turn_deferred_section.is_empty() {
         system_prompt.push('\n');
         system_prompt.push_str(&turn_deferred_section);
+    }
+    if !prompt_additions_section.is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(prompt_additions_section);
     }
     if let Some(prefix) = thinking_prefix {
         system_prompt = format!("{prefix}\n\n{system_prompt}");
@@ -1077,6 +1084,114 @@ pub struct AgentRunOverrides {
     /// (`Arc<dyn Observer>`) so it stays a pure runtime seam with no swarm
     /// coupling in the loop.
     pub extra_observer: Option<Arc<dyn Observer>>,
+    /// Mutable, per-turn role/job additions layered onto this agent's system
+    /// prompt. Read FRESH at the start of every turn, so editing the shared
+    /// value (e.g. from a swarm worker pane's editable header) changes the
+    /// agent's very next turn without restarting the loop.
+    ///
+    /// `None` (or empty fields) contributes nothing — a worker with blank
+    /// role/job behaves exactly like an agent without this override.
+    pub prompt_additions: Option<Arc<std::sync::RwLock<PromptAdditions>>>,
+}
+
+/// A worker's runtime-editable role and job, appended to its system prompt.
+///
+/// Formatted so BOTH the worker itself and the orchestrating queen can read a
+/// worker's purpose at a glance: the queen sees each worker's role/job when it
+/// inspects the roster, and the worker sees its own here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptAdditions {
+    /// Short label for what this agent IS (e.g. "Researcher", "Rust reviewer").
+    pub role: String,
+    /// What this agent is currently tasked to DO (the active job/goal).
+    pub job: String,
+}
+
+impl PromptAdditions {
+    /// Render the role/job as a compact, labeled section for the system
+    /// prompt. Blank fields are skipped; if both are blank the result is
+    /// empty (contributing nothing to the prompt). Kept terse and clearly
+    /// delimited so it's fast to parse for a human, the worker, and the queen.
+    pub fn render(&self) -> String {
+        let role = self.role.trim();
+        let job = self.job.trim();
+        if role.is_empty() && job.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("## Your Assignment\n");
+        if !role.is_empty() {
+            out.push_str("Role: ");
+            out.push_str(role);
+            out.push('\n');
+        }
+        if !job.is_empty() {
+            out.push_str("Job: ");
+            out.push_str(job);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// True when neither field carries content (nothing to inject).
+    pub fn is_empty(&self) -> bool {
+        self.role.trim().is_empty() && self.job.trim().is_empty()
+    }
+}
+
+#[cfg(test)]
+mod prompt_additions_tests {
+    use super::PromptAdditions;
+
+    #[test]
+    fn both_blank_renders_nothing() {
+        let a = PromptAdditions::default();
+        assert!(a.is_empty());
+        assert_eq!(a.render(), "");
+        // Whitespace-only counts as blank.
+        let a = PromptAdditions {
+            role: "   ".into(),
+            job: "\t\n".into(),
+        };
+        assert!(a.is_empty());
+        assert_eq!(a.render(), "");
+    }
+
+    #[test]
+    fn role_only_skips_job_line() {
+        let a = PromptAdditions {
+            role: "Researcher".into(),
+            job: String::new(),
+        };
+        assert!(!a.is_empty());
+        let out = a.render();
+        assert!(out.starts_with("## Your Assignment\n"));
+        assert!(out.contains("Role: Researcher"));
+        assert!(!out.contains("Job:"));
+    }
+
+    #[test]
+    fn job_only_skips_role_line() {
+        let a = PromptAdditions {
+            role: String::new(),
+            job: "Audit the auth module".into(),
+        };
+        let out = a.render();
+        assert!(out.contains("Job: Audit the auth module"));
+        assert!(!out.contains("Role:"));
+    }
+
+    #[test]
+    fn both_present_renders_labeled_section_trimmed() {
+        let a = PromptAdditions {
+            role: "  Rust reviewer  ".into(),
+            job: "  Find unsafe blocks  ".into(),
+        };
+        let out = a.render();
+        assert_eq!(
+            out,
+            "## Your Assignment\nRole: Rust reviewer\nJob: Find unsafe blocks\n"
+        );
+    }
 }
 
 fn agent_provider_composite(
@@ -1235,6 +1350,18 @@ pub async fn run(
                 Box::new(extra),
             ])),
             None => Arc::from(base_observer),
+        };
+        // Shared, mutable role/job additions (e.g. a swarm worker pane's
+        // editable header). Cloned handle; re-read + re-rendered at the START
+        // of every turn below so live edits take effect on the next turn.
+        let prompt_additions_handle = overrides.prompt_additions.clone();
+        // Render the current role/job section on demand. Reads the shared
+        // handle each call, so a turn always sees the latest edited values.
+        let render_prompt_additions = || -> String {
+            prompt_additions_handle
+                .as_ref()
+                .and_then(|h| h.read().ok().map(|a| a.render()))
+                .unwrap_or_default()
         };
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
@@ -1697,6 +1824,7 @@ pub async fn run(
             true,
             config.channels.show_tool_calls,
             None,
+            &render_prompt_additions(),
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
@@ -1791,6 +1919,7 @@ pub async fn run(
                 true,
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
+                &render_prompt_additions(),
             )?;
 
             let excluded_tool_names: HashSet<&str> =
@@ -1912,6 +2041,7 @@ pub async fn run(
                         true,
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
+                        &render_prompt_additions(),
                     )?;
                 }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -2457,6 +2587,7 @@ pub async fn run(
                             true,
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
+                            &render_prompt_additions(),
                         )?;
                     }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -13123,6 +13254,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            "",
         )
         .expect("startup prompt should build");
         assert!(startup_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -13155,6 +13287,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            "",
         )
         .expect("no-tools turn prompt should build");
         assert!(
@@ -13190,6 +13323,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            "",
         )
         .expect("tools turn prompt should build");
         assert!(tools_turn_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -13257,6 +13391,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            "",
         )
         .expect("compact-mode text prompt should build");
 

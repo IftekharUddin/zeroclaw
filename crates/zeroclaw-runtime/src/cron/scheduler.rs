@@ -870,6 +870,8 @@ async fn run_agent_job(
         mcp_registry: None,
         // Cron jobs don't drive a swarm TUI; no extra observer.
         extra_observer: None,
+        // Cron jobs have no editable role/job header.
+        prompt_additions: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {

@@ -1655,6 +1655,8 @@ fn build_owned_step_system_prompt(
         true,
         config.channels.show_tool_calls,
         None,
+        // SOP step prompts don't carry swarm worker role/job additions.
+        "",
     )
 }
 

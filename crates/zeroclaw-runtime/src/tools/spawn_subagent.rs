@@ -191,6 +191,8 @@ impl Tool for SpawnSubagentTool {
             mcp_registry: None,
             // Sub-agents don't drive a swarm TUI; no extra observer.
             extra_observer: None,
+            // Sub-agents have no editable role/job header.
+            prompt_additions: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
