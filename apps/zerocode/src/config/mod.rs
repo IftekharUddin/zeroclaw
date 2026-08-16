@@ -148,6 +148,8 @@ pub(crate) struct ZerocodeConfig {
     pub theme: ThemeSection,
     #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
     pub connection: ConnectionSection,
+    #[serde(default, skip_serializing_if = "InputSection::is_default")]
+    pub input: InputSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -160,9 +162,43 @@ impl Default for ZerocodeConfig {
             locale: default_locale(),
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
+            input: InputSection::default(),
             keybindings: HashMap::new(),
         }
     }
+}
+
+/// Terminal input behavior for the ZeroCode TUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InputSection {
+    /// When `true` (default), ZeroCode captures mouse events so scroll,
+    /// scrollbar dragging, and click targets work inside the TUI. This
+    /// prevents the terminal's own click-and-drag text selection, so
+    /// select-to-copy stops working.
+    ///
+    /// Set to `false` to release mouse events back to the terminal and
+    /// restore native select-to-copy — at the cost of in-app mouse
+    /// scrolling and clickable controls. Keyboard scrolling still works.
+    #[serde(default = "default_mouse_capture")]
+    pub mouse_capture: bool,
+}
+
+impl InputSection {
+    fn is_default(&self) -> bool {
+        self.mouse_capture == default_mouse_capture()
+    }
+}
+
+impl Default for InputSection {
+    fn default() -> Self {
+        Self {
+            mouse_capture: default_mouse_capture(),
+        }
+    }
+}
+
+fn default_mouse_capture() -> bool {
+    true
 }
 
 fn default_locale() -> Option<String> {
@@ -553,6 +589,49 @@ mod tests {
         assert!(
             body.contains("locale = \"en\""),
             "default config must surface the locale prop on disk; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_defaults_to_on() {
+        let c = ZerocodeConfig::default();
+        assert!(
+            c.input.mouse_capture,
+            "mouse capture must default to on so scroll/scrollbar/clicks work"
+        );
+    }
+
+    #[test]
+    fn default_input_section_is_omitted_on_disk() {
+        // A default [input] section must not be serialized, keeping the
+        // on-disk config minimal for users who never touch it.
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            !body.contains("[input]"),
+            "default input section must be skipped on disk; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_false_parses_and_serializes() {
+        let parsed: ZerocodeConfig = toml::from_str("[input]\nmouse_capture = false\n").unwrap();
+        assert!(
+            !parsed.input.mouse_capture,
+            "explicit mouse_capture = false must be honored"
+        );
+        let body = toml::to_string_pretty(&parsed).unwrap();
+        assert!(
+            body.contains("mouse_capture = false"),
+            "non-default input section must round-trip to disk; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn missing_input_section_falls_back_to_default() {
+        let parsed: ZerocodeConfig = toml::from_str("locale = \"en\"\n").unwrap();
+        assert!(
+            parsed.input.mouse_capture,
+            "configs without an [input] section keep mouse capture on"
         );
     }
 

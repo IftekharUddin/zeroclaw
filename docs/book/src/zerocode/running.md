@@ -38,6 +38,31 @@ events, not native platform text-field events. On macOS, system text
 replacements therefore work only when your terminal expands them before
 zerocode receives the input.
 
+### Copying text from the chat
+
+By default zerocode captures mouse events so that scrolling, dragging the
+scrollbar, and clickable controls work inside the TUI. While mouse capture is
+on, the terminal hands mouse actions to zerocode instead of doing its own
+click-and-drag text selection, so you can't highlight chat text to copy it with
+a plain mouse drag.
+
+Two ways to copy text out of the chat:
+
+- **Keep mouse capture on (default):** use your terminal's selection override.
+  In iTerm2 and most macOS terminals, hold **Option (⌥)** and drag to select,
+  then copy as usual. Many terminals use a similar modifier.
+- **Turn mouse capture off:** set `mouse_capture = false` under `[input]` in the
+  zerocode config. The terminal's native select-to-copy then works everywhere,
+  at the cost of in-app mouse scrolling and clickable controls. Keyboard
+  scrolling still works.
+
+```toml
+[input]
+# Release mouse events to the terminal so click-and-drag select-to-copy works.
+# Default is true (zerocode captures the mouse for scroll/scrollbar/clicks).
+mouse_capture = false
+```
+
 ## CLI flags
 
 | Flag | Description |

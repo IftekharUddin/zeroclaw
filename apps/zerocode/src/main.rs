@@ -413,7 +413,7 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
-    let mut term = config_manager::init_terminal()?;
+    let mut term = config_manager::init_terminal(loaded_config.input.mouse_capture)?;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
 
     let result = run_until_exit(

@@ -52,15 +52,17 @@ fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
     fields.retain(|field| is_direct_child_path(&field.path, prefix));
 }
 
-pub(crate) fn init_terminal() -> Result<Term> {
+pub(crate) fn init_terminal(mouse_capture: bool) -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-    )?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Mouse capture routes click/drag/scroll to the app, which disables the
+    // terminal's native select-to-copy. Only enable it when the user wants
+    // in-app mouse support (the default); otherwise leave selection to the
+    // terminal. See issue #10022.
+    if mouse_capture {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
