@@ -63,9 +63,31 @@ impl SessionStore {
     }
 
     /// Clear a completed transcript mutation's durable intent marker.
+    ///
+    /// Removing the marker is the transcript's commit point, so the session
+    /// file's own data blocks must reach stable storage *first*. Appends are
+    /// buffered by the OS, and the directory fsync only covers directory
+    /// entries, so clearing the marker without this step could leave a crash
+    /// ordering where the durable marker removal outlives the messages it was
+    /// protecting: on restart the transcript would look complete while missing
+    /// the appended rows. Any sync failure keeps the marker in place.
     pub fn clear_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        self.clear_transcript_incomplete_with(session_key, sync_file)
+    }
+
+    fn clear_transcript_incomplete_with<F>(&self, session_key: &str, sync: F) -> std::io::Result<()>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+    {
         let _guard = self.mutation_lock.lock();
-        match std::fs::remove_file(self.incomplete_marker_path(session_key)) {
+        let marker_path = self.incomplete_marker_path(session_key);
+        if !marker_path.exists() {
+            return Ok(());
+        }
+
+        sync(&self.session_path(session_key))?;
+
+        match std::fs::remove_file(&marker_path) {
             Ok(()) => self.sync_sessions_dir(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -278,10 +300,25 @@ fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> 
     Ok(lock)
 }
 
+/// Flush a session file's own data blocks so an append is durable.
+///
+/// Returns `Ok(())` when the file does not exist: a mutation can be marked and
+/// then fail before its first append ever creates the JSONL file, and there is
+/// no data to lose in that case.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Flush a directory's metadata so a just-created or just-removed entry is durable.
 ///
-/// The individual files are always synced by their callers before this runs; this
-/// only makes the directory entry itself survive a crash.
+/// This only makes the directory entry itself survive a crash. Callers are
+/// responsible for syncing the entry's file contents first — see
+/// [`SessionStore::clear_transcript_incomplete`], which syncs the session file
+/// before removing its marker so the commit point cannot outrun the data.
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
@@ -780,6 +817,75 @@ mod tests {
 
         let store = SessionStore::new(tmp.path()).unwrap();
         assert!(store.transcript_incomplete(key).unwrap());
+        store.clear_transcript_incomplete(key).unwrap();
+        assert!(!store.transcript_incomplete(key).unwrap());
+    }
+
+    #[test]
+    fn clear_transcript_incomplete_syncs_the_transcript_before_the_marker() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "durable_commit";
+
+        store.mark_transcript_incomplete(key).unwrap();
+        store.append(key, &ChatMessage::user("committed")).unwrap();
+
+        let synced = std::cell::Cell::new(None);
+        store
+            .clear_transcript_incomplete_with(key, |path| {
+                // The marker must still be present at the moment the
+                // transcript is synced — that ordering is the commit point.
+                synced.set(Some(path.to_path_buf()));
+                assert!(
+                    path.with_extension("jsonl.incomplete").exists()
+                        || store.incomplete_marker_path(key).exists(),
+                    "marker cleared before the transcript was synced"
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            synced.into_inner().as_deref(),
+            Some(store.session_path(key).as_path())
+        );
+        assert!(!store.transcript_incomplete(key).unwrap());
+    }
+
+    #[test]
+    fn a_failed_transcript_sync_keeps_the_poison_marker_set() {
+        let tmp = TempDir::new().unwrap();
+        let key = "unsynced_commit";
+
+        {
+            let store = SessionStore::new(tmp.path()).unwrap();
+            store.mark_transcript_incomplete(key).unwrap();
+            store.append(key, &ChatMessage::user("at risk")).unwrap();
+
+            let error = store
+                .clear_transcript_incomplete_with(key, |_| {
+                    Err(std::io::Error::other("simulated fsync failure"))
+                })
+                .expect_err("an unsynced transcript must not be committed");
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(store.transcript_incomplete(key).unwrap());
+        }
+
+        // Restart: the marker outlived the process, so the transcript is
+        // still correctly treated as poisoned rather than complete.
+        let store = SessionStore::new(tmp.path()).unwrap();
+        assert!(store.transcript_incomplete(key).unwrap());
+    }
+
+    #[test]
+    fn clear_transcript_incomplete_tolerates_a_marked_session_with_no_file_yet() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "marked_but_empty";
+
+        store.mark_transcript_incomplete(key).unwrap();
+        assert!(!store.session_path(key).exists());
+
         store.clear_transcript_incomplete(key).unwrap();
         assert!(!store.transcript_incomplete(key).unwrap());
     }
