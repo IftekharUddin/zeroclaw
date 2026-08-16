@@ -2087,22 +2087,43 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-
-    // Verify the session exists before renaming
-    if !backend.session_exists(&session_key) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
+    // Rename is a metadata mutation owned by one incarnation. `set_session_name`
+    // is a real `UPDATE session_metadata` on the SQLite backend, so a rename
+    // that observed the old session as existing and then mutated after a
+    // delete/recreate would retitle the new incarnation. Unlike a queued
+    // writer, this handler has no permit to re-validate against, so it holds
+    // the session authority across both the existence probe and the mutation:
+    // DELETE, which takes the same authority, cannot land in between.
+    //
+    // Candidate order matches `resolve_gateway_session_key` — exact key first,
+    // then the `gw_` form — so the resolution contract is unchanged.
+    let mut candidates = vec![id.to_string()];
+    if !id.starts_with("gw_") {
+        candidates.push(format!("gw_{id}"));
     }
 
-    match backend.set_session_name(&session_key, name) {
-        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
-        Err(e) => (
+    let mut renamed = None;
+    for session_key in candidates {
+        renamed = state.session_lifecycle.with_existing_incarnation(
+            &session_key,
+            || backend.session_exists(&session_key),
+            || backend.set_session_name(&session_key, name),
+        );
+        if renamed.is_some() {
+            break;
+        }
+    }
+
+    match renamed {
+        Some(Ok(())) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Some(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response(),
     }
@@ -4216,6 +4237,245 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["name"], "alpha desk");
+    }
+
+    /// Records which session incarnation each metadata write landed on.
+    ///
+    /// The existence probe blocks once, on request, so a DELETE can be raced
+    /// into the window between "this session exists" and "rename it".
+    struct IncarnationRecordingBackend {
+        incarnation: std::sync::atomic::AtomicU64,
+        probe_entered: std::sync::atomic::AtomicBool,
+        release_probe: std::sync::atomic::AtomicBool,
+        probe_gate_armed: std::sync::atomic::AtomicBool,
+        /// (incarnation observed at write time, name) for every rename.
+        renames: std::sync::Mutex<Vec<(u64, String)>>,
+    }
+
+    impl IncarnationRecordingBackend {
+        fn new() -> Self {
+            Self {
+                incarnation: std::sync::atomic::AtomicU64::new(0),
+                probe_entered: std::sync::atomic::AtomicBool::new(false),
+                release_probe: std::sync::atomic::AtomicBool::new(false),
+                probe_gate_armed: std::sync::atomic::AtomicBool::new(true),
+                renames: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for IncarnationRecordingBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            vec!["gw_operator-1".to_string()]
+        }
+
+        fn session_exists(&self, session_key: &str) -> bool {
+            // Only the rename's own probe is gated; DELETE's key resolution
+            // must stay free to run so it can race the window.
+            if session_key == "gw_operator-1"
+                && self
+                    .probe_gate_armed
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.probe_entered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                while !self.release_probe.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+            session_key == "gw_operator-1"
+        }
+
+        fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+            self.incarnation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+
+        fn set_session_name(&self, _session_key: &str, name: &str) -> std::io::Result<()> {
+            let incarnation = self.incarnation.load(std::sync::atomic::Ordering::SeqCst);
+            self.renames
+                .lock()
+                .unwrap()
+                .push((incarnation, name.to_string()));
+            Ok(())
+        }
+    }
+
+    /// A rename must apply to the incarnation it resolved, never the next one.
+    ///
+    /// `set_session_name` is a real `UPDATE session_metadata` on the SQLite
+    /// backend, not a no-op, so a rename that observes the old session as
+    /// existing and only then mutates would retitle whatever was recreated
+    /// under the same key. The handler holds the session authority across the
+    /// existence probe and the mutation, and DELETE takes that same authority,
+    /// so the two cannot interleave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_rename_applies_to_the_incarnation_it_resolved() {
+        let backend = std::sync::Arc::new(IncarnationRecordingBackend::new());
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let rename_state = state.clone();
+        let rename = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_rename(
+                State(rename_state),
+                HeaderMap::new(),
+                Path("operator-1".to_string()),
+                Json(serde_json::json!({ "name": "renamed" })),
+            )
+            .await
+            .into_response()
+        });
+
+        // Wait until the rename is inside its existence probe — the exact
+        // window a delete would have to slip through.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !backend
+            .probe_entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the rename never reached its existence probe"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let delete_state = state.clone();
+        let delete = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_delete(
+                State(delete_state),
+                HeaderMap::new(),
+                Path("operator-1".to_string()),
+            )
+            .await
+            .into_response()
+        });
+
+        // Give the delete every chance to advance the incarnation while the
+        // rename sits in the window. Under the authority it cannot; the
+        // rename below therefore still writes to incarnation 0.
+        let settle = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < settle {
+            tokio::task::yield_now().await;
+        }
+
+        backend
+            .release_probe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let rename_status = rename.await.expect("rename task does not panic").status();
+        assert_eq!(
+            delete.await.expect("delete task does not panic").status(),
+            StatusCode::OK,
+            "the delete itself must succeed"
+        );
+
+        assert_eq!(rename_status, StatusCode::OK);
+        let renames = backend.renames.lock().unwrap().clone();
+        assert_eq!(
+            renames,
+            vec![(0, "renamed".to_string())],
+            "the rename must land on the incarnation it resolved, not one \
+             established by a delete that raced its existence probe"
+        );
+    }
+
+    /// A rename issued against a session that was deleted and recreated under
+    /// the same key targets the live incarnation, not the one it replaced.
+    #[tokio::test]
+    async fn session_rename_after_delete_and_recreate_titles_the_live_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("first incarnation"),
+            )
+            .unwrap();
+        backend
+            .set_session_name("gw_operator-1", "original")
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let delete_response = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        assert!(
+            !backend.session_exists("gw_operator-1"),
+            "the delete must remove the first incarnation"
+        );
+
+        // A rename with no session to resolve is refused rather than
+        // recreating metadata for a key that no longer exists.
+        let orphan = handle_api_session_rename(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(serde_json::json!({ "name": "orphan" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(orphan.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !backend.session_exists("gw_operator-1"),
+            "a refused rename must not create session metadata"
+        );
+
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("second incarnation"),
+            )
+            .unwrap();
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(serde_json::json!({ "name": "current" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            backend
+                .get_session_name("gw_operator-1")
+                .unwrap()
+                .as_deref(),
+            Some("current"),
+            "the live incarnation takes the new name"
+        );
     }
 
     #[tokio::test]

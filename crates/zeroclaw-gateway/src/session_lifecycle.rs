@@ -228,6 +228,29 @@ impl SessionLifecycle {
         Ok(mutate(&mut disposition))
     }
 
+    /// Run an incarnation-owned mutation on an existing session, holding the
+    /// authority across both the existence decision and the mutation.
+    ///
+    /// A metadata writer such as rename has no queue permit to re-validate
+    /// against, so it cannot capture a generation and compare it later: DELETE
+    /// could land in that window and the mutation would apply to whatever was
+    /// recreated under the same key. Probing and mutating under one hold
+    /// removes the window instead of checking across it. Returns `None` when
+    /// the session does not exist for this authority.
+    pub fn with_existing_incarnation<R>(
+        &self,
+        session_key: &str,
+        exists: impl FnOnce() -> bool,
+        mutate: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let authority = self.authority_for(session_key);
+        let _authority = authority.lock().expect("session authority lock poisoned");
+        if !exists() {
+            return None;
+        }
+        Some(mutate())
+    }
+
     /// Run an incarnation-owned mutation only while `deletion` is current.
     ///
     /// Turn state and handshake metadata use this seam so an old connection
