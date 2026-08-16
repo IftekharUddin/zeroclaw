@@ -1,16 +1,24 @@
 //! `zeroclaw swarm` — experimental goal-driven agent swarm.
 //!
-//! # Status: MVP-0
+//! # Status: MVP-1
 //!
-//! This is the first, deliberately minimal slice of the Swarm feature. It
-//! provisions or reuses a single **queen** orchestrator agent and drops the
-//! user into a live chat with it. There are no worker agents, no
-//! orchestration loop, no shared state board, and no persistence beyond what
-//! the underlying agent already does. Those land in later iterations.
+//! Provisions or reuses a single **queen** orchestrator agent, attaches one or
+//! more **ephemeral worker** agents she can delegate to, and drops the user
+//! into a live chat with the queen. There is no shared state board or
+//! multi-round orchestration loop yet; those land in later iterations.
 //!
-//! The queen is, for now, just an ordinary configured agent. Swarm is a thin
-//! launcher over the existing interactive agent loop so we have a runnable,
-//! demoable surface to grow the real orchestration layer onto.
+//! ## Ephemeral workers
+//!
+//! Workers are **never persisted to disk.** They are synthesized into the
+//! in-memory [`Config`] at launch — cloned from the queen so they inherit her
+//! provider, risk profile, and runtime profile — and the queen's `delegates`
+//! roster is wired to them in-memory. The existing
+//! [`DelegateTool`](zeroclaw_runtime::tools::DelegateTool) resolves delegation
+//! targets from that in-memory map (never a disk read), so no persistence and
+//! no schema change are required. When the swarm process exits, the workers
+//! evaporate; the user's `config.toml` only ever gains the one queen. This
+//! keeps the agent list uncluttered — workers are runtime constructs, not
+//! installed agents.
 //!
 //! ## Flow
 //!
@@ -20,8 +28,9 @@
 //!    - Otherwise, if several exist, ask the user to pick one.
 //!    - Otherwise (none configured), run the **queen wizard** to provision one
 //!      from scratch via the shared quickstart apply path.
-//! 2. Print a short Swarm banner describing the queen.
-//! 3. Launch the interactive queen chat via the shared agent loop.
+//! 2. Assemble ephemeral workers in-memory and wire the queen's delegates.
+//! 3. Print a short Swarm banner describing the queen and worker roster.
+//! 4. Launch the interactive queen chat via the shared agent loop.
 //!
 //! The wizard never hand-writes config: it builds a
 //! [`BuilderSubmission`](zeroclaw_config::presets::BuilderSubmission) and calls
@@ -33,15 +42,18 @@ use crate::config::Config;
 /// Default alias assigned to a freshly-provisioned queen.
 const DEFAULT_QUEEN_ALIAS: &str = "queen";
 
+/// Number of ephemeral workers attached to the queen in this MVP. Kept at one
+/// until a `--workers N` flag / `[swarm]` config block lands.
+const DEFAULT_WORKER_COUNT: usize = 1;
+
 /// System prompt seeded into a wizard-provisioned queen. Describes the
-/// orchestrator role so the agent behaves like a swarm lead even in the
-/// current queen-only MVP (workers arrive later).
+/// orchestrator role so the agent behaves like a swarm lead.
 const QUEEN_SYSTEM_PROMPT: &str = "\
 You are the queen of a zeroclaw agent swarm. You coordinate work toward a \
-single goal the user sets. Break the goal into concrete steps, track progress, \
-and keep the user informed with concise status updates. Worker agents are not \
-available yet in this build — for now, do the work directly and think out loud \
-about how you would delegate once workers exist.";
+single goal the user sets. Break the goal into concrete subtasks and delegate \
+each to a worker agent using the delegate tool, then synthesize their results. \
+Track progress and keep the user informed with concise status updates. Prefer \
+delegating focused, self-contained subtasks over doing everything yourself.";
 
 /// Entry point for `zeroclaw swarm`.
 ///
@@ -77,13 +89,24 @@ pub(crate) async fn run(
         (provider_override, model_override)
     };
 
+    // Attach ephemeral workers in-memory and wire the queen's delegate roster.
+    // Nothing here is persisted: workers live only for this process. Failure to
+    // assemble workers is non-fatal — the queen can still run solo.
+    let workers = match assemble_workers(&mut config, &queen_alias, DEFAULT_WORKER_COUNT) {
+        Ok(workers) => workers,
+        Err(err) => {
+            eprintln!("⚠️  could not attach workers ({err}); running queen solo.");
+            Vec::new()
+        }
+    };
+
     // Resolve the effective temperature the same way `zeroclaw agent` does:
     // fall back to the agent's configured provider entry.
     let temperature = config
         .model_provider_for_agent(&queen_alias)
         .and_then(|e| e.temperature);
 
-    print_banner(&config, &queen_alias);
+    print_banner(&config, &queen_alias, &workers);
 
     // Wire the CLI channel + channel map exactly as `zeroclaw agent` does, so
     // the interactive queen chat has a terminal to talk on.
@@ -380,7 +403,80 @@ fn default_runtime_profile(config: &Config) -> String {
 
 /// Print a short banner so the user knows a swarm queen was launched and which
 /// agent is driving it.
-fn print_banner(config: &Config, queen_alias: &str) {
+/// Attach `count` ephemeral worker agents to the queen, entirely in-memory.
+///
+/// Each worker is cloned from the queen's `AliasedAgentConfig` so it inherits
+/// her provider, risk profile, and runtime profile (which keeps it both
+/// functional and reachable — the [`DelegateTool`] gates on matching risk
+/// profiles unless an explicit `delegates` entry is present, and we add one).
+/// The worker's system prompt is replaced with [`WORKER_SYSTEM_PROMPT`] and its
+/// workspace path is cleared so the runtime derives a per-alias workspace dir
+/// (`agents/<alias>/workspace`), avoiding collisions with the queen.
+///
+/// The queen's `delegates` roster is extended with an explicit, bounded target
+/// per worker so delegation authority is intentional rather than ambient. None
+/// of this is written to disk; it lives only in the passed-in `config`.
+///
+/// Returns the list of worker aliases attached. Errors only if the queen
+/// herself is missing from the config (a caller bug).
+fn assemble_workers(
+    config: &mut Config,
+    queen_alias: &str,
+    count: usize,
+) -> anyhow::Result<Vec<String>> {
+    use zeroclaw_config::schema::DelegateTargetConfig;
+
+    let Some(queen) = config.agents.get(queen_alias).cloned() else {
+        anyhow::bail!("queen `{queen_alias}` is not in the config; cannot attach workers");
+    };
+
+    let mut worker_aliases = Vec::with_capacity(count);
+    for n in 1..=count {
+        // Derive a stable, collision-checked alias. The reserved `swarm-`
+        // prefix signals these are runtime constructs, not user agents.
+        let mut alias = format!("swarm-worker-{n}");
+        let mut suffix = n;
+        while config.agents.contains_key(&alias) {
+            suffix += count;
+            alias = format!("swarm-worker-{suffix}");
+        }
+
+        let mut worker = queen.clone();
+        worker.enabled = true;
+        // Clear any custom workspace path so the runtime derives a per-alias
+        // workspace dir (`agents/<alias>/workspace`), avoiding collisions with
+        // the queen. Workers inherit the queen's personality/system prompt
+        // (which is delivered via workspace personality files, not a config
+        // field) — acceptable for MVP since a worker is a focused clone.
+        worker.workspace.path = None;
+        // Workers do not delegate onward in this MVP.
+        worker.delegates = Vec::new();
+
+        config.agents.insert(alias.clone(), worker);
+        worker_aliases.push(alias);
+    }
+
+    // Wire the queen -> worker delegation authority in-memory.
+    if let Some(queen_mut) = config.agents.get_mut(queen_alias) {
+        for alias in &worker_aliases {
+            if !queen_mut
+                .delegates
+                .iter()
+                .any(|t| t.agent().trim() == alias)
+            {
+                queen_mut
+                    .delegates
+                    .push(DelegateTargetConfig::bounded(alias.clone()));
+            }
+        }
+    }
+
+    Ok(worker_aliases)
+}
+
+/// Print a short banner so the user knows a swarm queen was launched, which
+/// agent is driving it, and which workers are attached.
+fn print_banner(config: &Config, queen_alias: &str, workers: &[String]) {
     let model = config
         .model_provider_for_agent(queen_alias)
         .and_then(|e| e.model.clone())
@@ -390,11 +486,17 @@ fn print_banner(config: &Config, queen_alias: &str) {
         .map(|p| format!("{:?}", p.level))
         .unwrap_or_else(|| "<no risk_profile>".to_string());
 
-    eprintln!("🐝 zeroclaw swarm (experimental — MVP-0)");
-    eprintln!("   queen : {queen_alias}");
-    eprintln!("   model : {model}");
-    eprintln!("   risk  : {risk}");
-    eprintln!("   workers: none yet — this is a queen-only chat.");
+    let workers_line = if workers.is_empty() {
+        "none — queen runs solo".to_string()
+    } else {
+        format!("{} ({})", workers.len(), workers.join(", "))
+    };
+
+    eprintln!("🐝 zeroclaw swarm (experimental — MVP-1)");
+    eprintln!("   queen  : {queen_alias}");
+    eprintln!("   model  : {model}");
+    eprintln!("   risk   : {risk}");
+    eprintln!("   workers: {workers_line}  (ephemeral — not saved)");
     eprintln!("   Type your goal for the queen, or Ctrl-C to exit.");
     eprintln!();
 }
@@ -501,5 +603,80 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn assemble_workers_injects_and_wires_delegates() {
+        let mut config = config_with_agents(&["queen"]);
+        let workers = assemble_workers(&mut config, "queen", 2).unwrap();
+
+        // Two workers attached with the reserved prefix.
+        assert_eq!(workers.len(), 2);
+        assert!(workers.iter().all(|w| w.starts_with("swarm-worker-")));
+
+        // Each worker exists in the in-memory config and is enabled.
+        for w in &workers {
+            let agent = config.agent(w).expect("worker must be in config");
+            assert!(agent.enabled, "worker must be enabled");
+            // Worker shares the queen's risk profile so delegation is reachable.
+            assert_eq!(agent.risk_profile.trim(), "default");
+            // Worker doesn't delegate onward.
+            assert!(agent.delegates.is_empty());
+            // Worker gets its own derived workspace (no inherited custom path).
+            assert!(agent.workspace.path.is_none());
+        }
+
+        // Queen's delegate roster now names every worker exactly once.
+        let queen = config.agent("queen").unwrap();
+        for w in &workers {
+            let hits = queen
+                .delegates
+                .iter()
+                .filter(|t| t.agent().trim() == w)
+                .count();
+            assert_eq!(hits, 1, "queen must delegate to {w} exactly once");
+        }
+    }
+
+    #[test]
+    fn assemble_workers_is_idempotent_on_delegate_roster() {
+        // Re-running must not duplicate delegate entries for the same worker.
+        let mut config = config_with_agents(&["queen"]);
+        let first = assemble_workers(&mut config, "queen", 1).unwrap();
+        // Call again: new distinct workers, but no duplicate roster entries for
+        // the originals.
+        let second = assemble_workers(&mut config, "queen", 1).unwrap();
+        assert_ne!(first, second, "second run must mint fresh aliases");
+
+        let queen = config.agent("queen").unwrap();
+        // No delegate alias appears twice.
+        let mut seen = std::collections::HashSet::new();
+        for t in &queen.delegates {
+            assert!(
+                seen.insert(t.agent().trim().to_string()),
+                "duplicate delegate entry for {}",
+                t.agent()
+            );
+        }
+    }
+
+    #[test]
+    fn assemble_workers_errors_when_queen_missing() {
+        let mut config = config_with_agents(&["someone-else"]);
+        let err = assemble_workers(&mut config, "ghost-queen", 1).unwrap_err();
+        assert!(
+            err.to_string().contains("ghost-queen"),
+            "error should name the missing queen; got: {err}"
+        );
+    }
+
+    #[test]
+    fn assemble_zero_workers_is_a_noop() {
+        let mut config = config_with_agents(&["queen"]);
+        let workers = assemble_workers(&mut config, "queen", 0).unwrap();
+        assert!(workers.is_empty());
+        assert!(config.agent("queen").unwrap().delegates.is_empty());
+        // No stray swarm-worker agents were added.
+        assert!(!config.agents.keys().any(|k| k.starts_with("swarm-worker-")));
     }
 }
