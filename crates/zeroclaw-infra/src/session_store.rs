@@ -45,7 +45,7 @@ impl SessionStore {
     }
 
     fn sync_sessions_dir(&self) -> std::io::Result<()> {
-        std::fs::File::open(&self.sessions_dir)?.sync_all()
+        sync_directory(&self.sessions_dir)
     }
 
     /// Durably record that a transcript mutation is in progress.
@@ -276,6 +276,55 @@ fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> 
     let lock = Arc::new(MutationLock::new(()));
     locks.insert(key, Arc::downgrade(&lock));
     Ok(lock)
+}
+
+/// Flush a directory's metadata so a just-created or just-removed entry is durable.
+///
+/// The individual files are always synced by their callers before this runs; this
+/// only makes the directory entry itself survive a crash.
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Windows variant of [`sync_directory`].
+///
+/// Opening a directory handle requires `FILE_FLAG_BACKUP_SEMANTICS`, and
+/// `FlushFileBuffers` on a directory handle returns `ERROR_ACCESS_DENIED`
+/// (OS error 5) because NTFS does not expose Unix-style directory metadata
+/// flushing. The entry's file was already synced, so that expected error is
+/// non-fatal; every other error still propagates.
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(5) => {
+            ::zeroclaw_log::record!(
+                TRACE,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Ignoring expected ACCESS_DENIED when fsyncing directory on Windows: {}",
+                    path.display()
+                )
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Fallback for targets that expose neither directory-fsync mechanism.
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    let _ = path;
+    Ok(())
 }
 
 impl SessionBackend for SessionStore {
@@ -747,6 +796,30 @@ mod tests {
         assert!(store.delete_session(key).unwrap());
         assert!(!store.transcript_incomplete(key).unwrap());
         assert!(!store.delete_session(key).unwrap());
+    }
+
+    #[test]
+    fn transcript_marker_lifecycle_syncs_sessions_dir_on_every_platform() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "marker_lifecycle";
+
+        // Directory sync runs on the first-turn persistence path; on Windows the
+        // expected directory-flush refusal must not fail the mutation.
+        store.mark_transcript_incomplete(key).unwrap();
+        assert!(store.transcript_incomplete(key).unwrap());
+
+        store.append(key, &ChatMessage::user("first turn")).unwrap();
+        assert_eq!(store.load(key).len(), 1);
+
+        store.clear_transcript_incomplete(key).unwrap();
+        assert!(!store.transcript_incomplete(key).unwrap());
+
+        assert!(store.delete_session(key).unwrap());
+        assert!(!store.session_path(key).exists());
+
+        // The helper itself must succeed against a real directory handle.
+        sync_directory(tmp.path().join("sessions").as_path()).unwrap();
     }
 
     #[test]
