@@ -28,6 +28,7 @@ Accepted ADRs are immutable. If the architecture changes, write a new ADR and ma
 | [ADR-010](./ADR-010-memory-authority-boundaries.md) | proposed | Session history, curated memory, and enrichment have separate authority boundaries. |
 | [ADR-011](./ADR-011-multi-agent-runtime-boundaries.md) | accepted | Configured agents have explicit runtime boundaries under one daemon. |
 | [ADR-012](./ADR-012-generation-scoped-live-config-apply.md) | proposed | Live config application uses canonical generations and target-specific results. |
+| [ADR-013](./ADR-013-swarm-runtime-boundaries.md) | accepted | Swarms are runtime state with roster-scoped delegation and memory boundaries. |
 
 ADR-006 and ADR-007 are implementation-gated roadmap decisions from [FND-002](../../foundations/fnd-002-documentation-standards.md). Their target directions are recorded, but they remain proposed until the acceptance boundaries in each record ship.
 

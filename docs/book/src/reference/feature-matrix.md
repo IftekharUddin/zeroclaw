@@ -70,6 +70,25 @@ it is **none**. Hermes ships cron and webhook "routines" that pair a trigger wit
 a free-form agent prompt but no deterministic multi-step engine, approval gates,
 or audited run state, so it is **partial** on the trigger side only.
 
+## Swarm support
+
+[Swarms](../agents/swarms.md) are supervised, bounded runs of a small roster of
+ephemeral worker agents ("boxes") that coordinate on one goal, authored and
+driven from the `zeroclaw swarm` terminal UI
+([ADR-013](../architecture/decisions/ADR-013-swarm-runtime-boundaries.md)). This
+row is hand-recorded rather than code-walked: swarm is not part of the channel,
+provider, or tool registries the tables above are generated from.
+
+| Capability | ZeroClaw | OpenClaw | Hermes |
+|---|---|---|---|
+| Supervised multi-box swarm (roster-only delegation, bounded budget, resumable runs) | 🧪 | ❓ | ❓ |
+
+ZeroClaw's swarm runtime is present but new. It is CLI-TUI-only (gateway and web
+parity are a non-goal), and it carries tracked follow-ups
+([known limitations](../agents/swarm-known-limitations.md)), so the capability is
+**experimental**. Parity for OpenClaw and Hermes has not yet been recorded, so
+both are **unknown**.
+
 ## ZeroClaw, OpenClaw, and Hermes
 
 ZeroClaw is a from-scratch runtime, not a fork. The comparison columns state
