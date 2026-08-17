@@ -414,6 +414,8 @@ mod skills;
 #[cfg(feature = "agent-runtime")]
 mod sop;
 #[cfg(feature = "agent-runtime")]
+mod swarm_tui;
+#[cfg(feature = "agent-runtime")]
 mod tools;
 #[cfg(feature = "agent-runtime")]
 mod trust;
@@ -431,7 +433,7 @@ pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
     GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
     ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
-    SopCommands, SopGraphFormat,
+    SopCommands, SopGraphFormat, SwarmCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -892,6 +894,13 @@ Examples:
     Sop {
         #[command(subcommand)]
         sop_command: SopCommands,
+    },
+
+    /// Author and inspect swarms — a dashboard TUI, or one-shot verbs
+    #[cfg(feature = "agent-runtime")]
+    Swarm {
+        #[command(subcommand)]
+        swarm_command: Option<SwarmCommands>,
     },
 
     /// Migrate data from other agent runtimes
@@ -5074,6 +5083,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
             | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
             other => sop::handle_command(other, &config),
         },
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Swarm { swarm_command } => {
+            Box::pin(swarm_tui::handle_command(swarm_command, &config)).await
+        }
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await

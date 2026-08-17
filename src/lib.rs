@@ -1062,6 +1062,24 @@ Examples:
     FlashNucleo,
 }
 
+/// Swarm subcommands. Bare `zeroclaw swarm` opens the dashboard TUI; these
+/// verbs are the one-shot, pipe-safe surface that needs no terminal. Run
+/// control (start / pause / stop) is deliberately absent — a swarm is authored
+/// here and driven elsewhere.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SwarmCommands {
+    /// List stored swarms as plain lines (no TUI; safe to pipe)
+    List,
+    /// Delete a stored swarm
+    Delete {
+        /// Id of the swarm to delete
+        swarm_id: String,
+        /// Delete even while a live run holds the swarm
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 /// SOP management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SopCommands {
