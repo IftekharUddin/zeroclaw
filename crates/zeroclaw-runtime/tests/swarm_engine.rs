@@ -838,11 +838,20 @@ async fn swarm_concurrent_box_turns_admit_at_most_the_turn_budget() {
     for handle in handles {
         match handle.await.expect("join") {
             Ok(_) => admitted += 1,
-            Err(BoxTurnError::BudgetExhausted(BudgetAxis::Turns)) => denied += 1,
+            // Two legitimate denials for an over-budget racer: it either loses the
+            // atomic admission race (`BudgetExhausted`), or it arrives after the
+            // racer that tripped the ceiling already parked the run and tore it
+            // out of the live-run map (`NotRunning`). Which one is scheduling-
+            // dependent; both mean "refused before running, no budget spent".
+            Err(BoxTurnError::BudgetExhausted(BudgetAxis::Turns))
+            | Err(BoxTurnError::NotRunning(_)) => denied += 1,
             Err(other) => panic!("unexpected box turn error: {other}"),
         }
     }
-    assert_eq!(admitted, 2, "exactly the turn budget is admitted");
+    assert_eq!(
+        admitted, 2,
+        "atomic admission admits exactly the turn budget regardless of race order"
+    );
     assert_eq!(
         denied, 2,
         "over-budget delegations are refused before running"

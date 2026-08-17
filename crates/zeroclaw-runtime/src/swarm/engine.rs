@@ -166,6 +166,11 @@ pub enum BoxTurnError {
     /// delegations are held until the user hands it back (`resume`, an explicit
     /// release, or the idle timeout). No turn ran and no budget was spent.
     UserEngaged(String),
+    /// The swarm has no live run: it was never started, or it was parked/stopped
+    /// before this delegation was admitted — e.g. a concurrent delegation
+    /// exhausted the budget and the run was torn down first. No turn ran and no
+    /// budget was spent; distinct from `Turn` (an actual build/agent failure).
+    NotRunning(String),
     /// The box turn itself failed (build or agent error).
     Turn(String),
 }
@@ -181,6 +186,7 @@ impl std::fmt::Display for BoxTurnError {
                 f,
                 "box {box_id:?} is engaged with a user; orchestrator delegation is held until handback"
             ),
+            Self::NotRunning(swarm_id) => write!(f, "swarm {swarm_id:?} has no live run"),
             Self::Turn(msg) => write!(f, "box turn failed: {msg}"),
         }
     }
@@ -1403,7 +1409,7 @@ impl SwarmEngine {
             let runs = self.runs.lock();
             runs.get(swarm_id).map(|live| Arc::clone(&live.state))
         }
-        .ok_or_else(|| BoxTurnError::Turn(format!("swarm {swarm_id:?} is not running")))?;
+        .ok_or_else(|| BoxTurnError::NotRunning(swarm_id.to_string()))?;
         let result = state.run_box_turn(box_id, subtask).await;
         // A driver-less run (begin_run + direct box turns, the S7 RPC path) has
         // no orchestrator loop to notice a budget-park, so if this delegation
