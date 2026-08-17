@@ -286,6 +286,12 @@ pub mod error_codes {
     pub const SWARM_REVISION_CONFLICT: i32 = -32031;
     /// A live run holds the swarm's claim; stop it or pass `force`.
     pub const SWARM_RUN_ACTIVE: i32 = -32032;
+    /// A run-control call (`swarm/pause|resume|stop|chat`) targeted a swarm that
+    /// no live run is driving. Start or resume it first.
+    pub const SWARM_NOT_RUNNING: i32 = -32033;
+    /// A run-control call targeted a terminal swarm (`stopped`/`completed`); it
+    /// is read-only history and cannot be driven again.
+    pub const SWARM_TERMINAL: i32 = -32034;
     // Filesystem RPC errors (internal numeric codes; wire uses string codes e.g. "fs.not_found")
     pub const FS_NOT_FOUND: i32 = 4001;
     pub const FS_PERMISSION_DENIED: i32 = 4002;

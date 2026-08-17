@@ -36,11 +36,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::json;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use zeroclaw_api::model_provider::ModelProvider;
@@ -54,8 +55,11 @@ use crate::agent::dispatcher::NativeToolDispatcher;
 use crate::control_plane::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 use crate::observability::{NoopObserver, Observer};
 use crate::platform::RuntimeAdapter;
+use crate::rpc::session::SessionStore;
+use crate::rpc::steering::SteeringQueue;
 use crate::rpc::turn::{TurnOutcome, execute_turn};
-use crate::swarm::board::{BoxStatus, SwarmStateBoard};
+use crate::rpc::types::{SessionUpdateEvent, SwarmUpdate, TurnCompletionOutcome};
+use crate::swarm::board::{BoardError, BoardEvent, BoxStatus, SwarmStateBoard};
 use crate::swarm::delegate_tool::SwarmDelegateTool;
 use crate::swarm::reap::{ReapReport, reap_swarm};
 use crate::swarm::roster::{RosterBox, SwarmRoster, build_swarm_roster};
@@ -77,6 +81,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// before this in practice; the bound only guarantees the loop can never spin
 /// forever if an orchestrator keeps delegating without ever finishing.
 const MAX_ROUNDS: usize = 10_000;
+
+/// How long a box stays held for the user after the last interjection before it
+/// is handed back to the orchestrator on idle. Reset by every `swarm/chat`;
+/// cleared early by the literal message `resume` or an explicit release.
+const USER_ENGAGED_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Capacity of the per-engine `swarm/update` fan-out channel. A slow subscriber
+/// lags (drops the oldest updates) rather than back-pressuring a box turn.
+const UPDATES_BROADCAST_CAPACITY: usize = 512;
 
 /// Tools a box must never inherit from the parent envelope, on top of the two
 /// [`REENTRANT_AGENT_TOOLS`] (`spawn_subagent` / `delegate`). A box
@@ -149,6 +162,10 @@ pub enum BoxTurnError {
     BudgetExhausted(BudgetAxis),
     /// The named box is not on this swarm's roster.
     UnknownBox(String),
+    /// The box is currently engaged with a user (via `swarm/chat`): orchestrator
+    /// delegations are held until the user hands it back (`resume`, an explicit
+    /// release, or the idle timeout). No turn ran and no budget was spent.
+    UserEngaged(String),
     /// The box turn itself failed (build or agent error).
     Turn(String),
 }
@@ -160,6 +177,10 @@ impl std::fmt::Display for BoxTurnError {
                 write!(f, "swarm budget exhausted on the {} axis", axis.as_str())
             }
             Self::UnknownBox(box_id) => write!(f, "box {box_id:?} is not on this swarm's roster"),
+            Self::UserEngaged(box_id) => write!(
+                f,
+                "box {box_id:?} is engaged with a user; orchestrator delegation is held until handback"
+            ),
             Self::Turn(msg) => write!(f, "box turn failed: {msg}"),
         }
     }
@@ -178,6 +199,8 @@ pub enum SwarmEngineError {
     AlreadyClaimed(String),
     #[error("swarm {swarm_id:?} is not running")]
     NotRunning { swarm_id: String },
+    #[error("box {box_id:?} is not on swarm {swarm_id:?}'s roster")]
+    UnknownBox { swarm_id: String, box_id: String },
     #[error("swarm store error: {0}")]
     Store(#[from] StoreError),
     #[error("roster build failed: {0}")]
@@ -247,6 +270,15 @@ impl SwarmProviderFactory for ConfigSwarmProviderFactory {
     }
 }
 
+/// Identifies the box a streamed turn belongs to: the box id (the `swarm/update`
+/// multiplexing key) and the box's agent session id (the steering-registration
+/// key and the `session_id` stamped into each projected event).
+#[derive(Clone)]
+struct BoxStreamCtx {
+    box_id: String,
+    session_id: String,
+}
+
 /// A live swarm run entry in the engine's registry. The hard-stop token and the
 /// pause flag are reached through `state` and this `pause` handle respectively.
 struct LiveRun {
@@ -305,6 +337,20 @@ pub struct SwarmRunState {
     /// completion. A box's scoped handle refuses the cross-agent deletes reaping
     /// performs, so the driver keeps the admin handle here.
     reap_memory: Arc<dyn Memory>,
+    /// Per-engine fan-out of per-box turn events (projected onto the shared
+    /// session-update vocabulary). Cloned from the engine so every run's box
+    /// turns publish onto the same bus `swarm/subscribe` reads.
+    updates: broadcast::Sender<SwarmUpdate>,
+    /// The daemon's RPC session store, when wired. A box turn registers its
+    /// steering queue + cancel token here under the box's session id, so
+    /// `swarm/chat` (`SessionStore::steer`) can reach the running box turn.
+    /// `None` for a headless engine with no RPC surface (the S6 engine tests).
+    sessions: Option<Arc<SessionStore>>,
+    /// Boxes currently held for a user, `box_id` -> handback deadline. While a
+    /// box is present and its deadline is in the future, orchestrator
+    /// delegations to it are refused. Expiry is lazy (checked at delegation
+    /// admission) so no timer task is needed.
+    user_engaged: Mutex<HashMap<String, Instant>>,
 }
 
 impl SwarmRunState {
@@ -324,6 +370,56 @@ impl SwarmRunState {
     #[must_use]
     pub fn limits(&self) -> SwarmBudgetLimits {
         self.limits
+    }
+
+    /// The agent session id a box speaks through, if the run has minted one.
+    fn box_session_id(&self, box_id: &str) -> Option<String> {
+        self.current.lock().run.sessions.get(box_id).cloned()
+    }
+
+    /// Hold `box_id` for a user: (re)arm the idle-handback deadline. Called by
+    /// `swarm/chat` when a user interjects. Returns whether the box is on the
+    /// roster (a non-roster box is never engaged).
+    fn engage_box_for_user(&self, box_id: &str) -> bool {
+        if self.roster.get(box_id).is_none() {
+            return false;
+        }
+        self.user_engaged.lock().insert(
+            box_id.to_string(),
+            Instant::now() + USER_ENGAGED_IDLE_TIMEOUT,
+        );
+        self.append_event("box_user_engaged", Some(box_id.to_string()), json!({}));
+        true
+    }
+
+    /// Hand `box_id` back to the orchestrator (the `resume` message, an explicit
+    /// release, or expiry). Returns whether the box had been held.
+    fn release_box_for_user(&self, box_id: &str) -> bool {
+        let was_held = self.user_engaged.lock().remove(box_id).is_some();
+        if was_held {
+            self.append_event("box_user_released", Some(box_id.to_string()), json!({}));
+        }
+        was_held
+    }
+
+    /// Whether `box_id` is currently held for a user. Lazily expires a stale
+    /// hold (idle-timeout handback) so no background timer is needed.
+    fn is_box_user_engaged(&self, box_id: &str) -> bool {
+        let mut held = self.user_engaged.lock();
+        match held.get(box_id) {
+            Some(deadline) if *deadline > Instant::now() => true,
+            Some(_) => {
+                held.remove(box_id);
+                drop(held);
+                self.append_event(
+                    "box_user_released",
+                    Some(box_id.to_string()),
+                    json!({"reason": "idle_timeout"}),
+                );
+                false
+            }
+            None => false,
+        }
     }
 
     fn append_event(&self, kind: &str, box_id: Option<String>, payload: serde_json::Value) {
@@ -495,11 +591,19 @@ impl SwarmRunState {
     /// Run one turn for `agent` with `prompt`, measuring tokens + cost. Always
     /// reports a spend of at least one turn, even when the turn errors: a failed
     /// turn still consumed provider calls.
+    ///
+    /// When `stream` is `Some` (a box turn) and an RPC session store is wired,
+    /// the turn is made steerable and observable: a fresh [`SteeringQueue`] is
+    /// registered under the box's session id so `swarm/chat` can fold a user
+    /// message in mid-turn, and every turn event is projected onto the
+    /// `swarm/update` fan-out under that box. An orchestrator planning turn
+    /// (`stream = None`) neither streams nor steers.
     async fn run_turn_with_prompt(
         &self,
         agent_alias: &str,
         prompt: String,
         agent: Agent,
+        stream: Option<BoxStreamCtx>,
     ) -> (SwarmSpend, Result<String, String>) {
         let usage = Arc::new(Mutex::new(TurnUsage::default()));
         let cost_ctx = ToolLoopCostTrackingContext {
@@ -509,33 +613,112 @@ impl SwarmRunState {
             agent_alias: Some(agent_alias.to_string()),
         };
         let attribution = crate::rpc::turn::TurnAttribution {
-            session_key: None,
+            session_key: stream.as_ref().map(|ctx| ctx.session_id.clone()),
             agent_alias: agent_alias.to_string(),
             model_provider: self.spec.provider.clone(),
             model: self.spec.model.clone(),
             channel: "swarm",
         };
+
+        // Steering + a per-turn cancel child, registered under the box session
+        // so `swarm/chat` reaches this turn. Kept `None` for orchestrator turns
+        // and for a headless engine (no session store wired).
+        let mut steering_teardown: Option<(Arc<SessionStore>, String, u64)> = None;
+        let mut turn_cancel = self.cancel.clone();
+        let steer_rx = match (stream.as_ref(), self.sessions.as_ref()) {
+            (Some(ctx), Some(sessions)) => {
+                let child = self.cancel.child_token();
+                let generation = sessions.register_cancel_token(&ctx.session_id, child.clone());
+                let (queue, rx) = SteeringQueue::start();
+                sessions.register_steering(&ctx.session_id, generation, queue);
+                steering_teardown =
+                    Some((Arc::clone(sessions), ctx.session_id.clone(), generation));
+                turn_cancel = child;
+                Some(rx)
+            }
+            _ => None,
+        };
+
+        let on_event = {
+            let updates = self.updates.clone();
+            let swarm_id = self.swarm_id.clone();
+            let stream = stream.clone();
+            move |event: TurnEvent| {
+                if let Some(ctx) = stream.as_ref()
+                    && let Some(update) =
+                        SessionUpdateEvent::from_turn_event(&ctx.session_id, &event, None)
+                {
+                    let _ = updates.send(SwarmUpdate {
+                        swarm_id: swarm_id.clone(),
+                        box_id: ctx.box_id.clone(),
+                        event: update,
+                    });
+                }
+                std::future::ready(())
+            }
+        };
+
         let outcome = execute_turn(
             Arc::new(TokioMutex::new(agent)),
             prompt,
-            self.cancel.clone(),
+            turn_cancel,
             attribution,
             Some(cost_ctx),
-            None,
-            ignore_event,
+            steer_rx,
+            on_event,
         )
         .await;
+
+        if let Some((sessions, session_id, generation)) = steering_teardown {
+            let undelivered = sessions.remove_steering(&session_id, generation);
+            sessions.remove_cancel_token(&session_id, generation);
+            if undelivered > 0 {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(json!({
+                            "swarm_id": self.swarm_id,
+                            "session_id": session_id,
+                            "undelivered": undelivered,
+                        })),
+                    "swarm: box turn ended before draining every queued steering message"
+                );
+            }
+        }
+
         let observed = *usage.lock();
         let spend = SwarmSpend {
             turns: 1,
             tokens: observed.input_tokens.saturating_add(observed.output_tokens),
             cost_usd: observed.cost_usd,
         };
-        let result = match outcome {
-            Ok(TurnOutcome::Completed { text, .. }) => Ok(text),
-            Ok(TurnOutcome::Cancelled { partial_text, .. }) => Ok(partial_text),
-            Err(err) => Err(err.to_string()),
+        let (completion, result) = match outcome {
+            Ok(TurnOutcome::Completed { text, .. }) => (TurnCompletionOutcome::Completed, Ok(text)),
+            Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
+                (TurnCompletionOutcome::Cancelled, Ok(partial_text))
+            }
+            Err(err) => (TurnCompletionOutcome::Failed, Err(err.to_string())),
         };
+
+        // A box turn's terminal event, so a subscriber that renders per-box
+        // streams knows the turn ended (and with what).
+        if let Some(ctx) = stream.as_ref() {
+            let content = match &result {
+                Ok(text) => text.clone(),
+                Err(_) => String::new(),
+            };
+            let _ = self.updates.send(SwarmUpdate {
+                swarm_id: self.swarm_id.clone(),
+                box_id: ctx.box_id.clone(),
+                event: SessionUpdateEvent::TurnComplete {
+                    session_id: ctx.session_id.clone(),
+                    outcome: completion,
+                    content,
+                },
+            });
+        }
+
         (spend, result)
     }
 
@@ -554,6 +737,12 @@ impl SwarmRunState {
             .ok_or_else(|| BoxTurnError::UnknownBox(box_id.to_string()))?
             .clone();
 
+        // A box held for a user answers the user first: orchestrator delegations
+        // are refused (before any budget is spent) until the user hands it back.
+        if self.is_box_user_engaged(box_id) {
+            return Err(BoxTurnError::UserEngaged(box_id.to_string()));
+        }
+
         match self.admit_and_reserve() {
             BudgetAdmission::Exhausted(axis) => return Err(BoxTurnError::BudgetExhausted(axis)),
             BudgetAdmission::Admitted => {}
@@ -571,8 +760,12 @@ impl SwarmRunState {
             .build_box_agent(&entry)
             .await
             .map_err(BoxTurnError::Turn)?;
+        let stream = self.box_session_id(box_id).map(|session_id| BoxStreamCtx {
+            box_id: box_id.to_string(),
+            session_id,
+        });
         let (usage, result) = self
-            .run_turn_with_prompt(&entry.alias, subtask.to_string(), agent)
+            .run_turn_with_prompt(&entry.alias, subtask.to_string(), agent, stream)
             .await;
         // The turn was already debited by `admit_and_reserve`; reconcile only
         // the tokens + cost it actually consumed.
@@ -831,7 +1024,9 @@ impl SwarmRunState {
             };
             let prompt = self.render_orchestrator_prompt(round);
             let orch_alias = format!("swarm/{}/orchestrator", self.swarm_id);
-            let (usage, result) = self.run_turn_with_prompt(&orch_alias, prompt, agent).await;
+            let (usage, result) = self
+                .run_turn_with_prompt(&orch_alias, prompt, agent, None)
+                .await;
             // The planning turn was already debited by `admit_and_reserve`;
             // reconcile only its tokens + cost.
             self.record_usage(usage);
@@ -914,6 +1109,13 @@ pub struct SwarmEngine {
     tasks: Option<Arc<dyn TaskRegistry>>,
     boot_id: String,
     runs: Arc<Mutex<HashMap<String, LiveRun>>>,
+    /// Per-box turn-event fan-out. Every live run publishes its box turns'
+    /// events here; `swarm/subscribe` reads from a filtered subscription.
+    updates: broadcast::Sender<SwarmUpdate>,
+    /// The daemon's RPC session store, wired via [`Self::with_sessions`]. Lets a
+    /// box turn register its steering queue so `swarm/chat` can reach it. `None`
+    /// for a headless engine (the S6 engine tests).
+    sessions: Option<Arc<SessionStore>>,
 }
 
 impl SwarmEngine {
@@ -948,7 +1150,73 @@ impl SwarmEngine {
             tasks,
             boot_id: boot_id.into(),
             runs: Arc::new(Mutex::new(HashMap::new())),
+            updates: broadcast::channel(UPDATES_BROADCAST_CAPACITY).0,
+            sessions: None,
         }
+    }
+
+    /// Wire the daemon's RPC session store so box turns register a steering
+    /// queue under the box's session id (letting `swarm/chat` fold a user
+    /// message into a running box turn) and `swarm/chat` reaches them. Additive:
+    /// a headless engine built without it simply runs box turns un-steerable.
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: Arc<SessionStore>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Subscribe to the per-box turn-event stream for the `swarm/update`
+    /// notification. The receiver carries updates for every swarm; the caller
+    /// filters by `swarm_id`.
+    #[must_use]
+    pub fn subscribe_updates(&self) -> broadcast::Receiver<SwarmUpdate> {
+        self.updates.subscribe()
+    }
+
+    /// Subscribe to a live swarm's state-board change feed for the `swarm/board`
+    /// notification. Errors when the swarm has no live board (not running).
+    pub fn subscribe_board(
+        &self,
+        swarm_id: &str,
+    ) -> Result<broadcast::Receiver<BoardEvent>, BoardError> {
+        self.board.subscribe(swarm_id)
+    }
+
+    /// A live run's shared state, if this engine is driving `swarm_id`.
+    fn live_run(&self, swarm_id: &str) -> Option<Arc<SwarmRunState>> {
+        self.runs
+            .lock()
+            .get(swarm_id)
+            .map(|live| Arc::clone(&live.state))
+    }
+
+    /// The agent session id a box speaks through on a live run, or `None` when
+    /// the swarm is not running or the box is not on the roster.
+    #[must_use]
+    pub fn box_session(&self, swarm_id: &str, box_id: &str) -> Option<String> {
+        self.live_run(swarm_id)?.box_session_id(box_id)
+    }
+
+    /// Hold a box for a user (`swarm/chat`): arm the idle-handback deadline so
+    /// orchestrator delegations to it are refused until handback. Returns
+    /// whether the box exists on a live run's roster.
+    pub fn engage_box_for_user(&self, swarm_id: &str, box_id: &str) -> bool {
+        self.live_run(swarm_id)
+            .is_some_and(|state| state.engage_box_for_user(box_id))
+    }
+
+    /// Hand a box back to the orchestrator (explicit release / the `resume`
+    /// message). Returns whether the box had been held.
+    pub fn release_box_for_user(&self, swarm_id: &str, box_id: &str) -> bool {
+        self.live_run(swarm_id)
+            .is_some_and(|state| state.release_box_for_user(box_id))
+    }
+
+    /// Whether a box is currently held for a user (with lazy idle expiry).
+    #[must_use]
+    pub fn is_box_user_engaged(&self, swarm_id: &str, box_id: &str) -> bool {
+        self.live_run(swarm_id)
+            .is_some_and(|state| state.is_box_user_engaged(box_id))
     }
 
     /// Claim a swarm and bring it to `Running` without starting the orchestrator
@@ -1031,6 +1299,9 @@ impl SwarmEngine {
             pause: Arc::new(AtomicBool::new(false)),
             delegations: AtomicU64::new(0),
             reap_memory: Arc::clone(&self.memory),
+            updates: self.updates.clone(),
+            sessions: self.sessions.clone(),
+            user_engaged: Mutex::new(HashMap::new()),
         });
 
         // Bring the run to Running and mint a session per box (rehydrating any
@@ -1310,10 +1581,6 @@ impl SwarmEngine {
         }
         Ok(recovered)
     }
-}
-
-fn ignore_event(_event: TurnEvent) -> std::future::Ready<()> {
-    std::future::ready(())
 }
 
 fn truncate(text: &str, max: usize) -> String {

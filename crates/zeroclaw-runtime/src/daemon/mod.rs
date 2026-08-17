@@ -742,6 +742,85 @@ pub async fn run(
             None
         };
 
+        // Swarm run-control engine, built next to the store it shares. Needs the
+        // memory backend and a default agent to inherit the parent envelope
+        // from; a daemon with neither (no agents/provider configured) simply has
+        // no live engine and the run-control RPC verbs report that. Recovery
+        // (free prior-boot claims, park orphaned Running swarms) runs once here.
+        let swarm_engine: Option<std::sync::Arc<crate::swarm::SwarmEngine>> = match (
+            rpc_memory.as_ref(),
+            config.agents.keys().min().cloned(),
+        ) {
+            (Some(memory), Some(parent_alias)) => {
+                match zeroclaw_config::policy::SecurityPolicy::for_agent(&config, &parent_alias) {
+                    Ok(policy) => {
+                        let config_arc = std::sync::Arc::new(config.clone());
+                        let pricing = std::sync::Arc::new(
+                            crate::agent::cost::build_model_provider_pricing(&config),
+                        );
+                        let (boot_id, tasks) = match crate::control_plane::control_plane() {
+                            Some(handle) => (
+                                handle.boot_id.clone(),
+                                Some(std::sync::Arc::clone(&handle.store)),
+                            ),
+                            None => (uuid::Uuid::new_v4().to_string(), None),
+                        };
+                        let factory: std::sync::Arc<dyn crate::swarm::SwarmProviderFactory> =
+                            std::sync::Arc::new(crate::swarm::ConfigSwarmProviderFactory::new(
+                                std::sync::Arc::clone(&config_arc),
+                            ));
+                        let workspace_dir = config.agent_workspace_dir(&parent_alias);
+                        let engine = std::sync::Arc::new(
+                            crate::swarm::SwarmEngine::new(
+                                std::sync::Arc::clone(&swarm_store),
+                                crate::swarm::SwarmStateBoard::new(),
+                                std::sync::Arc::clone(memory),
+                                config_arc,
+                                parent_alias,
+                                std::sync::Arc::new(policy),
+                                factory,
+                                pricing,
+                                workspace_dir,
+                                tasks,
+                                boot_id,
+                            )
+                            .with_sessions(std::sync::Arc::clone(&sessions)),
+                        );
+                        let recover_engine = std::sync::Arc::clone(&engine);
+                        zeroclaw_spawn::spawn!(async move {
+                            if let Err(e) = recover_engine.recover().await {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note,
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                                    "swarm engine: restart recovery pass failed"
+                                );
+                            }
+                        });
+                        Some(engine)
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                            "swarm engine: could not resolve the parent security policy; run-control disabled"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -766,6 +845,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             swarm_store,
+            swarm_engine,
             hooks,
         }))
     } else {

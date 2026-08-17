@@ -111,6 +111,10 @@ impl Tool for SwarmDelegateTool {
                 axis.as_str()
             ))),
             Err(err @ BoxTurnError::UnknownBox(_)) => Ok(ToolResult::err(err.to_string())),
+            Err(BoxTurnError::UserEngaged(_)) => Ok(ToolResult::err(format!(
+                "box {box_id} is engaged with a user right now; it will be available again once \
+                 the user hands it back — do not delegate to it until then"
+            ))),
             Err(BoxTurnError::Turn(msg)) => {
                 Ok(ToolResult::err(format!("box {box_id} turn failed: {msg}")))
             }

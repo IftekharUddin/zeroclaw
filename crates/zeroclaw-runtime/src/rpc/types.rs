@@ -1448,6 +1448,82 @@ pub enum SessionUpdateEvent {
     },
 }
 
+impl SessionUpdateEvent {
+    /// Project a live turn event onto the wire-stable session-update vocabulary,
+    /// keyed by `session_id`. The single source of truth for the mapping shared
+    /// by the `session/update` fan-out and the swarm per-box `swarm/update`
+    /// fan-out — a box turn is a real session, so its chunk / tool / usage / plan
+    /// events surface with the same shape a plain session's do. Returns `None`
+    /// for a turn event with no session-update projection.
+    #[must_use]
+    pub fn from_turn_event(
+        session_id: &str,
+        event: &crate::agent::agent::TurnEvent,
+        max_context_tokens: Option<u64>,
+    ) -> Option<Self> {
+        use crate::agent::agent::TurnEvent;
+        let update = match event {
+            TurnEvent::Chunk { delta } => Self::AgentMessageChunk {
+                session_id: session_id.to_string(),
+                text: delta.clone(),
+            },
+            TurnEvent::Thinking { delta } => Self::AgentThoughtChunk {
+                session_id: session_id.to_string(),
+                text: delta.clone(),
+            },
+            TurnEvent::ToolCall { id, name, args } => Self::ToolCall {
+                session_id: session_id.to_string(),
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                raw_input: args.clone(),
+            },
+            TurnEvent::ToolResult {
+                id,
+                name,
+                output,
+                artifact: _,
+            } => Self::ToolResult {
+                session_id: session_id.to_string(),
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                raw_output: output.clone(),
+            },
+            TurnEvent::ApprovalRequest {
+                request_id,
+                tool_name,
+                arguments_summary,
+                timeout_secs,
+            } => Self::ApprovalRequest {
+                session_id: session_id.to_string(),
+                request_id: request_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments_summary: arguments_summary.clone(),
+                timeout_secs: *timeout_secs,
+            },
+            TurnEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+            } => Self::HistoryTrimmed {
+                session_id: session_id.to_string(),
+                dropped_messages: *dropped_messages,
+                kept_turns: *kept_turns,
+                reason: reason.clone(),
+            },
+            TurnEvent::Usage { input_tokens, .. } => Self::ContextUsage {
+                session_id: session_id.to_string(),
+                input_tokens: *input_tokens,
+                max_context_tokens,
+            },
+            TurnEvent::Plan { entries } => Self::Plan {
+                session_id: session_id.to_string(),
+                entries: entries.clone(),
+            },
+        };
+        Some(update)
+    }
+}
+
 /// Wire-stable subset of [`crate::rpc::turn::TurnOutcome`] for
 /// `TurnComplete`. `messages` is intentionally not on the wire — the TUI
 /// rebuilds from streamed chunks.
@@ -1690,6 +1766,101 @@ rpc_type! {
     pub struct SwarmFieldsResult {
         pub steps: Vec<SwarmStepShape>,
     }
+}
+
+// ── Swarm run-control (`swarm/start|pause|resume|stop`) ───────────────
+
+rpc_type! {
+    /// Request payload for every single-swarm run-control verb
+    /// (`swarm/start`, `swarm/pause`, `swarm/resume`, `swarm/stop`) and
+    /// `swarm/subscribe`. They all take exactly a swarm id.
+    pub struct SwarmRunControlParams {
+        pub swarm_id: String,
+    }
+}
+
+rpc_type! {
+    /// Reply for `swarm/start`, `swarm/pause`, and `swarm/resume`: the swarm's
+    /// lifecycle state and spend after the transition, read back from the store
+    /// so the caller never has to guess what the engine landed on (a
+    /// budget-exhausted resume, for instance, re-parks and comes back `paused`).
+    pub struct SwarmRunControlResult {
+        pub swarm_id: String,
+        pub status: crate::swarm::store::SwarmStatus,
+        pub spent: crate::swarm::store::SwarmSpend,
+    }
+}
+
+rpc_type! {
+    /// Reply for `swarm/stop`: the terminal status plus the reap summary, so a
+    /// caller can confirm the roster was torn down cleanly (`reap.warnings`
+    /// empty) in the same round trip that stopped it.
+    pub struct SwarmStopResult {
+        pub swarm_id: String,
+        pub status: crate::swarm::store::SwarmStatus,
+        pub reap: crate::swarm::reap::ReapReport,
+    }
+}
+
+rpc_type! {
+    /// Reply for `swarm/subscribe`. Opt-in: until a client calls this it
+    /// receives no `swarm/update` or `swarm/board` notifications for the swarm,
+    /// so an old client that never learns the method degrades silently.
+    pub struct SwarmSubscribeResult {
+        pub swarm_id: String,
+        pub subscribed: bool,
+    }
+}
+
+rpc_type! {
+    /// Request payload for `swarm/chat`: a user message to one box of a live
+    /// swarm, carrying human (`user`) priority. The literal message `resume`
+    /// hands the box back to the orchestrator instead of steering it.
+    pub struct SwarmChatParams {
+        pub swarm_id: String,
+        pub box_id: String,
+        pub message: String,
+    }
+}
+
+rpc_type! {
+    /// Reply for `swarm/chat`. On an ordinary message `queued` is true and
+    /// `user_engaged` flips true — the box now answers the user first and
+    /// orchestrator delegations to it are held. On the `resume` message
+    /// `released` is true, `queued`/`user_engaged` false, and the orchestrator
+    /// regains the box.
+    pub struct SwarmChatResult {
+        pub swarm_id: String,
+        pub box_id: String,
+        /// The user message was accepted into the box turn's steering queue.
+        pub queued: bool,
+        /// The box is held for the user (orchestrator delegations refused).
+        pub user_engaged: bool,
+        /// A `resume` handed the box back to the orchestrator.
+        pub released: bool,
+    }
+}
+
+/// Params of the `swarm/update` notification: one per-box turn event, projected
+/// onto the shared [`SessionUpdateEvent`] vocabulary. `session_id` inside the
+/// nested event is the box's agent session. This is the sub-turn stream that
+/// closes the "delegate result is final-string-only" gap — a box turn is a real
+/// session, so its chunks, tool calls, usage, and turn completion all flow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmUpdate {
+    pub swarm_id: String,
+    pub box_id: String,
+    pub event: SessionUpdateEvent,
+}
+
+/// Params of the `swarm/board` notification: one state-board transition for a
+/// subscribed swarm (a box publishing status, a task-key claim/release, or the
+/// board being reaped). Coarser than `swarm/update`; a live view renders the
+/// roster grid from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmBoardNotify {
+    pub swarm_id: String,
+    pub event: crate::swarm::board::BoardEvent,
 }
 
 #[cfg(test)]

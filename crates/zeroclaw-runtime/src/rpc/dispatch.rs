@@ -34,6 +34,10 @@ pub const RPC_PROTOCOL_VERSION: u64 = 1;
 mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
+    /// One per-box turn event on a subscribed swarm (opt-in via `swarm/subscribe`).
+    pub const SWARM_UPDATE: &str = "swarm/update";
+    /// One state-board transition on a subscribed swarm.
+    pub const SWARM_BOARD: &str = "swarm/board";
 }
 
 struct StatusRuntimeContext {
@@ -198,6 +202,14 @@ pub enum Method {
     SwarmDelete,
     SwarmFields,
     SwarmValidate,
+    // Swarm run-control + live stream + interjection (S7). Additive: an old
+    // client that never learns these degrades on method-not-found.
+    SwarmStart,
+    SwarmPause,
+    SwarmResume,
+    SwarmStop,
+    SwarmSubscribe,
+    SwarmChat,
 }
 
 impl Method {
@@ -317,6 +329,12 @@ impl Method {
         (Method::SwarmDelete, "swarm/delete"),
         (Method::SwarmFields, "swarm/fields"),
         (Method::SwarmValidate, "swarm/validate"),
+        (Method::SwarmStart, "swarm/start"),
+        (Method::SwarmPause, "swarm/pause"),
+        (Method::SwarmResume, "swarm/resume"),
+        (Method::SwarmStop, "swarm/stop"),
+        (Method::SwarmSubscribe, "swarm/subscribe"),
+        (Method::SwarmChat, "swarm/chat"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -368,6 +386,28 @@ fn swarm_store_err(e: crate::swarm::store::StoreError) -> JsonRpcError {
         _ => INTERNAL_ERROR,
     };
     rpc_err(code, e.to_string())
+}
+
+/// Map a swarm engine (run-control) failure onto the wire. Each variant a
+/// client reacts to differently gets its own code; an unknown swarm or box stays
+/// `INVALID_PARAMS` (a caller error, as the read surface established), a lost
+/// revision race keeps the store's own code, and infrastructure faults fall to
+/// `INTERNAL_ERROR`.
+fn swarm_engine_err(e: crate::swarm::engine::SwarmEngineError) -> JsonRpcError {
+    use crate::swarm::engine::SwarmEngineError;
+    match e {
+        SwarmEngineError::NotFound(id) => {
+            rpc_err(INVALID_PARAMS, format!("swarm '{id}' not found"))
+        }
+        SwarmEngineError::UnknownBox { .. } => rpc_err(INVALID_PARAMS, e.to_string()),
+        SwarmEngineError::Terminal(_) => rpc_err(SWARM_TERMINAL, e.to_string()),
+        SwarmEngineError::AlreadyClaimed(_) => rpc_err(SWARM_RUN_ACTIVE, e.to_string()),
+        SwarmEngineError::NotRunning { .. } => rpc_err(SWARM_NOT_RUNNING, e.to_string()),
+        SwarmEngineError::Store(store) => swarm_store_err(store),
+        SwarmEngineError::Roster(_) | SwarmEngineError::Board(_) => {
+            rpc_err(INTERNAL_ERROR, e.to_string())
+        }
+    }
 }
 
 /// Refuse an edit whose base revision is no longer current. Guards the write
@@ -970,6 +1010,12 @@ impl RpcDispatcher {
             Method::SwarmDelete => self.handle_swarm_delete(&req.params),
             Method::SwarmFields => self.handle_swarm_fields(&req.params).await,
             Method::SwarmValidate => self.handle_swarm_validate(&req.params),
+            Method::SwarmStart => self.handle_swarm_start(&req.params).await,
+            Method::SwarmPause => self.handle_swarm_pause(&req.params).await,
+            Method::SwarmResume => self.handle_swarm_resume(&req.params).await,
+            Method::SwarmStop => self.handle_swarm_stop(&req.params).await,
+            Method::SwarmSubscribe => self.handle_swarm_subscribe(&req.params).await,
+            Method::SwarmChat => self.handle_swarm_chat(&req.params).await,
         };
 
         if is_notification {
@@ -4994,6 +5040,236 @@ impl RpcDispatcher {
         to_result(body)
     }
 
+    // ── Swarm run-control + live stream + interjection (S7) ──────────
+
+    /// The live run-control engine, or a wire error when this daemon built none
+    /// (no agents / provider, or an embedded host). The read/authoring surface
+    /// works off the store alone; only the run-control verbs need the engine.
+    fn swarm_engine(&self) -> Result<&Arc<crate::swarm::SwarmEngine>, JsonRpcError> {
+        self.ctx.swarm_engine.as_ref().ok_or_else(|| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "swarm run-control is not available on this daemon",
+            )
+        })
+    }
+
+    /// Read a swarm's post-transition run state (status + spend) back from the
+    /// store, so a run-control reply reports what the engine actually landed on.
+    fn swarm_run_control_result(&self, swarm_id: &str) -> RpcResult {
+        let stored = self.load_swarm_or_reject(swarm_id)?;
+        to_result(SwarmRunControlResult {
+            swarm_id: swarm_id.to_string(),
+            status: stored.run.status,
+            spent: stored.run.spent,
+        })
+    }
+
+    /// Claim a swarm and start its orchestrator driver.
+    async fn handle_swarm_start(&self, params: &Value) -> RpcResult {
+        let req: SwarmRunControlParams = parse_params(params)?;
+        let engine = self.swarm_engine()?;
+        engine
+            .start(&req.swarm_id)
+            .await
+            .map_err(swarm_engine_err)?;
+        self.swarm_run_control_result(&req.swarm_id)
+    }
+
+    /// Finish the in-flight round, then hold the swarm at `Paused{UserRequested}`.
+    async fn handle_swarm_pause(&self, params: &Value) -> RpcResult {
+        let req: SwarmRunControlParams = parse_params(params)?;
+        let engine = self.swarm_engine()?;
+        engine
+            .pause(&req.swarm_id)
+            .await
+            .map_err(swarm_engine_err)?;
+        self.swarm_run_control_result(&req.swarm_id)
+    }
+
+    /// Re-claim a paused swarm, rehydrate its box sessions, and resume driving.
+    async fn handle_swarm_resume(&self, params: &Value) -> RpcResult {
+        let req: SwarmRunControlParams = parse_params(params)?;
+        let engine = self.swarm_engine()?;
+        engine
+            .resume(&req.swarm_id)
+            .await
+            .map_err(swarm_engine_err)?;
+        self.swarm_run_control_result(&req.swarm_id)
+    }
+
+    /// Hard-stop a run: cancel in-flight work, reap the roster, mark `Stopped`.
+    async fn handle_swarm_stop(&self, params: &Value) -> RpcResult {
+        let req: SwarmRunControlParams = parse_params(params)?;
+        let engine = self.swarm_engine()?;
+        let report = engine.stop(&req.swarm_id).await.map_err(swarm_engine_err)?;
+        let stored = self.load_swarm_or_reject(&req.swarm_id)?;
+        to_result(SwarmStopResult {
+            swarm_id: req.swarm_id,
+            status: stored.run.status,
+            reap: report,
+        })
+    }
+
+    /// Opt into a swarm's live streams. Spawns a per-connection fan-out that
+    /// forwards per-box turn events as `swarm/update` notifications and
+    /// state-board transitions as `swarm/board` notifications until the
+    /// connection closes. Mirrors `logs/subscribe`.
+    async fn handle_swarm_subscribe(&self, params: &Value) -> RpcResult {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let req: SwarmRunControlParams = parse_params(params)?;
+        let engine = self.swarm_engine()?;
+
+        // The turn-event bus is engine-wide (filter by swarm id); the board feed
+        // is per-swarm and only exists while the swarm is running, so it is
+        // best-effort at subscribe time.
+        let mut updates_rx = engine.subscribe_updates();
+        let mut board_rx = engine.subscribe_board(&req.swarm_id).ok();
+
+        let rpc = self.rpc.clone();
+        let swarm_id = req.swarm_id.clone();
+        zeroclaw_spawn::spawn!(async move {
+            loop {
+                let board_recv = async {
+                    match board_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    () = rpc.closed() => break,
+                    update = updates_rx.recv() => match update {
+                        Ok(update) => {
+                            if update.swarm_id != swarm_id {
+                                continue;
+                            }
+                            if let Ok(params) = serde_json::to_value(&update) {
+                                let n = JsonRpcNotification::new(notification::SWARM_UPDATE, params);
+                                if let Ok(s) = serde_json::to_string(&n)
+                                    && !rpc.send_raw(s).await
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        // The engine (and its update bus) outlives every
+                        // connection, so Closed here means the daemon is gone.
+                        Err(RecvError::Closed) => break,
+                    },
+                    board = board_recv => match board {
+                        Ok(event) => {
+                            let notify = SwarmBoardNotify {
+                                swarm_id: swarm_id.clone(),
+                                event: event.clone(),
+                            };
+                            if let Ok(params) = serde_json::to_value(&notify) {
+                                let n = JsonRpcNotification::new(notification::SWARM_BOARD, params);
+                                if let Ok(s) = serde_json::to_string(&n)
+                                    && !rpc.send_raw(s).await
+                                {
+                                    break;
+                                }
+                            }
+                            if matches!(event, crate::swarm::board::BoardEvent::Reaped) {
+                                // The board is gone; stop polling it but keep
+                                // forwarding turn events (a resume rebuilds it,
+                                // and the client can re-subscribe for a fresh
+                                // board feed).
+                                board_rx = None;
+                            }
+                        }
+                        // A lagged or closed board feed stops the board half only.
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => board_rx = None,
+                    },
+                }
+            }
+        });
+
+        to_result(SwarmSubscribeResult {
+            swarm_id: req.swarm_id,
+            subscribed: true,
+        })
+    }
+
+    /// Interject a user message into one box of a live swarm, carrying human
+    /// (`user`) priority. The literal message `resume` hands the box back to the
+    /// orchestrator; any other message is folded into the box's running turn
+    /// ahead of any queued orchestrator steer, and flips the box to
+    /// `user_engaged` so orchestrator delegations to it are held until handback.
+    async fn handle_swarm_chat(&self, params: &Value) -> RpcResult {
+        use crate::rpc::steering::SteeringError;
+
+        let req: SwarmChatParams = parse_params(params)?;
+        let engine = self.swarm_engine()?;
+
+        // Resolving the box's live session both proves the swarm is running and
+        // that the box is on its roster.
+        let session_id = engine
+            .box_session(&req.swarm_id, &req.box_id)
+            .ok_or_else(|| {
+                rpc_err(
+                    SWARM_NOT_RUNNING,
+                    format!(
+                        "box '{}' of swarm '{}' is not running (start or resume the swarm first)",
+                        req.box_id, req.swarm_id
+                    ),
+                )
+            })?;
+
+        // Handback: `resume` returns the box to the orchestrator without steering.
+        if req.message.trim() == "resume" {
+            engine.release_box_for_user(&req.swarm_id, &req.box_id);
+            return to_result(SwarmChatResult {
+                swarm_id: req.swarm_id,
+                box_id: req.box_id,
+                queued: false,
+                user_engaged: false,
+                released: true,
+            });
+        }
+
+        if req.message.trim().is_empty() {
+            return Err(rpc_err(INVALID_PARAMS, "Chat message cannot be empty"));
+        }
+
+        match self.ctx.sessions.steer(
+            &session_id,
+            None,
+            crate::rpc::steering::SteeringClass::User,
+            req.message.clone(),
+        ) {
+            Ok(_generation) => {
+                // Only claim the box for the user once the steer landed on a real
+                // in-flight turn, so a failed steer never strands the box.
+                engine.engage_box_for_user(&req.swarm_id, &req.box_id);
+                to_result(SwarmChatResult {
+                    swarm_id: req.swarm_id,
+                    box_id: req.box_id,
+                    queued: true,
+                    user_engaged: true,
+                    released: false,
+                })
+            }
+            Err(err @ (SteeringError::NoTurnInFlight | SteeringError::TurnEnded)) => Err(rpc_err(
+                SWARM_NOT_RUNNING,
+                format!(
+                    "box '{}' has no turn in flight to interject into: {err}",
+                    req.box_id
+                ),
+            )),
+            Err(err @ SteeringError::StaleGeneration { .. }) => {
+                Err(rpc_err(SESSION_STEER_STALE_GENERATION, format!("{err}")))
+            }
+            Err(err @ SteeringError::QueueFull) => {
+                Err(rpc_err(SESSION_STEER_QUEUE_FULL, format!("{err}")))
+            }
+        }
+    }
+
     /// Resolve selectable values for a domain-typed tool parameter.
     /// Params: `{ domain, agent?, args? }`. `domain` is an
     /// `OptionDomain` wire name (e.g. `peer_targets`); `agent` scopes
@@ -5268,67 +5544,7 @@ fn notification_for_turn_event(
     event: &TurnEvent,
     max_context_tokens: Option<u64>,
 ) -> Option<String> {
-    let update = match event {
-        TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
-            session_id: session_id.to_string(),
-            text: delta.clone(),
-        },
-        TurnEvent::Thinking { delta } => SessionUpdateEvent::AgentThoughtChunk {
-            session_id: session_id.to_string(),
-            text: delta.clone(),
-        },
-        TurnEvent::ToolCall { id, name, args } => SessionUpdateEvent::ToolCall {
-            session_id: session_id.to_string(),
-            tool_call_id: id.clone(),
-            name: name.clone(),
-            raw_input: args.clone(),
-        },
-        // The RPC/SessionUpdateEvent surface forwards the text output only; file
-        // attachment happens on the direct ACP path, so `artifact` is not needed here.
-        TurnEvent::ToolResult {
-            id,
-            name,
-            output,
-            artifact: _,
-        } => SessionUpdateEvent::ToolResult {
-            session_id: session_id.to_string(),
-            tool_call_id: id.clone(),
-            name: name.clone(),
-            raw_output: output.clone(),
-        },
-        TurnEvent::ApprovalRequest {
-            request_id,
-            tool_name,
-            arguments_summary,
-            timeout_secs,
-        } => SessionUpdateEvent::ApprovalRequest {
-            session_id: session_id.to_string(),
-            request_id: request_id.clone(),
-            tool_name: tool_name.clone(),
-            arguments_summary: arguments_summary.clone(),
-            timeout_secs: *timeout_secs,
-        },
-        TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            kept_turns,
-            reason,
-        } => SessionUpdateEvent::HistoryTrimmed {
-            session_id: session_id.to_string(),
-            dropped_messages: *dropped_messages,
-            kept_turns: *kept_turns,
-            reason: reason.clone(),
-        },
-        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
-            session_id: session_id.to_string(),
-            input_tokens: *input_tokens,
-            max_context_tokens,
-        },
-        TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
-            session_id: session_id.to_string(),
-            entries: entries.clone(),
-        },
-    };
-
+    let update = SessionUpdateEvent::from_turn_event(session_id, event, max_context_tokens)?;
     let params = serde_json::to_value(update).ok()?;
     let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
     serde_json::to_string(&n).ok()
@@ -11047,6 +11263,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: Some(Arc::new(runner)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -11091,6 +11308,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: Some(Arc::new(runner)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -11192,6 +11410,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: Some(Arc::new(runner)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
