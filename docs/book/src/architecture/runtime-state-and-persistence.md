@@ -26,6 +26,7 @@ move it). The current layout is:
 │   │   └── acp-sessions.db     # ACP protocol sessions
 │   ├── cron/jobs.db            # scheduled job state
 │   ├── sop/runs.db             # optional durable SOP run state
+│   ├── swarms/swarms.db        # supervised swarm run state
 │   ├── control_plane.db        # task supervision records
 │   ├── state/
 │   │   ├── runtime-trace.jsonl # persisted logs
@@ -55,6 +56,7 @@ new runtime state should be described in terms of `<install>/data/`,
 | Cron jobs | Declarative config membership plus cron SQLite store | `data/cron/jobs.db` | `zeroclaw-runtime::cron` scheduler/store | Read paths do not create `jobs.db`; scheduler owns due/lock state | Declarative jobs are reconciled from config, while run metadata and locks live in the cron DB. |
 | SOP runs | `SopEngine` plus `SopRunStore` | None by default; `data/sop/runs.db` when durable SQLite initialization succeeds | SOP engine active/finished run caches | The durable store owns admission claims and persisted revisions; the engine restores active and terminal state on startup | Store initialization failure logs a warning and falls back to memory. Memory-backed audit records are not the run-lifecycle source of truth. |
 | Background task supervision | Durable task control plane | `data/control_plane.db` | control-plane handle, task producers, and reaper | Owner PID/boot ID identifies prior-boot orphans; heartbeat timeout applies only to producers that emit heartbeats | Current delegate/subagent producers register best-effort rows but leave heartbeat, parent, route, and principal fields absent. Goal APIs exist, but end-to-end goal execution is not yet wired. |
+| Swarm runs | Durable swarm store (`SqliteSwarmStore`) | `data/swarms/swarms.db` | swarm engine roster/board/claim state, plus the RPC read handle set via `set_swarm_store` | Always-durable SQLite opened at boot and in the RPC context; every save is revision-guarded (compare-and-set) and a claim token stamped with the owning boot id serializes the single live driver. A `TaskKind::Swarm` control-plane record supervises the run | Swarm state is runtime state, not config: the v3 schema dropped the `[swarms]` config table (see [ADR-013](./decisions/ADR-013-swarm-runtime-boundaries.md)). A spec including its resolved budget is copied in at create time, so retuning a preset never rewrites a stored swarm. Boxes are ephemeral: the reap cascade deletes a run's derived box identities and their memory attribution; nothing is written to `[agents.*]`. |
 | Background delegate results | Delegate result record | `<workspace>/delegate_results/<task-id>.json` | delegate tool cancellation registry and running future | Result files survive restart; live cancellation handles do not | Reads are file-first and overlay only `lost` or `timed_out` supervision when the file still says `running`; result and control-plane writes are independent and can diverge. |
 | Runtime logs | `zeroclaw-log` event schema and subscriber layer | `data/state/runtime-trace.jsonl` when persistence is enabled | broadcast hook, JSONL writer, `/api/logs` reader, `Observer` bridge | Rolling/full/none persistence is config-controlled; dashboard SSE receives events even when JSONL is disabled | Logs are evidence and observability, not the source of user config or session state. |
 | Cost ledger | `CostTracker` plus rate config | `data/state/costs.jsonl` | process-global `CostTracker` | Reload hot-swaps `CostConfig`; the tracker is constructed on demand if cost tracking becomes enabled | Existing records keep their recorded price; rate edits affect future requests after reload. |
@@ -85,6 +87,7 @@ At minimum, include:
 - `data/sessions/`
 - `data/cron/jobs.db` if cron jobs are configured through runtime surfaces
 - `data/sop/runs.db` if durable SOP runs are enabled
+- `data/swarms/swarms.db` if swarm run history matters
 - `data/control_plane.db` if supervised task history matters
 - `data/state/costs.jsonl` if cost history matters
 - `data/state/runtime-trace.jsonl` if logs are needed for incident review
@@ -102,6 +105,7 @@ the instance.
 - RPC live sessions: `crates/zeroclaw-runtime/src/rpc/session.rs`
 - Cron persistence: `crates/zeroclaw-runtime/src/cron/store.rs`
 - SOP persistence: `crates/zeroclaw-runtime/src/sop/store/`
+- Swarm persistence and engine: `crates/zeroclaw-runtime/src/swarm/store/`, `crates/zeroclaw-runtime/src/swarm/engine.rs`
 - Background task and goal supervision: `crates/zeroclaw-runtime/src/control_plane/`
 - Background delegation results: `crates/zeroclaw-runtime/src/tools/delegate.rs`
 - Logs: `crates/zeroclaw-log/`
