@@ -37,9 +37,22 @@ pub trait SwarmStore: Send + Sync {
     fn delete_swarm(&self, swarm_id: &str) -> Result<bool, StoreError>;
 
     // ── CAS ownership (exactly one driver per swarm) ──
-    /// Take ownership of a non-terminal, unclaimed swarm. `Ok(None)` means a
+    /// Take ownership of a non-terminal, unclaimed swarm, stamping the claim
+    /// with the owning `boot_id` so restart recovery can tell a live claim (the
+    /// current boot) from a dead one (a prior boot). `Ok(None)` means a
     /// concurrent winner holds it, or the swarm has already finished.
-    fn try_claim_swarm(&self, swarm_id: &str) -> Result<Option<SwarmClaimToken>, StoreError>;
+    fn try_claim_swarm_with_boot(
+        &self,
+        swarm_id: &str,
+        boot_id: &str,
+    ) -> Result<Option<SwarmClaimToken>, StoreError>;
+    /// Boot-agnostic claim: the swarm-delete probe path, which only needs to
+    /// learn whether a live driver holds the swarm. Stamps an empty boot id; a
+    /// driver that must survive restart recovery claims through
+    /// [`Self::try_claim_swarm_with_boot`] instead.
+    fn try_claim_swarm(&self, swarm_id: &str) -> Result<Option<SwarmClaimToken>, StoreError> {
+        self.try_claim_swarm_with_boot(swarm_id, "")
+    }
     /// Extend this token's lease. `ClaimLost` when the claim is gone or now
     /// belongs to a different holder — the caller must stop driving the swarm.
     fn heartbeat_claim(&self, token: &SwarmClaimToken) -> Result<(), StoreError>;
@@ -48,6 +61,11 @@ pub trait SwarmStore: Send + Sync {
     fn release_claim(&self, token: &SwarmClaimToken) -> Result<(), StoreError>;
     /// Reaper source: claims whose lease expired at/<= `now_iso`.
     fn expired_claims(&self, now_iso: &str) -> Result<Vec<SwarmClaimToken>, StoreError>;
+    /// Restart-recovery source: every claim NOT stamped with `boot_id`. A claim
+    /// from a prior process is dead regardless of lease age or run status, so
+    /// this returns foreign claims unconditionally — the current boot's own
+    /// live claims are never included.
+    fn claims_not_held_by_boot(&self, boot_id: &str) -> Result<Vec<SwarmClaimToken>, StoreError>;
 
     // ── append-only event log ──
     /// Append-only, monotonic-seq, never-overwrite. Returns the assigned seq.
@@ -170,8 +188,9 @@ fn open_durable_store(data_dir: &Path) -> Result<SqliteSwarmStore, StoreError> {
 /// could renew its successor's lease.
 static CLAIM_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Mint a fresh claim for this process at the default lease.
-fn mint_claim(swarm_id: &str) -> SwarmClaimToken {
+/// Mint a fresh claim for this process at the default lease, stamped with the
+/// owning `boot_id`.
+fn mint_claim(swarm_id: &str, boot_id: &str) -> SwarmClaimToken {
     let now = Utc::now();
     let nonce = CLAIM_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     SwarmClaimToken {
@@ -179,6 +198,7 @@ fn mint_claim(swarm_id: &str) -> SwarmClaimToken {
         claimed_at: now.to_rfc3339(),
         lease_expires: (now + Duration::seconds(DEFAULT_CLAIM_LEASE_SECS)).to_rfc3339(),
         holder: format!("pid-{}-{nonce}", std::process::id()),
+        boot_id: boot_id.to_string(),
     }
 }
 
@@ -289,7 +309,11 @@ impl SwarmStore for InMemorySwarmStore {
         Ok(removed)
     }
 
-    fn try_claim_swarm(&self, swarm_id: &str) -> Result<Option<SwarmClaimToken>, StoreError> {
+    fn try_claim_swarm_with_boot(
+        &self,
+        swarm_id: &str,
+        boot_id: &str,
+    ) -> Result<Option<SwarmClaimToken>, StoreError> {
         let mut g = self.lock()?;
         if g.claims.contains_key(swarm_id) {
             return Ok(None);
@@ -301,7 +325,7 @@ impl SwarmStore for InMemorySwarmStore {
         {
             return Ok(None);
         }
-        let token = mint_claim(swarm_id);
+        let token = mint_claim(swarm_id, boot_id);
         g.claims.insert(swarm_id.to_string(), token.clone());
         Ok(Some(token))
     }
@@ -339,6 +363,18 @@ impl SwarmStore for InMemorySwarmStore {
             .claims
             .values()
             .filter(|c| c.lease_expires.as_str() <= now_iso)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.swarm_id.cmp(&b.swarm_id));
+        Ok(out)
+    }
+
+    fn claims_not_held_by_boot(&self, boot_id: &str) -> Result<Vec<SwarmClaimToken>, StoreError> {
+        let g = self.lock()?;
+        let mut out: Vec<SwarmClaimToken> = g
+            .claims
+            .values()
+            .filter(|c| c.boot_id != boot_id)
             .cloned()
             .collect();
         out.sort_by(|a, b| a.swarm_id.cmp(&b.swarm_id));
@@ -600,6 +636,56 @@ pub(crate) mod conformance {
         assert_eq!(expired[0].holder, token.holder);
     }
 
+    pub(crate) fn claims_are_scoped_to_owning_boot(store: &dyn SwarmStore) {
+        for id in ["s1", "s2", "s3"] {
+            store
+                .save_swarm(&swarm(id, "2020-01-01T00:00:00Z"))
+                .expect("save");
+        }
+        let a = store
+            .try_claim_swarm_with_boot("s1", "boot-a")
+            .expect("claim")
+            .expect("claim wins");
+        let b = store
+            .try_claim_swarm_with_boot("s2", "boot-b")
+            .expect("claim")
+            .expect("claim wins");
+        // The owning boot's own claim is never foreign to itself.
+        assert_eq!(a.boot_id, "boot-a");
+        assert_eq!(b.boot_id, "boot-b");
+
+        let foreign_to_a = store.claims_not_held_by_boot("boot-a").expect("scan");
+        assert_eq!(
+            foreign_to_a
+                .iter()
+                .map(|c| c.swarm_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s2"],
+            "boot-a sees only the other boot's claim as reclaimable"
+        );
+
+        let foreign_to_b = store.claims_not_held_by_boot("boot-b").expect("scan");
+        assert_eq!(
+            foreign_to_b
+                .iter()
+                .map(|c| c.swarm_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1"]
+        );
+
+        // A third, unrelated boot inherits every existing claim: every one is
+        // from a process that is not it.
+        let foreign_to_c = store.claims_not_held_by_boot("boot-c").expect("scan");
+        assert_eq!(
+            foreign_to_c
+                .iter()
+                .map(|c| c.swarm_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2"],
+            "a claim from any prior boot is dead regardless of lease age"
+        );
+    }
+
     pub(crate) fn events_are_append_only_and_ordered(store: &dyn SwarmStore) {
         assert_eq!(
             store
@@ -699,6 +785,11 @@ mod tests {
     #[test]
     fn in_memory_expired_claims_match_past_due_leases() {
         conformance::expired_claims_match_past_due_leases(&store());
+    }
+
+    #[test]
+    fn in_memory_claims_are_scoped_to_owning_boot() {
+        conformance::claims_are_scoped_to_owning_boot(&store());
     }
 
     #[test]

@@ -607,8 +607,10 @@ async fn swarm_restart_recovery_parks_and_resume_rehydrates() {
             .insert("box-2".to_string(), "sess-box-2".to_string());
         store.save_swarm(&swarm).expect("save running");
     }
+    // A prior boot claimed it (fresh, unexpired lease). The recovering engine
+    // runs under a different boot ("boot-test").
     let _claim = store
-        .try_claim_swarm("s-recover")
+        .try_claim_swarm_with_boot("s-recover", "boot-dead")
         .expect("claim")
         .expect("claim wins");
 
@@ -622,12 +624,9 @@ async fn swarm_restart_recovery_parks_and_resume_rehydrates() {
     });
     let engine = h.engine(Arc::clone(&store), factory, HashMap::new(), None);
 
-    // The live claim is fresh (not expired), so recover with a far-future "now"
-    // to exercise the expired-lease path deterministically.
-    let recovered = engine
-        .recover_at("2999-01-01T00:00:00Z")
-        .await
-        .expect("recover");
+    // The prior boot's lease is still live, but recovery keys on the owning boot
+    // id, not the lease age: a claim from a dead process is reclaimed regardless.
+    let recovered = engine.recover().await.expect("recover");
     assert_eq!(recovered, vec!["s-recover".to_string()]);
     let run = store.load_swarm("s-recover").unwrap().unwrap().run;
     assert_eq!(
@@ -791,5 +790,177 @@ async fn swarm_stop_cancels_and_reaps_cleanly() {
     assert_eq!(
         store.load_swarm("s-stop").unwrap().unwrap().run.status,
         SwarmStatus::Stopped
+    );
+}
+
+// ── (f) atomic budget admission under concurrency ────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swarm_concurrent_box_turns_admit_at_most_the_turn_budget() {
+    let h = Harness::new();
+    let store: Arc<dyn SwarmStore> = Arc::new(InMemorySwarmStore::new());
+    // Two turns permitted; tokens/cost unbounded so only the turns axis can trip.
+    save_created(
+        &store,
+        spec_with("s-atomic", 2, custom(2, u64::MAX, f64::MAX)),
+    );
+
+    // A gate holds each admitted box turn open in the provider call, maximizing
+    // the overlap of concurrent delegations: under the old read-then-write
+    // admission every racer would read the same stale spend and over-admit.
+    let (started_tx, _started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(TurnGate {
+        started: started_tx,
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let factory: Arc<dyn SwarmProviderFactory> = Arc::new(ScriptedFactory {
+        orch_queue: Arc::new(StdMutex::new(VecDeque::new())),
+        orch_fallback: Reply::final_text("done"),
+        box_reply: Reply::box_result("ok", 0, 0),
+        box_gate: Some(Arc::clone(&gate)),
+    });
+    let engine = h.engine(Arc::clone(&store), factory, HashMap::new(), None);
+    engine.begin_run("s-atomic").await.expect("begin");
+
+    // Four delegations race the two-turn budget at once.
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let e = Arc::clone(&engine);
+        handles.push(zeroclaw_spawn::spawn!(async move {
+            e.run_box_turn("s-atomic", "box-1", "work").await
+        }));
+    }
+    // Let every admitted (blocked) box turn finish.
+    gate.release.add_permits(64);
+
+    let mut admitted = 0;
+    let mut denied = 0;
+    for handle in handles {
+        match handle.await.expect("join") {
+            Ok(_) => admitted += 1,
+            Err(BoxTurnError::BudgetExhausted(BudgetAxis::Turns)) => denied += 1,
+            Err(other) => panic!("unexpected box turn error: {other}"),
+        }
+    }
+    assert_eq!(admitted, 2, "exactly the turn budget is admitted");
+    assert_eq!(
+        denied, 2,
+        "over-budget delegations are refused before running"
+    );
+
+    let run = store.load_swarm("s-atomic").unwrap().unwrap().run;
+    assert_eq!(
+        run.spent.turns, 2,
+        "atomic admission never lets recorded spend exceed the ceiling"
+    );
+    assert_eq!(
+        run.status,
+        SwarmStatus::Paused {
+            reason: SwarmPauseReason::BudgetExhausted
+        }
+    );
+}
+
+// ── (g) claim lifecycle: driver-less pause + prior-boot recovery ──────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swarm_pause_on_begin_run_releases_claim_and_resume_succeeds() {
+    let h = Harness::new();
+    let store: Arc<dyn SwarmStore> = Arc::new(InMemorySwarmStore::new());
+    save_created(
+        &store,
+        spec_with("s-begin", 2, custom(100, 10_000_000, 1000.0)),
+    );
+
+    let factory: Arc<dyn SwarmProviderFactory> = Arc::new(ScriptedFactory {
+        orch_queue: Arc::new(StdMutex::new(VecDeque::new())),
+        orch_fallback: Reply::final_text("nothing to do"),
+        box_reply: Reply::box_result("ok", 1, 1),
+        box_gate: None,
+    });
+    let engine = h.engine(Arc::clone(&store), factory, HashMap::new(), None);
+
+    // A driver-less run (begin_run holds the claim + heartbeat but starts no
+    // orchestrator loop).
+    engine.begin_run("s-begin").await.expect("begin");
+    engine.pause("s-begin").await.expect("pause");
+
+    assert_eq!(
+        store.load_swarm("s-begin").unwrap().unwrap().run.status,
+        SwarmStatus::Paused {
+            reason: SwarmPauseReason::UserRequested
+        },
+        "a driver-less pause must park the run"
+    );
+
+    // The pause released the claim + cancelled the heartbeat, so a resume can
+    // re-claim it (before the fix the heartbeat kept the lease alive and this
+    // failed AlreadyClaimed).
+    engine
+        .resume("s-begin")
+        .await
+        .expect("resume must succeed after a begin_run pause released the claim");
+    wait_for_status(&store, "s-begin", |s| s.is_terminal(), "resumed completion").await;
+    assert_eq!(
+        store.load_swarm("s-begin").unwrap().unwrap().run.status,
+        SwarmStatus::Completed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swarm_recover_reclaims_prior_boot_claim_even_when_paused_with_live_lease() {
+    let h = Harness::new();
+    let store: Arc<dyn SwarmStore> = Arc::new(InMemorySwarmStore::new());
+    save_created(
+        &store,
+        spec_with("s-wedge", 2, custom(100, 10_000_000, 1000.0)),
+    );
+
+    // A prior boot budget-parked the swarm (non-Running) then crashed, leaking
+    // its claim with a still-live lease.
+    {
+        let mut swarm = store.load_swarm("s-wedge").unwrap().unwrap();
+        swarm.revision += 1;
+        swarm.run.status = SwarmStatus::Paused {
+            reason: SwarmPauseReason::BudgetExhausted,
+        };
+        store.save_swarm(&swarm).expect("save paused");
+    }
+    let _dead = store
+        .try_claim_swarm_with_boot("s-wedge", "boot-dead")
+        .expect("claim")
+        .expect("claim wins");
+
+    let factory: Arc<dyn SwarmProviderFactory> = Arc::new(ScriptedFactory {
+        orch_queue: Arc::new(StdMutex::new(VecDeque::new())),
+        orch_fallback: Reply::final_text("done"),
+        box_reply: Reply::box_result("ok", 1, 1),
+        box_gate: None,
+    });
+    let engine = h.engine(Arc::clone(&store), factory, HashMap::new(), None);
+
+    // recover runs at real "now" (the dead lease is unexpired) and against a
+    // Paused (non-Running) swarm — the two cases old recovery skipped.
+    let recovered = engine.recover().await.expect("recover");
+    assert!(
+        recovered.is_empty(),
+        "an already-paused swarm is not re-parked, only its dead claim is freed"
+    );
+    assert_eq!(
+        store.load_swarm("s-wedge").unwrap().unwrap().run.status,
+        SwarmStatus::Paused {
+            reason: SwarmPauseReason::BudgetExhausted
+        },
+        "recovery must not touch a non-Running swarm's status (never auto-resume)"
+    );
+
+    // The dead claim was freed regardless of lease age or run status: the swarm
+    // is reclaimable again.
+    assert!(
+        store
+            .try_claim_swarm_with_boot("s-wedge", "boot-test")
+            .expect("claim")
+            .is_some(),
+        "recover must free a prior-boot claim so the swarm can be resumed"
     );
 }

@@ -287,6 +287,13 @@ pub struct SwarmClaimToken {
     /// Process nonce plus a per-grant counter, so a CAS winner is provably this
     /// process *and* this grant — a released token cannot renew its successor.
     pub holder: String,
+    /// Boot id of the process that owns this claim. Restart recovery reclaims
+    /// any claim whose boot id is not the current process's: a claim from a
+    /// prior boot is dead regardless of lease age or run status. Defaulted so a
+    /// claim written before this field existed deserializes (empty == "no boot",
+    /// treated as foreign to every live boot).
+    #[serde(default)]
+    pub boot_id: String,
 }
 
 /// One append-only audit row. Never overwritten; `seq` is assigned by the store.

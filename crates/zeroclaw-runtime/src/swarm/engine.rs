@@ -14,12 +14,23 @@
 //! lifecycle primitives (`start` / `pause` / `resume` / `stop` / `recover`) as
 //! plain engine methods; S7 drives them over the local RPC surface.
 //!
-//! Boxes run under [`TurnOrigin::Swarm`], which every origin gate treats as
-//! restrictively as a sub-turn: a box turn is a bare tool-loop turn (no
-//! operator origin, no memory-context injection) whose tool set is scoped
-//! through [`ScopedToolRegistry::assemble`] with the re-entrant agent-spawning
-//! tools removed and the `swarm_state` board tool added — a box can neither
-//! spawn nor delegate, only coordinate.
+//! A box's tool set is scoped through [`ScopedToolRegistry::assemble`], then
+//! stripped of every tool that would let it escape the swarm: the re-entrant
+//! agent-spawning tools (`spawn_subagent` / `delegate`), the agent-launching
+//! coding-CLI tools, and the scheduling tools (see [`SWARM_BOX_EXCLUDED_TOOLS`]);
+//! the `swarm_state` board tool is added. A box can neither spawn nor delegate
+//! nor launch or schedule external work — only coordinate.
+//!
+//! Box turns are *intended* to run under the restrictive `TurnOrigin::Swarm`
+//! posture (sub-turn-equivalent: no operator origin, no memory-context
+//! injection). The memory-inject gate already treats `TurnOrigin::Swarm`
+//! exactly as `TurnOrigin::SubTurn` (see `agent::memory_inject`). They do NOT
+//! reach it under that origin yet: a box turn runs through the shared
+//! `execute_turn` -> `Agent::turn_streamed_with_steering_state` entry, which
+//! stamps `IngressContext::agent_direct()`, so the gate currently resolves the
+//! permissive `AgentDirect` posture and a box may receive a memory preamble.
+//! Threading the swarm origin requires a change to that shared turn entry,
+//! which is out of this module's scope.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -32,7 +43,6 @@ use serde_json::json;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use zeroclaw_api::ingress::TurnOrigin;
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
@@ -67,6 +77,44 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// before this in practice; the bound only guarantees the loop can never spin
 /// forever if an orchestrator keeps delegating without ever finishing.
 const MAX_ROUNDS: usize = 10_000;
+
+/// Tools a box must never inherit from the parent envelope, on top of the two
+/// [`REENTRANT_AGENT_TOOLS`] (`spawn_subagent` / `delegate`). A box
+/// "coordinates only": it may neither launch a nested autonomous agent nor
+/// queue future autonomous work, because `reap` can clean up neither — both
+/// escape the swarm's lifetime.
+///
+/// - The coding-CLI tools each spawn an external autonomous coding-agent
+///   subprocess (`claude_code`, `claude_code_runner`, `codex_cli`,
+///   `gemini_cli`, `opencode_cli`).
+/// - The scheduling tools each queue or trigger future autonomous work
+///   (`cron_add`, `cron_update`, `cron_run`, `schedule`).
+///
+/// These names mirror each tool's `Tool::name()` return value; those tools
+/// define their name inline (there is no shared `NAME` const to reference), so
+/// the boundary is asserted against the live names by
+/// [`SwarmRunState::assemble_box_tools`]'s unit coverage.
+const SWARM_BOX_EXCLUDED_TOOLS: &[&str] = &[
+    // Agent launchers.
+    "claude_code",
+    "claude_code_runner",
+    "codex_cli",
+    "gemini_cli",
+    "opencode_cli",
+    // Schedulers.
+    "cron_add",
+    "cron_update",
+    "cron_run",
+    "schedule",
+];
+
+/// Whether a box keeps the tool named `name` after assembly. A box keeps the
+/// ordinary built-ins (shell, filesystem, memory, `swarm_state`, …) but never
+/// the re-entrant agent-spawning tools or the agent-launching / scheduling
+/// tools in [`SWARM_BOX_EXCLUDED_TOOLS`] — the "coordinate only" boundary.
+fn box_retains_tool(name: &str) -> bool {
+    !REENTRANT_AGENT_TOOLS.contains(&name) && !SWARM_BOX_EXCLUDED_TOOLS.contains(&name)
+}
 
 /// The turn budget's three axes. A run parks when spend reaches any one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,27 +363,59 @@ impl SwarmRunState {
         self.current.lock().run.status
     }
 
-    fn spent(&self) -> SwarmSpend {
-        self.current.lock().run.spent
-    }
-
-    /// Check spend against every axis. On exhaustion, park the run at
-    /// `Paused{BudgetExhausted}` (idempotent) and report which axis tripped.
-    fn admit(&self) -> BudgetAdmission {
-        let spent = self.spent();
-        let limits = self.limits;
-        let axis = if spent.turns >= limits.max_turns {
-            Some(BudgetAxis::Turns)
-        } else if spent.tokens >= limits.max_tokens {
-            Some(BudgetAxis::Tokens)
-        } else if spent.cost_usd >= limits.max_cost_usd {
-            Some(BudgetAxis::Cost)
-        } else {
-            None
+    /// Atomically admit one turn against the budget. Under the `current` lock,
+    /// check every axis and, if all are below their ceiling, immediately debit a
+    /// one-turn reservation before releasing the lock. Holding the lock across
+    /// the check-and-debit is what closes the concurrent over-admit: two
+    /// `run_box_turn` calls (or a future `parallel_tools=true` fan-out of
+    /// delegations) can never both admit on the same stale spend — the loser
+    /// observes the winner's reservation and is denied. The reserved turn is the
+    /// authoritative turn-count spend; [`Self::record_usage`] reconciles only
+    /// the token/cost axes after the turn runs.
+    ///
+    /// Preserves the admit-then-deny per-axis semantics: a turn admitted while
+    /// spend is below a ceiling may still overshoot it by one turn's worth (the
+    /// intentional single-turn overshoot), and the first axis at/over its
+    /// ceiling parks the run at `Paused{BudgetExhausted}` and names itself.
+    fn admit_and_reserve(&self) -> BudgetAdmission {
+        let axis = {
+            let mut cur = self.current.lock();
+            let spent = cur.run.spent;
+            let limits = self.limits;
+            let axis = if spent.turns >= limits.max_turns {
+                Some(BudgetAxis::Turns)
+            } else if spent.tokens >= limits.max_tokens {
+                Some(BudgetAxis::Tokens)
+            } else if spent.cost_usd >= limits.max_cost_usd {
+                Some(BudgetAxis::Cost)
+            } else {
+                None
+            };
+            if axis.is_none() {
+                // Reserve one turn under the same lock, before any concurrent
+                // admission can observe this spend — the atomic debit.
+                cur.run.spent.turns = cur.run.spent.turns.saturating_add(1);
+                cur.revision += 1;
+                cur.updated_at = chrono::Utc::now().to_rfc3339();
+                if let Err(err) = self.store.save_swarm(&cur) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                json!({"swarm_id": self.swarm_id, "error": err.to_string()})
+                            ),
+                        "swarm: failed to persist turn reservation"
+                    );
+                }
+            }
+            axis
         };
         match axis {
             None => BudgetAdmission::Admitted,
             Some(axis) => {
+                // Park outside the lock (idempotent) so `park_for_budget` can
+                // re-take it without deadlocking.
                 self.park_for_budget(axis);
                 BudgetAdmission::Exhausted(axis)
             }
@@ -366,11 +446,41 @@ impl SwarmRunState {
         self.append_event("budget_exhausted", None, json!({"axis": axis.as_str()}));
     }
 
-    fn record_spend(&self, delta: SwarmSpend) {
+    /// Park the run at `Paused{UserRequested}` (idempotent). Shared by the
+    /// driver loop, which honors an operator pause at a round boundary, and by
+    /// the engine's driver-less `pause` path, which has no loop to honor it.
+    fn park_for_user_pause(&self) {
+        {
+            let cur = self.current.lock();
+            if cur.run.status.is_terminal() || matches!(cur.run.status, SwarmStatus::Paused { .. })
+            {
+                return;
+            }
+        }
         if let Err(err) = self.persist_run(|run| {
-            run.spent.turns = run.spent.turns.saturating_add(delta.turns);
-            run.spent.tokens = run.spent.tokens.saturating_add(delta.tokens);
-            run.spent.cost_usd += delta.cost_usd;
+            run.status = SwarmStatus::Paused {
+                reason: SwarmPauseReason::UserRequested,
+            };
+        }) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(json!({"swarm_id": self.swarm_id, "error": err.to_string()})),
+                "swarm: failed to persist user pause"
+            );
+        }
+        self.append_event("swarm_paused", None, json!({"reason": "user_requested"}));
+    }
+
+    /// Reconcile the actual tokens + cost a turn consumed after it ran. The turn
+    /// itself was already debited by [`Self::admit_and_reserve`] before the turn
+    /// started, so only the token and cost axes are accumulated here — folding
+    /// the turn count in again would double-count it.
+    fn record_usage(&self, usage: SwarmSpend) {
+        if let Err(err) = self.persist_run(|run| {
+            run.spent.tokens = run.spent.tokens.saturating_add(usage.tokens);
+            run.spent.cost_usd += usage.cost_usd;
         }) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -444,7 +554,7 @@ impl SwarmRunState {
             .ok_or_else(|| BoxTurnError::UnknownBox(box_id.to_string()))?
             .clone();
 
-        match self.admit() {
+        match self.admit_and_reserve() {
             BudgetAdmission::Exhausted(axis) => return Err(BoxTurnError::BudgetExhausted(axis)),
             BudgetAdmission::Admitted => {}
         }
@@ -461,31 +571,39 @@ impl SwarmRunState {
             .build_box_agent(&entry)
             .await
             .map_err(BoxTurnError::Turn)?;
-        let (spend, result) = self
+        let (usage, result) = self
             .run_turn_with_prompt(&entry.alias, subtask.to_string(), agent)
             .await;
-        self.record_spend(spend);
-        // A box turn is a bare tool-loop turn with the swarm origin: every
-        // origin gate treats `TurnOrigin::Swarm` exactly as restrictively as a
-        // sub-turn (never operator-driven, no memory-context injection), which
-        // `execute_turn` already provides by construction. Recorded here so the
-        // audit trail names the origin the turn ran under.
+        // The turn was already debited by `admit_and_reserve`; reconcile only
+        // the tokens + cost it actually consumed.
+        self.record_usage(usage);
+        // A box turn is meant to run under the restrictive `TurnOrigin::Swarm`
+        // posture (sub-turn-equivalent: no operator origin, no memory-context
+        // injection). It does not yet: box turns reach the memory-inject gate
+        // via the shared `execute_turn` -> `Agent::turn_streamed_with_steering_state`
+        // entry, which stamps `IngressContext::agent_direct()`. Threading the
+        // swarm origin needs a change to that shared (frozen) turn entry, so the
+        // audit trail records only measured usage rather than asserting an origin
+        // the turn did not actually run under.
         self.append_event(
             "box_delegated",
             Some(box_id.to_string()),
             json!({
-                "tokens": spend.tokens,
-                "cost_usd": spend.cost_usd,
-                "origin": TurnOrigin::Swarm,
+                "tokens": usage.tokens,
+                "cost_usd": usage.cost_usd,
             }),
         );
         result.map_err(BoxTurnError::Turn)
     }
 
     /// Assemble the box's scoped tool set: the standard built-ins through the
-    /// one gated seam, minus the re-entrant agent-spawning tools, plus the
-    /// `swarm_state` board tool. A box can coordinate but cannot spawn or
-    /// delegate.
+    /// one gated seam, minus every tool that would let the box escape the swarm
+    /// ("coordinate only"), plus the `swarm_state` board tool. The strip drops
+    /// the two re-entrant agent-spawning tools (`spawn_subagent` / `delegate`)
+    /// AND the agent-launching + scheduling tools in
+    /// [`SWARM_BOX_EXCLUDED_TOOLS`]: a box can neither spawn another agent,
+    /// launch an external coding-agent subprocess, nor queue future autonomous
+    /// work that `reap` could not clean up.
     async fn assemble_box_tools(&self, entry: &RosterBox) -> Vec<Box<dyn Tool>> {
         let risk_profile = self
             .config
@@ -542,9 +660,11 @@ impl SwarmRunState {
         .await;
 
         let mut tools = assembled.registry.into_inner();
-        // A box never gets the re-entrant agent-spawning tools, even if the
-        // parent envelope grants them: fan-out is the orchestrator's job.
-        tools.retain(|tool| !REENTRANT_AGENT_TOOLS.contains(&tool.name()));
+        // A box never gets the agent-spawning, agent-launching, or scheduling
+        // tools, even if the parent envelope grants them: fan-out is the
+        // orchestrator's job, and anything a box could spawn or schedule would
+        // outlive the swarm beyond reap's reach.
+        tools.retain(|tool| box_retains_tool(tool.name()));
         tools.push(Box::new(SwarmStateTool::new(
             self.board.clone(),
             self.swarm_id.clone(),
@@ -693,25 +813,10 @@ impl SwarmRunState {
                 return DriverExit::Cancelled;
             }
             if self.pause.load(Ordering::SeqCst) {
-                if let Err(err) = self.persist_run(|run| {
-                    run.status = SwarmStatus::Paused {
-                        reason: SwarmPauseReason::UserRequested,
-                    };
-                }) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                json!({"swarm_id": self.swarm_id, "error": err.to_string()})
-                            ),
-                        "swarm: failed to persist user pause"
-                    );
-                }
-                self.append_event("swarm_paused", None, json!({"reason": "user_requested"}));
+                self.park_for_user_pause();
                 return DriverExit::Paused;
             }
-            match self.admit() {
+            match self.admit_and_reserve() {
                 BudgetAdmission::Exhausted(_) => return DriverExit::BudgetExhausted,
                 BudgetAdmission::Admitted => {}
             }
@@ -726,8 +831,10 @@ impl SwarmRunState {
             };
             let prompt = self.render_orchestrator_prompt(round);
             let orch_alias = format!("swarm/{}/orchestrator", self.swarm_id);
-            let (spend, result) = self.run_turn_with_prompt(&orch_alias, prompt, agent).await;
-            self.record_spend(spend);
+            let (usage, result) = self.run_turn_with_prompt(&orch_alias, prompt, agent).await;
+            // The planning turn was already debited by `admit_and_reserve`;
+            // reconcile only its tokens + cost.
+            self.record_usage(usage);
             if let Err(err) = result {
                 self.append_event("orchestrator_error", None, json!({"error": err}));
                 return DriverExit::Completed;
@@ -863,7 +970,7 @@ impl SwarmEngine {
 
         let claim = self
             .store
-            .try_claim_swarm(swarm_id)?
+            .try_claim_swarm_with_boot(swarm_id, &self.boot_id)?
             .ok_or_else(|| SwarmEngineError::AlreadyClaimed(swarm_id.to_string()))?;
 
         let roster = build_swarm_roster(
@@ -1026,7 +1133,32 @@ impl SwarmEngine {
             runs.get(swarm_id).map(|live| Arc::clone(&live.state))
         }
         .ok_or_else(|| BoxTurnError::Turn(format!("swarm {swarm_id:?} is not running")))?;
-        state.run_box_turn(box_id, subtask).await
+        let result = state.run_box_turn(box_id, subtask).await;
+        // A driver-less run (begin_run + direct box turns, the S7 RPC path) has
+        // no orchestrator loop to notice a budget-park, so if this delegation
+        // parked the run, tear its claim + heartbeat down here exactly like
+        // `drive`'s self-exit — otherwise the heartbeat renews a dead lease
+        // forever and a later `resume` fails `AlreadyClaimed`.
+        self.finalize_if_parked_driverless(swarm_id, &state).await;
+        result
+    }
+
+    /// Release the claim + cancel the heartbeat (and park the control-plane
+    /// record) of a driver-less run that has parked itself, then drop it from
+    /// the live registry. A no-op for a run that is still `Running` or that a
+    /// driver owns — the driver's `drive` loop handles its own teardown.
+    async fn finalize_if_parked_driverless(&self, swarm_id: &str, state: &Arc<SwarmRunState>) {
+        let is_driverless = {
+            let runs = self.runs.lock();
+            matches!(runs.get(swarm_id), Some(live) if live.driver.is_none())
+        };
+        if !is_driverless || !matches!(state.status(), SwarmStatus::Paused { .. }) {
+            return;
+        }
+        state.heartbeat_cancel.cancel();
+        let _ = state.store.release_claim(&state.claim);
+        state.cp_update(TaskStatus::Paused).await;
+        self.runs.lock().remove(swarm_id);
     }
 
     /// Read a swarm's current lifecycle state from the store.
@@ -1036,21 +1168,39 @@ impl SwarmEngine {
 
     /// Finish any in-flight round, then hold the run at `Paused{UserRequested}`.
     pub async fn pause(&self, swarm_id: &str) -> Result<(), SwarmEngineError> {
-        let (pause, driver) = {
+        let (state, pause, driver) = {
             let mut runs = self.runs.lock();
             let live = runs
                 .get_mut(swarm_id)
                 .ok_or_else(|| SwarmEngineError::NotRunning {
                     swarm_id: swarm_id.to_string(),
                 })?;
-            (Arc::clone(&live.pause), live.driver.take())
+            (
+                Arc::clone(&live.state),
+                Arc::clone(&live.pause),
+                live.driver.take(),
+            )
         };
         pause.store(true, Ordering::SeqCst);
-        if let Some(driver) = driver {
-            let _ = driver.await;
+        match driver {
+            // A driver honors the pause at the next round boundary, then
+            // releases the claim + cancels the heartbeat on its way out.
+            Some(driver) => {
+                let _ = driver.await;
+            }
+            // A driver-less run (begin_run) has no loop to honor the flag: park
+            // it here and tear the claim + heartbeat down exactly like `drive`'s
+            // self-exit, or the heartbeat renews a dead lease forever and a
+            // later `resume` fails `AlreadyClaimed`.
+            None => {
+                state.park_for_user_pause();
+                state.heartbeat_cancel.cancel();
+                let _ = state.store.release_claim(&state.claim);
+                state.cp_update(TaskStatus::Paused).await;
+            }
         }
         // The parked run is no longer live; drop its registry entry so a resume
-        // rebuilds it. (The driver already released the claim + heartbeat.)
+        // rebuilds it.
         self.runs.lock().remove(swarm_id);
         Ok(())
     }
@@ -1099,10 +1249,11 @@ impl SwarmEngine {
         Ok(())
     }
 
-    /// Restart recovery: park every swarm whose claim lease expired while
-    /// `Running` at `Paused{DaemonRestart}`. Resumable, but never auto-resumed
-    /// — spend only advances again on a deliberate `resume`. Run once at engine
-    /// boot.
+    /// Restart recovery: reclaim every swarm still held by a *prior* boot's
+    /// claim. A `Running` swarm is parked at `Paused{DaemonRestart}`; a
+    /// paused/terminal one keeps its status. Either way the dead claim is freed.
+    /// Resumable, but never auto-resumed — spend only advances again on a
+    /// deliberate `resume`. Run once at engine boot.
     pub async fn recover(&self) -> Result<Vec<String>, SwarmEngineError> {
         let now = chrono::Utc::now().to_rfc3339();
         self.recover_at(&now).await
@@ -1111,41 +1262,51 @@ impl SwarmEngine {
     /// Restart recovery as of an explicit clock. `recover` is the boot entry
     /// (`now`); this variant lets a caller replay recovery against a supplied
     /// time.
+    ///
+    /// A claim not stamped with THIS boot's id belongs to a dead process, so it
+    /// is reclaimed regardless of lease age or run status: the lease age is
+    /// irrelevant (a fast restart leaves an unexpired-but-dead lease) and so is
+    /// the status (a crash after a budget-park leaves a non-`Running` swarm
+    /// holding a leaked claim). Returns the swarms this call transitioned to
+    /// `Paused{DaemonRestart}` — an already-paused swarm whose dead claim was
+    /// merely freed is reclaimable but not re-parked, so it is not listed.
     pub async fn recover_at(&self, now_iso: &str) -> Result<Vec<String>, SwarmEngineError> {
         let now = now_iso.to_string();
-        let expired = self.store.expired_claims(&now)?;
+        let foreign = self.store.claims_not_held_by_boot(&self.boot_id)?;
         let mut recovered = Vec::new();
-        for claim in expired {
+        for claim in foreign {
             let Some(mut persisted) = self.store.load_swarm(&claim.swarm_id)? else {
+                // Orphan claim with no swarm document: free it and move on.
+                self.store.release_claim(&claim)?;
                 continue;
             };
-            if persisted.run.status.is_terminal()
-                || !matches!(persisted.run.status, SwarmStatus::Running)
-            {
-                continue;
+            // Only a Running swarm needs a status transition; a paused/terminal
+            // one keeps its status so recovery never auto-resumes spend.
+            if matches!(persisted.run.status, SwarmStatus::Running) {
+                persisted.revision += 1;
+                persisted.updated_at = now.clone();
+                persisted.run.status = SwarmStatus::Paused {
+                    reason: SwarmPauseReason::DaemonRestart,
+                };
+                self.store.save_swarm(&persisted)?;
+                self.store.append_event(&SwarmEventRecord {
+                    swarm_id: claim.swarm_id.clone(),
+                    seq: 0,
+                    ts: now.clone(),
+                    kind: "swarm_recovered".to_string(),
+                    box_id: None,
+                    payload: json!({"reason": "daemon_restart"}),
+                })?;
+                if let Some(tasks) = self.tasks.as_ref() {
+                    let _ = tasks
+                        .update_status(&claim.swarm_id, TaskStatus::Paused, None, None)
+                        .await;
+                }
+                recovered.push(claim.swarm_id.clone());
             }
-            persisted.revision += 1;
-            persisted.updated_at = now.clone();
-            persisted.run.status = SwarmStatus::Paused {
-                reason: SwarmPauseReason::DaemonRestart,
-            };
-            self.store.save_swarm(&persisted)?;
-            self.store.append_event(&SwarmEventRecord {
-                swarm_id: claim.swarm_id.clone(),
-                seq: 0,
-                ts: now.clone(),
-                kind: "swarm_recovered".to_string(),
-                box_id: None,
-                payload: json!({"reason": "daemon_restart"}),
-            })?;
-            // Free the dead driver's claim so a deliberate resume can re-take it.
+            // Free the dead process's claim so a deliberate resume can re-take
+            // it — for every foreign claim, whatever the run status.
             self.store.release_claim(&claim)?;
-            if let Some(tasks) = self.tasks.as_ref() {
-                let _ = tasks
-                    .update_status(&claim.swarm_id, TaskStatus::Paused, None, None)
-                    .await;
-            }
-            recovered.push(claim.swarm_id);
         }
         Ok(recovered)
     }
@@ -1179,5 +1340,47 @@ mod tests {
     fn truncate_keeps_short_text_and_marks_long_text() {
         assert_eq!(truncate("hi", 8), "hi");
         assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    /// The box tool boundary (`assemble_box_tools`'s post-assemble retain) drops
+    /// every agent-spawning, agent-launching, and scheduling tool but keeps the
+    /// coordination + ordinary built-ins. Asserted against the live tool names
+    /// (there is no shared `NAME` const for the coding-CLI / cron tools).
+    #[test]
+    fn box_tool_boundary_strips_launchers_and_schedulers_keeps_coordination() {
+        // Re-entrant agent-spawning tools are excluded (spawn_subagent / delegate).
+        for name in REENTRANT_AGENT_TOOLS {
+            assert!(
+                !box_retains_tool(name),
+                "a box must not keep the re-entrant tool {name:?}"
+            );
+        }
+        // Agent launchers and schedulers are excluded.
+        for name in [
+            "claude_code",
+            "claude_code_runner",
+            "codex_cli",
+            "gemini_cli",
+            "opencode_cli",
+            "cron_add",
+            "cron_update",
+            "cron_run",
+            "schedule",
+        ] {
+            assert!(
+                !box_retains_tool(name),
+                "a box must not keep the escape-hatch tool {name:?}"
+            );
+            assert!(
+                SWARM_BOX_EXCLUDED_TOOLS.contains(&name),
+                "{name:?} must be in the documented exclusion set"
+            );
+        }
+        // Coordination + ordinary tools survive. `swarm_state` is added back
+        // after the retain, and the retain never targets it or the built-ins.
+        assert!(box_retains_tool(SwarmStateTool::NAME));
+        for name in ["shell", "read_file", "write_file", "memory_store"] {
+            assert!(box_retains_tool(name), "a box must keep {name:?}");
+        }
     }
 }
