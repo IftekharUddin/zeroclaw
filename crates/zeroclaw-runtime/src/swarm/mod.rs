@@ -5,5 +5,6 @@
 //! store this module owns, keyed by swarm id and guarded by a revision.
 
 pub mod store;
+pub mod wizard;
 
 pub use store::{SwarmStore, build_swarm_store};

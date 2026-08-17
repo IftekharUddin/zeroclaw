@@ -1149,3 +1149,23 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+
+# Swarm wizard (swarm/fields step shapes)
+swarm-wizard-provider-title = Model provider
+swarm-wizard-provider-help = The model provider every box in this swarm talks to.
+swarm-wizard-model-title = Model
+swarm-wizard-model-help = The model every box runs. The list comes from the chosen provider.
+swarm-wizard-risk-profile-title = Risk profile
+swarm-wizard-risk-profile-help = The approval and sandbox posture applied to every box.
+swarm-wizard-boundedness-title = Boundedness
+swarm-wizard-boundedness-help = The ceiling a run stops at, so a swarm can never spend without a limit.
+swarm-wizard-channels-title = Channels
+swarm-wizard-channels-help = Channels that receive outbound status notifications. A swarm is never driven from a channel.
+swarm-wizard-role-title = Role
+swarm-wizard-role-help = The supervising role the swarm as a whole plays.
+swarm-wizard-goal-title = Goal
+swarm-wizard-goal-help = What this swarm is being created to accomplish.
+swarm-wizard-budget-preset-help = Pick quick, standard, or marathon, or choose custom to set the triple below yourself.
+swarm-wizard-max-turns-help = Maximum turns across the whole swarm. Used only when the preset is custom.
+swarm-wizard-max-tokens-help = Maximum tokens across the whole swarm. Used only when the preset is custom.
+swarm-wizard-max-cost-help = Maximum spend in USD across the whole swarm. Used only when the preset is custom.

@@ -757,6 +757,28 @@ mod tests {
     }
 
     #[test]
+    fn budget_preset_wire_names_match_the_serde_tags() {
+        // `wire_name` exists so pickers can name a preset without a serde
+        // round-trip. If the two ever diverge, a wizard would offer a name
+        // the store cannot parse back.
+        for preset in SwarmBudgetPreset::ALL {
+            // A budget encodes as `{"preset": "<wire name>"}`; the picker only
+            // ever handles the inner tag.
+            let encoded = serde_json::to_value(SwarmBudget::Preset(preset)).expect("encode");
+            assert_eq!(
+                encoded.get("preset").and_then(serde_json::Value::as_str),
+                Some(preset.wire_name()),
+                "serde encoded {preset:?} as {encoded}"
+            );
+            assert_eq!(
+                SwarmBudgetPreset::from_wire(preset.wire_name()),
+                Some(preset)
+            );
+        }
+        assert_eq!(SwarmBudgetPreset::from_wire("marathon-plus"), None);
+    }
+
+    #[test]
     fn default_roster_fills_every_layout_slot() {
         let roster = default_roster(DEFAULT_ROSTER_SIZE);
         assert_eq!(roster.len(), 4);

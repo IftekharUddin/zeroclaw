@@ -998,3 +998,23 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+
+# Asistente de enjambres (formas de paso de swarm/fields)
+swarm-wizard-provider-title = Proveedor de modelos
+swarm-wizard-provider-help = El proveedor de modelos con el que habla cada caja de este enjambre.
+swarm-wizard-model-title = Modelo
+swarm-wizard-model-help = El modelo que ejecuta cada caja. La lista proviene del proveedor elegido.
+swarm-wizard-risk-profile-title = Perfil de riesgo
+swarm-wizard-risk-profile-help = La postura de aprobación y aislamiento aplicada a todas las cajas.
+swarm-wizard-boundedness-title = Límites
+swarm-wizard-boundedness-help = El techo en el que se detiene una ejecución, para que un enjambre nunca gaste sin límite.
+swarm-wizard-channels-title = Canales
+swarm-wizard-channels-help = Canales que reciben notificaciones de estado salientes. Un enjambre nunca se controla desde un canal.
+swarm-wizard-role-title = Rol
+swarm-wizard-role-help = El rol supervisor que desempeña el enjambre en su conjunto.
+swarm-wizard-goal-title = Objetivo
+swarm-wizard-goal-help = Lo que este enjambre se creó para lograr.
+swarm-wizard-budget-preset-help = Elige quick, standard o marathon, o selecciona custom para fijar tú mismo los tres valores de abajo.
+swarm-wizard-max-turns-help = Turnos máximos en todo el enjambre. Solo se usa cuando el ajuste es custom.
+swarm-wizard-max-tokens-help = Tokens máximos en todo el enjambre. Solo se usa cuando el ajuste es custom.
+swarm-wizard-max-cost-help = Gasto máximo en USD en todo el enjambre. Solo se usa cuando el ajuste es custom.

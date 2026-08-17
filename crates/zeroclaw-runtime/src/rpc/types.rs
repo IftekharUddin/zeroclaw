@@ -1603,6 +1603,95 @@ rpc_type! {
     }
 }
 
+pub use crate::swarm::wizard::{
+    SwarmSpecPatch, SwarmStepShape, SwarmSubmission, SwarmValidationError, SwarmWizardStep,
+};
+
+rpc_type! {
+    /// Request payload for `swarm/create`. Mirrors `quickstart/apply`: one
+    /// `submission` key so the authored payload has a single home on the wire.
+    pub struct SwarmCreateParams {
+        pub submission: SwarmSubmission,
+    }
+}
+
+rpc_type! {
+    /// Request payload for `swarm/validate` — the same submission
+    /// `swarm/create` takes, run through the same validator without a write.
+    pub struct SwarmValidateParams {
+        pub submission: SwarmSubmission,
+    }
+}
+
+/// Tagged enum — the same `kind` discriminator `quickstart/validate` uses, so
+/// a client handles both dry runs the same way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmValidateResult {
+    Ok,
+    Errors { errors: Vec<SwarmValidationError> },
+}
+
+rpc_type! {
+    /// Request payload for `swarm/update`: a revision-guarded partial edit of
+    /// the authored spec. The roster is deliberately absent — box slots,
+    /// roles and jobs move through `swarm/update-layout`.
+    pub struct SwarmUpdateParams {
+        pub swarm_id: String,
+        /// The revision the caller last read. A mismatch is refused rather
+        /// than merged, so a stale pane cannot silently overwrite an edit.
+        pub revision: u64,
+        pub patch: SwarmSpecPatch,
+    }
+}
+
+rpc_type! {
+    /// Request payload for `swarm/update-layout`: the box canvas writing back
+    /// a whole roster. Replaces `spec.boxes` and nothing else.
+    pub struct SwarmUpdateLayoutParams {
+        pub swarm_id: String,
+        pub revision: u64,
+        pub boxes: Vec<crate::swarm::store::BoxSpec>,
+    }
+}
+
+rpc_type! {
+    /// Request payload for `swarm/delete`. Refused while a live run holds the
+    /// swarm's claim unless `force` is set.
+    pub struct SwarmDeleteParams {
+        pub swarm_id: String,
+        #[serde(default)]
+        pub force: bool,
+    }
+}
+
+rpc_type! {
+    /// Response payload for `swarm/delete`. `deleted` is `false` when the
+    /// swarm was already gone — deleting an absent swarm is idempotent, the
+    /// same posture the store takes.
+    pub struct SwarmDeleteResult {
+        pub swarm_id: String,
+        pub deleted: bool,
+    }
+}
+
+rpc_type! {
+    /// Request payload for `swarm/fields`. `provider` is whatever the wizard
+    /// has been answered with so far: supplying it turns the model step into
+    /// a live picker and surfaces the provider's own credential shape.
+    pub struct SwarmFieldsParams {
+        #[serde(default)]
+        pub provider: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Response payload for `swarm/fields`: every wizard step, in order.
+    pub struct SwarmFieldsResult {
+        pub steps: Vec<SwarmStepShape>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

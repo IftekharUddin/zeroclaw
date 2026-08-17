@@ -1236,6 +1236,62 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn swarm_create_then_get_round_trips_over_the_socket() {
+        use crate::swarm::store::PersistedSwarm;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        let submission = serde_json::json!({
+            "submission": {
+                "swarm_id": "sw-socket-create",
+                "name": "Socket squad",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4",
+                "risk_profile": "balanced",
+                "role": "supervisor",
+                "goal": "author over IPC",
+            }
+        });
+        writer
+            .write_all(rpc_request(Method::SwarmCreate, &submission, 21).as_bytes())
+            .await
+            .unwrap();
+        let (_frame, created): (_, PersistedSwarm) = read_result(&mut reader).await;
+        assert_eq!(created.spec.id, "sw-socket-create");
+        assert_eq!(created.revision, 0);
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SwarmGet,
+                    &serde_json::json!({"swarm_id": "sw-socket-create"}),
+                    22,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_frame, fetched): (_, PersistedSwarm) = read_result(&mut reader).await;
+        assert_eq!(
+            fetched, created,
+            "the created document is exactly what the read surface returns"
+        );
+
+        cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn client_count_tracks_connections() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());

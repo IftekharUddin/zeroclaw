@@ -1001,3 +1001,23 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+
+# Assistant d'essaim (formes d'étape de swarm/fields)
+swarm-wizard-provider-title = Fournisseur de modèles
+swarm-wizard-provider-help = Le fournisseur de modèles auquel s'adresse chaque boîte de cet essaim.
+swarm-wizard-model-title = Modèle
+swarm-wizard-model-help = Le modèle exécuté par chaque boîte. La liste provient du fournisseur choisi.
+swarm-wizard-risk-profile-title = Profil de risque
+swarm-wizard-risk-profile-help = La posture d'approbation et de bac à sable appliquée à toutes les boîtes.
+swarm-wizard-boundedness-title = Bornage
+swarm-wizard-boundedness-help = Le plafond auquel une exécution s'arrête, pour qu'un essaim ne dépense jamais sans limite.
+swarm-wizard-channels-title = Canaux
+swarm-wizard-channels-help = Canaux qui reçoivent les notifications d'état sortantes. Un essaim n'est jamais piloté depuis un canal.
+swarm-wizard-role-title = Rôle
+swarm-wizard-role-help = Le rôle de supervision que joue l'essaim dans son ensemble.
+swarm-wizard-goal-title = Objectif
+swarm-wizard-goal-help = Ce que cet essaim a été créé pour accomplir.
+swarm-wizard-budget-preset-help = Choisissez quick, standard ou marathon, ou sélectionnez custom pour fixer vous-même le triplet ci-dessous.
+swarm-wizard-max-turns-help = Nombre maximal de tours pour tout l'essaim. Utilisé uniquement lorsque le préréglage est custom.
+swarm-wizard-max-tokens-help = Nombre maximal de jetons pour tout l'essaim. Utilisé uniquement lorsque le préréglage est custom.
+swarm-wizard-max-cost-help = Dépense maximale en USD pour tout l'essaim. Utilisée uniquement lorsque le préréglage est custom.

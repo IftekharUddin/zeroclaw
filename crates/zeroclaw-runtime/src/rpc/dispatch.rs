@@ -192,6 +192,12 @@ pub enum Method {
     // directory of authored files like `sops/`)
     SwarmList,
     SwarmGet,
+    SwarmCreate,
+    SwarmUpdate,
+    SwarmUpdateLayout,
+    SwarmDelete,
+    SwarmFields,
+    SwarmValidate,
 }
 
 impl Method {
@@ -305,6 +311,12 @@ impl Method {
         // Swarms
         (Method::SwarmList, "swarm/list"),
         (Method::SwarmGet, "swarm/get"),
+        (Method::SwarmCreate, "swarm/create"),
+        (Method::SwarmUpdate, "swarm/update"),
+        (Method::SwarmUpdateLayout, "swarm/update-layout"),
+        (Method::SwarmDelete, "swarm/delete"),
+        (Method::SwarmFields, "swarm/fields"),
+        (Method::SwarmValidate, "swarm/validate"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -342,6 +354,53 @@ fn not_yet_implemented(method: Method) -> RpcResult {
         INTERNAL_ERROR,
         format!("{}: not yet implemented", method.wire_name()),
     ))
+}
+
+/// Map a swarm store failure onto the wire. A lost revision race is the one
+/// failure a client can act on by itself — reload and re-apply — so it keeps
+/// its own code; everything else is a backend fault.
+fn swarm_store_err(e: crate::swarm::store::StoreError) -> JsonRpcError {
+    use crate::swarm::store::StoreError;
+    let code = match e {
+        StoreError::StaleRevision { .. } | StoreError::RevisionConflict { .. } => {
+            SWARM_REVISION_CONFLICT
+        }
+        _ => INTERNAL_ERROR,
+    };
+    rpc_err(code, e.to_string())
+}
+
+/// Refuse an edit whose base revision is no longer current. Guards the write
+/// surface ahead of the store so a stale pane is told to reload rather than
+/// having its diff silently merged into someone else's edit.
+fn expect_swarm_revision(
+    stored: &crate::swarm::store::PersistedSwarm,
+    claimed: u64,
+) -> Result<(), JsonRpcError> {
+    if stored.revision == claimed {
+        return Ok(());
+    }
+    Err(rpc_err(
+        SWARM_REVISION_CONFLICT,
+        format!(
+            "swarm '{}' moved on: you edited revision {claimed}, the store holds {}; reload and re-apply",
+            stored.spec.id, stored.revision
+        ),
+    ))
+}
+
+/// Collapse field-level rejections into one wire error. `swarm/validate`
+/// returns them structured; the write methods only get to say no once, so
+/// every reason is named in the message.
+fn swarm_submission_rejected(
+    errors: Vec<crate::swarm::wizard::SwarmValidationError>,
+) -> JsonRpcError {
+    let detail = errors
+        .iter()
+        .map(|e| format!("{}: {}", e.field, e.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    rpc_err(INVALID_PARAMS, format!("invalid swarm: {detail}"))
 }
 
 fn doctor_summary(results: &[DiagResult]) -> DoctorSummary {
@@ -905,6 +964,12 @@ impl RpcDispatcher {
             // Swarms
             Method::SwarmList => self.handle_swarm_list(),
             Method::SwarmGet => self.handle_swarm_get(&req.params),
+            Method::SwarmCreate => self.handle_swarm_create(&req.params),
+            Method::SwarmUpdate => self.handle_swarm_update(&req.params),
+            Method::SwarmUpdateLayout => self.handle_swarm_update_layout(&req.params),
+            Method::SwarmDelete => self.handle_swarm_delete(&req.params),
+            Method::SwarmFields => self.handle_swarm_fields(&req.params).await,
+            Method::SwarmValidate => self.handle_swarm_validate(&req.params),
         };
 
         if is_notification {
@@ -4672,7 +4737,7 @@ impl RpcDispatcher {
             .ctx
             .swarm_store
             .list_swarms()
-            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+            .map_err(swarm_store_err)?;
         to_result(SwarmListResult { swarms })
     }
 
@@ -4680,18 +4745,253 @@ impl RpcDispatcher {
     /// backend failure, so it comes back as `INVALID_PARAMS`.
     fn handle_swarm_get(&self, params: &Value) -> RpcResult {
         let req: SwarmGetParams = parse_params(params)?;
-        let swarm = self
+        to_result(self.load_swarm_or_reject(&req.swarm_id)?)
+    }
+
+    /// Load one swarm or reject the call. The single not-found path for the
+    /// whole `swarm/` family, so every method names a missing swarm the same
+    /// way `swarm/get` always has.
+    fn load_swarm_or_reject(
+        &self,
+        swarm_id: &str,
+    ) -> Result<crate::swarm::store::PersistedSwarm, JsonRpcError> {
+        self.ctx
+            .swarm_store
+            .load_swarm(swarm_id)
+            .map_err(swarm_store_err)?
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, format!("swarm '{swarm_id}' not found")))
+    }
+
+    /// Append one authoring row to a swarm's audit log.
+    ///
+    /// Best effort by construction: the document is already persisted by the
+    /// time this runs, so a store that cannot take the row must not turn a
+    /// landed write into an RPC failure. The miss is logged instead.
+    fn record_swarm_event(&self, swarm_id: &str, kind: &str, payload: Value) {
+        let record = crate::swarm::store::SwarmEventRecord {
+            swarm_id: swarm_id.to_string(),
+            seq: 0,
+            ts: chrono::Utc::now().to_rfc3339(),
+            kind: kind.to_string(),
+            box_id: None,
+            payload,
+        };
+        if let Err(e) = self.ctx.swarm_store.append_event(&record) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "swarm_id": swarm_id,
+                        "kind": kind,
+                        "error": e.to_string(),
+                    })),
+                "Swarm: audit event could not be appended"
+            );
+        }
+    }
+
+    /// Persist an edited document under the swarm write protocol: bump the
+    /// revision, restamp `updated_at`, then save. The one place either
+    /// happens, so no write surface can forget half of it.
+    fn commit_swarm_edit(
+        &self,
+        mut swarm: crate::swarm::store::PersistedSwarm,
+    ) -> Result<crate::swarm::store::PersistedSwarm, JsonRpcError> {
+        swarm.revision = swarm.revision.saturating_add(1);
+        swarm.updated_at = chrono::Utc::now().to_rfc3339();
+        self.ctx
+            .swarm_store
+            .save_swarm(&swarm)
+            .map_err(swarm_store_err)?;
+        Ok(swarm)
+    }
+
+    /// Create a swarm from a wizard submission. Validation runs through the
+    /// same `prepare_spec` path `swarm/validate` uses, so a submission the dry
+    /// run accepted is exactly the one that persists.
+    fn handle_swarm_create(&self, params: &Value) -> RpcResult {
+        let req: SwarmCreateParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let spec = crate::swarm::wizard::prepare_spec(&req.submission, &config)
+            .map_err(swarm_submission_rejected)?;
+
+        // Report a taken id as a taken id. Left to the store this would
+        // surface as a revision conflict, which says nothing useful to a
+        // client that simply picked a name twice.
+        if self
+            .ctx
+            .swarm_store
+            .load_swarm(&spec.id)
+            .map_err(swarm_store_err)?
+            .is_some()
+        {
+            return Err(rpc_err(
+                SWARM_ALREADY_EXISTS,
+                format!("swarm '{}' already exists", spec.id),
+            ));
+        }
+
+        let created = crate::swarm::store::PersistedSwarm::new(spec);
+        self.ctx
+            .swarm_store
+            .save_swarm(&created)
+            .map_err(swarm_store_err)?;
+        self.record_swarm_event(
+            created.swarm_id(),
+            "swarm_created",
+            serde_json::json!({"name": created.spec.name}),
+        );
+        to_result(created)
+    }
+
+    /// Revision-guarded partial edit of an authored spec. The patch is applied
+    /// to the submission the stored spec round-trips to and re-validated whole,
+    /// so an edit can never leave a swarm in a state `swarm/create` would have
+    /// refused.
+    fn handle_swarm_update(&self, params: &Value) -> RpcResult {
+        let req: SwarmUpdateParams = parse_params(params)?;
+        let mut stored = self.load_swarm_or_reject(&req.swarm_id)?;
+        expect_swarm_revision(&stored, req.revision)?;
+
+        let mut submission = crate::swarm::wizard::SwarmSubmission::from_spec(&stored.spec);
+        req.patch.apply(&mut submission);
+        let config = self.ctx.config.read().clone();
+        stored.spec = crate::swarm::wizard::prepare_spec(&submission, &config)
+            .map_err(swarm_submission_rejected)?;
+
+        let updated = self.commit_swarm_edit(stored)?;
+        self.record_swarm_event(
+            updated.swarm_id(),
+            "swarm_spec_updated",
+            serde_json::json!({"revision": updated.revision}),
+        );
+        to_result(updated)
+    }
+
+    /// Write back the box canvas. Touches `spec.boxes` and nothing else, and
+    /// validates the roster on its own: moving a box must not fail because a
+    /// provider alias was renamed out from under a swarm that already exists.
+    fn handle_swarm_update_layout(&self, params: &Value) -> RpcResult {
+        let req: SwarmUpdateLayoutParams = parse_params(params)?;
+        let mut stored = self.load_swarm_or_reject(&req.swarm_id)?;
+        expect_swarm_revision(&stored, req.revision)?;
+
+        let boxes = crate::swarm::wizard::normalize_roster(&req.boxes);
+        let errors = crate::swarm::wizard::validate_roster(&boxes);
+        if !errors.is_empty() {
+            return Err(swarm_submission_rejected(errors));
+        }
+        stored.spec.boxes = boxes;
+
+        let updated = self.commit_swarm_edit(stored)?;
+        self.record_swarm_event(
+            updated.swarm_id(),
+            "swarm_layout_updated",
+            serde_json::json!({"boxes": updated.spec.boxes.len()}),
+        );
+        to_result(updated)
+    }
+
+    /// Drop a swarm with its event history and claim.
+    ///
+    /// A non-terminal swarm is probed by taking its claim: winning proves no
+    /// driver holds it, and the token is held through the delete so a driver
+    /// cannot start in the gap. The claim dies with the swarm, which is why
+    /// nothing releases it on the success path.
+    fn handle_swarm_delete(&self, params: &Value) -> RpcResult {
+        let req: SwarmDeleteParams = parse_params(params)?;
+        let Some(stored) = self
             .ctx
             .swarm_store
             .load_swarm(&req.swarm_id)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
-            .ok_or_else(|| {
-                rpc_err(
-                    INVALID_PARAMS,
-                    format!("swarm '{}' not found", req.swarm_id),
-                )
-            })?;
-        to_result(swarm)
+            .map_err(swarm_store_err)?
+        else {
+            // Deleting an absent swarm is idempotent, matching the store.
+            return to_result(SwarmDeleteResult {
+                swarm_id: req.swarm_id,
+                deleted: false,
+            });
+        };
+
+        let probe = if stored.run.status.is_terminal() {
+            // A finished swarm is history: never claimable, never driven.
+            None
+        } else {
+            match self
+                .ctx
+                .swarm_store
+                .try_claim_swarm(&req.swarm_id)
+                .map_err(swarm_store_err)?
+            {
+                Some(token) => Some(token),
+                None if req.force => None,
+                None => {
+                    return Err(rpc_err(
+                        SWARM_RUN_ACTIVE,
+                        format!(
+                            "swarm '{}' is being driven by a live run; stop it first or delete with force",
+                            req.swarm_id
+                        ),
+                    ));
+                }
+            }
+        };
+
+        let deleted = match self.ctx.swarm_store.delete_swarm(&req.swarm_id) {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                // Hand the probe claim back: a failed delete must not park the
+                // swarm for the rest of the lease.
+                if let Some(token) = probe.as_ref() {
+                    let _ = self.ctx.swarm_store.release_claim(token);
+                }
+                return Err(swarm_store_err(e));
+            }
+        };
+        to_result(SwarmDeleteResult {
+            swarm_id: req.swarm_id,
+            deleted,
+        })
+    }
+
+    /// Wizard step shapes. Everything a client needs to render the create /
+    /// edit flow without knowing what a swarm is made of — adding a step is a
+    /// daemon change alone.
+    async fn handle_swarm_fields(&self, params: &Value) -> RpcResult {
+        let req: SwarmFieldsParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let provider = req
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        // Reach for the live catalog only once a provider is chosen, so the
+        // first render of the wizard never blocks on a network round trip.
+        let models = match provider {
+            Some(provider) => {
+                crate::quickstart::model_catalog_with_config(Some(&config), provider)
+                    .await
+                    .0
+            }
+            None => Vec::new(),
+        };
+        to_result(SwarmFieldsResult {
+            steps: crate::swarm::wizard::wizard_steps(&config, provider, &models),
+        })
+    }
+
+    /// Dry-run a submission. Same validator as `swarm/create`, no write, and
+    /// the field-by-field errors come back as a result rather than an RPC
+    /// error — a rejected draft is a normal wizard state, not a fault.
+    fn handle_swarm_validate(&self, params: &Value) -> RpcResult {
+        let req: SwarmValidateParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let body = match crate::swarm::wizard::prepare_spec(&req.submission, &config) {
+            Ok(_) => SwarmValidateResult::Ok,
+            Err(errors) => SwarmValidateResult::Errors { errors },
+        };
+        to_result(body)
     }
 
     /// Resolve selectable values for a domain-typed tool parameter.
@@ -6399,6 +6699,25 @@ mod tests {
         assert_eq!(Method::from_wire("swarms/list"), None);
     }
 
+    #[test]
+    fn swarm_write_and_wizard_methods_round_trip_on_the_wire() {
+        for (method, wire) in [
+            (Method::SwarmCreate, "swarm/create"),
+            (Method::SwarmUpdate, "swarm/update"),
+            (Method::SwarmUpdateLayout, "swarm/update-layout"),
+            (Method::SwarmDelete, "swarm/delete"),
+            (Method::SwarmFields, "swarm/fields"),
+            (Method::SwarmValidate, "swarm/validate"),
+        ] {
+            assert_eq!(Method::from_wire(wire), Some(method));
+            assert_eq!(method.wire_name(), wire);
+        }
+        // Kebab-case, matching `sops/run-overlay`; the underscore spelling is
+        // not a second name for the same method.
+        assert_eq!(Method::from_wire("swarm/update_layout"), None);
+        assert_eq!(Method::from_wire("swarms/create"), None);
+    }
+
     fn make_swarm_test_dispatcher() -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -6471,6 +6790,387 @@ mod tests {
             .handle_swarm_get(&serde_json::json!({}))
             .expect_err("swarm_id is required");
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    /// A submission that every validator arm accepts against a default config:
+    /// a known provider family and a canonical risk preset, no channels.
+    fn swarm_submission() -> Value {
+        serde_json::json!({
+            "swarm_id": "sw-w1",
+            "name": "Research squad",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4",
+            "risk_profile": "balanced",
+            "role": "supervisor",
+            "goal": "survey the field",
+        })
+    }
+
+    fn create_swarm(dispatcher: &RpcDispatcher) -> Value {
+        dispatcher
+            .handle_swarm_create(&serde_json::json!({"submission": swarm_submission()}))
+            .expect("create")
+    }
+
+    #[test]
+    fn swarm_create_persists_a_validated_submission() {
+        let dispatcher = make_swarm_test_dispatcher();
+        let created = create_swarm(&dispatcher);
+
+        assert_eq!(created["spec"]["id"], "sw-w1");
+        assert_eq!(created["revision"], 0, "a fresh swarm starts at revision 0");
+        assert_eq!(created["run"]["status"], "created");
+        assert_eq!(
+            created["spec"]["budget"]["preset"], "standard",
+            "an unstated budget takes the default preset"
+        );
+        assert_eq!(
+            created["spec"]["boxes"].as_array().map(Vec::len),
+            Some(crate::swarm::store::DEFAULT_ROSTER_SIZE),
+            "an unstated roster becomes the default unassigned roster"
+        );
+
+        // The document is readable back through the read surface unchanged.
+        let fetched = dispatcher
+            .handle_swarm_get(&serde_json::json!({"swarm_id": "sw-w1"}))
+            .expect("get");
+        assert_eq!(fetched, created);
+
+        let events = dispatcher
+            .ctx
+            .swarm_store
+            .list_events("sw-w1")
+            .expect("events");
+        assert_eq!(
+            events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            vec!["swarm_created"],
+            "authoring a swarm is audited"
+        );
+
+        // A second create on the same id is a taken id, not a revision race.
+        let err = create_swarm_err(&dispatcher);
+        assert_eq!(err.code, SWARM_ALREADY_EXISTS);
+        assert!(err.message.contains("sw-w1"), "got: {}", err.message);
+    }
+
+    fn create_swarm_err(dispatcher: &RpcDispatcher) -> JsonRpcError {
+        dispatcher
+            .handle_swarm_create(&serde_json::json!({"submission": swarm_submission()}))
+            .expect_err("refused")
+    }
+
+    #[test]
+    fn swarm_create_rejects_garbage_with_actionable_messages() {
+        let dispatcher = make_swarm_test_dispatcher();
+        let mut submission = swarm_submission();
+        submission["provider"] = serde_json::json!("definitely-not-a-provider");
+        submission["goal"] = serde_json::json!("   ");
+        submission["budget"] = serde_json::json!({
+            "custom": {"max_turns": 0, "max_tokens": 0, "max_cost_usd": 0.0}
+        });
+
+        let err = dispatcher
+            .handle_swarm_create(&serde_json::json!({"submission": submission}))
+            .expect_err("refused");
+        assert_eq!(err.code, INVALID_PARAMS);
+        for expected in [
+            "definitely-not-a-provider",
+            "goal",
+            "max_turns",
+            "max_tokens",
+            "max_cost_usd",
+        ] {
+            assert!(
+                err.message.contains(expected),
+                "the rejection names {expected}, got: {}",
+                err.message
+            );
+        }
+        assert!(
+            dispatcher
+                .ctx
+                .swarm_store
+                .list_swarms()
+                .expect("list")
+                .is_empty(),
+            "a refused create must not persist anything"
+        );
+    }
+
+    #[test]
+    fn swarm_validate_reports_the_same_rejections_without_writing() {
+        let dispatcher = make_swarm_test_dispatcher();
+
+        let ok = dispatcher
+            .handle_swarm_validate(&serde_json::json!({"submission": swarm_submission()}))
+            .expect("validate");
+        assert_eq!(ok, serde_json::json!({"kind": "ok"}));
+
+        let mut submission = swarm_submission();
+        submission["provider"] = serde_json::json!("definitely-not-a-provider");
+        submission["model"] = serde_json::json!("");
+        let rejected = dispatcher
+            .handle_swarm_validate(&serde_json::json!({"submission": submission}))
+            .expect("validate");
+        assert_eq!(rejected["kind"], "errors");
+        let errors = rejected["errors"].as_array().expect("errors array");
+        let steps: Vec<&str> = errors
+            .iter()
+            .filter_map(|e| e["step"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            steps.contains(&"provider") && steps.contains(&"model"),
+            "each rejection names the step to jump back to: {rejected}"
+        );
+
+        assert!(
+            dispatcher
+                .ctx
+                .swarm_store
+                .list_swarms()
+                .expect("list")
+                .is_empty(),
+            "a dry run never writes"
+        );
+    }
+
+    #[test]
+    fn swarm_update_is_revision_guarded() {
+        let dispatcher = make_swarm_test_dispatcher();
+        create_swarm(&dispatcher);
+
+        // Two panes read revision 0 and both edit. The first wins.
+        let patch = serde_json::json!({
+            "swarm_id": "sw-w1",
+            "revision": 0,
+            "patch": {"goal": "ship the thing"},
+        });
+        let updated = dispatcher.handle_swarm_update(&patch).expect("first write");
+        assert_eq!(updated["revision"], 1, "a write bumps the revision by one");
+        assert_eq!(updated["spec"]["goal"], "ship the thing");
+        assert_ne!(
+            updated["updated_at"], updated["created_at"],
+            "a write restamps updated_at"
+        );
+
+        let err = dispatcher
+            .handle_swarm_update(&serde_json::json!({
+                "swarm_id": "sw-w1",
+                "revision": 0,
+                "patch": {"goal": "ship something else"},
+            }))
+            .expect_err("the stale pane loses");
+        assert_eq!(err.code, SWARM_REVISION_CONFLICT);
+        assert!(
+            err.message.contains("reload"),
+            "the conflict tells the caller what to do, got: {}",
+            err.message
+        );
+        assert_eq!(
+            dispatcher
+                .handle_swarm_get(&serde_json::json!({"swarm_id": "sw-w1"}))
+                .expect("get")["spec"]["goal"],
+            "ship the thing",
+            "the losing write left no trace"
+        );
+    }
+
+    #[test]
+    fn swarm_update_never_touches_the_roster() {
+        let dispatcher = make_swarm_test_dispatcher();
+        let created = create_swarm(&dispatcher);
+        let updated = dispatcher
+            .handle_swarm_update(&serde_json::json!({
+                "swarm_id": "sw-w1",
+                "revision": 0,
+                "patch": {"name": "Renamed squad", "budget": {"preset": "marathon"}},
+            }))
+            .expect("update");
+
+        assert_eq!(updated["spec"]["name"], "Renamed squad");
+        assert_eq!(updated["spec"]["budget"]["preset"], "marathon");
+        assert_eq!(
+            updated["spec"]["boxes"], created["spec"]["boxes"],
+            "the box canvas owns the roster, not the wizard patch"
+        );
+        assert_eq!(
+            updated["spec"]["goal"], created["spec"]["goal"],
+            "an unset patch field is left as stored"
+        );
+    }
+
+    #[test]
+    fn swarm_update_layout_only_touches_the_boxes() {
+        let dispatcher = make_swarm_test_dispatcher();
+        let created = create_swarm(&dispatcher);
+
+        let boxes = serde_json::json!([
+            {"box_id": "box-1", "role": "researcher", "job": " read the RFC ", "slot": 2},
+            {"box_id": "box-2", "role": "critic", "job": "poke holes", "slot": 0},
+        ]);
+        let updated = dispatcher
+            .handle_swarm_update_layout(&serde_json::json!({
+                "swarm_id": "sw-w1",
+                "revision": 0,
+                "boxes": boxes,
+            }))
+            .expect("layout write");
+
+        assert_eq!(updated["revision"], 1);
+        assert_eq!(updated["spec"]["boxes"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            updated["spec"]["boxes"][0]["job"], "read the RFC",
+            "authored box strings are trimmed"
+        );
+        assert_eq!(updated["spec"]["boxes"][0]["slot"], 2);
+        for untouched in ["name", "provider", "model", "risk_profile", "role", "goal"] {
+            assert_eq!(
+                updated["spec"][untouched], created["spec"][untouched],
+                "{untouched} must survive a layout edit"
+            );
+        }
+        assert_eq!(updated["run"], created["run"], "run state is not authoring");
+
+        // A colliding roster is refused, and the stored layout is untouched.
+        let err = dispatcher
+            .handle_swarm_update_layout(&serde_json::json!({
+                "swarm_id": "sw-w1",
+                "revision": 1,
+                "boxes": [
+                    {"box_id": "box-1", "role": "", "job": "", "slot": 0},
+                    {"box_id": "box-1", "role": "", "job": "", "slot": 0},
+                ],
+            }))
+            .expect_err("refused");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("box_id") && err.message.contains("slot"),
+            "both collisions are named, got: {}",
+            err.message
+        );
+        assert_eq!(
+            dispatcher
+                .handle_swarm_get(&serde_json::json!({"swarm_id": "sw-w1"}))
+                .expect("get")["spec"]["boxes"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn swarm_delete_is_refused_while_a_run_holds_the_claim() {
+        let dispatcher = make_swarm_test_dispatcher();
+        create_swarm(&dispatcher);
+
+        // Stand in for a live driver.
+        let token = dispatcher
+            .ctx
+            .swarm_store
+            .try_claim_swarm("sw-w1")
+            .expect("claim")
+            .expect("claim wins");
+
+        let err = dispatcher
+            .handle_swarm_delete(&serde_json::json!({"swarm_id": "sw-w1"}))
+            .expect_err("a driven swarm is not deletable");
+        assert_eq!(err.code, SWARM_RUN_ACTIVE);
+        assert!(
+            err.message.contains("force"),
+            "the refusal names the override, got: {}",
+            err.message
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .swarm_store
+                .load_swarm("sw-w1")
+                .expect("load")
+                .is_some(),
+            "the refusal left the swarm alone"
+        );
+
+        let deleted = dispatcher
+            .handle_swarm_delete(&serde_json::json!({"swarm_id": "sw-w1", "force": true}))
+            .expect("forced delete");
+        assert_eq!(
+            deleted,
+            serde_json::json!({"swarm_id": "sw-w1", "deleted": true})
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .swarm_store
+                .list_events("sw-w1")
+                .expect("events")
+                .is_empty(),
+            "the delete cascaded the event history"
+        );
+        assert!(
+            matches!(
+                dispatcher.ctx.swarm_store.heartbeat_claim(&token),
+                Err(crate::swarm::store::StoreError::ClaimLost { .. })
+            ),
+            "the delete cascaded the claim"
+        );
+    }
+
+    #[test]
+    fn swarm_delete_of_an_unclaimed_or_absent_swarm_is_idempotent() {
+        let dispatcher = make_swarm_test_dispatcher();
+        create_swarm(&dispatcher);
+
+        let deleted = dispatcher
+            .handle_swarm_delete(&serde_json::json!({"swarm_id": "sw-w1"}))
+            .expect("delete");
+        assert_eq!(deleted["deleted"], true);
+
+        let again = dispatcher
+            .handle_swarm_delete(&serde_json::json!({"swarm_id": "sw-w1"}))
+            .expect("deleting an absent swarm is not an error");
+        assert_eq!(again["deleted"], false);
+    }
+
+    #[tokio::test]
+    async fn swarm_fields_returns_every_wizard_step_with_a_shape() {
+        let dispatcher = make_swarm_test_dispatcher();
+        // No provider chosen: the daemon must answer without reaching the
+        // network for a model catalog.
+        let fields = dispatcher
+            .handle_swarm_fields(&serde_json::json!({}))
+            .await
+            .expect("fields");
+        let steps = fields["steps"].as_array().expect("steps array");
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| s["step"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec![
+                "provider",
+                "model",
+                "risk_profile",
+                "boundedness",
+                "channels",
+                "role",
+                "goal",
+            ],
+            "the wire order is the wizard order"
+        );
+        for step in steps {
+            assert!(
+                !step["title"].as_str().unwrap_or_default().is_empty(),
+                "{step} has no title"
+            );
+            assert!(
+                !step["help"].as_str().unwrap_or_default().is_empty(),
+                "{step} has no help"
+            );
+            assert!(
+                step["fields"].as_array().is_some_and(|f| !f.is_empty()),
+                "{step} renders nothing"
+            );
+        }
     }
 
     #[tokio::test]
