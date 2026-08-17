@@ -12,13 +12,19 @@
 //! screen needs from the daemon becomes an [`Effect`] variant plus the
 //! matching [`Update`]; the driver in [`super`] wires the pair together.
 
+use std::collections::HashSet;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use zeroclaw_api::jsonrpc::error_codes::SWARM_RUN_ACTIVE;
-use zeroclaw_runtime::rpc::types::{SwarmStepShape, SwarmSubmission, SwarmValidateResult};
-use zeroclaw_runtime::swarm::store::PersistedSwarm;
+use zeroclaw_runtime::rpc::types::{
+    SwarmBoardNotify, SwarmChatResult, SwarmStepShape, SwarmSubmission, SwarmUpdate,
+    SwarmValidateResult,
+};
+use zeroclaw_runtime::swarm::store::{BoxSpec, PersistedSwarm, SwarmSpend, SwarmStatus};
 
 use super::client::RpcFailure;
+use super::view::{ViewAction, ViewState};
 use super::wizard::{WizardAction, WizardState};
 
 /// Which way a wrapping cursor moved.
@@ -47,6 +53,8 @@ impl Direction {
 pub enum Input {
     Up,
     Down,
+    Left,
+    Right,
     Enter,
     Escape,
     Tab,
@@ -72,6 +80,8 @@ impl Input {
         match key.code {
             KeyCode::Up => Some(Self::Up),
             KeyCode::Down => Some(Self::Down),
+            KeyCode::Left => Some(Self::Left),
+            KeyCode::Right => Some(Self::Right),
             KeyCode::Enter => Some(Self::Enter),
             KeyCode::Esc => Some(Self::Escape),
             KeyCode::Tab => Some(Self::Tab),
@@ -102,6 +112,28 @@ pub enum Effect {
     Create(Box<SwarmSubmission>),
     /// `swarm/delete`.
     Delete { swarm_id: String, force: bool },
+    /// `swarm/subscribe` — opt into the swarm's live streams.
+    Subscribe { swarm_id: String },
+    /// `swarm/start`.
+    Start { swarm_id: String },
+    /// `swarm/pause`.
+    Pause { swarm_id: String },
+    /// `swarm/resume`.
+    Resume { swarm_id: String },
+    /// `swarm/stop`.
+    Stop { swarm_id: String },
+    /// `swarm/chat` — interject a user message into one box.
+    Chat {
+        swarm_id: String,
+        box_id: String,
+        message: String,
+    },
+    /// `swarm/update-layout` — persist the box canvas (slots, roles, jobs).
+    SaveLayout {
+        swarm_id: String,
+        revision: u64,
+        boxes: Vec<BoxSpec>,
+    },
 }
 
 /// A daemon answer, folded back into the state.
@@ -117,6 +149,31 @@ pub enum Update {
     Deleted {
         swarm_id: String,
     },
+    /// `swarm/subscribe` was accepted; the live view can start streaming.
+    Subscribed {
+        swarm_id: String,
+    },
+    /// A `swarm/start|pause|resume` reply: the post-transition run state.
+    RunControl {
+        swarm_id: String,
+        status: SwarmStatus,
+        spent: SwarmSpend,
+    },
+    /// A `swarm/stop` reply: the terminal status.
+    Stopped {
+        swarm_id: String,
+        status: SwarmStatus,
+    },
+    /// A `swarm/chat` reply: the box's new engagement state.
+    Chatted(Box<SwarmChatResult>),
+    /// A `swarm/update-layout` reply: the persisted document at its new revision.
+    LayoutSaved(Box<PersistedSwarm>),
+    /// A live `swarm/update` turn event.
+    Stream(Box<SwarmUpdate>),
+    /// A live `swarm/board` transition.
+    Board(Box<SwarmBoardNotify>),
+    /// The client dropped notifications it could not buffer.
+    StreamGap,
     /// A call came back as an error frame, or the transport gave out.
     Failed(RpcFailure),
 }
@@ -126,9 +183,10 @@ pub enum Update {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Dashboard,
-    /// A single swarm's spec and roster. The live canvas replaces this pane
-    /// later; the router does not care which one is mounted.
-    Detail {
+    /// The live multi-box canvas for one swarm: a grid of streaming cells, the
+    /// budget/run status bar, and the run-control, chat, and layout-edit keys.
+    /// Its working state lives in [`App::view`].
+    SwarmView {
         swarm_id: String,
     },
     Wizard,
@@ -163,6 +221,12 @@ pub struct App {
     modal: Modal,
     /// `None` while the wizard's shapes are still in flight.
     wizard: Option<WizardState>,
+    /// The live canvas's state, mounted while [`Screen::SwarmView`] is up.
+    view: Option<ViewState>,
+    /// Swarm ids already subscribed on this connection. A `swarm/subscribe`
+    /// fan-out lives until the connection closes and there is no unsubscribe, so
+    /// re-opening a swarm must not spawn a second fan-out that doubles events.
+    subscribed: HashSet<String>,
     status: String,
     busy: bool,
     quit: bool,
@@ -184,6 +248,8 @@ impl App {
             selected: 0,
             modal: Modal::None,
             wizard: None,
+            view: None,
+            subscribed: HashSet::new(),
             status: String::new(),
             busy: true,
             quit: false,
@@ -221,6 +287,31 @@ impl App {
 
     pub fn wizard(&self) -> Option<&WizardState> {
         self.wizard.as_ref()
+    }
+
+    pub fn view(&self) -> Option<&ViewState> {
+        self.view.as_ref()
+    }
+
+    /// The live view is up and its subscription is confirmed, so the driver
+    /// should pull the socket's notification stream.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.screen, Screen::SwarmView { .. })
+            && self.view.as_ref().is_some_and(ViewState::subscribed)
+    }
+
+    /// A change-detector the driver watches to re-arm its layout debounce timer;
+    /// it bumps on every layout-changing edit.
+    pub fn layout_generation(&self) -> u64 {
+        self.view.as_ref().map_or(0, ViewState::layout_generation)
+    }
+
+    /// Emit any pending layout write once the debounce has elapsed. Called by
+    /// the driver's timer arm.
+    pub fn flush_layout(&mut self) -> Effect {
+        self.view
+            .as_mut()
+            .map_or(Effect::None, ViewState::flush_layout)
     }
 
     pub fn status(&self) -> &str {
@@ -265,7 +356,7 @@ impl App {
         }
         match &self.screen {
             Screen::Dashboard => self.dashboard_input(input),
-            Screen::Detail { .. } => self.detail_input(input),
+            Screen::SwarmView { .. } => self.swarmview_input(input),
             Screen::Wizard => self.wizard_input(input),
             Screen::Unsupported => {
                 self.quit = true;
@@ -293,9 +384,8 @@ impl App {
                     return Effect::Fields { provider: None };
                 }
                 if let Some(swarm) = self.selected_swarm() {
-                    self.screen = Screen::Detail {
-                        swarm_id: swarm.spec.id.clone(),
-                    };
+                    let swarm = swarm.clone();
+                    return self.open_view(swarm);
                 }
                 Effect::None
             }
@@ -321,17 +411,44 @@ impl App {
         }
     }
 
-    fn detail_input(&mut self, input: Input) -> Effect {
-        match input {
-            Input::Escape | Input::Backspace => {
+    /// Mount the live canvas for a swarm and subscribe to its streams. A swarm
+    /// already subscribed on this connection skips a second `swarm/subscribe`
+    /// (no unsubscribe exists, so a re-subscribe would double every event) and
+    /// streams straight away.
+    fn open_view(&mut self, swarm: PersistedSwarm) -> Effect {
+        let swarm_id = swarm.spec.id.clone();
+        let mut view = ViewState::new(&swarm);
+        self.screen = Screen::SwarmView {
+            swarm_id: swarm_id.clone(),
+        };
+        if self.subscribed.contains(&swarm_id) {
+            view.mark_subscribed();
+            self.view = Some(view);
+            Effect::None
+        } else {
+            self.view = Some(view);
+            self.busy = true;
+            Effect::Subscribe { swarm_id }
+        }
+    }
+
+    fn swarmview_input(&mut self, input: Input) -> Effect {
+        let Some(view) = self.view.as_mut() else {
+            self.screen = Screen::Dashboard;
+            return Effect::None;
+        };
+        match view.on_input(input) {
+            ViewAction::Idle => Effect::None,
+            ViewAction::Leave => {
                 self.screen = Screen::Dashboard;
+                self.view = None;
                 Effect::None
             }
-            Input::Char('q') => {
+            ViewAction::Quit => {
                 self.quit = true;
                 Effect::Quit
             }
-            _ => Effect::None,
+            ViewAction::Call(effect) => effect,
         }
     }
 
@@ -438,20 +555,113 @@ impl App {
                     "Swarm deleted.",
                 );
                 self.modal = Modal::None;
-                if matches!(&self.screen, Screen::Detail { swarm_id: shown } if *shown == swarm_id)
+                if matches!(&self.screen, Screen::SwarmView { swarm_id: shown } if *shown == swarm_id)
                 {
                     self.screen = Screen::Dashboard;
+                    self.view = None;
                 }
                 self.busy = true;
                 Effect::List
             }
+            Update::Subscribed { swarm_id } => {
+                self.subscribed.insert(swarm_id.clone());
+                if let Some(view) = self.view.as_mut()
+                    && view.swarm_id() == swarm_id
+                {
+                    view.mark_subscribed();
+                }
+                Effect::None
+            }
+            Update::RunControl {
+                swarm_id,
+                status,
+                spent,
+            } => {
+                if let Some(view) = self.view.as_mut()
+                    && view.swarm_id() == swarm_id
+                {
+                    view.set_run_state(status, spent);
+                }
+                self.sync_run_state(&swarm_id, Some(status), Some(spent));
+                Effect::None
+            }
+            Update::Stopped { swarm_id, status } => {
+                if let Some(view) = self.view.as_mut()
+                    && view.swarm_id() == swarm_id
+                {
+                    view.set_status(status);
+                }
+                self.sync_run_state(&swarm_id, Some(status), None);
+                Effect::None
+            }
+            Update::Chatted(result) => {
+                if let Some(view) = self.view.as_mut()
+                    && view.swarm_id() == result.swarm_id
+                {
+                    view.apply_chat(&result);
+                }
+                Effect::None
+            }
+            Update::LayoutSaved(saved) => {
+                if let Some(view) = self.view.as_mut()
+                    && view.swarm_id() == saved.spec.id
+                {
+                    view.apply_layout_saved(&saved);
+                }
+                if let Some(at) = self.swarms.iter().position(|s| s.spec.id == saved.spec.id) {
+                    self.swarms[at] = *saved;
+                }
+                Effect::None
+            }
+            Update::Stream(update) => {
+                if let Some(view) = self.view.as_mut() {
+                    view.apply_update(&update);
+                }
+                Effect::None
+            }
+            Update::Board(board) => {
+                if let Some(view) = self.view.as_mut()
+                    && view.swarm_id() == board.swarm_id
+                {
+                    view.apply_board(&board.event);
+                }
+                Effect::None
+            }
+            Update::StreamGap => {
+                if let Some(view) = self.view.as_mut() {
+                    view.note_gap();
+                }
+                Effect::None
+            }
             Update::Failed(failure) => self.on_failure(failure),
+        }
+    }
+
+    /// Keep the dashboard row for a swarm in step with a run-control reply, so
+    /// leaving the live view shows the status the run actually landed on.
+    fn sync_run_state(
+        &mut self,
+        swarm_id: &str,
+        status: Option<SwarmStatus>,
+        spent: Option<SwarmSpend>,
+    ) {
+        if let Some(swarm) = self.swarms.iter_mut().find(|s| s.spec.id == swarm_id) {
+            if let Some(status) = status {
+                swarm.run.status = status;
+            }
+            if let Some(spent) = spent {
+                swarm.run.spent = spent;
+            }
         }
     }
 
     fn on_failure(&mut self, failure: RpcFailure) -> Effect {
         if let Some(wizard) = self.wizard.as_mut() {
             wizard.on_call_failed();
+        }
+        // A rejected layout write must not strand the in-flight guard.
+        if let Some(view) = self.view.as_mut() {
+            view.clear_layout_saving();
         }
         if failure.is_method_not_found() {
             self.screen = Screen::Unsupported;
@@ -532,21 +742,40 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_swarm_opens_the_detail_pane() {
+    fn enter_on_a_swarm_opens_the_live_view_and_subscribes() {
         let mut app = loaded();
-        app.on_input(Input::Enter);
+        assert!(matches!(
+            app.on_input(Input::Enter),
+            Effect::Subscribe { swarm_id } if swarm_id == "sw-1"
+        ));
         assert_eq!(
             app.screen(),
-            &Screen::Detail {
+            &Screen::SwarmView {
                 swarm_id: "sw-1".to_string()
             }
         );
+        assert!(app.view().is_some(), "the live canvas is mounted");
         app.on_input(Input::Escape);
         assert_eq!(app.screen(), &Screen::Dashboard);
+        assert!(app.view().is_none(), "leaving tears the canvas down");
     }
 
     #[test]
-    fn q_quits_from_the_dashboard_and_the_detail_pane() {
+    fn a_second_open_of_the_same_swarm_does_not_resubscribe() {
+        let mut app = loaded();
+        app.on_input(Input::Enter);
+        app.on_update(Update::Subscribed {
+            swarm_id: "sw-1".to_string(),
+        });
+        app.on_input(Input::Escape);
+        // The fan-out already exists on this connection; re-opening streams
+        // straight away without a second subscribe.
+        assert!(matches!(app.on_input(Input::Enter), Effect::None));
+        assert!(app.is_streaming());
+    }
+
+    #[test]
+    fn q_quits_from_the_dashboard_and_the_live_view() {
         let mut app = loaded();
         assert!(matches!(app.on_input(Input::Char('q')), Effect::Quit));
         assert!(app.quit());
@@ -732,5 +961,124 @@ mod tests {
             app.swarms().first().map(|s| s.run.status),
             Some(SwarmStatus::Created)
         );
+    }
+
+    /// Open the live view for the first swarm and confirm its subscription.
+    fn streaming() -> App {
+        let mut app = loaded();
+        app.on_input(Input::Enter);
+        app.on_update(Update::Subscribed {
+            swarm_id: "sw-1".to_string(),
+        });
+        app
+    }
+
+    #[test]
+    fn subscription_gates_streaming() {
+        let mut app = loaded();
+        app.on_input(Input::Enter);
+        assert!(
+            !app.is_streaming(),
+            "no streaming before the subscribe reply"
+        );
+        app.on_update(Update::Subscribed {
+            swarm_id: "sw-1".to_string(),
+        });
+        assert!(app.is_streaming());
+    }
+
+    #[test]
+    fn a_run_control_reply_updates_both_the_view_and_the_dashboard_row() {
+        let mut app = streaming();
+        app.on_update(Update::RunControl {
+            swarm_id: "sw-1".to_string(),
+            status: SwarmStatus::Running,
+            spent: SwarmSpend {
+                turns: 5,
+                tokens: 100,
+                cost_usd: 0.25,
+            },
+        });
+        assert_eq!(
+            app.view().map(ViewState::status),
+            Some(SwarmStatus::Running)
+        );
+        // Leaving the view, the dashboard row reflects the landed status.
+        app.on_input(Input::Escape);
+        assert_eq!(
+            app.swarm("sw-1").map(|s| s.run.status),
+            Some(SwarmStatus::Running)
+        );
+        assert_eq!(app.swarm("sw-1").map(|s| s.run.spent.turns), Some(5));
+    }
+
+    #[test]
+    fn live_notifications_route_into_the_mounted_view() {
+        use zeroclaw_runtime::rpc::types::SessionUpdateEvent;
+        use zeroclaw_runtime::swarm::board::{BoardEvent, BoxState, BoxStatus};
+
+        let mut app = streaming();
+        app.on_update(Update::Stream(Box::new(SwarmUpdate {
+            swarm_id: "sw-1".to_string(),
+            box_id: "box-1".to_string(),
+            event: SessionUpdateEvent::AgentMessageChunk {
+                session_id: "s".to_string(),
+                text: "hello\n".to_string(),
+            },
+        })));
+        app.on_update(Update::Board(Box::new(SwarmBoardNotify {
+            swarm_id: "sw-1".to_string(),
+            event: BoardEvent::Published {
+                box_id: "box-1".to_string(),
+                state: BoxState {
+                    status: BoxStatus::Working,
+                    claim: None,
+                    note: String::new(),
+                },
+            },
+        })));
+        app.on_update(Update::StreamGap);
+
+        let view = app.view().expect("view is mounted");
+        assert_eq!(
+            view.stream("box-1")
+                .and_then(|s| s.lines().next())
+                .map(|l| l.text.as_str()),
+            Some("hello")
+        );
+        assert_eq!(
+            view.badge("box-1").map(|b| b.status),
+            Some(BoxStatus::Working)
+        );
+        assert!(
+            view.feed().any(|line| line.contains("gap")),
+            "a dropped burst is marked on the feed"
+        );
+    }
+
+    #[test]
+    fn a_layout_reply_refreshes_the_stored_revision() {
+        let mut app = streaming();
+        let mut saved = swarm("sw-1", "Research squad");
+        saved.revision = 9;
+        app.on_update(Update::LayoutSaved(Box::new(saved)));
+        assert_eq!(app.swarm("sw-1").map(|s| s.revision), Some(9));
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_subscribe_degrades_instead_of_crashing() {
+        let mut app = loaded();
+        // Opening the view asks to subscribe.
+        assert!(matches!(
+            app.on_input(Input::Enter),
+            Effect::Subscribe { .. }
+        ));
+        // An older daemon answers the subscribe with method-not-found.
+        app.on_update(Update::Failed(RpcFailure {
+            code: METHOD_NOT_FOUND,
+            message: "Method not found".to_string(),
+        }));
+        assert_eq!(app.screen(), &Screen::Unsupported);
+        assert!(!app.is_streaming());
     }
 }

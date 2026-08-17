@@ -248,6 +248,8 @@ impl WizardState {
             }
             Input::Up => self.vertical(Direction::Backward),
             Input::Down => self.vertical(Direction::Forward),
+            // The wizard is single-column; horizontal keys do nothing here.
+            Input::Left | Input::Right => WizardAction::Idle,
             Input::Backspace => {
                 self.edit(|value| {
                     value.pop();

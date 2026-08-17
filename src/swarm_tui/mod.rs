@@ -15,6 +15,7 @@
 mod client;
 mod render;
 mod state;
+mod view;
 mod wizard;
 
 use std::io::{IsTerminal, Stdout};
@@ -32,11 +33,16 @@ use ratatui::backend::CrosstermBackend;
 use crate::SwarmCommands;
 use crate::config::Config;
 
-use client::{CallError, CallResult, RpcFailure, SwarmClient};
+use client::{CallError, CallResult, RpcFailure, SwarmClient, SwarmNotification};
 use render::Palette;
 use state::{App, Effect, Input, Screen, Update};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Trailing debounce before a layout edit is written back with
+/// `swarm/update-layout`. Each further edit re-arms it, so a burst of moves and
+/// header keystrokes coalesces into one write once the canvas goes quiet.
+const LAYOUT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Set while the alternate screen is up, so the panic hook knows whether it
 /// has a terminal to put back.
@@ -146,32 +152,89 @@ async fn event_loop(
         Effect::List
     };
 
+    // Trailing debounce for layout writes: the deadline is absolute so a busy
+    // stream's redraws never keep pushing it back, and it re-arms whenever the
+    // canvas reports a fresh edit.
+    let mut layout_deadline: Option<tokio::time::Instant> = None;
+    let mut layout_gen_seen = app.layout_generation();
+
     loop {
         pump(terminal, app, client, palette, effect).await?;
         effect = Effect::None;
         if app.quit() {
             return Ok(());
         }
+
+        let generation = app.layout_generation();
+        if generation != layout_gen_seen {
+            layout_gen_seen = generation;
+            layout_deadline = Some(tokio::time::Instant::now() + LAYOUT_DEBOUNCE);
+        }
         terminal.draw(|frame| render::draw(frame, app, palette))?;
 
-        #[cfg(unix)]
-        let next = tokio::select! {
-            event = events.next() => event,
-            _ = sigterm.recv() => None,
+        let streaming = app.is_streaming();
+        let deadline = layout_deadline;
+        let terminate = async {
+            #[cfg(unix)]
+            {
+                sigterm.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await;
+            }
         };
-        #[cfg(not(unix))]
-        let next = events.next().await;
+        let layout_timer = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
 
-        let Some(event) = next else {
-            return Ok(());
-        };
-        let Event::Key(key) = event? else {
-            continue;
-        };
-        if let Some(input) = Input::from_key(key) {
-            effect = app.on_input(input);
+        tokio::select! {
+            () = terminate => return Ok(()),
+            maybe_event = events.next() => {
+                let Some(event) = maybe_event else {
+                    return Ok(());
+                };
+                if let Event::Key(key) = event?
+                    && let Some(input) = Input::from_key(key)
+                {
+                    effect = app.on_input(input);
+                }
+            }
+            notification = client.next_notification(), if streaming => {
+                match notification {
+                    Ok(first) => {
+                        apply_notification(app, first);
+                        // Coalesce any already-buffered notifications into this
+                        // one redraw so a chunk burst is not one frame each.
+                        while let Some(next) = client.try_next_notification() {
+                            apply_notification(app, next);
+                        }
+                    }
+                    // The stream connection is the whole session; a dead socket
+                    // ends it the same way a failed call does.
+                    Err(_) => return Ok(()),
+                }
+            }
+            () = layout_timer, if deadline.is_some() => {
+                layout_deadline = None;
+                effect = app.flush_layout();
+            }
         }
     }
+}
+
+/// Fold a live notification into the reducer. Stream updates never chain an
+/// effect, so the answer is discarded.
+fn apply_notification(app: &mut App, notification: SwarmNotification) {
+    let update = match notification {
+        SwarmNotification::Update(update) => Update::Stream(update),
+        SwarmNotification::Board(board) => Update::Board(board),
+        SwarmNotification::Gap => Update::StreamGap,
+    };
+    let _ = app.on_update(update);
 }
 
 /// Perform an effect, fold the answer back in, and keep going while the
@@ -220,8 +283,46 @@ async fn perform(client: &mut SwarmClient, effect: Effect) -> Result<Option<Upda
                 }
             })?
         }
+        Effect::Subscribe { swarm_id } => fold(client.subscribe(&swarm_id).await, |result| {
+            Update::Subscribed {
+                swarm_id: result.swarm_id,
+            }
+        })?,
+        Effect::Start { swarm_id } => fold(client.start(&swarm_id).await, run_control)?,
+        Effect::Pause { swarm_id } => fold(client.pause(&swarm_id).await, run_control)?,
+        Effect::Resume { swarm_id } => fold(client.resume(&swarm_id).await, run_control)?,
+        Effect::Stop { swarm_id } => {
+            fold(client.stop(&swarm_id).await, |result| Update::Stopped {
+                swarm_id: result.swarm_id,
+                status: result.status,
+            })?
+        }
+        Effect::Chat {
+            swarm_id,
+            box_id,
+            message,
+        } => fold(client.chat(&swarm_id, &box_id, &message).await, |result| {
+            Update::Chatted(Box::new(result))
+        })?,
+        Effect::SaveLayout {
+            swarm_id,
+            revision,
+            boxes,
+        } => fold(
+            client.update_layout(&swarm_id, revision, &boxes).await,
+            |saved| Update::LayoutSaved(Box::new(saved)),
+        )?,
     };
     Ok(Some(update))
+}
+
+/// Fold a run-control reply (`swarm/start|pause|resume`) into its update.
+fn run_control(result: zeroclaw_runtime::rpc::types::SwarmRunControlResult) -> Update {
+    Update::RunControl {
+        swarm_id: result.swarm_id,
+        status: result.status,
+        spent: result.spent,
+    }
 }
 
 /// Turn a call result into an update: success through `ok`, a daemon error

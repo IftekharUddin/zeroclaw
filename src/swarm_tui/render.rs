@@ -15,11 +15,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use zeroclaw_config::traits::PropKind;
 use zeroclaw_runtime::quickstart::FieldDescriptor;
+use zeroclaw_runtime::swarm::board::BoxStatus;
 use zeroclaw_runtime::swarm::store::{
-    BoxSpec, PersistedSwarm, SwarmBudget, SwarmPauseReason, SwarmStatus,
+    PersistedSwarm, SwarmBudget, SwarmBudgetLimits, SwarmPauseReason, SwarmSpend, SwarmStatus,
 };
 
 use super::state::{App, Modal, Screen};
+use super::view::{BoxBadge, EditLine, LineKind, Mode, ViewState};
 use super::wizard::WizardState;
 
 /// Column widths on the dashboard, in cells.
@@ -80,7 +82,7 @@ pub fn draw(frame: &mut Frame, app: &App, palette: Palette) {
     let area = frame.area();
     match app.screen() {
         Screen::Dashboard => draw_dashboard(frame, area, app, palette),
-        Screen::Detail { swarm_id } => draw_detail(frame, area, app, swarm_id, palette),
+        Screen::SwarmView { swarm_id } => draw_swarm_view(frame, area, app, swarm_id, palette),
         Screen::Wizard => draw_wizard(frame, area, app, palette),
         Screen::Unsupported => draw_unsupported(frame, area, palette),
     }
@@ -193,10 +195,10 @@ fn swarm_row(swarm: &PersistedSwarm, palette: Palette) -> Line<'static> {
     ])
 }
 
-// ── Detail ───────────────────────────────────────────────────────
+// ── Live multi-box canvas ────────────────────────────────────────
 
-fn draw_detail(frame: &mut Frame, area: Rect, app: &App, swarm_id: &str, palette: Palette) {
-    let Some(swarm) = app.swarm(swarm_id) else {
+fn draw_swarm_view(frame: &mut Frame, area: Rect, app: &App, swarm_id: &str, palette: Palette) {
+    let Some(view) = app.view() else {
         frame.render_widget(
             Paragraph::new(crate::t(
                 "cli-swarm-tui-detail-missing",
@@ -206,146 +208,314 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, swarm_id: &str, palette
         );
         return;
     };
+    let name = app
+        .swarm(swarm_id)
+        .map_or(swarm_id, |s| s.spec.name.as_str());
 
     let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(1), // title + run status
+        Constraint::Length(1), // budget bar
+        Constraint::Min(3),    // grid
+        Constraint::Length(3), // broadcast feed
+        Constraint::Length(1), // input (chat)
+        Constraint::Length(1), // hint
     ])
     .split(area);
 
+    draw_view_title(frame, rows[0], name, view, palette);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            crate::ta(
-                "cli-swarm-tui-detail-title",
-                &[("name", swarm.spec.name.as_str())],
-                "Swarm",
-            ),
+            budget_bar(view.spent(), view.limits()),
+            Style::default().fg(palette.muted),
+        ))),
+        rows[1],
+    );
+    draw_grid(frame, rows[2], view, palette);
+    draw_feed(frame, rows[3], view, palette);
+    draw_view_input(frame, rows[4], view, palette);
+    frame.render_widget(hint_line(&view_hint(view.mode()), palette), rows[5]);
+}
+
+fn draw_view_title(frame: &mut Frame, area: Rect, name: &str, view: &ViewState, palette: Palette) {
+    let status = status_detail(view.status());
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{name} "),
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
-        ))),
-        rows[0],
-    );
-
-    let spent = &swarm.run.spent;
-    let mut lines = vec![
-        field_line("cli-swarm-tui-field-id", "Id", &swarm.spec.id, palette),
-        field_line(
-            "cli-swarm-tui-field-status",
-            "Status",
-            &status_detail(swarm.run.status),
-            palette,
         ),
-        field_line(
-            "cli-swarm-tui-field-provider",
-            "Provider",
-            &swarm.spec.provider,
-            palette,
+        Span::styled(
+            status,
+            Style::default().fg(status_color(view.status(), palette)),
         ),
-        field_line(
-            "cli-swarm-tui-field-model",
-            "Model",
-            &swarm.spec.model,
-            palette,
-        ),
-        field_line(
-            "cli-swarm-tui-field-risk",
-            "Risk profile",
-            &swarm.spec.risk_profile,
-            palette,
-        ),
-        field_line(
-            "cli-swarm-tui-field-budget",
-            "Budget",
-            &budget_detail(swarm.spec.budget),
-            palette,
-        ),
-        field_line(
-            "cli-swarm-tui-field-spent",
-            "Spent",
-            &format!(
-                "{} turns / {} tokens / {:.2} USD",
-                spent.turns, spent.tokens, spent.cost_usd
-            ),
-            palette,
-        ),
-        field_line(
-            "cli-swarm-tui-field-channels",
-            "Channels",
-            &join_or_dash(&swarm.spec.channels),
-            palette,
-        ),
-        field_line(
-            "cli-swarm-tui-field-role",
-            "Role",
-            &swarm.spec.role,
-            palette,
-        ),
-        field_line(
-            "cli-swarm-tui-field-goal",
-            "Goal",
-            &swarm.spec.goal,
-            palette,
-        ),
-        Line::raw(""),
-        Line::from(Span::styled(
-            crate::t("cli-swarm-tui-roster", "Roster"),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "{}{}{}{}",
-                pad(&crate::t("cli-swarm-tui-col-slot", "Slot"), 6),
-                pad(&crate::t("cli-swarm-tui-col-box", "Box"), 12),
-                pad(&crate::t("cli-swarm-tui-col-role", "Role"), 16),
-                crate::t("cli-swarm-tui-col-job", "Job"),
-            ),
-            Style::default().fg(palette.muted),
-        )),
-    ];
-    for entry in &swarm.spec.boxes {
-        lines.push(box_line(entry, palette));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[1]);
-
-    frame.render_widget(
-        hint_line(
-            &crate::t("cli-swarm-tui-keys-detail", "esc back - q quit"),
-            palette,
-        ),
-        rows[2],
-    );
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
-fn box_line(entry: &BoxSpec, palette: Palette) -> Line<'static> {
-    let unassigned = crate::t("cli-swarm-tui-box-unassigned", "unassigned");
-    let role = if entry.role.is_empty() {
-        unassigned.clone()
+/// Split the grid area into rows then columns and draw one cell per box.
+fn draw_grid(frame: &mut Frame, area: Rect, view: &ViewState, palette: Palette) {
+    let boxes = view.boxes();
+    if boxes.is_empty() {
+        frame.render_widget(
+            Paragraph::new(crate::t(
+                "cli-swarm-tui-view-empty",
+                "This swarm has no boxes.",
+            )),
+            area,
+        );
+        return;
+    }
+    let (rows, cols) = view.grid_shape();
+    let row_n = u32::try_from(rows).unwrap_or(1).max(1);
+    let col_n = u32::try_from(cols).unwrap_or(1).max(1);
+    let row_areas = Layout::vertical(vec![Constraint::Ratio(1, row_n); rows]).split(area);
+    for r in 0..rows {
+        let col_areas =
+            Layout::horizontal(vec![Constraint::Ratio(1, col_n); cols]).split(row_areas[r]);
+        for c in 0..cols {
+            let idx = r * cols + c;
+            if idx < boxes.len() {
+                draw_cell(frame, col_areas[c], view, idx, palette);
+            }
+        }
+    }
+}
+
+fn draw_cell(frame: &mut Frame, area: Rect, view: &ViewState, idx: usize, palette: Palette) {
+    let entry = &view.boxes()[idx];
+    let focused = view.focus() == idx;
+    let grabbed = focused && matches!(view.mode(), Mode::Move);
+    let border = if grabbed {
+        palette.warn
+    } else if focused {
+        palette.accent
     } else {
-        entry.role.clone()
+        palette.muted
     };
-    let job = if entry.job.is_empty() {
-        unassigned
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" {} ", entry.box_id),
+            Style::default().fg(border),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // The editable role/job header (two lines), then badges, then the stream.
+    // While editing, the header shows the in-progress buffers, not the last
+    // committed values, so typing is visible.
+    let editing = focused_edit(view, idx);
+    let (role, job) = match (editing.is_some(), view.mode()) {
+        (true, Mode::Edit { role, job, .. }) => (role.as_str(), job.as_str()),
+        _ => (entry.role.as_str(), entry.job.as_str()),
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(header_line(
+        &crate::t("cli-swarm-tui-cell-role", "role"),
+        role,
+        editing == Some(EditLine::Role),
+        palette,
+    ));
+    lines.push(header_line(
+        &crate::t("cli-swarm-tui-cell-job", "job"),
+        job,
+        editing == Some(EditLine::Job),
+        palette,
+    ));
+    lines.push(badge_line(view.badge(&entry.box_id), palette));
+
+    let height = inner.height as usize;
+    let stream_room = height.saturating_sub(lines.len());
+    lines.extend(stream_lines(view, &entry.box_id, stream_room, palette));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// The header row for one editable field: `label: value`, with a cursor and
+/// accent when that line is the one being edited.
+fn header_line(label: &str, value: &str, editing: bool, palette: Palette) -> Line<'static> {
+    let shown = if value.is_empty() && !editing {
+        crate::t("cli-swarm-tui-box-unassigned", "unassigned")
     } else {
-        entry.job.clone()
+        value.to_string()
     };
-    let dim = entry.role.is_empty() && entry.job.is_empty();
-    let style = if dim {
+    let cursor = if editing { "_" } else { "" };
+    let value_style = if editing {
+        Style::default().fg(palette.accent)
+    } else if value.is_empty() {
         Style::default().fg(palette.muted)
     } else {
         Style::default()
     };
-    Line::from(Span::styled(
-        format!(
-            "{}{}{}{}",
-            pad(&entry.slot.to_string(), 6),
-            pad(&entry.box_id, 12),
-            pad(&role, 16),
-            job
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(palette.muted)),
+        Span::styled(format!("{shown}{cursor}"), value_style),
+    ])
+}
+
+/// The badge row: board status, current claim, the user-engaged flag, and the
+/// latest context usage.
+fn badge_line(badge: Option<&BoxBadge>, palette: Palette) -> Line<'static> {
+    let Some(badge) = badge else {
+        return Line::from(Span::styled(
+            crate::t("cli-swarm-tui-badge-idle", "idle"),
+            Style::default().fg(palette.muted),
+        ));
+    };
+    let mut spans = vec![Span::styled(
+        box_status_label(badge.status),
+        Style::default().fg(box_status_color(badge.status, palette)),
+    )];
+    if let Some(claim) = &badge.claim {
+        spans.push(Span::styled(
+            format!(
+                " {}",
+                crate::ta(
+                    "cli-swarm-tui-badge-claim",
+                    &[("claim", claim.as_str())],
+                    "claim"
+                )
+            ),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    if badge.engaged {
+        spans.push(Span::styled(
+            format!(" {}", crate::t("cli-swarm-tui-badge-engaged", "(you)")),
+            Style::default().fg(palette.warn),
+        ));
+    }
+    if let Some((tokens, ceiling)) = badge.context {
+        let ceiling = ceiling.map_or_else(|| "?".to_string(), |c| c.to_string());
+        let ctx = crate::ta(
+            "cli-swarm-tui-badge-ctx",
+            &[
+                ("tokens", tokens.to_string().as_str()),
+                ("ceiling", ceiling.as_str()),
+            ],
+            "ctx",
+        );
+        spans.push(Span::styled(
+            format!(" {ctx}"),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The tail of a box's stream that fits `room` lines: a gap marker when the ring
+/// dropped content, then the most recent finished lines, then the live partial.
+fn stream_lines(
+    view: &ViewState,
+    box_id: &str,
+    room: usize,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    if room == 0 {
+        return Vec::new();
+    }
+    let Some(stream) = view.stream(box_id) else {
+        return vec![Line::from(Span::styled(
+            crate::t("cli-swarm-tui-cell-waiting", "waiting…"),
+            Style::default().fg(palette.muted),
+        ))];
+    };
+
+    // Collect the renderable lines newest-last, then keep only the tail.
+    let mut all: Vec<Line<'static>> = Vec::new();
+    if stream.has_gap() {
+        all.push(Line::from(Span::styled(
+            crate::t("cli-swarm-tui-stream-gap", "… (stream gap)"),
+            Style::default().fg(palette.warn),
+        )));
+    }
+    for line in stream.lines() {
+        all.push(Line::from(Span::styled(
+            line.text.clone(),
+            Style::default().fg(line_color(line.kind, palette)),
+        )));
+    }
+    if let Some((kind, text)) = stream.partial() {
+        all.push(Line::from(Span::styled(
+            format!("{text}_"),
+            Style::default().fg(line_color(kind, palette)),
+        )));
+    }
+    if all.len() > room {
+        all.split_off(all.len() - room)
+    } else {
+        all
+    }
+}
+
+fn draw_feed(frame: &mut Frame, area: Rect, view: &ViewState, palette: Palette) {
+    let mut lines = vec![Line::from(Span::styled(
+        crate::t("cli-swarm-tui-feed-label", "Broadcast"),
+        Style::default()
+            .fg(palette.muted)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let room = (area.height as usize).saturating_sub(1);
+    let entries: Vec<&String> = view.feed().collect();
+    let tail = entries.iter().rev().take(room).rev();
+    for entry in tail {
+        lines.push(Line::from(Span::styled(
+            (*entry).clone(),
+            Style::default().fg(palette.muted),
+        )));
+    }
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            crate::t("cli-swarm-tui-feed-empty", "no board activity yet"),
+            Style::default().fg(palette.muted),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The chat input row, shown only while typing to a box.
+fn draw_view_input(frame: &mut Frame, area: Rect, view: &ViewState, palette: Palette) {
+    let Mode::Chat { buffer } = view.mode() else {
+        return;
+    };
+    let box_id = view.focused_box().map_or("", |b| b.box_id.as_str());
+    let prompt = crate::ta("cli-swarm-tui-chat-prompt", &[("box", box_id)], "chat");
+    let line = Line::from(vec![
+        Span::styled(format!("{prompt} "), Style::default().fg(palette.accent)),
+        Span::raw(format!("{buffer}_")),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn view_hint(mode: &Mode) -> String {
+    match mode {
+        Mode::Nav => crate::t(
+            "cli-swarm-tui-keys-view",
+            "arrows focus - enter chat - e edit - m move - s/p/r/x run - esc back - q quit",
         ),
-        style,
-    ))
+        Mode::Chat { .. } => crate::t(
+            "cli-swarm-tui-keys-chat",
+            "type message - enter send - 'resume' hands back - esc cancel",
+        ),
+        Mode::Edit { .. } => crate::t(
+            "cli-swarm-tui-keys-edit",
+            "type - tab role/job - enter save - esc cancel",
+        ),
+        Mode::Move => crate::t("cli-swarm-tui-keys-move", "arrows swap - enter/m/esc drop"),
+    }
+}
+
+/// Which header line of cell `idx` is being edited, if the focused box is in
+/// edit mode.
+fn focused_edit(view: &ViewState, idx: usize) -> Option<EditLine> {
+    if view.focus() != idx {
+        return None;
+    }
+    match view.mode() {
+        Mode::Edit { line, .. } => Some(*line),
+        _ => None,
+    }
 }
 
 // ── Wizard ───────────────────────────────────────────────────────
@@ -667,34 +837,56 @@ pub fn budget_label(budget: SwarmBudget) -> String {
     }
 }
 
-/// The budget with its ceilings spelled out, for the detail pane.
-fn budget_detail(budget: SwarmBudget) -> String {
-    let limits = budget.limits();
-    format!(
-        "{} ({} turns / {} tokens / {:.2} USD)",
-        budget_label(budget),
-        limits.max_turns,
-        limits.max_tokens,
-        limits.max_cost_usd
+/// The swarm-level budget status bar: turns / tokens / cost spent against the
+/// preset ceiling.
+fn budget_bar(spent: SwarmSpend, limits: SwarmBudgetLimits) -> String {
+    let turns = spent.turns.to_string();
+    let max_turns = limits.max_turns.to_string();
+    let tokens = spent.tokens.to_string();
+    let max_tokens = limits.max_tokens.to_string();
+    let cost = format!("{:.2}", spent.cost_usd);
+    let max_cost = format!("{:.2}", limits.max_cost_usd);
+    crate::ta(
+        "cli-swarm-tui-budget-bar",
+        &[
+            ("turns", turns.as_str()),
+            ("max_turns", max_turns.as_str()),
+            ("tokens", tokens.as_str()),
+            ("max_tokens", max_tokens.as_str()),
+            ("cost", cost.as_str()),
+            ("max_cost", max_cost.as_str()),
+        ],
+        "budget",
     )
 }
 
-fn join_or_dash(values: &[String]) -> String {
-    if values.is_empty() {
-        "-".to_string()
-    } else {
-        values.join(", ")
+/// A box's board status as one localized word.
+fn box_status_label(status: BoxStatus) -> String {
+    match status {
+        BoxStatus::Idle => crate::t("cli-swarm-tui-badge-idle", "idle"),
+        BoxStatus::Working => crate::t("cli-swarm-tui-badge-working", "working"),
+        BoxStatus::Blocked => crate::t("cli-swarm-tui-badge-blocked", "blocked"),
+        BoxStatus::Done => crate::t("cli-swarm-tui-badge-done", "done"),
     }
 }
 
-fn field_line(key: &str, fallback: &str, value: &str, palette: Palette) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            pad(&crate::t(key, fallback), 14),
-            Style::default().fg(palette.muted),
-        ),
-        Span::raw(value.to_string()),
-    ])
+fn box_status_color(status: BoxStatus, palette: Palette) -> Color {
+    match status {
+        BoxStatus::Working => palette.ok,
+        BoxStatus::Blocked => palette.danger,
+        BoxStatus::Done => palette.accent,
+        BoxStatus::Idle => palette.muted,
+    }
+}
+
+/// The colour a coalesced stream line is tinted with.
+fn line_color(kind: LineKind, palette: Palette) -> Color {
+    match kind {
+        LineKind::Message => Color::Reset,
+        LineKind::Thought => palette.muted,
+        LineKind::Tool => palette.accent,
+        LineKind::System => palette.warn,
+    }
 }
 
 fn muted_row(text: &str, palette: Palette) -> Line<'static> {
@@ -854,15 +1046,115 @@ mod tests {
     }
 
     #[test]
-    fn the_detail_pane_shows_the_spec_and_the_roster() {
+    fn the_live_canvas_shows_a_cell_per_box_and_the_budget_bar() {
         let mut app = loaded();
         app.on_input(Input::Enter);
         let rendered = render(&app);
-        assert!(rendered.contains("claude-sonnet-4"), "{rendered}");
-        assert!(rendered.contains("survey the field"));
-        assert!(rendered.contains("box-1"));
+        // One grid cell per roster box, titled by box id.
+        assert!(rendered.contains("box-1"), "{rendered}");
         assert!(rendered.contains("box-4"));
-        assert!(rendered.contains(&crate::t("cli-swarm-tui-roster", "Roster")));
+        // The swarm-level budget status bar and the broadcast feed.
+        assert!(rendered.contains(&crate::t("cli-swarm-tui-feed-label", "Broadcast")));
+        assert!(
+            rendered.contains(&status_label(SwarmStatus::Created)),
+            "the run status is shown"
+        );
+    }
+
+    /// Headless smoke: drive the reducer with a scripted stream and assert the
+    /// rendered frame shows four streaming boxes with badges plus the budget
+    /// bar — no TTY, no daemon.
+    #[test]
+    fn a_scripted_run_renders_four_streaming_boxes_with_badges() {
+        use zeroclaw_runtime::rpc::types::{SessionUpdateEvent, SwarmBoardNotify, SwarmUpdate};
+        use zeroclaw_runtime::swarm::board::{BoardEvent, BoxState, BoxStatus};
+
+        let mut app = loaded();
+        app.on_input(Input::Enter); // open the live view for sw-1
+        app.on_update(Update::Subscribed {
+            swarm_id: "sw-1".to_string(),
+        });
+        assert!(app.is_streaming(), "the view streams once subscribed");
+
+        // Every box works its job and streams a line.
+        for n in 1..=4 {
+            let box_id = format!("box-{n}");
+            app.on_update(Update::Board(Box::new(SwarmBoardNotify {
+                swarm_id: "sw-1".to_string(),
+                event: BoardEvent::Published {
+                    box_id: box_id.clone(),
+                    state: BoxState {
+                        status: BoxStatus::Working,
+                        claim: Some(format!("task-{n}")),
+                        note: String::new(),
+                    },
+                },
+            })));
+            app.on_update(Update::Stream(Box::new(SwarmUpdate {
+                swarm_id: "sw-1".to_string(),
+                box_id: box_id.clone(),
+                event: SessionUpdateEvent::AgentMessageChunk {
+                    session_id: box_id,
+                    text: format!("analyzing shard {n}\n"),
+                },
+            })));
+        }
+        // A live spend so the budget bar is not all zeros.
+        app.on_update(Update::RunControl {
+            swarm_id: "sw-1".to_string(),
+            status: SwarmStatus::Running,
+            spent: SwarmSpend {
+                turns: 12,
+                tokens: 3400,
+                cost_usd: 1.5,
+            },
+        });
+
+        let rendered = render(&app);
+        for n in 1..=4 {
+            assert!(
+                rendered.contains(&format!("box-{n}")),
+                "cell {n}: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("analyzing shard {n}")),
+                "streamed line {n}: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains(&crate::t("cli-swarm-tui-badge-working", "working")),
+            "working badge: {rendered}"
+        );
+        assert!(rendered.contains("task-1"), "claim badge: {rendered}");
+        assert!(
+            rendered.contains("12"),
+            "spent turns in the budget bar: {rendered}"
+        );
+        assert!(
+            rendered.contains(&status_label(SwarmStatus::Running)),
+            "run status: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_chat_input_row_appears_while_typing_to_a_box() {
+        let mut app = loaded();
+        app.on_input(Input::Enter);
+        app.on_input(Input::Enter); // open chat on the focused box
+        app.on_input(Input::Char('h'));
+        app.on_input(Input::Char('i'));
+        let rendered = render(&app);
+        assert!(
+            rendered.contains(&clip(
+                &crate::ta("cli-swarm-tui-chat-prompt", &[("box", "box-1")], "chat"),
+                8
+            )),
+            "the chat prompt names the box: {rendered}"
+        );
+        assert!(
+            rendered.contains("hi"),
+            "the typed message is shown: {rendered}"
+        );
     }
 
     #[test]
