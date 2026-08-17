@@ -713,6 +713,72 @@ fn t12_reliability_fallback_fields_dropped() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// legacy [swarms] config table stays dropped (swarm runtime state)
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn swarms_legacy_table_dropped_v2_to_v3() {
+    // Swarm state is runtime state under `data/swarms/swarms.db`, never
+    // configuration, so the V2→V3 `[swarms]` drop must hold. A
+    // legacy `[swarms]` block must migrate cleanly with every key DROPPED and
+    // nothing may resurrect the table. `migrate_v2` also round-trips the output
+    // through `Config`, so a surviving `[swarms]` key would additionally trip
+    // the schema-round-trip gate baked into that helper.
+    let v3 = migrate_v2(
+        r#"
+schema_version = 2
+
+[swarms.research]
+goal = "map the codebase"
+roster = 4
+
+[swarms.research.budget]
+max_turns = 100
+"#,
+    );
+    assert!(
+        v3.get("swarms").is_none(),
+        "legacy [swarms] table must be dropped by the V2→V3 migration; got {:?}",
+        v3.get("swarms")
+    );
+}
+
+#[test]
+fn swarms_legacy_table_dropped_full_v1_chain() {
+    // The same drop holds across the full V1→V2→V3 chain. Unlike a
+    // truly-unknown section (which passes through, see
+    // `passthrough_propagates_unknown_section`), `[swarms]` is a KNOWN dropped
+    // table: V1→V2 hoists it into the typed V2 slot and V2→V3 discards it, so
+    // it never survives even though passthrough would otherwise preserve it.
+    let raw = r#"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+
+[swarms.research]
+goal = "map the codebase"
+roster = 4
+"#;
+    let migrated = migrate_file(raw)
+        .expect("migrate_file succeeds")
+        .expect("migration ran (V1 input)");
+    let value: toml::Value = toml::from_str(&migrated).expect("migrated TOML parses");
+    assert!(
+        value.get("swarms").is_none(),
+        "legacy [swarms] table must not survive the V1→V3 chain; got {:?}",
+        value.get("swarms")
+    );
+
+    // Re-running the migration on the V3 output is a no-op: a second pass must
+    // not resurrect the table (or anything else).
+    assert!(
+        migrate_file(&migrated)
+            .expect("second migrate succeeds")
+            .is_none(),
+        "migrating an already-current config must be a no-op"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
 // T13 — security.sandbox + .resources fold into risk_profiles.default
 // ─────────────────────────────────────────────────────────────
 
