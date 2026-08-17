@@ -5,6 +5,8 @@
 //! store this module owns, keyed by swarm id and guarded by a revision.
 
 pub mod board;
+pub mod delegate_tool;
+pub mod engine;
 pub mod reap;
 pub mod roster;
 pub mod state_tool;
@@ -13,6 +15,11 @@ pub mod wizard;
 
 pub use board::{
     BoardEvent, BoardSnapshot, BoxState, BoxStatus, ClaimOutcome, ReleaseOutcome, SwarmStateBoard,
+};
+pub use delegate_tool::SwarmDelegateTool;
+pub use engine::{
+    BoxTurnError, BudgetAxis, ConfigSwarmProviderFactory, SwarmEngine, SwarmEngineError,
+    SwarmProviderFactory, SwarmRunState,
 };
 pub use reap::{ReapReport, reap_swarm};
 pub use roster::{RosterBox, RosterError, SwarmRoster, build_swarm_roster, swarm_box_alias};
