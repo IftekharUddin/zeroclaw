@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS swarm_claims (
     swarm_id      TEXT PRIMARY KEY,
     holder        TEXT NOT NULL,
     claimed_at    TEXT NOT NULL,
-    lease_expires TEXT NOT NULL
+    lease_expires TEXT NOT NULL,
+    boot_id       TEXT NOT NULL DEFAULT ''
 );
 ";
 
@@ -166,7 +167,11 @@ impl SwarmStore for SqliteSwarmStore {
         Ok(removed > 0)
     }
 
-    fn try_claim_swarm(&self, swarm_id: &str) -> Result<Option<SwarmClaimToken>, StoreError> {
+    fn try_claim_swarm_with_boot(
+        &self,
+        swarm_id: &str,
+        boot_id: &str,
+    ) -> Result<Option<SwarmClaimToken>, StoreError> {
         let g = self.lock()?;
         // A finished swarm is history, not work: never re-claimable.
         let terminal: Option<i64> = g
@@ -194,15 +199,16 @@ impl SwarmStore for SqliteSwarmStore {
         if claimed.is_some() {
             return Ok(None);
         }
-        let token = mint_claim(swarm_id);
+        let token = mint_claim(swarm_id, boot_id);
         g.execute(
-            "INSERT INTO swarm_claims (swarm_id, holder, claimed_at, lease_expires)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO swarm_claims (swarm_id, holder, claimed_at, lease_expires, boot_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 token.swarm_id,
                 token.holder,
                 token.claimed_at,
-                token.lease_expires
+                token.lease_expires,
+                token.boot_id
             ],
         )
         .map_err(sql_err)?;
@@ -247,7 +253,7 @@ impl SwarmStore for SqliteSwarmStore {
         let g = self.lock()?;
         let mut stmt = g
             .prepare(
-                "SELECT swarm_id, holder, claimed_at, lease_expires FROM swarm_claims
+                "SELECT swarm_id, holder, claimed_at, lease_expires, boot_id FROM swarm_claims
                  WHERE lease_expires <= ?1 ORDER BY swarm_id",
             )
             .map_err(sql_err)?;
@@ -258,6 +264,33 @@ impl SwarmStore for SqliteSwarmStore {
                     holder: r.get(1)?,
                     claimed_at: r.get(2)?,
                     lease_expires: r.get(3)?,
+                    boot_id: r.get(4)?,
+                })
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql_err)?);
+        }
+        Ok(out)
+    }
+
+    fn claims_not_held_by_boot(&self, boot_id: &str) -> Result<Vec<SwarmClaimToken>, StoreError> {
+        let g = self.lock()?;
+        let mut stmt = g
+            .prepare(
+                "SELECT swarm_id, holder, claimed_at, lease_expires, boot_id FROM swarm_claims
+                 WHERE boot_id <> ?1 ORDER BY swarm_id",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![boot_id], |r| {
+                Ok(SwarmClaimToken {
+                    swarm_id: r.get(0)?,
+                    holder: r.get(1)?,
+                    claimed_at: r.get(2)?,
+                    lease_expires: r.get(3)?,
+                    boot_id: r.get(4)?,
                 })
             })
             .map_err(sql_err)?;
@@ -363,6 +396,11 @@ mod tests {
     #[test]
     fn sqlite_expired_claims_match_past_due_leases() {
         conformance::expired_claims_match_past_due_leases(&store());
+    }
+
+    #[test]
+    fn sqlite_claims_are_scoped_to_owning_boot() {
+        conformance::claims_are_scoped_to_owning_boot(&store());
     }
 
     #[test]
