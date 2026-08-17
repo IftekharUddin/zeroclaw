@@ -1761,6 +1761,32 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn purge_agent_identity(&self, agent_alias: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            // Single writer under the connection lock: count-then-delete cannot
+            // race a concurrent insert into the window. Refuse while rows still
+            // point at the binding — deleting it would orphan attributed rows
+            // behind a UUID nothing can resolve.
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
+                params![agent_alias],
+                |row| row.get(0),
+            )?;
+            if rows > 0 {
+                anyhow::bail!(
+                    "cannot remove the agent identity for `{agent_alias}`: {rows} memory row(s) still reference it; purge them first"
+                );
+            }
+            let affected = conn.execute("DELETE FROM agents WHERE alias = ?1", params![agent_alias])?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
     async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
         let from = from.to_string();
@@ -2395,6 +2421,42 @@ mod tests {
         let purged_ghost = mem.purge_agent("ghost").await.unwrap();
         assert_eq!(purged_ghost, 0);
         assert_eq!(mem.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_agent_identity_drops_the_binding_only_once_rows_are_gone() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        mem.store_with_agent(
+            "alpha-0",
+            "alpha row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&alpha),
+        )
+        .await
+        .unwrap();
+
+        // Refused while rows still reference the binding: dropping it would
+        // orphan them behind an unresolvable UUID.
+        let err = mem
+            .purge_agent_identity("alpha")
+            .await
+            .expect_err("a referenced identity must not be removable");
+        assert!(err.to_string().contains("still reference"), "{err}");
+
+        assert_eq!(mem.purge_agent("alpha").await.unwrap(), 1);
+        assert!(
+            mem.purge_agent_identity("alpha").await.unwrap(),
+            "an unreferenced identity must be removable"
+        );
+        // Gone for real: a re-mint allocates a fresh UUID.
+        assert_ne!(mem.ensure_agent_uuid("alpha").await.unwrap(), alpha);
+
+        // Unknown alias → nothing to remove, and not an error.
+        assert!(!mem.purge_agent_identity("ghost").await.unwrap());
     }
 
     #[tokio::test]

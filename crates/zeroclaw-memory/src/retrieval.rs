@@ -411,6 +411,12 @@ impl Memory for RetrievalPipeline {
         result
     }
 
+    async fn purge_agent_identity(&self, agent_alias: &str) -> anyhow::Result<bool> {
+        // Identity-only delete: the rows are already gone (the backend refuses
+        // otherwise), so there is nothing cached left to invalidate.
+        self.memory.purge_agent_identity(agent_alias).await
+    }
+
     async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
         self.memory.export_agent(agent_alias).await
     }

@@ -206,7 +206,9 @@ pub fn resolve_inject_policy(
         return InjectPolicy::Skip;
     }
     match origin {
-        TurnOrigin::SubTurn => InjectPolicy::Skip,
+        // Swarm boxes are nested internal workers: same restriction as a
+        // sub-turn, never the permissive arm.
+        TurnOrigin::SubTurn | TurnOrigin::Swarm => InjectPolicy::Skip,
         TurnOrigin::Cron | TurnOrigin::Daemon => InjectPolicy::Inject {
             exclude_conversation: true,
         },
@@ -599,6 +601,27 @@ mod tests {
         );
     }
 
+    /// Swarm boxes must be gated exactly as hard as sub-turns, at every
+    /// combination of the inputs this gate reads — not merely "also skips
+    /// today".
+    #[test]
+    fn policy_swarm_matches_sub_turn_at_every_gate_input() {
+        for has_session in [true, false] {
+            for suppress in [true, false] {
+                assert_eq!(
+                    resolve_inject_policy(TurnOrigin::Swarm, has_session, suppress),
+                    resolve_inject_policy(TurnOrigin::SubTurn, has_session, suppress),
+                    "swarm must not be more permissive than a sub-turn \
+                     (has_session={has_session}, suppress={suppress})"
+                );
+                assert_eq!(
+                    resolve_inject_policy(TurnOrigin::Swarm, has_session, suppress),
+                    InjectPolicy::Skip
+                );
+            }
+        }
+    }
+
     #[test]
     fn policy_scheduled_origins_always_exclude_conversation() {
         for origin in [TurnOrigin::Cron, TurnOrigin::Daemon] {
@@ -644,6 +667,7 @@ mod tests {
             TurnOrigin::Daemon,
             TurnOrigin::AgentDirect,
             TurnOrigin::SubTurn,
+            TurnOrigin::Swarm,
         ] {
             assert_eq!(
                 resolve_inject_policy(origin, true, true),
@@ -1278,6 +1302,14 @@ mod tests {
             (
                 "sub_turn_never_injects",
                 TurnOrigin::SubTurn,
+                true,
+                false,
+                flags_off,
+                "",
+            ),
+            (
+                "swarm_never_injects",
+                TurnOrigin::Swarm,
                 true,
                 false,
                 flags_off,

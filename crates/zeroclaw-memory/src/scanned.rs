@@ -401,6 +401,10 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.inner.purge_agent(agent_alias).await
     }
 
+    async fn purge_agent_identity(&self, agent_alias: &str) -> anyhow::Result<bool> {
+        self.inner.purge_agent_identity(agent_alias).await
+    }
+
     async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
         self.inner.export_agent(agent_alias).await
     }

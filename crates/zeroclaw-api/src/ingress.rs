@@ -50,6 +50,11 @@ pub enum TurnOrigin {
     /// or legacy envelope behaves like a sub-turn.
     #[default]
     SubTurn,
+    /// A turn driven for one box of a swarm roster. Boxes are ephemeral
+    /// internal workers spawned inside the parent agent's envelope, so every
+    /// origin gate must treat this exactly as restrictively as
+    /// [`Self::SubTurn`] — never as an operator-driven origin.
+    Swarm,
 }
 
 /// Trust class resolved for the turn's sender. Minimal for phase 1; peer-group
@@ -144,6 +149,13 @@ impl IngressContext {
         Self::phase1(TurnOrigin::SubTurn)
     }
 
+    /// Envelope for a turn driven for one box of a swarm roster. Carries the
+    /// same restrictions as [`Self::sub_turn`].
+    #[must_use]
+    pub fn swarm() -> Self {
+        Self::phase1(TurnOrigin::Swarm)
+    }
+
     /// Envelope for a turn whose origin is threaded in from the entry
     /// point (e.g. `agent::run` / `process_message`, whose one body serves
     /// several distinct entries: CLI, cron, daemon, subagent spawn).
@@ -182,6 +194,21 @@ mod tests {
     }
 
     #[test]
+    fn swarm_envelope_differs_from_a_sub_turn_only_in_the_origin() {
+        let swarm = IngressContext::swarm();
+        let sub = IngressContext::sub_turn();
+        assert_eq!(swarm.origin, TurnOrigin::Swarm);
+        assert_eq!(
+            IngressContext {
+                origin: TurnOrigin::SubTurn,
+                ..swarm
+            },
+            sub,
+            "a swarm envelope must carry sub-turn restrictions verbatim"
+        );
+    }
+
+    #[test]
     fn from_origin_matches_the_named_constructor() {
         assert_eq!(
             IngressContext::from_origin(TurnOrigin::Cron),
@@ -202,6 +229,7 @@ mod tests {
             (IngressContext::daemon(), TurnOrigin::Daemon),
             (IngressContext::agent_direct(), TurnOrigin::AgentDirect),
             (IngressContext::sub_turn(), TurnOrigin::SubTurn),
+            (IngressContext::swarm(), TurnOrigin::Swarm),
         ];
         for (ctx, origin) in cases {
             assert_eq!(ctx.origin, origin);
