@@ -998,3 +998,23 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+
+# スウォームウィザード (swarm/fields のステップ定義)
+swarm-wizard-provider-title = モデルプロバイダー
+swarm-wizard-provider-help = このスウォームの各ボックスが利用するモデルプロバイダーです。
+swarm-wizard-model-title = モデル
+swarm-wizard-model-help = 各ボックスが実行するモデルです。一覧は選択したプロバイダーから取得します。
+swarm-wizard-risk-profile-title = リスクプロファイル
+swarm-wizard-risk-profile-help = すべてのボックスに適用される承認とサンドボックスの方針です。
+swarm-wizard-boundedness-title = 上限設定
+swarm-wizard-boundedness-help = 実行が停止する上限です。スウォームが無制限に消費することを防ぎます。
+swarm-wizard-channels-title = チャネル
+swarm-wizard-channels-help = 送信専用のステータス通知を受け取るチャネルです。スウォームがチャネルから操作されることはありません。
+swarm-wizard-role-title = ロール
+swarm-wizard-role-help = スウォーム全体が担う監督ロールです。
+swarm-wizard-goal-title = ゴール
+swarm-wizard-goal-help = このスウォームが達成するために作成された目的です。
+swarm-wizard-budget-preset-help = quick、standard、marathon のいずれかを選ぶか、custom を選んで下の 3 つの値を自分で設定します。
+swarm-wizard-max-turns-help = スウォーム全体での最大ターン数です。プリセットが custom の場合にのみ使用されます。
+swarm-wizard-max-tokens-help = スウォーム全体での最大トークン数です。プリセットが custom の場合にのみ使用されます。
+swarm-wizard-max-cost-help = スウォーム全体での最大支出 (USD) です。プリセットが custom の場合にのみ使用されます。

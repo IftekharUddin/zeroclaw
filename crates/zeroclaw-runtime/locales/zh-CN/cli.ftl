@@ -997,3 +997,23 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+
+# 蜂群向导（swarm/fields 步骤定义）
+swarm-wizard-provider-title = 模型提供方
+swarm-wizard-provider-help = 该蜂群中每个盒子所使用的模型提供方。
+swarm-wizard-model-title = 模型
+swarm-wizard-model-help = 每个盒子运行的模型。列表来自所选的提供方。
+swarm-wizard-risk-profile-title = 风险配置
+swarm-wizard-risk-profile-help = 应用于所有盒子的审批与沙箱策略。
+swarm-wizard-boundedness-title = 运行上限
+swarm-wizard-boundedness-help = 运行停止的上限，确保蜂群不会无限制地消耗资源。
+swarm-wizard-channels-title = 通道
+swarm-wizard-channels-help = 接收对外状态通知的通道。蜂群永远不会由通道驱动。
+swarm-wizard-role-title = 角色
+swarm-wizard-role-help = 蜂群整体所承担的监督角色。
+swarm-wizard-goal-title = 目标
+swarm-wizard-goal-help = 创建该蜂群所要达成的目标。
+swarm-wizard-budget-preset-help = 选择 quick、standard 或 marathon，或选择 custom 自行设置下面的三项数值。
+swarm-wizard-max-turns-help = 整个蜂群的最大轮次。仅在预设为 custom 时生效。
+swarm-wizard-max-tokens-help = 整个蜂群的最大令牌数。仅在预设为 custom 时生效。
+swarm-wizard-max-cost-help = 整个蜂群的最大花费（美元）。仅在预设为 custom 时生效。

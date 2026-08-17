@@ -270,6 +270,16 @@ pub mod error_codes {
     // SOP authoring
     pub const SOP_ALREADY_EXISTS: i32 = -32020;
     pub const SOP_NOT_FOUND: i32 = -32021;
+
+    // Swarm authoring. An unknown swarm stays INVALID_PARAMS (a caller error,
+    // as `swarm/get` established); these three name the failures a client has
+    // to react to differently: reload, retry, or stop the run first.
+    pub const SWARM_ALREADY_EXISTS: i32 = -32030;
+    /// The caller's `revision` no longer matches the stored document; reload
+    /// the swarm and re-apply the edit.
+    pub const SWARM_REVISION_CONFLICT: i32 = -32031;
+    /// A live run holds the swarm's claim; stop it or pass `force`.
+    pub const SWARM_RUN_ACTIVE: i32 = -32032;
     // Filesystem RPC errors (internal numeric codes; wire uses string codes e.g. "fs.not_found")
     pub const FS_NOT_FOUND: i32 = 4001;
     pub const FS_PERMISSION_DENIED: i32 = 4002;

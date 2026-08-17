@@ -23,6 +23,25 @@ pub enum SwarmBudgetPreset {
 }
 
 impl SwarmBudgetPreset {
+    /// Every preset, in the order the boundedness step offers them. The one
+    /// list a picker walks, so adding an envelope lights it up everywhere.
+    pub const ALL: [Self; 3] = [Self::Quick, Self::Standard, Self::Marathon];
+
+    /// Stable wire name — the same tag serde writes for this variant.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::Marathon => "marathon",
+        }
+    }
+
+    /// Resolve a wire name back to a preset. `None` for anything not in
+    /// [`Self::ALL`].
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.wire_name() == name)
+    }
+
     /// The turn / token / cost triple this preset expands to.
     pub const fn limits(self) -> SwarmBudgetLimits {
         match self {
