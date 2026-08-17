@@ -964,3 +964,95 @@ async fn swarm_recover_reclaims_prior_boot_claim_even_when_paused_with_live_leas
         "recover must free a prior-boot claim so the swarm can be resumed"
     );
 }
+
+// ── (h) interjection: a user-engaged box holds orchestrator delegation ─
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swarm_user_engaged_box_holds_delegation_until_handback() {
+    let h = Harness::new();
+    let store: Arc<dyn SwarmStore> = Arc::new(InMemorySwarmStore::new());
+    save_created(
+        &store,
+        spec_with("s-engaged", 2, custom(100, 10_000_000, 1000.0)),
+    );
+
+    let factory: Arc<dyn SwarmProviderFactory> = Arc::new(ScriptedFactory {
+        orch_queue: Arc::new(StdMutex::new(VecDeque::new())),
+        orch_fallback: Reply::final_text("done"),
+        box_reply: Reply::box_result("box ok", 1, 1),
+        box_gate: None,
+    });
+    let engine = h.engine(Arc::clone(&store), factory, HashMap::new(), None);
+
+    // A driver-less run so the direct `run_box_turn` primitive stands in for the
+    // orchestrator's delegation admission.
+    engine.begin_run("s-engaged").await.expect("begin");
+
+    // Baseline: an unengaged box is delegable.
+    engine
+        .run_box_turn("s-engaged", "box-1", "warm up")
+        .await
+        .expect("an unengaged box is admitted");
+    assert!(!engine.is_box_user_engaged("s-engaged", "box-1"));
+
+    // A user interjects: the box is held; orchestrator delegation is refused
+    // before any turn runs.
+    assert!(
+        engine.engage_box_for_user("s-engaged", "box-1"),
+        "engaging a roster box must succeed"
+    );
+    assert!(engine.is_box_user_engaged("s-engaged", "box-1"));
+    let held = engine
+        .run_box_turn("s-engaged", "box-1", "orchestrator work")
+        .await
+        .expect_err("a user-engaged box must refuse orchestrator delegation");
+    assert!(
+        matches!(held, BoxTurnError::UserEngaged(ref b) if b == "box-1"),
+        "expected UserEngaged, got {held:?}"
+    );
+
+    // Another box on the roster is unaffected — the hold is per box.
+    engine
+        .run_box_turn("s-engaged", "box-2", "sibling work")
+        .await
+        .expect("a different box is still delegable while box-1 is engaged");
+
+    // Handback: the orchestrator regains the box.
+    assert!(
+        engine.release_box_for_user("s-engaged", "box-1"),
+        "releasing a held box reports it was held"
+    );
+    assert!(!engine.is_box_user_engaged("s-engaged", "box-1"));
+    engine
+        .run_box_turn("s-engaged", "box-1", "orchestrator work again")
+        .await
+        .expect("a released box is delegable again");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swarm_engage_and_release_are_scoped_to_a_live_run() {
+    let h = Harness::new();
+    let store: Arc<dyn SwarmStore> = Arc::new(InMemorySwarmStore::new());
+    save_created(
+        &store,
+        spec_with("s-norun", 2, custom(100, 10_000_000, 1000.0)),
+    );
+
+    let factory: Arc<dyn SwarmProviderFactory> = Arc::new(ScriptedFactory {
+        orch_queue: Arc::new(StdMutex::new(VecDeque::new())),
+        orch_fallback: Reply::final_text("done"),
+        box_reply: Reply::box_result("box ok", 1, 1),
+        box_gate: None,
+    });
+    let engine = h.engine(Arc::clone(&store), factory, HashMap::new(), None);
+
+    // No live run: engaging/reading a box is a no-op that reports "not held".
+    assert!(!engine.engage_box_for_user("s-norun", "box-1"));
+    assert!(!engine.is_box_user_engaged("s-norun", "box-1"));
+    assert!(!engine.release_box_for_user("s-norun", "box-1"));
+
+    // A box outside the roster is never engaged, even on a live run.
+    engine.begin_run("s-norun").await.expect("begin");
+    assert!(!engine.engage_box_for_user("s-norun", "ghost"));
+    assert!(!engine.is_box_user_engaged("s-norun", "ghost"));
+}

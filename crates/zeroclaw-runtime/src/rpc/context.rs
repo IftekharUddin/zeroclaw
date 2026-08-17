@@ -172,6 +172,16 @@ pub struct RpcContext {
     /// [`build_swarm_store`] rather than leaving the RPC surface unanswerable.
     pub swarm_store: Arc<dyn SwarmStore>,
 
+    /// Swarm run-control engine. Constructed at daemon boot next to the store
+    /// (same store handle) with the live provider factory, the daemon default
+    /// agent as the parent envelope, and the control-plane task registry.
+    /// `Option` because a daemon with no agents/provider (or an embedded host /
+    /// test) has nothing to build a live engine from: the run-control RPC
+    /// surface (`swarm/start|pause|resume|stop|subscribe|chat`) then answers
+    /// "engine not available" and the read/authoring surface still works off the
+    /// store alone.
+    pub swarm_engine: Option<Arc<crate::swarm::SwarmEngine>>,
+
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
@@ -200,6 +210,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             swarm_store: build_swarm_store(data_dir.as_path()),
+            swarm_engine: None,
             hooks: None,
         })
     }
@@ -222,6 +233,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: None,
         })
     }
@@ -248,6 +260,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: None,
         })
     }
@@ -274,6 +287,7 @@ impl RpcContext {
             sop_engine: Some(sop_engine),
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: None,
         })
     }
@@ -300,6 +314,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: None,
         })
     }
@@ -326,6 +341,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: None,
         })
     }
@@ -353,6 +369,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: None,
         })
     }
@@ -380,6 +397,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
+            swarm_engine: None,
             hooks: None,
         })
     }
