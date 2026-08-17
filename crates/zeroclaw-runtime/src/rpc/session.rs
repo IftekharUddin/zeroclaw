@@ -2,6 +2,7 @@
 
 use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
+use crate::rpc::steering::{SteeringClass, SteeringError, SteeringQueue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,6 +106,11 @@ pub struct SessionStore {
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
+    /// Steering queues for the turns currently in flight, keyed by session id
+    /// and stamped with that turn's generation (the value
+    /// [`Self::register_cancel_token`] handed back). The generation is what
+    /// makes a steer aimed at turn N un-deliverable once turn N has ended.
+    steering: std::sync::Mutex<HashMap<String, (u64, Arc<SteeringQueue>)>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
 }
@@ -118,6 +124,7 @@ impl SessionStore {
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
+            steering: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
         }
@@ -394,6 +401,7 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
             token.cancel();
         }
+        self.drop_steering(id);
         self.sessions.lock().await.remove(id).is_some()
     }
 
@@ -499,6 +507,97 @@ impl SessionStore {
             .contains_key(id)
     }
 
+    /// Publish the steering queue for a turn that is starting, stamped with the
+    /// generation [`Self::register_cancel_token`] returned for the same turn.
+    ///
+    /// A queue left behind by a superseded turn is closed here, mirroring the
+    /// cancel token's re-register behaviour: the old turn is already being torn
+    /// down, and its queued steers must not survive into the new turn.
+    pub fn register_steering(&self, id: &str, generation: u64, queue: Arc<SteeringQueue>) {
+        let stale = self
+            .steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), (generation, queue));
+        if let Some((_, stale)) = stale {
+            stale.close();
+        }
+    }
+
+    /// Retire the steering queue for a finished turn. Returns the number of
+    /// messages that were still queued (never handed to the turn) so the caller
+    /// can log the loss. A non-matching generation is a no-op — the same
+    /// stale-remove guard [`Self::remove_cancel_token`] uses, so a slow
+    /// teardown cannot unregister the turn that superseded it.
+    pub fn remove_steering(&self, id: &str, generation: u64) -> usize {
+        let queue = {
+            let mut steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
+            match steering.get(id) {
+                Some((current, _)) if *current == generation => {
+                    steering.remove(id).map(|(_, queue)| queue)
+                }
+                _ => None,
+            }
+        };
+        queue.map_or(0, |queue| queue.close())
+    }
+
+    /// Turn generation currently accepting steering for `id`, or `None` when no
+    /// turn is in flight. Callers that want to pin a steer to a specific turn
+    /// read this first and pass it to [`Self::steer`].
+    pub fn steering_generation(&self, id: &str) -> Option<u64> {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|(generation, _)| *generation)
+    }
+
+    /// Queue a mid-turn steering message for the turn in flight on `id`.
+    ///
+    /// `expected_generation` is the anti-leak guard: pass `Some(n)` to demand
+    /// that the message land in turn `n` or nowhere. Omitting it targets
+    /// whatever turn is in flight right now, which is what an interactive
+    /// client wants. Returns the generation the message was accepted for.
+    pub fn steer(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        class: SteeringClass,
+        message: String,
+    ) -> Result<u64, SteeringError> {
+        let (generation, queue) = {
+            let steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
+            match steering.get(id) {
+                Some((generation, queue)) => (*generation, Arc::clone(queue)),
+                None => return Err(SteeringError::NoTurnInFlight),
+            }
+        };
+        if let Some(requested) = expected_generation
+            && requested != generation
+        {
+            return Err(SteeringError::StaleGeneration {
+                requested,
+                current: generation,
+            });
+        }
+        queue.send(class, message)?;
+        Ok(generation)
+    }
+
+    /// Tear down any steering queue for `id` regardless of generation. Used by
+    /// the session-removal paths, where the whole session is going away.
+    fn drop_steering(&self, id: &str) {
+        let queue = self
+            .steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        if let Some((_, queue)) = queue {
+            queue.close();
+        }
+    }
+
     pub async fn kill_session(&self, id: &str) -> bool {
         if let Some((_, token)) = self
             .cancel_tokens
@@ -509,6 +608,7 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::AdminKill);
             token.cancel();
         }
+        self.drop_steering(id);
         self.sessions.lock().await.remove(id).is_some()
     }
 
@@ -983,6 +1083,140 @@ mod tests {
     async fn cancel_nonexistent_returns_false() {
         let store = make_store(4);
         assert!(!store.cancel_session("nope"));
+    }
+
+    #[tokio::test]
+    async fn steer_without_a_turn_in_flight_is_refused() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.steering_generation("s1"), None);
+        assert_eq!(
+            store.steer("s1", None, SteeringClass::User, "hello".into()),
+            Err(SteeringError::NoTurnInFlight),
+            "an idle session has nothing to steer; the caller must be told so \
+             instead of the message being buffered for a future turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_reaches_the_registered_turn() {
+        let store = make_store(4);
+        let generation =
+            store.register_cancel_token("s1", tokio_util::sync::CancellationToken::new());
+        let (queue, mut rx) = SteeringQueue::start();
+        store.register_steering("s1", generation, queue);
+
+        assert_eq!(store.steering_generation("s1"), Some(generation));
+        assert_eq!(
+            store.steer(
+                "s1",
+                Some(generation),
+                SteeringClass::User,
+                "turn left".into()
+            ),
+            Ok(generation)
+        );
+        assert_eq!(rx.recv().await.as_deref(), Some("turn left"));
+    }
+
+    #[tokio::test]
+    async fn steer_aimed_at_a_finished_turn_never_leaks_into_the_next_one() {
+        let store = make_store(4);
+        let first = store.register_cancel_token("s1", tokio_util::sync::CancellationToken::new());
+        let (first_queue, first_rx) = SteeringQueue::start();
+        store.register_steering("s1", first, first_queue);
+
+        // Turn one ends.
+        store.remove_steering("s1", first);
+        drop(first_rx);
+
+        // Turn two starts on the same session.
+        let second = store.register_cancel_token("s1", tokio_util::sync::CancellationToken::new());
+        assert_ne!(first, second);
+        let (second_queue, mut second_rx) = SteeringQueue::start();
+        store.register_steering("s1", second, second_queue);
+
+        assert_eq!(
+            store.steer(
+                "s1",
+                Some(first),
+                SteeringClass::User,
+                "meant for turn one".into()
+            ),
+            Err(SteeringError::StaleGeneration {
+                requested: first,
+                current: second,
+            }),
+            "a steer pinned to the finished turn must be refused, not silently \
+             redirected — landing it in turn two would read as an unexplained \
+             user message"
+        );
+        assert_eq!(
+            second_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "the stale steer must not have reached the live turn"
+        );
+
+        // An unpinned steer still targets whatever is running now.
+        assert_eq!(
+            store.steer("s1", None, SteeringClass::User, "meant for turn two".into()),
+            Ok(second)
+        );
+        assert_eq!(
+            second_rx.recv().await.as_deref(),
+            Some("meant for turn two")
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_steering_with_a_stale_generation_leaves_the_live_turn_alone() {
+        let store = make_store(4);
+        let first = store.register_cancel_token("s1", tokio_util::sync::CancellationToken::new());
+        let (first_queue, _first_rx) = SteeringQueue::start();
+        store.register_steering("s1", first, first_queue);
+        let second = store.register_cancel_token("s1", tokio_util::sync::CancellationToken::new());
+        let (second_queue, mut second_rx) = SteeringQueue::start();
+        store.register_steering("s1", second, second_queue);
+
+        store.remove_steering("s1", first);
+
+        assert_eq!(
+            store.steer("s1", None, SteeringClass::User, "still live".into()),
+            Ok(second),
+            "a late teardown from the superseded turn must not unregister the \
+             turn that replaced it"
+        );
+        assert_eq!(second_rx.recv().await.as_deref(), Some("still live"));
+    }
+
+    #[tokio::test]
+    async fn session_removal_tears_down_steering() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let generation =
+            store.register_cancel_token("s1", tokio_util::sync::CancellationToken::new());
+        let (queue, _rx) = SteeringQueue::start();
+        store.register_steering("s1", generation, queue);
+
+        assert!(store.remove("s1").await);
+        assert_eq!(store.steering_generation("s1"), None);
+        assert_eq!(
+            store.steer("s1", None, SteeringClass::User, "ghost".into()),
+            Err(SteeringError::NoTurnInFlight)
+        );
     }
 
     #[tokio::test]

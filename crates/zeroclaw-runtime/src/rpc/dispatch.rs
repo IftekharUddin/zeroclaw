@@ -81,6 +81,7 @@ pub enum Method {
     SessionPrompt,
     SessionConfigure,
     SessionCancel,
+    SessionSteer,
     SessionGitBranch,
     SessionList,
     SessionListAcp,
@@ -206,6 +207,7 @@ impl Method {
         (Method::SessionPrompt, "session/prompt"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
+        (Method::SessionSteer, "session/steer"),
         (Method::SessionGitBranch, "session/git_branch"),
         (Method::SessionList, "session/list"),
         (Method::SessionListAcp, "session/list-acp"),
@@ -789,6 +791,7 @@ impl RpcDispatcher {
             }
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params).await,
+            Method::SessionSteer => self.handle_session_steer(&req.params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
             Method::SessionList => self.handle_session_list(&req.params).await,
             Method::SessionListAcp => self.handle_session_list_acp(&req.params).await,
@@ -1809,6 +1812,12 @@ impl RpcDispatcher {
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
+        // Mid-turn steering. Published under the same generation as the cancel
+        // token so `session/steer` can be pinned to this turn and nothing else.
+        let (steering_queue, steering_rx) = crate::rpc::steering::SteeringQueue::start();
+        self.ctx
+            .sessions
+            .register_steering(sid, cancel_generation, steering_queue);
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -1888,6 +1897,7 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
+            Some(steering_rx),
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -1918,6 +1928,25 @@ impl RpcDispatcher {
             },
         )
         .await;
+
+        // Retire the steering queue with the turn. A message still queued here
+        // was accepted for a turn that has now ended: it must not leak into the
+        // next one, so it is dropped — loudly, since the caller was told it was
+        // queued.
+        let undelivered_steers = self.ctx.sessions.remove_steering(sid, cancel_generation);
+        if undelivered_steers > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": sid,
+                        "undelivered": undelivered_steers,
+                    })),
+                "turn ended before it drained every queued steering message"
+            );
+        }
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
@@ -2297,6 +2326,69 @@ impl RpcDispatcher {
                 SESSION_NOT_FOUND,
                 "No active turn for this session",
             ))
+        }
+    }
+
+    /// Queue a mid-turn steering message for the session's in-flight turn.
+    ///
+    /// Additive: the wire protocol version is unchanged and a client that never
+    /// calls this sees identical behaviour. The counterpart to `session/cancel`
+    /// — instead of killing the turn to say one more thing, the message is
+    /// folded into the turn at its next round boundary.
+    ///
+    /// `generation` is optional. Omit it to target whatever turn is running
+    /// (the interactive case); pass the generation a previous call returned to
+    /// demand that the message land in that turn or nowhere, which is what
+    /// keeps a steer written for turn N out of turn N+1.
+    ///
+    /// Unlike `session/cancel` this is not gated on TUI ownership: an
+    /// `orchestrator`-class steer comes from automation that owns no TUI, and
+    /// the same transport authentication `session/prompt` relies on already
+    /// bounds who can reach the socket at all.
+    async fn handle_session_steer(&self, params: &Value) -> RpcResult {
+        use crate::rpc::steering::SteeringError;
+
+        let SessionSteerParams {
+            session_id,
+            message,
+            generation: expected_generation,
+            class,
+        } = parse_params(params)?;
+        // A blank steer would push a timestamp-only user turn into history; the
+        // agent refuses those outright, so reject it at the wire instead.
+        if message.trim().is_empty() {
+            return Err(rpc_err(INVALID_PARAMS, "Steering message cannot be empty"));
+        }
+        if self
+            .ctx
+            .sessions
+            .session_owner_tui_id(&session_id)
+            .await
+            .is_none()
+        {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+        let class = class.unwrap_or_default();
+        match self
+            .ctx
+            .sessions
+            .steer(&session_id, expected_generation, class, message)
+        {
+            Ok(generation) => to_result(SessionSteerResult {
+                session_id,
+                generation,
+                class,
+                queued: true,
+            }),
+            Err(err @ (SteeringError::NoTurnInFlight | SteeringError::TurnEnded)) => {
+                Err(rpc_err(SESSION_NOT_FOUND, format!("{err}")))
+            }
+            Err(err @ SteeringError::StaleGeneration { .. }) => {
+                Err(rpc_err(SESSION_STEER_STALE_GENERATION, format!("{err}")))
+            }
+            Err(err @ SteeringError::QueueFull) => {
+                Err(rpc_err(SESSION_STEER_QUEUE_FULL, format!("{err}")))
+            }
         }
     }
 
@@ -10013,6 +10105,186 @@ mod tests {
             token.is_cancelled(),
             "owner cancel must fire the session's cancel token"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // session/steer — mid-turn steering on the local RPC path
+    // -----------------------------------------------------------------------
+
+    /// Session owned by `tui-A` with a turn in flight. Returns the generation
+    /// that turn is running under plus the receiver the turn would drain.
+    async fn create_steerable_session(
+        dispatcher: &mut RpcDispatcher,
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        session_id: &str,
+    ) -> (u64, tokio::sync::mpsc::Receiver<String>) {
+        create_session_with_owner(dispatcher, sessions, session_id, "tui-A").await;
+        let generation =
+            sessions.register_cancel_token(session_id, tokio_util::sync::CancellationToken::new());
+        let (queue, rx) = crate::rpc::steering::SteeringQueue::start();
+        sessions.register_steering(session_id, generation, queue);
+        (generation, rx)
+    }
+
+    #[test]
+    fn session_steer_is_additive_to_the_method_table() {
+        assert_eq!(
+            Method::from_wire("session/steer"),
+            Some(Method::SessionSteer)
+        );
+        assert_eq!(Method::SessionSteer.wire_name(), "session/steer");
+        assert_eq!(
+            RPC_PROTOCOL_VERSION, 1,
+            "session/steer is an additive method: a client that never calls it \
+             behaves exactly as before, so the wire version must not move"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_steer_reaches_the_in_flight_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _other, sessions) = make_two_dispatchers_sharing_context(config);
+        let (generation, mut rx) =
+            create_steerable_session(&mut dispatcher, &sessions, "sess-steer").await;
+
+        let result = dispatcher
+            .handle_session_steer(&json!({
+                "session_id": "sess-steer",
+                "message": "one more thing",
+            }))
+            .await
+            .expect("a live turn must accept a steer");
+
+        assert_eq!(result["session_id"], "sess-steer");
+        assert_eq!(result["generation"], generation);
+        assert_eq!(
+            result["class"], "user",
+            "an unclassed steer defaults to user"
+        );
+        assert_eq!(result["queued"], true);
+        assert_eq!(
+            rx.recv().await.as_deref(),
+            Some("one more thing"),
+            "the message must reach the channel the running turn drains; this \
+             is the whole point of the RPC path no longer passing a hardcoded \
+             `None` steering receiver"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_steer_without_a_turn_in_flight_errors_cleanly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _other, sessions) = make_two_dispatchers_sharing_context(config);
+        create_session_with_owner(&mut dispatcher, &sessions, "sess-idle", "tui-A").await;
+
+        let err = dispatcher
+            .handle_session_steer(&json!({
+                "session_id": "sess-idle",
+                "message": "nobody is listening",
+            }))
+            .await
+            .expect_err("an idle session has no turn to steer");
+
+        assert_eq!(err.code, SESSION_NOT_FOUND);
+        assert!(
+            err.message.contains("no turn in flight"),
+            "the error must say the turn is missing, not the session: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_steer_on_an_unknown_session_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _rx, _sessions) = make_dispatcher_with_capture(config);
+
+        let err = dispatcher
+            .handle_session_steer(&json!({
+                "session_id": "ghost",
+                "message": "anyone there",
+            }))
+            .await
+            .expect_err("an unknown session must be refused");
+
+        assert_eq!(err.code, SESSION_NOT_FOUND);
+        assert!(err.message.contains("Session not found"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn session_steer_with_a_stale_generation_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _other, sessions) = make_two_dispatchers_sharing_context(config);
+        let (generation, mut rx) =
+            create_steerable_session(&mut dispatcher, &sessions, "sess-stale").await;
+
+        let err = dispatcher
+            .handle_session_steer(&json!({
+                "session_id": "sess-stale",
+                "message": "meant for the previous turn",
+                "generation": generation.wrapping_sub(1),
+            }))
+            .await
+            .expect_err("a steer pinned to a finished turn must be refused");
+
+        assert_eq!(
+            err.code, SESSION_STEER_STALE_GENERATION,
+            "the caller needs a distinct code so it can tell 'your turn ended' \
+             apart from 'no such session'"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "a stale steer must never leak into the turn that is running now"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_steer_rejects_a_blank_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _other, sessions) = make_two_dispatchers_sharing_context(config);
+        let (_generation, mut rx) =
+            create_steerable_session(&mut dispatcher, &sessions, "sess-blank").await;
+
+        let err = dispatcher
+            .handle_session_steer(&json!({
+                "session_id": "sess-blank",
+                "message": "   \n ",
+            }))
+            .await
+            .expect_err("a blank steer would push a timestamp-only user turn");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_steer_honours_the_orchestrator_class() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _other, sessions) = make_two_dispatchers_sharing_context(config);
+        let (generation, mut rx) =
+            create_steerable_session(&mut dispatcher, &sessions, "sess-class").await;
+
+        let result = dispatcher
+            .handle_session_steer(&json!({
+                "session_id": "sess-class",
+                "message": "automated nudge",
+                "class": "orchestrator",
+                "generation": generation,
+            }))
+            .await
+            .expect("a classed steer must be accepted");
+
+        assert_eq!(result["class"], "orchestrator");
+        assert_eq!(rx.recv().await.as_deref(), Some("automated nudge"));
     }
 
     // ── Missing-session regression: close / delete must not fabricate

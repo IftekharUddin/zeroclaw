@@ -9,6 +9,7 @@ use serde_json::Value;
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
+pub use crate::rpc::steering::SteeringClass;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
 pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -278,6 +279,39 @@ rpc_type! {
     pub struct SessionCancelResult {
         pub session_id: String,
         pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// `session/steer` request. Queues a mid-turn message for the turn already
+    /// running on `session_id` instead of cancelling and re-prompting.
+    pub struct SessionSteerParams {
+        pub session_id: String,
+        /// Text to fold into the running turn. Blank messages are refused.
+        pub message: String,
+        /// Turn generation this message is aimed at. Omit to target whatever
+        /// turn is in flight; pass a generation to have the message refused
+        /// (rather than silently redirected) once that turn has ended.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generation: Option<u64>,
+        /// Priority class. Defaults to `user`, which drains ahead of any queued
+        /// `orchestrator` message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub class: Option<SteeringClass>,
+    }
+}
+
+rpc_type! {
+    /// `session/steer` reply. `queued` is always true on success: the message
+    /// is accepted into the turn's steering queue, and the turn folds it in at
+    /// its next round boundary.
+    pub struct SessionSteerResult {
+        pub session_id: String,
+        /// Generation the message was accepted for. Echo it back on later
+        /// calls to pin them to the same turn.
+        pub generation: u64,
+        pub class: SteeringClass,
+        pub queued: bool,
     }
 }
 

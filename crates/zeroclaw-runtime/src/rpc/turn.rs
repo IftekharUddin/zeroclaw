@@ -65,12 +65,20 @@ pub struct TurnAttribution {
     pub channel: &'static str,
 }
 
+/// Run one agent turn, streaming its events to `on_event`.
+///
+/// `steering` is the mid-turn interjection channel: pass the receiver half of a
+/// [`crate::rpc::steering::SteeringQueue`] to let callers push messages into the
+/// turn while it streams (the agent drains them at each round boundary), or
+/// `None` for a turn nobody can steer. Ownership is taken so the queue's pump
+/// shuts down the moment this function returns.
 pub async fn execute_turn<F, Fut>(
     agent: Arc<Mutex<Agent>>,
     prompt: String,
     cancel: CancellationToken,
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
+    steering: Option<mpsc::Receiver<String>>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -86,6 +94,7 @@ where
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
+            let mut steering = steering;
             let span = ::zeroclaw_log::info_span!(
                 target: "zeroclaw_log_internal_scope",
                 "zeroclaw_scope",
@@ -103,7 +112,7 @@ where
                             &prompt,
                             event_tx,
                             Some(cancel_clone),
-                            None,
+                            steering.as_mut(),
                         )
                         .instrument(span),
                 )
@@ -415,6 +424,174 @@ mod tests {
         );
     }
 
+    /// Build a minimal agent around `provider`. Mirrors the wiring the RPC
+    /// session path performs, minus everything a steering test does not touch.
+    fn agent_with_provider(
+        provider: Box<dyn zeroclaw_api::model_provider::ModelProvider>,
+    ) -> Agent {
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::observability::{NoopObserver, Observer};
+        use zeroclaw_memory::Memory;
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        Agent::builder()
+            .model_provider(provider)
+            .tools(vec![])
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed")
+    }
+
+    fn rpc_attribution() -> TurnAttribution {
+        TurnAttribution {
+            session_key: Some("s1".into()),
+            agent_alias: "rpc-agent".into(),
+            model_provider: "mock-provider".into(),
+            model: "test-model".into(),
+            channel: "rpc",
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_turn_folds_steering_messages_into_the_running_turn() {
+        use crate::rpc::steering::{SteeringClass, SteeringQueue};
+        use async_trait::async_trait;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_providers::ChatRequest;
+
+        /// Steers its own turn: the first provider call queues two messages of
+        /// different classes and waits for the queue to hand them over, so the
+        /// round boundary that follows is guaranteed to observe them.
+        struct SteeringProbeProvider {
+            queue: Arc<SteeringQueue>,
+            rounds: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for SteeringProbeProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                let round = {
+                    let mut rounds = self.rounds.lock().expect("round log");
+                    rounds.push(
+                        request
+                            .messages
+                            .iter()
+                            .filter(|m| m.role == "user")
+                            .map(|m| m.content.clone())
+                            .collect(),
+                    );
+                    rounds.len()
+                };
+                if round == 1 {
+                    self.queue
+                        .send(SteeringClass::Orchestrator, "check the logs too".into())
+                        .expect("the turn is live, so the steer must be accepted");
+                    self.queue
+                        .send(SteeringClass::User, "actually, do it in reverse".into())
+                        .expect("the turn is live, so the steer must be accepted");
+                    for _ in 0..1_000 {
+                        if self.queue.pending() == 0 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        impl Attributable for SteeringProbeProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "mock-provider"
+            }
+        }
+
+        let (queue, steering_rx) = SteeringQueue::start();
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = agent_with_provider(Box::new(SteeringProbeProvider {
+            queue: Arc::clone(&queue),
+            rounds: Arc::clone(&rounds),
+        }));
+
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "do the thing".to_string(),
+            CancellationToken::new(),
+            rpc_attribution(),
+            None,
+            Some(steering_rx),
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+
+        let rounds = rounds.lock().expect("round log").clone();
+        assert_eq!(
+            rounds.len(),
+            2,
+            "a queued steering message must reopen the turn for another round; \
+             one round means the RPC path dropped the steer on the floor, which \
+             is the `None` steering receiver this seam used to hardcode"
+        );
+        let second = &rounds[1];
+        let position = |needle: &str| {
+            second
+                .iter()
+                .position(|message| message.contains(needle))
+                .unwrap_or_else(|| panic!("round two never saw {needle:?}: {second:?}"))
+        };
+        let user_steer = position("actually, do it in reverse");
+        let orchestrator_steer = position("check the logs too");
+        assert!(
+            user_steer < orchestrator_steer,
+            "both steers were queued together, so the User-class one must be \
+             folded in first even though the Orchestrator-class one was sent \
+             earlier"
+        );
+        assert!(
+            position("do the thing") < user_steer,
+            "the original prompt must stay ahead of the mid-turn interjections"
+        );
+    }
+
     #[tokio::test]
     async fn execute_turn_scopes_cost_context_so_usage_is_persisted() {
         use crate::agent::agent::Agent;
@@ -528,6 +705,7 @@ mod tests {
                 channel: "rpc",
             },
             Some(cost_context),
+            None,
             noop,
         )
         .await
