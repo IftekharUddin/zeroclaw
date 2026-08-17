@@ -72,8 +72,8 @@ pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{
-    ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage, is_recent_recall_query,
-    normalize_recent_recall_query,
+    ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage, StoreOptions,
+    is_recent_recall_query, normalize_recent_recall_query,
 };
 
 use anyhow::Context;
@@ -1052,6 +1052,108 @@ pub async fn create_memory_for_agent(
 
     let scoped = AgentScopedMemory::new(inner_arc, bound_id, allowlist_ids);
     Ok(wrap_in_retrieval_pipeline(Arc::new(scoped), &config.memory))
+}
+
+/// The namespace every write from a swarm box carries: one per swarm, so a
+/// run's rows are addressable — and reapable — as a set.
+#[must_use]
+pub fn swarm_namespace(swarm_id: &str) -> String {
+    format!("swarm/{swarm_id}")
+}
+
+/// A composed memory handle for one box of a swarm roster, with the two
+/// identifiers a caller needs to write through it correctly.
+pub struct SwarmBoxMemory {
+    handle: Arc<dyn Memory>,
+    namespace: String,
+    agent_id: String,
+}
+
+impl SwarmBoxMemory {
+    /// The composed handle, for the box's agent loop and memory tools.
+    ///
+    /// Writes made straight through it — the box's own memory tools — are not
+    /// namespaced, because stamping them would mean a decorator between the
+    /// agent loop and the scoping wrapper. They are still attributed to this
+    /// box, which is the attribution the reap cascade deletes by, so the
+    /// namespace is an addressing convenience and never the thing containment
+    /// rests on.
+    #[must_use]
+    pub fn handle(&self) -> Arc<dyn Memory> {
+        Arc::clone(&self.handle)
+    }
+
+    /// The swarm namespace stamped on writes made through [`Self::store`].
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// This box's memory UUID. Writes through the handle are attributed to it,
+    /// and the reap cascade deletes by it.
+    #[must_use]
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// Write options carrying the swarm namespace.
+    #[must_use]
+    pub fn store_options(&self) -> StoreOptions {
+        StoreOptions::default().with_namespace(self.namespace.clone())
+    }
+
+    /// Namespace-stamped store. Attribution is deliberately not a parameter:
+    /// the scoping wrapper stamps the bound box, so a box can only write as
+    /// itself no matter what it asks for.
+    pub async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.handle
+            .store_with_options(key, content, category, session_id, self.store_options())
+            .await
+    }
+}
+
+/// Build the memory wrapper for one box of a swarm roster.
+///
+/// The decorator stack is the per-agent one from [`create_memory_for_agent`],
+/// unchanged: the install-composed backend (content scanning closest to
+/// storage, optional audit over it) wrapped in `AgentScopedMemory`, wrapped in
+/// the [`retrieval::RetrievalPipeline`]. Only two things differ, and both are
+/// arguments rather than new behavior:
+///
+/// * the recall allowlist is the whole roster's agent ids, so boxes read each
+///   other's work. It is enumerated here, at composition time, and dies with
+///   the handle — there is no runtime path that widens it, and writes stay
+///   self-attributed because the wrapper stamps `box_agent_id` on every one.
+/// * writes made through [`SwarmBoxMemory::store`] carry the swarm namespace.
+///
+/// Unlike the per-agent factory this takes a built backend and a resolved
+/// UUID rather than a `&Config` and an alias: a box alias is synthetic and
+/// never present in `[agents.*]`, and one backend handle is shared by the
+/// whole roster instead of one per box.
+#[must_use]
+pub fn create_memory_for_swarm_box(
+    inner: Arc<dyn Memory>,
+    swarm_id: &str,
+    box_agent_id: &str,
+    roster_agent_ids: &[String],
+    memory_config: &MemoryConfig,
+) -> SwarmBoxMemory {
+    let scoped = AgentScopedMemory::new(
+        inner,
+        box_agent_id,
+        roster_agent_ids.iter().map(String::clone),
+    );
+    SwarmBoxMemory {
+        handle: wrap_in_retrieval_pipeline(Arc::new(scoped), memory_config),
+        namespace: swarm_namespace(swarm_id),
+        agent_id: box_agent_id.to_string(),
+    }
 }
 
 /// Factory: create an optional response cache from config.
@@ -2752,5 +2854,133 @@ store_timeout_ms = 40000
             2,
             "a handle must see its own writes even with the cache on"
         );
+    }
+
+    /// A roster of two boxes over one shared backend, plus the UUID of an
+    /// agent that is not on it.
+    async fn swarm_fixture(tmp: &TempDir) -> (Arc<dyn Memory>, Vec<String>, String) {
+        let inner: Arc<dyn Memory> = Arc::new(SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let mut roster_ids = Vec::new();
+        for alias in ["swarm/s1/box-a", "swarm/s1/box-b"] {
+            roster_ids.push(inner.ensure_agent_uuid(alias).await.unwrap());
+        }
+        let outsider = inner.ensure_agent_uuid("outsider").await.unwrap();
+        (inner, roster_ids, outsider)
+    }
+
+    #[tokio::test]
+    async fn swarm_boxes_read_each_other_and_still_write_only_as_themselves() {
+        let tmp = TempDir::new().unwrap();
+        let (inner, roster_ids, outsider) = swarm_fixture(&tmp).await;
+        let config = MemoryConfig::default();
+
+        let box_a = create_memory_for_swarm_box(
+            Arc::clone(&inner),
+            "s1",
+            &roster_ids[0],
+            &roster_ids,
+            &config,
+        );
+        let box_b = create_memory_for_swarm_box(
+            Arc::clone(&inner),
+            "s1",
+            &roster_ids[1],
+            &roster_ids,
+            &config,
+        );
+
+        box_b
+            .store(
+                "beta-finding",
+                "the shared finding",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // (1) the allowlist widens reads across the roster.
+        let seen = box_a
+            .handle()
+            .recall("finding", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(seen.len(), 1, "box A must recall box B's swarm write");
+        assert_eq!(seen[0].namespace, "swarm/s1", "writes carry the namespace");
+        assert_eq!(
+            seen[0].agent_id.as_deref(),
+            Some(roster_ids[1].as_str()),
+            "the row stays attributed to the box that wrote it"
+        );
+
+        // (2) it does not widen writes: A cannot write as B.
+        let forged = box_a
+            .handle()
+            .store_with_agent(
+                "forged",
+                "written as box B",
+                MemoryCategory::Core,
+                None,
+                Some("swarm/s1"),
+                None,
+                Some(&roster_ids[1]),
+            )
+            .await;
+        assert!(
+            forged.is_err(),
+            "a box must never be able to write as a sibling"
+        );
+
+        // (3) and it does not widen beyond the roster.
+        let stranger = AgentScopedMemory::new(Arc::clone(&inner), outsider, Vec::new());
+        assert!(
+            stranger
+                .recall("finding", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an agent off the roster must not see the swarm's rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn swarm_box_writes_are_namespaced_per_swarm() {
+        let tmp = TempDir::new().unwrap();
+        let (inner, roster_ids, _) = swarm_fixture(&tmp).await;
+        let config = MemoryConfig::default();
+
+        let one = create_memory_for_swarm_box(
+            Arc::clone(&inner),
+            "s1",
+            &roster_ids[0],
+            &roster_ids[..1],
+            &config,
+        );
+        let two = create_memory_for_swarm_box(
+            Arc::clone(&inner),
+            "s2",
+            &roster_ids[1],
+            &roster_ids[1..],
+            &config,
+        );
+        assert_eq!(one.namespace(), "swarm/s1");
+        assert_eq!(two.namespace(), "swarm/s2");
+        assert_eq!(one.agent_id(), roster_ids[0]);
+
+        one.store("k", "first swarm note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        two.store("k", "second swarm note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        for (namespace, expected) in [("swarm/s1", "first"), ("swarm/s2", "second")] {
+            let hits = inner
+                .recall_namespaced(namespace, "swarm note", 10, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{namespace} must hold exactly its own write");
+            assert!(hits[0].content.contains(expected));
+        }
     }
 }
