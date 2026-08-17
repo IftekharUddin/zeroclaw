@@ -9,6 +9,9 @@ const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::f
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Session-key prefix owned by the gateway lifecycle. Mirrors
+/// `GW_SESSION_PREFIX` in `crates/zeroclaw-gateway/src/ws.rs`.
+const GATEWAY_SESSION_KEY_PREFIX: &str = "gw_";
 use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
@@ -2512,6 +2515,17 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // Runtime RPC owns raw and `rpc_` chat-session keys only. A caller can
+        // put any string in `session_id`, so a gateway-prefixed value must be
+        // refused before any mutation runs: deleting it here would evict the
+        // transcript without the gateway's cancellation token, lifecycle
+        // generation, transcript-intent marker, queue, or version eviction.
+        if req.session_id.starts_with(GATEWAY_SESSION_KEY_PREFIX) {
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Gateway sessions are deleted through the gateway lifecycle owner",
+            ));
+        }
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2523,11 +2537,9 @@ impl RpcDispatcher {
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
-        // Runtime RPC owns raw and `rpc_` chat-session keys only. Gateway
-        // `gw_` incarnations are deleted through the gateway lifecycle owner,
-        // which coordinates detached-turn cancellation, persistence, and
-        // version eviction. Deleting that namespace here would bypass every
-        // one of those authority boundaries.
+        // The bare and `rpc_` forms are the only keys this transport owns.
+        // `gw_` is unreachable here: prefixed IDs are rejected above, and the
+        // bare id can never synthesize one.
         if let Some(ref backend) = self.ctx.session_backend {
             for key in &[req.session_id.clone(), format!("rpc_{}", req.session_id)] {
                 let _ = backend.delete_session(key);
@@ -7751,6 +7763,49 @@ mod tests {
             backend.load(&gateway_key).len(),
             1,
             "runtime RPC must leave gw_ sessions to the gateway lifecycle owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_session_delete_rejects_gateway_prefixed_ids() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        // A gateway incarnation mid-turn: its transcript is marked incomplete
+        // because a detached turn is still settling.
+        let gateway_key = "gw_operator-1";
+        backend
+            .append(gateway_key, &zeroclaw_providers::ChatMessage::user("seed"))
+            .expect("seed gateway session");
+        backend
+            .mark_transcript_incomplete(gateway_key)
+            .expect("mark transcript incomplete");
+
+        let err = dispatcher
+            .handle_session_delete(&serde_json::json!({"session_id": gateway_key}))
+            .await
+            .expect_err("RPC delete must refuse a gateway-prefixed id");
+        assert_eq!(
+            err.code, SESSION_NOT_OWNED,
+            "refusal must name the ownership boundary, not a generic failure"
+        );
+
+        assert_eq!(
+            backend.load(gateway_key).len(),
+            1,
+            "gateway transcript must survive a refused RPC delete"
+        );
+        assert!(
+            backend
+                .transcript_incomplete(gateway_key)
+                .expect("read transcript marker"),
+            "the transcript-intent marker must stay owned by the gateway lifecycle"
+        );
+        assert!(
+            backend.load(&format!("rpc_{gateway_key}")).is_empty(),
+            "a refused delete must not touch any derived key either"
         );
     }
 
