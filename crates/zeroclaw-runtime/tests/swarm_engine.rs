@@ -527,8 +527,8 @@ async fn swarm_full_lifecycle_start_run_complete() {
         spec_with("s-life", 2, custom(100, 10_000_000, 1000.0)),
     );
 
-    // Round 1: delegate to box-1, then finish the round. Round 2: no delegation
-    // -> the goal is met.
+    // First planning pass: delegate to box-1, then finish the pass. Second pass
+    // makes no delegation, so the goal is met.
     let orch_queue = VecDeque::from(vec![
         Reply::delegate("box-1", "gather findings"),
         Reply::final_text("round one complete"),
