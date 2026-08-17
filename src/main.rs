@@ -4248,6 +4248,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     (None, None)
                 };
 
+                // Swarm state is runtime state, not configuration, so the store
+                // is opened unconditionally at `<data_dir>/swarms/swarms.db`
+                // rather than behind a config key. A data dir the durable
+                // backend cannot use degrades to in-memory inside the factory.
+                let swarm_store =
+                    zeroclaw_runtime::swarm::build_swarm_store(&current_config.data_dir);
+
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
                 // triggers against the shared engine for this daemon iteration.
                 let sop_maintenance = spawn_sop_maintenance(
@@ -4375,6 +4382,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
                 registry.set_sop_engine(sop_engine, sop_audit);
+                // Same hand-off for the swarm store: the RPC read surface must
+                // answer from the store the daemon persists into.
+                registry.set_swarm_store(swarm_store);
 
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),

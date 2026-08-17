@@ -1194,6 +1194,48 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn swarm_list_round_trips_over_the_socket() {
+        use crate::rpc::types::SwarmListResult;
+        use crate::swarm::store::{PersistedSwarm, SwarmSpec};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let mut seeded = PersistedSwarm::new(SwarmSpec::new(
+            "sw-socket",
+            "Socket squad",
+            "anthropic",
+            "claude-sonnet-4",
+            "standard",
+            "supervisor",
+            "answer over IPC",
+        ));
+        seeded.created_at = "2020-01-01T00:00:00Z".to_string();
+        ctx.swarm_store.save_swarm(&seeded).unwrap();
+
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        writer
+            .write_all(rpc_request(Method::SwarmList, &serde_json::json!({}), 20).as_bytes())
+            .await
+            .unwrap();
+
+        let (_frame, listed): (_, SwarmListResult) = read_result(&mut reader).await;
+        assert_eq!(listed.swarms.len(), 1);
+        assert_eq!(listed.swarms[0], seeded);
+
+        cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn client_count_tracks_connections() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());

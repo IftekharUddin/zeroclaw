@@ -186,6 +186,11 @@ pub enum Method {
     SopsGraphDraft,
     SopsTriggerSources,
     ToolsParamOptions,
+
+    // Swarms (`swarm/`, singular — a swarm is one durable roster, not a
+    // directory of authored files like `sops/`)
+    SwarmList,
+    SwarmGet,
 }
 
 impl Method {
@@ -295,6 +300,9 @@ impl Method {
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
         (Method::ToolsParamOptions, "tools/param-options"),
+        // Swarms
+        (Method::SwarmList, "swarm/list"),
+        (Method::SwarmGet, "swarm/get"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -890,6 +898,10 @@ impl RpcDispatcher {
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
             Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
+
+            // Swarms
+            Method::SwarmList => self.handle_swarm_list(),
+            Method::SwarmGet => self.handle_swarm_get(&req.params),
         };
 
         if is_notification {
@@ -4560,6 +4572,36 @@ impl RpcDispatcher {
         to_result(registry)
     }
 
+    /// Every stored swarm, newest-created first. Reads the daemon's swarm
+    /// store directly — swarms have no config gate, so there is no
+    /// "subsystem not enabled" arm here.
+    fn handle_swarm_list(&self) -> RpcResult {
+        let swarms = self
+            .ctx
+            .swarm_store
+            .list_swarms()
+            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        to_result(SwarmListResult { swarms })
+    }
+
+    /// One stored swarm by id. An unknown id is a caller error, not a
+    /// backend failure, so it comes back as `INVALID_PARAMS`.
+    fn handle_swarm_get(&self, params: &Value) -> RpcResult {
+        let req: SwarmGetParams = parse_params(params)?;
+        let swarm = self
+            .ctx
+            .swarm_store
+            .load_swarm(&req.swarm_id)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
+            .ok_or_else(|| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("swarm '{}' not found", req.swarm_id),
+                )
+            })?;
+        to_result(swarm)
+    }
+
     /// Resolve selectable values for a domain-typed tool parameter.
     /// Params: `{ domain, agent?, args? }`. `domain` is an
     /// `OptionDomain` wire name (e.g. `peer_targets`); `agent` scopes
@@ -6252,6 +6294,91 @@ mod tests {
     fn doctor_run_method_is_registered() {
         assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
         assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[test]
+    fn swarm_methods_are_registered_under_the_swarm_family() {
+        // The family is `swarm/`, not `swarms/` — the neighbouring SOP family
+        // is plural and the two must not be confused on the wire.
+        assert_eq!(Method::from_wire("swarm/list"), Some(Method::SwarmList));
+        assert_eq!(Method::SwarmList.wire_name(), "swarm/list");
+        assert_eq!(Method::from_wire("swarm/get"), Some(Method::SwarmGet));
+        assert_eq!(Method::SwarmGet.wire_name(), "swarm/get");
+        assert_eq!(Method::from_wire("swarms/list"), None);
+    }
+
+    fn make_swarm_test_dispatcher() -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-swarm:pid=1".into())
+    }
+
+    #[test]
+    fn swarm_list_and_get_read_the_daemon_store() {
+        use crate::swarm::store::{PersistedSwarm, SwarmSpec, SwarmStatus};
+
+        let dispatcher = make_swarm_test_dispatcher();
+        // Empty store: a well-formed empty listing, not an error.
+        let listed = dispatcher.handle_swarm_list().expect("list");
+        assert_eq!(listed["swarms"], serde_json::json!([]));
+
+        let mut stored = PersistedSwarm::new(SwarmSpec::new(
+            "sw-1",
+            "Research squad",
+            "anthropic",
+            "claude-sonnet-4",
+            "standard",
+            "supervisor",
+            "survey the field",
+        ));
+        stored.created_at = "2020-01-01T00:00:00Z".to_string();
+        dispatcher
+            .ctx
+            .swarm_store
+            .save_swarm(&stored)
+            .expect("seed the store");
+
+        let listed = dispatcher.handle_swarm_list().expect("list");
+        assert_eq!(listed["swarms"].as_array().map(Vec::len), Some(1));
+        assert_eq!(listed["swarms"][0]["spec"]["id"], "sw-1");
+        assert_eq!(
+            listed["swarms"][0]["spec"]["boxes"]
+                .as_array()
+                .map(Vec::len),
+            Some(4)
+        );
+        assert_eq!(listed["swarms"][0]["run"]["status"], "created");
+        assert_eq!(listed["swarms"][0]["spec"]["budget"]["preset"], "standard");
+
+        let got = dispatcher
+            .handle_swarm_get(&serde_json::json!({"swarm_id": "sw-1"}))
+            .expect("get");
+        let round_tripped: PersistedSwarm =
+            serde_json::from_value(got).expect("swarm/get returns the persisted document");
+        assert_eq!(round_tripped, stored);
+        assert_eq!(round_tripped.run.status, SwarmStatus::Created);
+    }
+
+    #[test]
+    fn swarm_get_rejects_unknown_and_malformed_ids() {
+        let dispatcher = make_swarm_test_dispatcher();
+        let err = dispatcher
+            .handle_swarm_get(&serde_json::json!({"swarm_id": "nope"}))
+            .expect_err("an unknown swarm is a caller error");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("nope"),
+            "the rejection names the swarm, got: {}",
+            err.message
+        );
+
+        let err = dispatcher
+            .handle_swarm_get(&serde_json::json!({}))
+            .expect_err("swarm_id is required");
+        assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[tokio::test]
@@ -9947,6 +10074,7 @@ mod tests {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: Some(Arc::new(runner)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -9990,6 +10118,7 @@ mod tests {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: Some(Arc::new(runner)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -10090,6 +10219,7 @@ mod tests {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: Some(Arc::new(runner)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);

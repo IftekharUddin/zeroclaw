@@ -68,6 +68,10 @@ pub struct DaemonRegistry {
     /// RpcContext so RPC/TUI agent sessions share the same engine.
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    /// Swarm store built by the daemon reload loop. Passed through to
+    /// RpcContext so the swarm read surface answers from the same store the
+    /// daemon persists into.
+    swarm_store: Option<Arc<dyn crate::swarm::SwarmStore>>,
 }
 
 impl DaemonRegistry {
@@ -164,6 +168,21 @@ impl DaemonRegistry {
     ) {
         (self.sop_engine.take(), self.sop_audit.take())
     }
+
+    /// Set the swarm store for this daemon iteration.
+    pub fn set_swarm_store(&mut self, swarm_store: Arc<dyn crate::swarm::SwarmStore>) -> &mut Self {
+        self.swarm_store = Some(swarm_store);
+        self
+    }
+
+    /// The swarm store for this iteration, or an ephemeral one when the host
+    /// wired none (embedded hosts, tests). Swarms have no config gate, so the
+    /// RPC surface always has a store to answer from.
+    pub(crate) fn take_swarm_store(&mut self) -> Arc<dyn crate::swarm::SwarmStore> {
+        self.swarm_store
+            .take()
+            .unwrap_or_else(|| Arc::new(crate::swarm::store::InMemorySwarmStore::new()))
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +235,22 @@ mod tests {
         assert!(registry.has_socket_start());
         assert!(registry.has_wss_start());
         assert!(registry.has_mqtt_start());
+    }
+
+    #[test]
+    fn swarm_store_defaults_to_an_ephemeral_backend() {
+        let mut registry = DaemonRegistry::new();
+        // No host-wired store: the RPC surface still gets a working one.
+        assert_eq!(registry.take_swarm_store().backend(), "in-memory");
+
+        let store = Arc::new(crate::swarm::store::SqliteSwarmStore::open_in_memory().unwrap());
+        registry.set_swarm_store(store);
+        assert_eq!(registry.take_swarm_store().backend(), "sqlite");
+        assert_eq!(
+            registry.take_swarm_store().backend(),
+            "in-memory",
+            "taking the store consumes the slot"
+        );
     }
 
     #[test]

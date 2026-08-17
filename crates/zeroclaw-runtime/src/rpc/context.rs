@@ -16,6 +16,7 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
+use crate::swarm::store::{SwarmStore, build_swarm_store};
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
@@ -165,6 +166,12 @@ pub struct RpcContext {
     pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
 
+    /// Swarm persistence. Always present — swarms are runtime state with no
+    /// config gate, so the handle is a store, never an `Option`; a data dir the
+    /// durable backend cannot use degrades to the in-memory backend inside
+    /// [`build_swarm_store`] rather than leaving the RPC surface unanswerable.
+    pub swarm_store: Arc<dyn SwarmStore>,
+
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
@@ -192,6 +199,7 @@ impl RpcContext {
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
             sop_audit: None,
+            swarm_store: build_swarm_store(data_dir.as_path()),
             hooks: None,
         })
     }
@@ -213,6 +221,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: None,
         })
     }
@@ -238,6 +247,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: None,
         })
     }
@@ -263,6 +273,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: Some(sop_engine),
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: None,
         })
     }
@@ -288,6 +299,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: None,
         })
     }
@@ -313,6 +325,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: None,
         })
     }
@@ -339,6 +352,7 @@ impl RpcContext {
             acp_session_store,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: None,
         })
     }
@@ -365,6 +379,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            swarm_store: Arc::new(crate::swarm::store::InMemorySwarmStore::new()),
             hooks: None,
         })
     }

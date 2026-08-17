@@ -645,6 +645,7 @@ pub async fn run(
 
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
+    let swarm_store = registry.take_swarm_store();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -764,6 +765,7 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            swarm_store,
             hooks,
         }))
     } else {

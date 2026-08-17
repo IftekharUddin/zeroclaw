@@ -1549,6 +1549,26 @@ rpc_type! {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// ── Swarms ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Request payload for `swarm/get`: one stored swarm by id.
+    pub struct SwarmGetParams {
+        pub swarm_id: String,
+    }
+}
+
+rpc_type! {
+    /// Response payload for `swarm/list`. The entries are the persisted
+    /// documents themselves, so the read surface has no parallel summary
+    /// shape to drift from the store.
+    pub struct SwarmListResult {
+        pub swarms: Vec<crate::swarm::store::PersistedSwarm>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
