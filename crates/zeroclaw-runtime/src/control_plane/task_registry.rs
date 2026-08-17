@@ -14,6 +14,12 @@ pub enum TaskKind {
     Goal,
     /// Peer inbox task.
     PeerInbox,
+    /// A supervised swarm run. The record tracks one live driver of a swarm
+    /// roster; the individual box delegations are child records under it. This
+    /// is the first real consumer of the non-terminal [`TaskStatus::Paused`]:
+    /// a swarm parks (budget exhausted, operator request, daemon restart)
+    /// without becoming terminal, and resumes from the same record.
+    Swarm,
     // EPIC E: RemoteTurn
 }
 
@@ -157,6 +163,16 @@ mod tests {
         assert_eq!(s, "\"goal\"");
         let back: TaskKind = serde_json::from_str(&s).unwrap();
         assert_eq!(back, TaskKind::Goal);
+    }
+
+    #[test]
+    fn swarm_kind_roundtrips_snake_case() {
+        // The swarm run record persists through the same serde<->TEXT column
+        // helpers the store uses, so the wire tag must be stable.
+        let s = serde_json::to_string(&TaskKind::Swarm).unwrap();
+        assert_eq!(s, "\"swarm\"");
+        let back: TaskKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, TaskKind::Swarm);
     }
 
     #[test]
