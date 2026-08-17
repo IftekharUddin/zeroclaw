@@ -1136,24 +1136,43 @@ impl SwarmBoxMemory {
 /// UUID rather than a `&Config` and an alias: a box alias is synthetic and
 /// never present in `[agents.*]`, and one backend handle is shared by the
 /// whole roster instead of one per box.
-#[must_use]
+///
+/// Fails closed on a backend that cannot honor the allowlist. Box isolation
+/// rests on two backend contracts: `recall_for_agents` filtering to the
+/// roster's UUIDs, and `store_with_agent` stamping the box's own UUID. The
+/// Markdown and None backends honor neither through this scoping wrapper
+/// (Markdown composes isolation via per-agent directories in a separate
+/// wrapper; None drops everything), so a box over either would read every
+/// row including the parent's and write unattributed. Rather than silently
+/// collapse the boundary, reject those backends — swarm memory requires a
+/// sqlite, postgres, or vector backend.
 pub fn create_memory_for_swarm_box(
     inner: Arc<dyn Memory>,
     swarm_id: &str,
     box_agent_id: &str,
     roster_agent_ids: &[String],
     memory_config: &MemoryConfig,
-) -> SwarmBoxMemory {
+) -> anyhow::Result<SwarmBoxMemory> {
+    let backend_kind = classify_memory_backend(&backend_kind_from_dotted(&memory_config.backend));
+    if matches!(
+        backend_kind,
+        MemoryBackendKind::Markdown | MemoryBackendKind::None
+    ) {
+        anyhow::bail!(
+            "swarm memory requires a sqlite, postgres, or vector backend, but memory.backend = {:?} cannot enforce the box allowlist",
+            memory_config.backend
+        );
+    }
     let scoped = AgentScopedMemory::new(
         inner,
         box_agent_id,
         roster_agent_ids.iter().map(String::clone),
     );
-    SwarmBoxMemory {
+    Ok(SwarmBoxMemory {
         handle: wrap_in_retrieval_pipeline(Arc::new(scoped), memory_config),
         namespace: swarm_namespace(swarm_id),
         agent_id: box_agent_id.to_string(),
-    }
+    })
 }
 
 /// Factory: create an optional response cache from config.
@@ -2880,14 +2899,16 @@ store_timeout_ms = 40000
             &roster_ids[0],
             &roster_ids,
             &config,
-        );
+        )
+        .expect("a swarm box over sqlite must compose");
         let box_b = create_memory_for_swarm_box(
             Arc::clone(&inner),
             "s1",
             &roster_ids[1],
             &roster_ids,
             &config,
-        );
+        )
+        .expect("a swarm box over sqlite must compose");
 
         box_b
             .store(
@@ -2955,14 +2976,16 @@ store_timeout_ms = 40000
             &roster_ids[0],
             &roster_ids[..1],
             &config,
-        );
+        )
+        .expect("a swarm box over sqlite must compose");
         let two = create_memory_for_swarm_box(
             Arc::clone(&inner),
             "s2",
             &roster_ids[1],
             &roster_ids[1..],
             &config,
-        );
+        )
+        .expect("a swarm box over sqlite must compose");
         assert_eq!(one.namespace(), "swarm/s1");
         assert_eq!(two.namespace(), "swarm/s2");
         assert_eq!(one.agent_id(), roster_ids[0]);
@@ -2981,6 +3004,35 @@ store_timeout_ms = 40000
                 .unwrap();
             assert_eq!(hits.len(), 1, "{namespace} must hold exactly its own write");
             assert!(hits[0].content.contains(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn swarm_box_rejects_an_allowlist_blind_backend() {
+        // Markdown and None cannot enforce the roster allowlist through the
+        // scoping wrapper, so composing a box over either must fail closed
+        // rather than silently collapse box isolation.
+        let tmp = TempDir::new().unwrap();
+        let (inner, roster_ids, _) = swarm_fixture(&tmp).await;
+        for backend in ["markdown", "none"] {
+            let config = MemoryConfig {
+                backend: backend.into(),
+                ..MemoryConfig::default()
+            };
+            let err = match create_memory_for_swarm_box(
+                Arc::clone(&inner),
+                "s1",
+                &roster_ids[0],
+                &roster_ids,
+                &config,
+            ) {
+                Ok(_) => panic!("an allowlist-blind backend ({backend}) must be refused"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("swarm memory requires"),
+                "unexpected error for {backend}: {err}"
+            );
         }
     }
 }

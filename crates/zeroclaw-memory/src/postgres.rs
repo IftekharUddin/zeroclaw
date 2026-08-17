@@ -584,6 +584,42 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    async fn purge_agent_identity(&self, agent_alias: &str) -> Result<bool> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = agent_alias.to_string();
+
+        run_on_os_thread(move || -> Result<bool> {
+            let mut client = client.lock();
+            // One transaction so the count-then-delete cannot race a
+            // concurrent insert into the window. Refuse while rows still
+            // point at the binding — deleting it would orphan attributed rows
+            // behind a UUID nothing can resolve. Mirrors the sqlite impl.
+            let mut tx = client.transaction()?;
+            let rows: i64 = tx
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(*) FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+                    ),
+                    &[&alias],
+                )?
+                .get(0);
+            if rows > 0 {
+                anyhow::bail!(
+                    "cannot remove the agent identity for `{alias}`: {rows} memory row(s) still reference it; purge them first"
+                );
+            }
+            let deleted = tx.execute(
+                &format!("DELETE FROM {qualified_agents} WHERE alias = $1"),
+                &[&alias],
+            )?;
+            tx.commit()?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
+
     async fn export_agent(&self, agent_alias: &str) -> Result<Vec<MemoryEntry>> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();

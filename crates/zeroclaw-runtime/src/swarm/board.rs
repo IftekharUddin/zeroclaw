@@ -25,6 +25,15 @@ pub const MAX_BOARDS: usize = 64;
 /// ceiling is what keeps a looping box from exhausting memory.
 pub const MAX_CLAIMS_PER_SWARM: usize = 512;
 
+/// Maximum live claims a single box may hold, well under the per-swarm
+/// ceiling. Without a per-box cap one looping box could take the whole pool
+/// and starve its siblings, whose `claim` would then fail for the rest of the
+/// run; releasing is holder-only, so the victims could not recover.
+pub const MAX_CLAIMS_PER_BOX: usize = 32;
+
+/// Longest accepted box id on registration.
+pub const MAX_BOX_ID_LEN: usize = 64;
+
 /// Maximum length of a published note.
 pub const MAX_NOTE_LEN: usize = 2048;
 
@@ -150,8 +159,17 @@ pub enum BoardError {
     UnknownBox { swarm_id: String, box_id: String },
     #[error("cannot register another swarm board: the limit of {MAX_BOARDS} is reached")]
     BoardLimit,
+    #[error("swarm {swarm_id:?} already has a live board; resume is a separate explicit op")]
+    AlreadyRegistered { swarm_id: String },
+    #[error("box id is invalid: {reason}")]
+    InvalidBoxId { reason: String },
     #[error("swarm {swarm_id:?} already holds the maximum of {MAX_CLAIMS_PER_SWARM} claims")]
     ClaimLimit { swarm_id: String },
+    #[error(
+        "box {box_id:?} on swarm {swarm_id:?} already holds the maximum of \
+         {MAX_CLAIMS_PER_BOX} claims"
+    )]
+    BoxClaimLimit { swarm_id: String, box_id: String },
     #[error("note is {len} bytes; the maximum is {MAX_NOTE_LEN}")]
     NoteTooLong { len: usize },
     #[error("task key is invalid: {reason}")]
@@ -186,21 +204,46 @@ impl SwarmStateBoard {
         Self::default()
     }
 
-    /// Register (or re-register, on resume) a swarm's boxes. Every named box
-    /// starts idle and unclaimed; nothing outside this roster can ever publish
-    /// or claim, which is what stops a box from speaking as a sibling.
+    /// Register a swarm's boxes for the first time. Every named box starts
+    /// idle and unclaimed; nothing outside this roster can ever publish or
+    /// claim, which is what stops a box from speaking as a sibling.
+    ///
+    /// Refuses if the swarm already has a live board rather than replacing it:
+    /// a silent re-`insert` would drop every claim, install a fresh broadcast
+    /// sender that orphans existing subscribers with no [`BoardEvent::Reaped`],
+    /// and briefly let two boxes believe they each hold the same `task_key`.
+    /// Resuming or reconciling a board is a deliberate, separate operation, not
+    /// a side effect of registering.
     pub fn register(
         &self,
         swarm_id: &str,
         box_ids: impl IntoIterator<Item = String>,
     ) -> Result<(), BoardError> {
-        let boxes: BTreeMap<String, BoxState> = box_ids
-            .into_iter()
-            .map(|box_id| (box_id, BoxState::default()))
-            .collect();
+        let mut boxes: BTreeMap<String, BoxState> = BTreeMap::new();
+        for box_id in box_ids {
+            if box_id.is_empty() {
+                return Err(BoardError::InvalidBoxId {
+                    reason: "must not be empty".to_string(),
+                });
+            }
+            if box_id.len() > MAX_BOX_ID_LEN {
+                return Err(BoardError::InvalidBoxId {
+                    reason: format!(
+                        "{} bytes exceeds the maximum of {MAX_BOX_ID_LEN}",
+                        box_id.len()
+                    ),
+                });
+            }
+            boxes.insert(box_id, BoxState::default());
+        }
 
         let mut boards = self.inner.write();
-        if !boards.contains_key(swarm_id) && boards.len() >= MAX_BOARDS {
+        if boards.contains_key(swarm_id) {
+            return Err(BoardError::AlreadyRegistered {
+                swarm_id: swarm_id.to_string(),
+            });
+        }
+        if boards.len() >= MAX_BOARDS {
             return Err(BoardError::BoardLimit);
         }
         boards.insert(
@@ -242,11 +285,39 @@ impl SwarmStateBoard {
             })?;
         state.status = status;
         state.note = note.to_string();
+        // A finished box must not keep siblings' keys locked: auto-release
+        // everything it holds when it reports Done, so the pool is returned
+        // for the rest of the run.
+        if status == BoxStatus::Done {
+            state.claim = None;
+        }
         let published = state.clone();
+
+        let released: Vec<String> = if status == BoxStatus::Done {
+            let keys: Vec<String> = entry
+                .claims
+                .iter()
+                .filter(|(_, holder)| holder.as_str() == box_id)
+                .map(|(task_key, _)| task_key.clone())
+                .collect();
+            for task_key in &keys {
+                entry.claims.remove(task_key);
+            }
+            keys
+        } else {
+            Vec::new()
+        };
+
         let _ = entry.tx.send(BoardEvent::Published {
             box_id: box_id.to_string(),
             state: published.clone(),
         });
+        for task_key in released {
+            let _ = entry.tx.send(BoardEvent::Released {
+                box_id: box_id.to_string(),
+                task_key,
+            });
+        }
         Ok(published)
     }
 
@@ -283,6 +354,21 @@ impl SwarmStateBoard {
         if entry.claims.len() >= MAX_CLAIMS_PER_SWARM {
             return Err(BoardError::ClaimLimit {
                 swarm_id: swarm_id.to_string(),
+            });
+        }
+        // Per-box cap so one looping box cannot drain the shared pool and
+        // starve its siblings. Only new keys reach here (a re-claim by the
+        // current holder returned Granted above), so this bounds distinct
+        // live claims per box.
+        let held_by_box = entry
+            .claims
+            .values()
+            .filter(|holder| holder.as_str() == box_id)
+            .count();
+        if held_by_box >= MAX_CLAIMS_PER_BOX {
+            return Err(BoardError::BoxClaimLimit {
+                swarm_id: swarm_id.to_string(),
+                box_id: box_id.to_string(),
             });
         }
         entry
@@ -610,22 +696,152 @@ mod tests {
                 .expect("registrations below the limit must succeed");
         }
         assert_eq!(board.register("overflow", []), Err(BoardError::BoardLimit));
-        // Re-registering an existing swarm is not a new board.
-        assert_eq!(board.register("s0", ["box-1".to_string()]), Ok(()));
         assert_eq!(board.len(), MAX_BOARDS);
     }
 
     #[test]
-    fn claims_are_bounded_per_swarm() {
+    fn register_refuses_to_clobber_a_live_board() {
         let board = board_with_two_boxes();
-        for i in 0..MAX_CLAIMS_PER_SWARM {
+        board.claim("s1", "box-1", "task-a").expect("claim");
+
+        // A subscriber taken before the re-register attempt must keep working:
+        // a clobber would have swapped the broadcast sender and orphaned it.
+        let mut subscriber = board.subscribe("s1").expect("board must exist");
+        assert_eq!(
+            board.register("s1", ["box-9".to_string()]),
+            Err(BoardError::AlreadyRegistered {
+                swarm_id: "s1".to_string(),
+            }),
+            "re-registering a live board must be refused, not clobber it"
+        );
+
+        // The original state and roster survive intact.
+        let snapshot = board.snapshot("s1").expect("board must exist");
+        assert_eq!(snapshot.claims["task-a"], "box-1");
+        assert!(snapshot.boxes.contains_key("box-1"));
+        assert!(
+            !snapshot.boxes.contains_key("box-9"),
+            "the refused registration must not have leaked its boxes"
+        );
+
+        // The pre-existing subscriber still receives events off the original
+        // sender, proving it was not replaced.
+        board
+            .publish("s1", "box-1", BoxStatus::Working, "still here")
+            .expect("publish");
+        assert!(matches!(
+            subscriber.try_recv(),
+            Ok(BoardEvent::Published { .. })
+        ));
+    }
+
+    #[test]
+    fn register_rejects_unusable_box_ids() {
+        let board = SwarmStateBoard::new();
+        assert!(matches!(
+            board.register("s1", ["".to_string()]),
+            Err(BoardError::InvalidBoxId { .. })
+        ));
+        assert!(matches!(
+            board.register("s1", ["b".repeat(MAX_BOX_ID_LEN + 1)]),
+            Err(BoardError::InvalidBoxId { .. })
+        ));
+        assert!(
+            board.is_empty(),
+            "a rejected registration must not create a board"
+        );
+    }
+
+    #[test]
+    fn claims_are_bounded_per_box() {
+        let board = board_with_two_boxes();
+        for i in 0..MAX_CLAIMS_PER_BOX {
             assert_eq!(
                 board.claim("s1", "box-1", &format!("task-{i}")),
                 Ok(ClaimOutcome::Granted)
             );
         }
+        // box-1 is at its cap and cannot take another key.
         assert!(matches!(
             board.claim("s1", "box-1", "one-too-many"),
+            Err(BoardError::BoxClaimLimit { .. })
+        ));
+        // A sibling is unaffected: the per-box cap is not the per-swarm pool.
+        assert_eq!(
+            board.claim("s1", "box-2", "sibling-task"),
+            Ok(ClaimOutcome::Granted),
+            "one box exhausting its quota must not starve a sibling"
+        );
+    }
+
+    #[test]
+    fn publishing_done_auto_releases_the_boxs_claims() {
+        let board = board_with_two_boxes();
+        board.claim("s1", "box-1", "task-a").expect("claim");
+        board.claim("s1", "box-1", "task-b").expect("claim");
+        board.claim("s1", "box-2", "task-c").expect("claim");
+
+        let mut rx = board.subscribe("s1").expect("board must exist");
+        board
+            .publish("s1", "box-1", BoxStatus::Done, "finished")
+            .expect("publish");
+
+        let snapshot = board.snapshot("s1").expect("board must exist");
+        assert!(
+            !snapshot.claims.contains_key("task-a") && !snapshot.claims.contains_key("task-b"),
+            "a Done box must release its own claims"
+        );
+        assert_eq!(
+            snapshot.claims["task-c"], "box-2",
+            "a sibling's claim must survive another box finishing"
+        );
+        assert_eq!(snapshot.boxes["box-1"].claim, None);
+
+        // The auto-release is observable on the feed: one Published, then a
+        // Released for each dropped key.
+        let events: Vec<BoardEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(matches!(events[0], BoardEvent::Published { .. }));
+        let released: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                BoardEvent::Released { task_key, .. } => Some(task_key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(released.len(), 2, "got {events:?}");
+        assert!(released.contains(&"task-a") && released.contains(&"task-b"));
+    }
+
+    #[test]
+    fn claims_are_bounded_per_swarm() {
+        // No single box can reach the per-swarm ceiling on its own (the
+        // per-box cap stops it first), so fill the pool across enough boxes:
+        // `box_count` boxes each at their per-box cap sum to exactly the
+        // per-swarm ceiling.
+        let box_count = MAX_CLAIMS_PER_SWARM / MAX_CLAIMS_PER_BOX;
+        assert_eq!(
+            box_count * MAX_CLAIMS_PER_BOX,
+            MAX_CLAIMS_PER_SWARM,
+            "this test assumes the per-swarm ceiling is a multiple of the per-box cap"
+        );
+        let board = SwarmStateBoard::new();
+        let box_ids: Vec<String> = (0..=box_count).map(|i| format!("box-{i}")).collect();
+        board.register("s1", box_ids).expect("register");
+
+        for b in 0..box_count {
+            let box_id = format!("box-{b}");
+            for k in 0..MAX_CLAIMS_PER_BOX {
+                assert_eq!(
+                    board.claim("s1", &box_id, &format!("task-{b}-{k}")),
+                    Ok(ClaimOutcome::Granted)
+                );
+            }
+        }
+
+        // A fresh box holding nothing — under its own per-box cap — still
+        // cannot claim, because the swarm-wide pool is full.
+        assert!(matches!(
+            board.claim("s1", &format!("box-{box_count}"), "one-too-many"),
             Err(BoardError::ClaimLimit { .. })
         ));
     }

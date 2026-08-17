@@ -13,9 +13,13 @@
 //! * a real memory UUID from `Memory::ensure_agent_uuid`, so every row a box
 //!   writes is attributed to that box and is deletable by attribution.
 //!
-//! The permissions envelope is the parent agent's, resolved through the same
-//! [`SubAgentSpawn`] machinery as any other runtime-spawned sub-agent. A box
-//! may narrow it; a box that asks for anything wider fails the whole build.
+//! The permissions envelope is the live parent agent's, threaded in by the
+//! caller and installed through the same [`SubAgentSpawn`] machinery as any
+//! other runtime-spawned sub-agent. In v1 every box inherits that policy
+//! verbatim — the builder takes no caller-authored per-box policy, so a box
+//! can never be handed a wider (or differently-shaped) envelope than the
+//! parent holds. Runtime narrowing of what a box may *do* is a tool-registry
+//! concern, resolved when the box's tools are scoped, not here.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -64,17 +68,10 @@ pub enum RosterError {
     AliasCollision { alias: String },
     #[error("cannot resolve the parent envelope from agent {alias:?}: {reason}")]
     Parent { alias: String, reason: String },
-    #[error(
-        "box {box_id:?} requested a policy outside the {parent_alias:?} envelope: {reason}; \
-         a box may only narrow it"
-    )]
-    PolicyEscalation {
-        box_id: String,
-        parent_alias: String,
-        reason: String,
-    },
     #[error("could not mint a memory identity for {alias:?}: {reason}")]
     Identity { alias: String, reason: String },
+    #[error("cannot compose swarm-box memory: {reason}")]
+    Memory { reason: String },
 }
 
 /// One built box: its authored shape, its two minted identities, and the
@@ -167,44 +164,53 @@ impl SwarmRoster {
     /// "a box reads whatever it was handed". Writes stay self-attributed:
     /// the scoping wrapper stamps the bound box's UUID, so the allowlist
     /// widens reads only.
-    #[must_use]
+    ///
+    /// Fails closed if the backend cannot enforce that allowlist (Markdown /
+    /// None): a swarm cannot run its memory boundary on a backend that would
+    /// silently ignore it.
     pub fn compose_memories(
         &self,
         inner: &Arc<dyn Memory>,
         memory_config: &MemoryConfig,
-    ) -> BTreeMap<String, SwarmBoxMemory> {
+    ) -> Result<BTreeMap<String, SwarmBoxMemory>, RosterError> {
         let roster_ids = self.agent_ids();
-        self.boxes
-            .iter()
-            .map(|entry| {
-                (
-                    entry.box_id.clone(),
-                    create_memory_for_swarm_box(
-                        Arc::clone(inner),
-                        &self.swarm_id,
-                        &entry.agent_id,
-                        &roster_ids,
-                        memory_config,
-                    ),
-                )
-            })
-            .collect()
+        let mut composed = BTreeMap::new();
+        for entry in &self.boxes {
+            let handle = create_memory_for_swarm_box(
+                Arc::clone(inner),
+                &self.swarm_id,
+                &entry.agent_id,
+                &roster_ids,
+                memory_config,
+            )
+            .map_err(|err| RosterError::Memory {
+                reason: err.to_string(),
+            })?;
+            composed.insert(entry.box_id.clone(), handle);
+        }
+        Ok(composed)
     }
 }
 
-/// Build the roster for `spec` inside `parent_alias`'s envelope.
+/// Build the roster for `spec` inside `parent_alias`'s live envelope.
 ///
-/// `policy_requests` maps `box_id` to the narrowed policy that box should run
-/// under; a box with no entry inherits the parent's verbatim. Requests are
-/// validated by [`SecurityPolicy::ensure_no_escalation_beyond`] through
-/// [`SubAgentSpawn`], so a request for anything the parent does not already
-/// hold fails the build rather than the box.
+/// `parent_policy` is the parent agent's *live* [`SecurityPolicy`] — the one
+/// the daemon is actually running under, complete with any runtime narrowing
+/// and its action-budget bucket — supplied by the caller rather than
+/// re-derived from `config` here. Re-deriving would discard that narrowing,
+/// mint a fresh budget bucket, and (via `SecurityPolicy::for_agent`) touch the
+/// filesystem during what is meant to be an in-memory build.
+///
+/// In v1 every box inherits this policy verbatim: the builder takes no
+/// caller-authored per-box policy, so a box can never be handed anything wider
+/// than the parent. Narrowing what a box may *do* is a tool-registry concern
+/// resolved when its tools are scoped, not a policy the caller threads here.
 pub async fn build_swarm_roster(
     config: &Config,
     memory: &Arc<dyn Memory>,
     spec: &SwarmSpec,
     parent_alias: &str,
-    policy_requests: &BTreeMap<String, SecurityPolicy>,
+    parent_policy: Arc<SecurityPolicy>,
 ) -> Result<SwarmRoster, RosterError> {
     validate_id("id", &spec.id)?;
     if spec.boxes.is_empty() {
@@ -218,16 +224,6 @@ pub async fn build_swarm_roster(
             size: spec.boxes.len(),
         });
     }
-
-    // Resolve the envelope once: every box narrows the same parent policy, so
-    // re-resolving per box would let a mid-build config change hand two boxes
-    // different parents.
-    let parent_policy = Arc::new(SecurityPolicy::for_agent(config, parent_alias).map_err(
-        |err| RosterError::Parent {
-            alias: parent_alias.to_string(),
-            reason: err.to_string(),
-        },
-    )?);
 
     let mut seen: HashSet<&str> = HashSet::with_capacity(spec.boxes.len());
     let mut boxes = Vec::with_capacity(spec.boxes.len());
@@ -248,6 +244,9 @@ pub async fn build_swarm_roster(
             return Err(RosterError::AliasCollision { alias });
         }
 
+        // Every box inherits the live parent envelope verbatim: no override is
+        // threaded in, so `build` installs the parent policy (and its shared
+        // action-budget bucket) unchanged. Widening is unrepresentable here.
         let spawn =
             SubAgentSpawn::for_agent_with_policy(config, parent_alias, Arc::clone(&parent_policy))
                 .map_err(|err| RosterError::Parent {
@@ -256,12 +255,11 @@ pub async fn build_swarm_roster(
                 })?;
         let context = spawn
             .build(SubAgentOverrides {
-                policy: policy_requests.get(&box_spec.box_id).cloned(),
+                policy: None,
                 allowed_agent_aliases: None,
             })
-            .map_err(|err| RosterError::PolicyEscalation {
-                box_id: box_spec.box_id.clone(),
-                parent_alias: parent_alias.to_string(),
+            .map_err(|err| RosterError::Parent {
+                alias: parent_alias.to_string(),
                 reason: err.to_string(),
             })?;
 
@@ -326,7 +324,6 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), RosterError> {
 mod tests {
     use super::*;
     use crate::swarm::store::model::BoxSpec;
-    use std::path::PathBuf;
     use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
     use zeroclaw_memory::SqliteMemory;
 
@@ -374,15 +371,26 @@ mod tests {
         (tmp, Arc::new(mem))
     }
 
+    /// The live parent policy the caller threads into the builder.
+    fn parent_policy(config: &Config, alias: &str) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::for_agent(config, alias).expect("parent policy"))
+    }
+
     #[tokio::test]
     async fn builds_synthetic_aliases_and_real_uuids() {
         let config = test_config();
         let (_tmp, memory) = temp_memory();
         let spec = spec_with_boxes("swarm-1", &["box-1", "box-2"]);
 
-        let roster = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
-            .await
-            .expect("a roster inside the parent envelope must build");
+        let roster = build_swarm_roster(
+            &config,
+            &memory,
+            &spec,
+            "default",
+            parent_policy(&config, "default"),
+        )
+        .await
+        .expect("a roster inside the parent envelope must build");
 
         assert_eq!(roster.len(), 2);
         assert_eq!(
@@ -399,9 +407,15 @@ mod tests {
             );
         }
         // The identities are stable: rebuilding resolves the same rows.
-        let again = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
-            .await
-            .expect("rebuild must succeed");
+        let again = build_swarm_roster(
+            &config,
+            &memory,
+            &spec,
+            "default",
+            parent_policy(&config, "default"),
+        )
+        .await
+        .expect("rebuild must succeed");
         assert_eq!(again.agent_ids(), ids);
     }
 
@@ -410,9 +424,9 @@ mod tests {
         let config = test_config();
         let (_tmp, memory) = temp_memory();
         let spec = spec_with_boxes("swarm-1", &["box-1"]);
-        let parent = SecurityPolicy::for_agent(&config, "default").expect("parent policy");
+        let parent = parent_policy(&config, "default");
 
-        let roster = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
+        let roster = build_swarm_roster(&config, &memory, &spec, "default", Arc::clone(&parent))
             .await
             .expect("build");
 
@@ -424,75 +438,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_narrowing_policy_request_is_accepted() {
+    async fn boxes_share_the_live_parents_action_budget_bucket() {
+        // With no override, a box runs under the very same live policy Arc as
+        // the parent — same allocation, therefore the same action-budget
+        // bucket — rather than a fresh one minted from config.
         let config = test_config();
         let (_tmp, memory) = temp_memory();
         let spec = spec_with_boxes("swarm-1", &["box-1"]);
+        let parent = parent_policy(&config, "default");
 
-        let mut narrowed = SecurityPolicy::for_agent(&config, "default").expect("parent policy");
-        narrowed.allowed_commands.clear();
-        narrowed.max_actions_per_hour = 1;
-        let requests = BTreeMap::from([("box-1".to_string(), narrowed)]);
-
-        let roster = build_swarm_roster(&config, &memory, &spec, "default", &requests)
+        let roster = build_swarm_roster(&config, &memory, &spec, "default", Arc::clone(&parent))
             .await
-            .expect("narrowing must be allowed");
-        assert_eq!(roster.boxes()[0].context.policy.max_actions_per_hour, 1);
-        assert!(roster.boxes()[0].context.policy.allowed_commands.is_empty());
-    }
+            .expect("build");
 
-    #[tokio::test]
-    async fn a_widening_policy_request_fails_the_build_closed() {
-        let config = test_config();
-        let (_tmp, memory) = temp_memory();
-        let spec = spec_with_boxes("swarm-1", &["box-1", "box-2"]);
-
-        let mut wider = SecurityPolicy::for_agent(&config, "default").expect("parent policy");
-        wider.allowed_roots.push(PathBuf::from("/secrets"));
-        let requests = BTreeMap::from([("box-2".to_string(), wider)]);
-
-        let err = build_swarm_roster(&config, &memory, &spec, "default", &requests)
-            .await
-            .expect_err("escalation must fail closed");
-        match err {
-            RosterError::PolicyEscalation { box_id, .. } => assert_eq!(box_id, "box-2"),
-            other => panic!("expected a policy-escalation refusal, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn every_escalation_axis_fails_the_build() {
-        let config = test_config();
-        let (_tmp, memory) = temp_memory();
-        let spec = spec_with_boxes("swarm-1", &["box-1"]);
-        let parent = SecurityPolicy::for_agent(&config, "default").expect("parent policy");
-
-        let mut wider_commands = parent.clone();
-        wider_commands.allowed_commands.push("rm".to_string());
-        let mut wider_actions = parent.clone();
-        wider_actions.max_actions_per_hour = parent.max_actions_per_hour + 1;
-        let mut wider_cost = parent.clone();
-        wider_cost.max_cost_per_day_cents = parent.max_cost_per_day_cents + 1;
-        let mut wider_env = parent.clone();
-        wider_env
-            .shell_env_passthrough
-            .push("AWS_SECRET".to_string());
-
-        for (label, policy) in [
-            ("commands", wider_commands),
-            ("actions", wider_actions),
-            ("cost", wider_cost),
-            ("env passthrough", wider_env),
-        ] {
-            let requests = BTreeMap::from([("box-1".to_string(), policy)]);
-            let err = build_swarm_roster(&config, &memory, &spec, "default", &requests)
-                .await
-                .expect_err("escalation must fail closed");
-            assert!(
-                matches!(err, RosterError::PolicyEscalation { .. }),
-                "widening {label} must be refused, got {err:?}"
-            );
-        }
+        assert!(
+            Arc::ptr_eq(&roster.boxes()[0].context.policy, &parent),
+            "a box must run under the live parent policy Arc, not a fresh copy"
+        );
     }
 
     #[tokio::test]
@@ -510,9 +472,15 @@ mod tests {
         let (_tmp, memory) = temp_memory();
         let spec = spec_with_boxes("swarm-1", &["box-1"]);
 
-        let err = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
-            .await
-            .expect_err("a shadowing alias must be refused");
+        let err = build_swarm_roster(
+            &config,
+            &memory,
+            &spec,
+            "default",
+            parent_policy(&config, "default"),
+        )
+        .await
+        .expect_err("a shadowing alias must be refused");
         assert_eq!(
             err,
             RosterError::AliasCollision {
@@ -538,9 +506,15 @@ mod tests {
             ("a", ""),
         ] {
             let spec = spec_with_boxes(swarm_id, &[box_id]);
-            let err = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
-                .await
-                .expect_err("unusable ids must be refused");
+            let err = build_swarm_roster(
+                &config,
+                &memory,
+                &spec,
+                "default",
+                parent_policy(&config, "default"),
+            )
+            .await
+            .expect_err("unusable ids must be refused");
             assert!(
                 matches!(err, RosterError::InvalidId { .. }),
                 "({swarm_id:?}, {box_id:?}) must be refused, got {err:?}"
@@ -555,14 +529,28 @@ mod tests {
 
         let dupes = spec_with_boxes("swarm-1", &["box-1", "box-1"]);
         assert!(matches!(
-            build_swarm_roster(&config, &memory, &dupes, "default", &BTreeMap::new()).await,
+            build_swarm_roster(
+                &config,
+                &memory,
+                &dupes,
+                "default",
+                parent_policy(&config, "default")
+            )
+            .await,
             Err(RosterError::DuplicateBox { .. })
         ));
 
         let mut empty = spec_with_boxes("swarm-1", &[]);
         empty.boxes.clear();
         assert!(matches!(
-            build_swarm_roster(&config, &memory, &empty, "default", &BTreeMap::new()).await,
+            build_swarm_roster(
+                &config,
+                &memory,
+                &empty,
+                "default",
+                parent_policy(&config, "default")
+            )
+            .await,
             Err(RosterError::EmptyRoster { .. })
         ));
 
@@ -570,7 +558,14 @@ mod tests {
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let too_many = spec_with_boxes("swarm-1", &refs);
         assert!(matches!(
-            build_swarm_roster(&config, &memory, &too_many, "default", &BTreeMap::new()).await,
+            build_swarm_roster(
+                &config,
+                &memory,
+                &too_many,
+                "default",
+                parent_policy(&config, "default")
+            )
+            .await,
             Err(RosterError::RosterTooLarge { .. })
         ));
     }
@@ -581,9 +576,17 @@ mod tests {
         let (_tmp, memory) = temp_memory();
         let spec = spec_with_boxes("swarm-1", &["box-1"]);
 
-        let err = build_swarm_roster(&config, &memory, &spec, "ghost", &BTreeMap::new())
-            .await
-            .expect_err("an unknown parent must be refused");
+        // The live policy is resolvable (built for `default`), but the alias
+        // `ghost` is not a configured agent, so the spawn resolution refuses.
+        let err = build_swarm_roster(
+            &config,
+            &memory,
+            &spec,
+            "ghost",
+            parent_policy(&config, "default"),
+        )
+        .await
+        .expect_err("an unknown parent must be refused");
         assert!(matches!(err, RosterError::Parent { .. }), "got {err:?}");
     }
 
@@ -594,9 +597,15 @@ mod tests {
         let spec = spec_with_boxes("swarm-1", &["box-1", "box-2"]);
         let before: Vec<String> = config.agents.keys().cloned().collect();
 
-        let roster = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
-            .await
-            .expect("build");
+        let roster = build_swarm_roster(
+            &config,
+            &memory,
+            &spec,
+            "default",
+            parent_policy(&config, "default"),
+        )
+        .await
+        .expect("build");
 
         let after: Vec<String> = config.agents.keys().cloned().collect();
         assert_eq!(before, after, "a roster must never add configured agents");

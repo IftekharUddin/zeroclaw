@@ -387,6 +387,27 @@ impl Memory for AgentScopedMemory {
             .await
     }
 
+    async fn purge_agent_identity(&self, agent_alias: &str) -> Result<bool> {
+        // Tearing down an identity binding is an admin lifecycle op, exactly
+        // like `purge_namespace` above: a box handle must never remove the
+        // alias -> UUID row of any agent, including its own. Refuse rather
+        // than forwarding; the reap cascade runs identity teardown through an
+        // admin Memory handle, not an agent loop.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "agent_alias": agent_alias,
+                    "bound_agent": self.agent_id,
+                })),
+            "purge_agent_identity refused: identity teardown requires an admin Memory handle"
+        );
+        anyhow::bail!(
+            "AgentScopedMemory refuses purge_agent_identity: identity teardown must run through an admin Memory handle"
+        );
+    }
+
     async fn reindex(&self) -> Result<usize> {
         // Reindex is an admin-shaped op (rebuilds FTS / re-embeds
         // missing vectors). Touching the inner backend here is

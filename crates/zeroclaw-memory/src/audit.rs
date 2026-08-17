@@ -370,6 +370,10 @@ impl<M: Memory> Memory for AuditedMemory<M> {
     }
 
     async fn purge_agent_identity(&self, agent_alias: &str) -> anyhow::Result<bool> {
+        // Audit only after the inner call succeeds: a refused purge (the
+        // fail-closed default, or the scoped-wrapper refusal) must not leave
+        // an audit row claiming an identity was torn down when it never was.
+        let removed = self.inner.purge_agent_identity(agent_alias).await?;
         self.log_audit(
             AuditOp::Purge,
             None,
@@ -377,7 +381,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             None,
             Some(&format!("agent_identity={agent_alias}")),
         );
-        self.inner.purge_agent_identity(agent_alias).await
+        Ok(removed)
     }
 
     async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {

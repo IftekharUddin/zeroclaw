@@ -120,8 +120,7 @@ pub async fn reap_swarm(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
+    use zeroclaw_config::policy::SecurityPolicy;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
     use zeroclaw_memory::{MemoryCategory, SqliteMemory};
 
@@ -129,6 +128,11 @@ mod tests {
     use crate::swarm::board::BoxStatus;
     use crate::swarm::roster::build_swarm_roster;
     use crate::swarm::store::model::{BoxSpec, SwarmSpec};
+
+    /// The live parent policy the caller threads into the builder.
+    fn parent_policy(config: &Config, alias: &str) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::for_agent(config, alias).expect("parent policy"))
+    }
 
     fn test_config() -> Config {
         let mut config = Config::default();
@@ -168,23 +172,34 @@ mod tests {
 
     /// Count rows straight out of the database, behind every wrapper: what
     /// the store actually holds, not what a handle chooses to report.
-    /// Returns `(memory rows, agents rows)` for the swarm's aliases.
-    fn residue(data_dir: &std::path::Path, swarm_id: &str) -> (i64, i64) {
+    /// Probes by the boxes' exact memory UUIDs — captured before the reap —
+    /// rather than by `alias LIKE 'swarm/<id>/%'`. The alias probe is vacuous
+    /// once identities are purged (their `agents` rows are gone) and treats a
+    /// literal `_` in an id as a SQL wildcard; probing by UUID stays valid
+    /// across the deletion and is exact.
+    /// Returns `(memory rows, agents rows)` for the given box UUIDs.
+    fn residue(data_dir: &std::path::Path, agent_ids: &[String]) -> (i64, i64) {
         let conn = rusqlite::Connection::open(data_dir.join("memory").join("brain.db"))
             .expect("open the memory db");
-        let alias_prefix = format!("swarm/{swarm_id}/%");
+        if agent_ids.is_empty() {
+            return (0, 0);
+        }
+        let placeholders = vec!["?"; agent_ids.len()].join(",");
+        let params: Vec<&dyn rusqlite::ToSql> = agent_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
         let rows: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM memories WHERE agent_id IN \
-                 (SELECT id FROM agents WHERE alias LIKE ?1)",
-                rusqlite::params![alias_prefix],
+                &format!("SELECT COUNT(*) FROM memories WHERE agent_id IN ({placeholders})"),
+                params.as_slice(),
                 |row| row.get(0),
             )
             .expect("count memory rows");
         let identities: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM agents WHERE alias LIKE ?1",
-                rusqlite::params![alias_prefix],
+                &format!("SELECT COUNT(*) FROM agents WHERE id IN ({placeholders})"),
+                params.as_slice(),
                 |row| row.get(0),
             )
             .expect("count agents rows");
@@ -199,16 +214,24 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(sqlite);
         let spec = spec_with_boxes("swarm-reap", 4);
 
-        let roster = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
-            .await
-            .expect("roster");
+        let roster = build_swarm_roster(
+            &config,
+            &memory,
+            &spec,
+            "default",
+            parent_policy(&config, "default"),
+        )
+        .await
+        .expect("roster");
         let board = SwarmStateBoard::new();
         board
             .register(roster.swarm_id(), roster.box_ids())
             .expect("register");
 
         // Two boxes work: publish, claim, and write namespaced memories.
-        let memories = roster.compose_memories(&memory, &config.memory);
+        let memories = roster
+            .compose_memories(&memory, &config.memory)
+            .expect("compose swarm-box memory over sqlite");
         for box_id in ["box-1", "box-3"] {
             let handle = memories.get(box_id).expect("composed handle");
             handle
@@ -229,7 +252,11 @@ mod tests {
         }
 
         let aliases = roster.aliases();
-        let (rows_before, identities_before) = residue(tmp.path(), roster.swarm_id());
+        // Capture the box UUIDs BEFORE the reap: residue is probed by these
+        // exact ids so the post-reap check stays meaningful after the agents
+        // rows are deleted.
+        let box_agent_ids = roster.agent_ids();
+        let (rows_before, identities_before) = residue(tmp.path(), &box_agent_ids);
         assert_eq!(rows_before, 2, "two boxes wrote one row each");
         assert_eq!(identities_before, 4, "every box minted an identity");
         assert_eq!(
@@ -261,7 +288,7 @@ mod tests {
         assert!(report.board_removed);
         assert_eq!(report.claims_dropped, 2);
 
-        let (rows_after, identities_after) = residue(tmp.path(), roster.swarm_id());
+        let (rows_after, identities_after) = residue(tmp.path(), &box_agent_ids);
         assert_eq!(rows_after, 0, "no memory row may survive a reap");
         assert_eq!(identities_after, 0, "no uuid row may survive a reap");
         assert!(
@@ -299,9 +326,15 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         let spec = spec_with_boxes("swarm-none", 2);
 
-        let roster = build_swarm_roster(&config, &memory, &spec, "default", &BTreeMap::new())
-            .await
-            .expect("roster");
+        let roster = build_swarm_roster(
+            &config,
+            &memory,
+            &spec,
+            "default",
+            parent_policy(&config, "default"),
+        )
+        .await
+        .expect("roster");
         let board = SwarmStateBoard::new();
         board
             .register(roster.swarm_id(), roster.box_ids())
