@@ -80,6 +80,7 @@ the operating system:
 | `session/close` | client -> daemon | Close and clean up a session |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
+| `session/steer` | client -> daemon | Queue a mid-turn message for the in-flight turn (optional `generation` pins it to that turn; optional `class` is `user` or `orchestrator`, and queued `user` messages drain first) |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |

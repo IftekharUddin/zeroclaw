@@ -264,6 +264,12 @@ pub mod error_codes {
     pub const SESSION_LIMIT_REACHED: i32 = -32001;
     pub const SESSION_BUSY: i32 = -32002;
     pub const SESSION_NOT_OWNED: i32 = -32003;
+    /// `session/steer` named a turn generation that is no longer running. The
+    /// message was dropped rather than redirected into the current turn.
+    pub const SESSION_STEER_STALE_GENERATION: i32 = -32004;
+    /// `session/steer` could not be queued: the running turn's steering queue
+    /// is saturated. Retriable once the turn drains it.
+    pub const SESSION_STEER_QUEUE_FULL: i32 = -32005;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
 
