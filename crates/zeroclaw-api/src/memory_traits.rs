@@ -352,6 +352,21 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("purge_agent not supported by this memory backend")
     }
 
+    /// Remove the alias -> UUID binding itself (the `agents` row), after its
+    /// memory rows are already gone. [`Self::purge_agent`] deletes the rows
+    /// but deliberately leaves the binding behind, which is right for a
+    /// configured alias and wrong for an ephemeral one (a swarm box) whose
+    /// identity must not outlive the run that minted it. Returns whether a
+    /// binding was removed; implementations refuse while rows still reference
+    /// it, so a caller cannot orphan attributed rows.
+    /// Default: `Ok(false)` — backends whose [`Self::ensure_agent_uuid`]
+    /// returns the alias verbatim (markdown, qdrant, none) have no binding to
+    /// remove. Backends with an `agents` table override this, and every
+    /// decorator over such a backend must forward it.
+    async fn purge_agent_identity(&self, _agent_alias: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Export every memory row attributed to `agent_alias`, for the agent-
     /// deletion archive (export-then-delete,). Pairs with
     /// [`Self::purge_agent`]: the surface exports these rows to the archive,
