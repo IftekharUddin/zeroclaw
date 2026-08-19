@@ -1349,6 +1349,13 @@ impl TelegramChannel {
                     Self::update_id(member).is_some_and(|id| id < update_id)
                         && Self::update_message_id(member).is_some_and(|id| id < message_id)
                 })
+                // Retained text-only members carry their own ordering identity,
+                // so a later unsupported sibling must hold the group pending
+                // just like a later materializable one.
+                && group
+                    .unsupported
+                    .iter()
+                    .all(|member| member.update_id < update_id && member.message_id < message_id)
         })
     }
 
@@ -1364,6 +1371,7 @@ impl TelegramChannel {
                     .updates
                     .iter()
                     .filter_map(Self::update_id)
+                    .chain(group.unsupported.iter().map(|member| member.update_id))
                     .min()
                     .unwrap_or(i64::MAX);
                 (key.clone(), earliest_update_id)
@@ -10169,6 +10177,167 @@ mod tests {
             poll_offsets.starts_with(&[0, 0, 0, 0, 14]),
             "album members must remain unacknowledged until the combined turn and follow-up are delivered: {poll_offsets:?}"
         );
+    }
+
+    /// An ordinary same-chat message that arrives between a buffered photo and
+    /// a later retained (text-only) album member must not flush the album: the
+    /// unsupported member has its own ordering identity, so the group is not
+    /// wholly prior to the ordinary update. The ordinary message is delivered
+    /// first, the album stays pending, and both photos are delivered together
+    /// exactly once when the later sibling arrives.
+    #[tokio::test]
+    async fn media_group_stays_pending_when_a_later_unsupported_member_follows_an_ordinary_update()
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Poll 0: supported photo A for the album.
+        let photo_a = media_group_update(10, 100, 100, "album");
+        // Poll 1: ordinary same-chat message B, then unsupported video C whose
+        // own update_id/message_id are LATER than B's.
+        let ordinary = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 101,
+                "text": "interleaved",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" }
+            }
+        });
+        let unsupported_video = serde_json::json!({
+            "update_id": 12,
+            "message": {
+                "message_id": 102,
+                "media_group_id": "album",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "video": { "file_id": "unsupported-video" },
+                "caption": "compare these"
+            }
+        });
+        // Poll 2: supported photo D completes the same album.
+        let photo_d = media_group_update(13, 103, 100, "album");
+
+        let poll_index = Arc::new(AtomicUsize::new(0));
+        let responder_index = Arc::clone(&poll_index);
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/getUpdates"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body.get("timeout").and_then(serde_json::Value::as_u64) == Some(0) {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": [] }));
+                }
+
+                let result = match responder_index.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![photo_a.clone()],
+                    1 => vec![ordinary.clone(), unsupported_video.clone()],
+                    2 => vec![photo_d.clone()],
+                    _ => Vec::new(),
+                };
+                let response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": result }));
+                if responder_index.load(Ordering::SeqCst) >= 3 {
+                    response.set_delay(Duration::from_millis(750))
+                } else {
+                    response
+                }
+            })
+            .mount(&server)
+            .await;
+        for command_path in [
+            "/botfake-token/setMyCommands",
+            "/botfake-token/sendChatAction",
+            "/botfake-token/setMessageReaction",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(command_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .mount(&server)
+                .await;
+        }
+        for (file_id, file_path) in [
+            ("file-100", "photos/first.jpg"),
+            ("file-103", "photos/second.jpg"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        // The retained video must never be downloaded.
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "unsupported-video"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(|| vec!["alice".into()]),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("the ordinary update should dispatch first")
+            .expect("listener should remain connected");
+        assert_eq!(
+            first.content, "interleaved",
+            "the ordinary same-chat update must be delivered before the album settles"
+        );
+
+        let album = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("the album should dispatch once both photos are in")
+            .expect("listener should remain connected");
+        assert_eq!(album.id, "telegram_100_100");
+        assert_eq!(
+            album.content.matches("[IMAGE:").count(),
+            2,
+            "both supported photos must arrive in one turn: {}",
+            album.content
+        );
+        assert!(album.content.contains("compare these"));
+        assert!(
+            rx.try_recv().is_err(),
+            "the album must not produce a second agent turn"
+        );
+        assert!(
+            telegram_wait_for_main_loop_offset(&server, 14, Duration::from_secs(2)).await,
+            "offset must advance only after the whole album is delivered"
+        );
+
+        listener.abort();
+        let _ = listener.await;
     }
 
     /// B1: a caption carried by an album member we never download (a video)
