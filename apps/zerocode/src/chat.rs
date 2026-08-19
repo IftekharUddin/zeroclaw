@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -149,6 +149,12 @@ pub(crate) struct Chat {
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
     model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
+    /// Background lost-session re-attachments. The set is the canonical
+    /// in-flight operation state and prevents duplicate `session/new` calls;
+    /// queued messages remain owned by their `ChatState` until success.
+    session_reattach_tx: mpsc::Sender<SessionReattachResult>,
+    session_reattach_rx: mpsc::Receiver<SessionReattachResult>,
+    session_reattach_in_flight: HashSet<String>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// Live but unfocused sessions of this pane. Each keeps its full
@@ -235,6 +241,13 @@ struct ModelFetchResult {
     current: Option<String>,
 }
 
+/// Completion of a background lost-session re-attachment. The message queue
+/// itself stays in `ChatState`; this carries only the operation result.
+struct SessionReattachResult {
+    session_id: String,
+    result: Result<(), String>,
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -243,6 +256,8 @@ impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
+        let (session_reattach_tx, session_reattach_rx) =
+            mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -253,6 +268,9 @@ impl Chat {
             git_branch_inflight: false,
             model_fetch_tx,
             model_fetch_rx,
+            session_reattach_tx,
+            session_reattach_rx,
+            session_reattach_in_flight: HashSet::new(),
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -412,12 +430,10 @@ impl Chat {
     /// Bring a tracked session to the front. Returns false when the id is
     /// unknown (e.g. a stale sidebar click racing a close).
     pub(crate) async fn focus_session(&mut self, session_id: &str) -> bool {
-        if let ChatPhase::Active(ref mut state) = self.phase
+        if let ChatPhase::Active(ref state) = self.phase
             && state.session_id == session_id
         {
-            let rpc = self.rpc.clone();
-            let pane_kind = self.pane_kind;
-            Self::ensure_session_alive(&rpc, pane_kind, state).await;
+            self.ensure_session_alive(session_id).await;
             return true;
         }
         let Some(idx) = self
@@ -440,11 +456,7 @@ impl Chat {
                 self.last_focused_sid = Some(session_id.to_string());
             }
         }
-        let rpc = self.rpc.clone();
-        let pane_kind = self.pane_kind;
-        if let ChatPhase::Active(ref mut state) = self.phase {
-            Self::ensure_session_alive(&rpc, pane_kind, state).await;
-        }
+        self.ensure_session_alive(session_id).await;
         true
     }
 
@@ -520,20 +532,29 @@ impl Chat {
     /// Re-attach a session the daemon reported lost (`session_not_found`).
     /// Runs at most one `session/new` per call; success clears the red
     /// status, failure keeps it with a notice.
-    async fn ensure_session_alive(
-        rpc: &Arc<RpcClient>,
-        pane_kind: PaneKind,
-        state: &mut ChatState,
-    ) {
-        if state.last_error != Some(SessionError::SessionLost) {
+    async fn ensure_session_alive(&mut self, session_id: &str) {
+        let Some(agent_alias) = self
+            .state_for_session_mut(session_id)
+            .filter(|state| state.last_error == Some(SessionError::SessionLost))
+            .map(|state| state.agent_alias.clone())
+        else {
+            return;
+        };
+
+        // A queue-driven re-attach may already be running while the user
+        // focuses this session. Let that single canonical operation finish.
+        if !self
+            .session_reattach_in_flight
+            .insert(session_id.to_string())
+        {
             return;
         }
-        let result = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&state.agent_alias, None, Some(&state.session_id))
-                .await
-        } else {
-            rpc.session_new_with_id(&state.agent_alias, None, Some(&state.session_id))
-                .await
+        let result =
+            Self::reattach_session(&self.rpc, self.pane_kind, session_id, &agent_alias).await;
+        self.session_reattach_in_flight.remove(session_id);
+
+        let Some(state) = self.state_for_session_mut(session_id) else {
+            return;
         };
         match result {
             Ok(_) => {
@@ -546,6 +567,25 @@ impl Chat {
                 ));
             }
         }
+        if state.last_error.is_none() {
+            self.pump_all_queues();
+        }
+    }
+
+    async fn reattach_session(
+        rpc: &Arc<RpcClient>,
+        pane_kind: PaneKind,
+        session_id: &str,
+        agent_alias: &str,
+    ) -> Result<(), String> {
+        let result = if pane_kind == PaneKind::Acp {
+            rpc.session_new_acp(agent_alias, None, Some(session_id))
+                .await
+        } else {
+            rpc.session_new_with_id(agent_alias, None, Some(session_id))
+                .await
+        };
+        result.map(|_| ()).map_err(|error| error.to_string())
     }
 
     /// The active session id, if a session is live.
@@ -1284,20 +1324,65 @@ impl Chat {
     /// while unfocused.
     fn pump_all_queues(&mut self) {
         let rpc_out = self.rpc_out.clone();
+        let rpc = self.rpc.clone();
         let transport = self.rpc.transport();
+        let pane_kind = self.pane_kind;
+        let session_reattach_tx = self.session_reattach_tx.clone();
+        let session_reattach_in_flight = &mut self.session_reattach_in_flight;
         if let ChatPhase::Active(ref mut state) = self.phase {
-            Self::pump_state_queue(&rpc_out, transport, state);
+            Self::pump_state_queue(
+                &rpc_out,
+                &rpc,
+                &session_reattach_tx,
+                session_reattach_in_flight,
+                pane_kind,
+                transport,
+                state,
+            );
         }
         for state in &mut self.background {
-            Self::pump_state_queue(&rpc_out, transport, state);
+            Self::pump_state_queue(
+                &rpc_out,
+                &rpc,
+                &session_reattach_tx,
+                session_reattach_in_flight,
+                pane_kind,
+                transport,
+                state,
+            );
         }
     }
 
     fn pump_state_queue(
         rpc_out: &Arc<RpcOutbound>,
+        rpc: &Arc<RpcClient>,
+        session_reattach_tx: &mpsc::Sender<SessionReattachResult>,
+        session_reattach_in_flight: &mut HashSet<String>,
+        pane_kind: PaneKind,
         transport: crate::client::Transport,
         state: &mut ChatState,
     ) {
+        if state.next_dispatch_index().is_none() {
+            return;
+        }
+        if state.last_error == Some(SessionError::SessionLost) {
+            let sid = state.session_id.clone();
+            if session_reattach_in_flight.insert(sid.clone()) {
+                let rpc = rpc.clone();
+                let tx = session_reattach_tx.clone();
+                let agent_alias = state.agent_alias.clone();
+                tokio::spawn(async move {
+                    let result = Self::reattach_session(&rpc, pane_kind, &sid, &agent_alias).await;
+                    let _ = tx
+                        .send(SessionReattachResult {
+                            session_id: sid,
+                            result,
+                        })
+                        .await;
+                });
+            }
+            return;
+        }
         let Some(msg) = state.take_next_dispatchable() else {
             return;
         };
@@ -1371,6 +1456,33 @@ impl Chat {
         }
     }
 
+    fn apply_session_reattach_result(&mut self, update: SessionReattachResult) {
+        self.session_reattach_in_flight.remove(&update.session_id);
+        let Some(state) = self.state_for_session_mut(&update.session_id) else {
+            return;
+        };
+        match update.result {
+            Ok(()) => {
+                state.last_error = None;
+                self.pump_all_queues();
+            }
+            Err(error) => {
+                // Keep `SessionLost` and the queued message intact so an
+                // explicit retry can attempt the same dispatch again.
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-switch-error",
+                    &[("error", &error)],
+                ));
+            }
+        }
+    }
+
+    fn drain_session_reattach_results(&mut self) {
+        while let Ok(update) = self.session_reattach_rx.try_recv() {
+            self.apply_session_reattach_result(update);
+        }
+    }
+
     /// Spawn a background `session/git_branch` poll when the cache is stale.
     /// Gated by `git_branch_inflight` so we never have more than one fetch
     /// outstanding per Chat — the daemon walks the filesystem each call and
@@ -1419,6 +1531,7 @@ impl Chat {
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
+        self.drain_session_reattach_results();
         self.maybe_refresh_git_branch();
 
         match &mut self.phase {
@@ -7930,6 +8043,14 @@ mod tests {
         );
     }
 
+    async fn apply_next_reattach_result(chat: &mut Chat, reason: &str) {
+        let update = tokio::time::timeout(Duration::from_secs(2), chat.session_reattach_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{reason}"))
+            .expect("session reattach result channel should stay open");
+        chat.apply_session_reattach_result(update);
+    }
+
     #[test]
     fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
         let mut s = state();
@@ -8643,6 +8764,108 @@ mod tests {
         assert_eq!(prompt["params"]["prompt"], "queued for b");
         let b = chat.background.first().expect("background session");
         assert!(b.turn_in_flight, "dispatch marks the turn in flight");
+    }
+
+    #[tokio::test]
+    async fn focused_next_send_reattaches_before_prompt_and_preserves_queue_on_failure() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("focused session must be active");
+        };
+        state.last_error = Some(SessionError::SessionLost);
+        state
+            .enqueue_message("retry focused".to_string(), Vec::new())
+            .expect("enqueue retry");
+
+        chat.pump_all_queues();
+        let reattach = next_rpc_request(&mut rx, "lost session must reattach before prompt").await;
+        assert_eq!(reattach["method"], "session/new");
+        assert_eq!(reattach["params"]["session_id"], "sess-a");
+        chat.pump_all_queues();
+        assert!(
+            rx.try_recv().is_err(),
+            "session/prompt and duplicate reattachments must wait for the in-flight operation"
+        );
+
+        respond_err(&rpc, &reattach, -32000, "reattach failed");
+        apply_next_reattach_result(&mut chat, "failed reattach must return to the pane").await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("focused session must remain active");
+        };
+        assert_eq!(state.queue_len(), 1, "failed reattach keeps the message");
+        assert_eq!(state.last_error, Some(SessionError::SessionLost));
+        assert!(!state.turn_in_flight);
+        assert!(
+            rx.try_recv().is_err(),
+            "failure must not dispatch the prompt"
+        );
+
+        chat.pump_all_queues();
+        let reattach = next_rpc_request(&mut rx, "explicit retry must reattach again").await;
+        assert_eq!(reattach["method"], "session/new");
+        respond_ok(
+            &rpc,
+            &reattach,
+            serde_json::json!({ "session_id": "sess-a", "workspace_dir": null }),
+        );
+        apply_next_reattach_result(&mut chat, "successful reattach must return to the pane").await;
+
+        let prompt = next_rpc_request(&mut rx, "successful reattach must release the prompt").await;
+        assert_eq!(prompt["method"], "session/prompt");
+        assert_eq!(prompt["params"]["session_id"], "sess-a");
+        assert_eq!(prompt["params"]["prompt"], "retry focused");
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("focused session must remain active");
+        };
+        assert_eq!(state.queue_len(), 0);
+        assert_eq!(state.last_error, None);
+        assert!(state.turn_in_flight);
+    }
+
+    #[tokio::test]
+    async fn lost_background_session_reattaches_before_queue_dispatch() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let background = chat.background.first_mut().expect("background session");
+        background.last_error = Some(SessionError::SessionLost);
+        background
+            .enqueue_message("retry background".to_string(), Vec::new())
+            .expect("enqueue retry");
+
+        chat.pump_all_queues();
+        let reattach = next_rpc_request(
+            &mut rx,
+            "lost background session must reattach before prompt",
+        )
+        .await;
+        assert_eq!(reattach["method"], "session/new");
+        assert_eq!(reattach["params"]["session_id"], "sess-b");
+        assert!(
+            rx.try_recv().is_err(),
+            "background session/prompt must wait for reattachment"
+        );
+        respond_ok(
+            &rpc,
+            &reattach,
+            serde_json::json!({ "session_id": "sess-b", "workspace_dir": null }),
+        );
+        apply_next_reattach_result(
+            &mut chat,
+            "successful background reattach must return to the pane",
+        )
+        .await;
+
+        let prompt = next_rpc_request(&mut rx, "background prompt must follow reattach").await;
+        assert_eq!(prompt["method"], "session/prompt");
+        assert_eq!(prompt["params"]["session_id"], "sess-b");
+        assert_eq!(prompt["params"]["prompt"], "retry background");
+        let background = chat.background.first().expect("background session");
+        assert_eq!(background.queue_len(), 0);
+        assert_eq!(background.last_error, None);
+        assert!(background.turn_in_flight);
     }
 
     #[tokio::test]
