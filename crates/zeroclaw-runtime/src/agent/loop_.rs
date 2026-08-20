@@ -158,6 +158,26 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// The single autosave decision for a turn's user-side text, shared by both
+/// store sites in this file so the gates cannot drift apart.
+///
+/// Order matters for meaning, not correctness: the origin gate
+/// (`should_autosave_origin`) is the load-bearing check — scheduled and
+/// parent-composed origins are known internal synthetic producers, whatever
+/// their text looks like. The content filter remains as a backstop for
+/// synthetic shapes that arrive on autosave-eligible origins (e.g. replayed
+/// histories).
+fn should_autosave_user_message(
+    auto_save: bool,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    content: &str,
+) -> bool {
+    auto_save
+        && zeroclaw_memory::should_autosave_origin(origin)
+        && content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(content)
+}
+
 pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Result of [`read_capped_line`].
@@ -488,11 +508,15 @@ pub(crate) fn compute_excluded_mcp_tools(
 
 pub fn native_tool_specs_present_for_turn(
     model_provider: &dyn ModelProvider,
+    model: &str,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
     activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Result<bool> {
-    if !model_provider.supports_native_tools() {
+    if !model_provider
+        .capabilities_for_model(model)
+        .native_tool_calling
+    {
         return Ok(false);
     }
 
@@ -598,9 +622,12 @@ pub(crate) fn build_system_prompt_for_turn(
     show_tool_calls: bool,
     thinking_prefix: Option<&str>,
 ) -> Result<String> {
-    let native_tools = model_provider.supports_native_tools();
+    let native_tools = model_provider
+        .capabilities_for_model(model_name)
+        .native_tool_calling;
     let native_tool_specs_present = native_tool_specs_present_for_turn(
         model_provider,
+        model_name,
         tools_registry,
         excluded_tools,
         activated_tools,
@@ -1130,6 +1157,30 @@ fn api_key_and_uri_for_provider(
     )
 }
 
+/// Project a typed terminal-completion failure only at the direct CLI boundary.
+///
+/// The typed error's `Display` remains the stable diagnostic used by provider
+/// and runtime telemetry. CLI delivery is the presentation boundary, where the
+/// corresponding Fluent message is required instead.
+fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error {
+    let Some(user_message) = crate::agent::terminal_completion_error_message(&error, None) else {
+        return error;
+    };
+    let diagnostic = error.to_string();
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error": diagnostic,
+                "error_key": "terminal_completion",
+            })),
+        "CLI agent turn failed"
+    );
+    anyhow::Error::msg(user_message)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -1275,12 +1326,13 @@ pub async fn run(
         // available on this path (CLI agent run). No channel map is wired on this
         // path, so the approval route adapter is the no-op (log-only); the daemon
         // path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );
@@ -1774,11 +1826,9 @@ pub async fn run(
                 return Ok(final_output);
             }
 
-            // Auto-save user message to memory (skip short/trivial messages)
-            if config.memory.auto_save
-                && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
-            {
+            // Auto-save user message to memory (skip autonomous origins
+            // and short/trivial or synthetic messages).
+            if should_autosave_user_message(config.memory.auto_save, origin, &effective_msg) {
                 let user_key = autosave_memory_key("user_msg");
                 let store_start = std::time::Instant::now();
                 let store_result = mem
@@ -1999,7 +2049,7 @@ pub async fn run(
 
                             continue;
                         }
-                        return Err(e);
+                        return Err(project_cli_terminal_completion_error(e));
                     }
                 }
             }
@@ -2292,11 +2342,9 @@ pub async fn run(
                     continue;
                 }
 
-                // Auto-save conversation turns (skip short/trivial messages)
-                if config.memory.auto_save
-                    && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                    && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
-                {
+                // Auto-save conversation turns (skip autonomous origins
+                // and short/trivial or synthetic messages).
+                if should_autosave_user_message(config.memory.auto_save, origin, &effective_input) {
                     let user_key = autosave_memory_key("user_msg");
                     let store_start = std::time::Instant::now();
                     let store_result = mem
@@ -2663,7 +2711,8 @@ pub async fn run(
                                 }
                             }
 
-                            eprintln!("\nError: {e}\n");
+                            let error = project_cli_terminal_completion_error(e);
+                            eprintln!("\nError: {error}\n");
                             break String::new();
                         }
                     }
@@ -2870,12 +2919,13 @@ pub async fn process_message(
         // available on this path (process_message CLI agent). No channel map is
         // wired here, so the approval route adapter is the no-op (log-only); the
         // daemon path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );
@@ -3116,9 +3166,12 @@ pub async fn process_message(
         } else {
             None
         };
-        let native_tools = model_provider.supports_native_tools();
+        let native_tools = model_provider
+            .capabilities_for_model(&model_name)
+            .native_tool_calling;
         let native_tool_specs_present = native_tool_specs_present_for_turn(
             model_provider.as_ref(),
+            &model_name,
             &tools_registry,
             &excluded_tools,
             activated_handle_pm.as_ref(),
@@ -3331,6 +3384,64 @@ mod tests {
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
+    /// One decision, four gates. The origin gate is the load-bearing one:
+    /// the heartbeat session-context shape defeats the content filter (it no
+    /// longer starts with `[Heartbeat Task`), and only the origin check
+    /// stops it. Interactive remains autosave-eligible for that same text,
+    /// which pins that the fix keys on trusted caller provenance, not on
+    /// smarter content sniffing or human-authorship detection.
+    #[test]
+    fn autosave_decision_keys_on_origin_before_content() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        let leaked_heartbeat_shape = "[Recent conversation history — use this for context \
+             when composing your message] (last message ~5 minutes ago)\nUser: how was the \
+             deploy?\n\n[Heartbeat Task | high] check the build";
+
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Daemon, leaked_heartbeat_shape),
+            "a heartbeat turn must not autosave its synthetic prompt, whatever its shape"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Cron, "[cron:job-1 build] check"),
+            "cron prompts stay suppressed (origin now, prefix as backstop)"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::SubTurn, leaked_heartbeat_shape),
+            "known parent-composed sub-turn text is not autosave-eligible"
+        );
+
+        assert!(
+            should_autosave_user_message(true, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "interactive provenance remains autosave-eligible regardless of prompt shape"
+        );
+        assert!(
+            should_autosave_user_message(
+                true,
+                TurnOrigin::Channel,
+                "please remember I prefer staged rollouts"
+            ),
+            "channel provenance remains autosave-eligible even when a peer may be automated"
+        );
+
+        assert!(
+            !should_autosave_user_message(false, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "auto_save off wins over everything"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Interactive, "short msg"),
+            "the length floor is unchanged"
+        );
+        assert!(
+            !should_autosave_user_message(
+                true,
+                TurnOrigin::Interactive,
+                "[cron:job-1 build] check the build status now"
+            ),
+            "the content backstop still filters synthetic shapes on user origins"
+        );
+    }
 
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
@@ -4059,6 +4170,25 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[test]
+    fn direct_cli_terminal_completion_projection_localizes_delivery() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let diagnostic = error.to_string();
+
+        let projected = super::project_cli_terminal_completion_error(error);
+
+        assert_eq!(
+            projected.to_string(),
+            crate::agent::semantic_empty_terminal_completion_message(None),
+            "both direct CLI boundaries must deliver the Fluent terminal-completion message"
+        );
+        assert_eq!(
+            diagnostic, "provider completed without final text or tool calls",
+            "the diagnostic supplied to the CLI boundary must remain stable for telemetry"
+        );
     }
 
     struct NonVisionModelProvider {
@@ -12931,9 +13061,14 @@ Let me check the result."#;
         let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
             vec![Box::new(CountingTool::new("shell", invocations))];
 
-        let native_tool_specs_present =
-            super::native_tool_specs_present_for_turn(&provider, &tools_registry, &[], None)
-                .expect("native spec availability should be derivable");
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            "test-model",
+            &tools_registry,
+            &[],
+            None,
+        )
+        .expect("native spec availability should be derivable");
         assert!(native_tool_specs_present);
 
         let system_prompt = build_system_prompt_with_mode(
@@ -12971,6 +13106,7 @@ Let me check the result."#;
 
         let native_tool_specs_present = super::native_tool_specs_present_for_turn(
             &provider,
+            "test-model",
             &tools_registry,
             &excluded_tools,
             None,
@@ -13005,9 +13141,14 @@ Let me check the result."#;
         ));
 
         let no_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
-        let native_tool_specs_present =
-            super::native_tool_specs_present_for_turn(&provider, &no_tools, &[], None)
-                .expect("native spec availability should be derivable");
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            "test-model",
+            &no_tools,
+            &[],
+            None,
+        )
+        .expect("native spec availability should be derivable");
 
         assert!(
             !native_tool_specs_present,
@@ -14460,6 +14601,162 @@ Let me check the result."#;
         assert!(
             !lifecycle.contains(&ProgressEvent::WaitingOnModel),
             "a budget-rejected turn never calls the provider, so it must not announce a model wait: {lifecycle:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_rejected_usage_is_billed_without_replacing_accepted_context_usage() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
+        };
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+
+        let rejected = ChatResponse {
+            text: Some("   ".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let accepted = ChatResponse {
+            text: Some("accepted response".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(7),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let provider = ReliableModelProvider::new(
+            "reliable-test",
+            vec![(
+                "scripted".to_string(),
+                Box::new(ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from([rejected, accepted]))),
+                    capabilities: ProviderCapabilities::default(),
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let observer = CapturingObserver::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let usage_ctx = ToolLoopCostTrackingContext::usage_only();
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("earlier question"),
+            ChatMessage::assistant("earlier answer"),
+            ChatMessage::user("current question"),
+        ];
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(usage_ctx.clone()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &provider,
+                            provider_name: "reliable-test",
+                            model: "test-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &[],
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 2,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 100,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: Some(event_tx),
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: "recovered-usage-test",
+                }),
+            )
+            .await
+            .expect("reliable recovery should produce the accepted response");
+
+        assert_eq!(result, "accepted response");
+        let usage = usage_ctx.snapshot_turn_usage();
+        assert_eq!(usage.input_tokens, 160, "both billed attempts are retained");
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(
+            usage.last_input_tokens, 80,
+            "only the accepted response may set the context-window fill"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "earlier question"),
+            "the accepted 80-token context fill must not trim existing history"
+        );
+
+        let events = observer.events.lock();
+        let responses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::LlmResponse {
+                    success: true,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => Some((*input_tokens, *output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses, vec![(Some(80), Some(7))]);
+        drop(events);
+
+        let mut usage_events = Vec::new();
+        let mut history_trimmed = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                TurnEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => usage_events.push((input_tokens, output_tokens)),
+                TurnEvent::HistoryTrimmed { .. } => history_trimmed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(usage_events, vec![(Some(80), Some(7))]);
+        assert!(
+            !history_trimmed,
+            "recovered rejected usage must not trim history"
         );
     }
 
