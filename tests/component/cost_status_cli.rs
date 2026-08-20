@@ -96,6 +96,7 @@ fn unpriced_status_fixture_warns_for_its_tokens() {
     assert!(stdout.contains("Spent today:       $0.0000 / $10.00"));
     assert!(stderr.contains("Pricing unavailable for 1 model(s) (150 tokens uncosted)"));
     assert!(stderr.contains("unpriced-model"));
+    assert!(stderr.contains("Add pricing to the active provider profile"));
 }
 
 #[test]

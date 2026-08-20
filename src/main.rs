@@ -4754,14 +4754,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
-                            // A model with recorded tokens but zero cost
-                            // is unpriced — its spend is invisible and the
-                            // daily/monthly caps cannot fire for it. Surface
-                            // this loudly rather than let $0.0000 reassure the
-                            // operator that they are inside a cap they don't
-                            // actually have. Provider-agnostic: any model that
-                            // lands here (Anthropic today, any future provider
-                            // without pricing metadata) is flagged.
+                            // Pricing provenance is recorded per usage row and
+                            // rolled up over the current month. Surface any
+                            // explicitly unpriced subset loudly rather than
+                            // let an understated dollar total reassure the
+                            // operator. Configured zero rates and legacy rows
+                            // without provenance remain compatible and do not
+                            // trigger this warning.
                             let unpriced =
                                 zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
                                     &summary.by_model,
@@ -4779,7 +4778,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 let warn_fallback = format!(
                                     "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
 Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
-Add a `pricing` table under `[providers.models.\"<type>\"]` or ship a catalog entry."
+Add pricing to the active provider profile or supply a catalog entry."
                                 );
                                 eprintln!(
                                     "{}",
