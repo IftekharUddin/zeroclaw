@@ -372,6 +372,12 @@ channel-whatsapp-web-delivery-failure-note-many = (nota: no pude entregar {$coun
 channel-line-bind-success = ✅ ¡Emparejado! Ya puedes chatear.
 channel-line-bind-invalid-code = ❌ Código no válido. Inténtalo de nuevo.
 channel-line-bind-rate-limited = ⏳ Demasiados intentos. Reintenta en { $secs }s.
+channel-telegram-cmd-new-desc = Iniciar una nueva sesión de conversación
+channel-telegram-cmd-clear-desc = Borrar esta sesión de conversación
+channel-telegram-cmd-stop-desc = Cancelar la tarea en curso
+channel-telegram-cmd-model-desc = Mostrar o cambiar el modelo actual
+channel-telegram-cmd-models-desc = Listar los proveedores de modelos disponibles o cambiar de proveedor
+channel-telegram-cmd-config-desc = Mostrar la configuración actual
 onboard-openai-auth-note =
     Autenticación de OpenAI:
     • Clave de API — acceso estándar a la API mediante platform.openai.com (sk-...)
@@ -429,7 +435,7 @@ cli-sop-ws-invalid-approval = sop approval_response requiere run_id y una decisi
 cli-sop-ws-resolve-failed = error al resolver SOP: {$error}
 cli-sop-ws-engine-lock-poisoned = bloqueo del motor SOP envenenado
 cli-sop-ws-subsystem-disabled = el subsistema SOP no está habilitado
-cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}Cree uno: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
 cli-sop-loaded-header = SOP cargados ({$count}):
 cli-sop-none-to-validate = No se encontraron SOP para validar.
@@ -717,8 +723,8 @@ cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de comp
 cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Clave de configuración ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = advertencia: se omitió crear la entrada de configuración para '{$name}': los nombres de plugin que contienen '.' no se pueden direccionar mediante rutas de configuración con puntos (`config set` divide por '.'). Agrega a mano un bloque [[plugins.entries]] con `name = "{$name}"` al archivo de configuración.
 cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
@@ -959,7 +965,6 @@ cli-doctor-probe-timeout-message = La comprobación de modelos agotó el tiempo 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = Sección de configuración CRÍTICA PARA LA SEGURIDAD `{$path}` no es válida y se restableció a sus valores predeterminados para que el daemon pueda arrancar; la postura en ejecución puede ser MÁS DÉBIL de lo previsto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
 cli-doctor-degraded-section = La sección de configuración `{$path}` está mal formada y se restableció a sus valores predeterminados; los valores de esa sección NO están en efecto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
-cli-doctor-skills-prompt-injection-mode-full-deprecated = El modo de inyección de instrucciones de habilidades "full" está obsoleto. El modo full explícito seguirá siendo compatible durante el periodo de obsolescencia, pero compact es ahora el valor predeterminado; migre antes de que Schema V4 elimine el modo full.
 sop-approval-deferred-at-capacity = No se pudo reanudar la ejecución {$run_id}: los cupos de ejecución están llenos. La aprobación sigue en espera; inténtalo de nuevo cuando se libere un cupo.
 sop-approval-policy-unavailable = La aprobación falló porque el paso de SOP en espera no está disponible: {$reason}. La ejecución sigue en espera.
 sop-rpc-decision-invalid-state = La ejecución {$run_id} no se puede resolver en su estado actual.
@@ -985,6 +990,8 @@ channel-approval-btn-always = Siempre
 channel-approval-tap-instruction = Toca un botón a continuación:
 channel-approval-reply-instruction-yesno = Responde: "{ $yes_command }", "{ $no_command }" o "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Responde con `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    Este es un chat de grupo, por lo que todos los presentes pueden ver este código y los argumentos de la herramienta mostrados arriba. Solo un par autorizado de este canal puede responder.
 channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado
