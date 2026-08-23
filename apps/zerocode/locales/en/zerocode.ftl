@@ -6,6 +6,7 @@ zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
 zc-pane-sop = SOPs
+zc-sop-empty-read-only = (no nodes)
 zc-sop-runs-stale = SOP run status is stale. Retrying…
 zc-chrome-summary-sessions = sessions
 zc-chrome-summary-ram = ram
@@ -472,6 +473,9 @@ zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 zc-chat-context-menu-copy = Copy
+zc-chat-context-menu-send-now = Send now
+zc-chat-context-menu-edit = Edit
+zc-chat-context-menu-delete = Delete
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
