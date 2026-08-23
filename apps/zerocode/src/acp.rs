@@ -26,12 +26,37 @@ impl Acp {
         self.inner.set_resume_sessions(entries);
     }
 
-    pub(crate) fn resume_entries(&self) -> Vec<chat::ResumeEntry> {
+    pub(crate) fn resume_entries(&mut self) -> Vec<chat::ResumeEntry> {
         self.inner.resume_entries()
     }
 
     pub(crate) fn session_summaries(&self) -> Vec<chat::SidebarSessionSummary> {
         self.inner.session_summaries()
+    }
+
+    pub(crate) fn owns_session(&self, session_id: &str) -> bool {
+        self.inner.owns_session(session_id)
+    }
+
+    pub(crate) fn try_install_elicitation(
+        &mut self,
+        request: crate::client::RpcInboundRequest,
+    ) -> chat::ElicitationRouting {
+        self.inner.try_install_elicitation(request)
+    }
+
+    pub(crate) fn note_elicitation_drop(&mut self) {
+        self.inner.note_elicitation_drop();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_session_for_test(&mut self, session_id: &str) {
+        self.inner.activate_session_for_test(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_elicitation_for_test(&self) -> bool {
+        self.inner.has_pending_elicitation_for_test()
     }
 
     pub(crate) async fn focus_session(&mut self, session_id: &str) -> bool {
@@ -48,6 +73,10 @@ impl Acp {
 
     pub(crate) async fn refresh_if_inactive(&mut self) {
         self.inner.refresh_if_inactive().await;
+    }
+
+    pub(crate) fn tick_transport_events(&mut self) {
+        self.inner.tick_transport_events();
     }
 
     pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {

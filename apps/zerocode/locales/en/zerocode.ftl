@@ -418,6 +418,10 @@ zc-chat-elicitation-dropped = A prompt from the agent was dropped before it coul
 zc-chat-session-restarted = New session started.
 zc-chat-session-cap = Session limit for this pane reached ({ $max }). Close a session from the sidebar first.
 zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached and were dropped.
+zc-chat-reconnect-interrupted = The connection was rebuilt. The durable transcript was reloaded, queued messages were preserved, and any in-progress approval or question was cancelled.
+zc-chat-resyncing = Some live updates were missed. Reloading this session before sending queued messages…
+zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
+zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 
 zc-chat-thinking-visible = Thinking output: visible

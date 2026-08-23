@@ -1043,9 +1043,9 @@ impl RpcClient {
     }
 
     /// Get a receiver for server-initiated JSON-RPC requests that
-    /// expect a response (today: `elicitation/create`). The Chat
-    /// widget subscribes per Code tab, filters by `params.sessionId`,
-    /// surfaces a modal, and answers via [`Self::respond_to_inbound_request`].
+    /// expect a response (today: `elicitation/create`). The app owns one
+    /// subscriber, resolves `params.sessionId` to the owning pane, and answers
+    /// via [`Self::respond_to_inbound_request`].
     pub fn subscribe_inbound_requests(&self) -> broadcast::Receiver<RpcInboundRequest> {
         self.inbound_requests_bcast.subscribe()
     }

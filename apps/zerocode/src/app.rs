@@ -12,7 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::acp;
 use crate::chat;
@@ -59,6 +59,129 @@ enum QuickstartChatDrain {
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
+const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
+
+/// The sole subscriber and responder for daemon-initiated JSON-RPC requests.
+/// Pane ownership is resolved here before a request is exposed to a chat pane,
+/// preventing a non-owner pane from racing the real owner with a cancellation.
+struct InboundRequestRouter {
+    rpc: Arc<RpcClient>,
+    rx: broadcast::Receiver<crate::client::RpcInboundRequest>,
+    deferred: Vec<DeferredInboundRequest>,
+}
+
+struct DeferredInboundRequest {
+    request: crate::client::RpcInboundRequest,
+    first_seen: Instant,
+}
+
+impl InboundRequestRouter {
+    fn new(rpc: Arc<RpcClient>) -> Self {
+        Self {
+            rx: rpc.subscribe_inbound_requests(),
+            rpc,
+            deferred: Vec::new(),
+        }
+    }
+
+    fn drain(&mut self, chat_pane: &mut chat::Chat, acp_pane: &mut acp::Acp) {
+        loop {
+            let request = match self.rx.try_recv() {
+                Ok(request) => request,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    chat_pane.note_elicitation_drop();
+                    acp_pane.note_elicitation_drop();
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if let Some(request) = self.route(request, chat_pane, acp_pane) {
+                self.deferred.push(DeferredInboundRequest {
+                    request,
+                    first_seen: Instant::now(),
+                });
+            }
+        }
+
+        let pending = std::mem::take(&mut self.deferred);
+        for deferred in pending {
+            let expired = deferred.first_seen.elapsed() >= ELICITATION_ROUTE_GRACE;
+            match self.route(deferred.request, chat_pane, acp_pane) {
+                None => {}
+                Some(request) if expired => {
+                    chat::Chat::answer_cancel(&self.rpc, request.id);
+                }
+                Some(request) => self.deferred.push(DeferredInboundRequest {
+                    request,
+                    first_seen: deferred.first_seen,
+                }),
+            }
+        }
+    }
+
+    /// Return the request only when no pane owns its session yet. The caller
+    /// keeps that genuinely orphaned request for the bounded grace period.
+    fn route(
+        &self,
+        request: crate::client::RpcInboundRequest,
+        chat_pane: &mut chat::Chat,
+        acp_pane: &mut acp::Acp,
+    ) -> Option<crate::client::RpcInboundRequest> {
+        if request.method != "elicitation/create" {
+            let method_name = request.method.clone();
+            let request_id = request.id;
+            let rpc = self.rpc.clone();
+            tokio::spawn(async move {
+                let _ = rpc
+                    .respond_to_inbound_request(
+                        request_id,
+                        Err(crate::jsonrpc::JsonRpcError {
+                            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                            message: format!("Method not found: {method_name}"),
+                            data: None,
+                        }),
+                    )
+                    .await;
+            });
+            return None;
+        }
+
+        let Some(session_id) =
+            serde_json::from_value::<crate::wire::ElicitationRequestParams>(request.params.clone())
+                .ok()
+                .map(|params| params.session_id)
+        else {
+            chat::Chat::answer_cancel(&self.rpc, request.id);
+            return None;
+        };
+        let chat_owns = chat_pane.owns_session(&session_id);
+        let acp_owns = acp_pane.owns_session(&session_id);
+
+        let routed = match (chat_owns, acp_owns) {
+            (true, false) => chat_pane.try_install_elicitation(request),
+            (false, true) => acp_pane.try_install_elicitation(request),
+            (false, false) => return Some(request),
+            (true, true) => {
+                // Session ids are globally unique. Ambiguous ownership is a
+                // protocol/state invariant violation; answer once and make it
+                // visible instead of letting two panes race the request.
+                chat_pane.note_elicitation_drop();
+                acp_pane.note_elicitation_drop();
+                chat::Chat::answer_cancel(&self.rpc, request.id);
+                return None;
+            }
+        };
+
+        match routed {
+            chat::ElicitationRouting::Installed => None,
+            chat::ElicitationRouting::Unparseable(id) => {
+                chat::Chat::answer_cancel(&self.rpc, id);
+                None
+            }
+            chat::ElicitationRouting::Defer(request) => Some(request),
+        }
+    }
+}
 
 fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
     match event {
@@ -427,6 +550,10 @@ pub async fn run(
         };
     }
 
+    // Subscribe before pane initialization. A reconnect can resume a live
+    // daemon turn, so an elicitation may arrive while the panes are still
+    // reattaching and must already have one app-level receiver waiting.
+    let mut inbound_router = InboundRequestRouter::new(rpc.clone());
     let (
         mut dashboard_pane,
         mut config_app,
@@ -572,6 +699,9 @@ pub async fn run(
             chrome_status.tick(&rpc);
             sidebar.drain_picker_fetch();
         }
+        inbound_router.drain(&mut chat_pane, &mut acp_pane);
+        acp_pane.tick_transport_events();
+        chat_pane.tick_transport_events();
         let chrome_summary = chrome_status.summary_line();
         doctor_pane.poll_refresh().await;
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
@@ -764,6 +894,7 @@ pub async fn run(
                         .await
                     {
                         rpc = Arc::new(new_client);
+                        let next_inbound_router = InboundRequestRouter::new(rpc.clone());
                         let resume_chat = chat_pane.resume_entries();
                         let resume_acp = acp_pane.resume_entries();
                         match build_panes!(resume_chat, resume_acp) {
@@ -776,6 +907,7 @@ pub async fn run(
                                 logs_pane = panes.5;
                                 quickstart = panes.6;
                                 sop_pane = panes.7;
+                                inbound_router = next_inbound_router;
                                 chrome_status.clear();
                                 chrome_status.tick(&rpc);
                                 sidebar.close_picker();
@@ -1886,6 +2018,88 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    fn inbound_elicitation(request_id: &str, session_id: &str) -> crate::client::RpcInboundRequest {
+        crate::client::RpcInboundRequest {
+            id: serde_json::json!(request_id),
+            method: "elicitation/create".to_string(),
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "mode": "form",
+                "message": "Pick one",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "choice": {
+                            "type": "string",
+                            "oneOf": [
+                                { "const": "choice-0", "title": "Yes" },
+                                { "const": "choice-1", "title": "No" }
+                            ]
+                        }
+                    }
+                }
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_elicitation_is_installed_only_by_owning_pane() {
+        let (tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound));
+        let router = InboundRequestRouter::new(client.clone());
+        let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut acp_pane = acp::Acp::new(client);
+        chat_pane.activate_session_for_test("chat-session");
+        acp_pane.activate_session_for_test("code-session");
+
+        let deferred = router.route(
+            inbound_elicitation("e1", "chat-session"),
+            &mut chat_pane,
+            &mut acp_pane,
+        );
+
+        assert!(deferred.is_none());
+        assert!(chat_pane.has_pending_elicitation_for_test());
+        assert!(!acp_pane.has_pending_elicitation_for_test());
+        tokio::task::yield_now().await;
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the non-owner pane must never cancel another pane's request"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_elicitation_is_cancelled_once_after_grace() {
+        let (tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound));
+        let mut router = InboundRequestRouter::new(client.clone());
+        let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut acp_pane = acp::Acp::new(client);
+        router.deferred.push(DeferredInboundRequest {
+            request: inbound_elicitation("e-orphan", "missing-session"),
+            first_seen: Instant::now() - (ELICITATION_ROUTE_GRACE + Duration::from_millis(1)),
+        });
+
+        router.drain(&mut chat_pane, &mut acp_pane);
+        let line = tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
+            .await
+            .expect("expired orphan should be cancelled")
+            .expect("writer channel remains open");
+        let response: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+        assert_eq!(response["id"], "e-orphan");
+        assert_eq!(response["result"]["action"], "cancel");
+        assert!(router.deferred.is_empty());
+
+        router.drain(&mut chat_pane, &mut acp_pane);
+        tokio::task::yield_now().await;
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a centrally handled orphan must not be answered twice"
+        );
+    }
 
     fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
