@@ -7,6 +7,7 @@ import {
   recoveryFailureOutcome,
   shouldBlockSending,
   shouldOfferRecoveryAction,
+  shouldRecycleSocketAfterRecovery,
   recoveryMessageKey,
 } from './sessionRecovery.logic.ts';
 
@@ -114,4 +115,31 @@ test('stale history is reported distinctly from an unreachable gateway', () => {
   // is incomplete", so it cannot reuse the connectivity message.
   assert.equal(recoveryMessageKey('hydration'), 'agent.session_recovery_hydration');
   assert.notEqual(recoveryMessageKey('hydration'), recoveryMessageKey('exhausted'));
+});
+
+test('an idle initial connection is not recycled', () => {
+  assert.equal(
+    shouldRecycleSocketAfterRecovery({
+      observedRunning: false,
+      alreadyVerified: false,
+    }),
+    false,
+  );
+});
+
+test('a socket opened during a detached turn is recycled exactly once', () => {
+  assert.equal(
+    shouldRecycleSocketAfterRecovery({
+      observedRunning: true,
+      alreadyVerified: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldRecycleSocketAfterRecovery({
+      observedRunning: true,
+      alreadyVerified: true,
+    }),
+    false,
+  );
 });

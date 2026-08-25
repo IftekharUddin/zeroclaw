@@ -20,6 +20,7 @@ import {
   recoveryMessageKey,
   shouldBlockSending,
   shouldOfferRecoveryAction,
+  shouldRecycleSocketAfterRecovery,
 } from '@/contexts/sessionRecovery.logic';
 import {
   loadChatHistory,
@@ -533,6 +534,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       wsVersion === wsVersionRef.current
       && recoveryGeneration === recoveryGenerationRef.current
     );
+    const clearTerminalRecoveryStream = () => {
+      foldTurnStream({ type: 'reset' });
+      setStreamingContent('');
+      setStreamingThinking('');
+    };
 
     // Set this before the first await. React batches it with `connected=true`
     // from onOpen, so a freshly remounted chat never exposes a writable input
@@ -559,6 +565,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           });
           if (outcome) {
             if (isCurrent()) {
+              clearTerminalRecoveryStream();
               setError(t(recoveryMessageKey(outcome.reason)));
               // Sending stays fail-closed while lifecycle state is unknown,
               // but the block must not be a dead end: no frame will ever
@@ -589,7 +596,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
     let sessionState = await readSessionState();
     if (!sessionState || !isCurrent()) return;
+    let observedRunning = false;
     if (sessionState.state === 'running') {
+      observedRunning = true;
       setPendingApproval(null);
 
       while (isCurrent() && sessionState.state === 'running') {
@@ -616,6 +625,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // silently would let a follow-up prompt be composed against history
       // the operator never saw, so surface it as a retryable recovery state.
       if (isCurrent()) {
+        clearTerminalRecoveryStream();
         const outcome = hydrationFailureOutcome();
         setError(t(recoveryMessageKey(outcome.reason)));
         setTyping(shouldBlockSending(outcome));
@@ -631,11 +641,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // Route the recovery cleanup through the canonical reducer instead of
     // resetting removed per-turn refs directly, so turnStreamStateRef stays
     // the single owner of stream state.
-    foldTurnStream({ type: 'reset' });
-    setStreamingContent('');
-    setStreamingThinking('');
+    clearTerminalRecoveryStream();
 
-    if (isCurrent() && !recoveryVerifiedRef.current) {
+    if (isCurrent() && shouldRecycleSocketAfterRecovery({
+      observedRunning,
+      alreadyVerified: recoveryVerifiedRef.current,
+    })) {
       // Keep typing=true across the recycle. The replacement socket will run
       // this same state check and clear it only after confirming idle, so no
       // prompt can slip through the stale Agent between hydration and cleanup.

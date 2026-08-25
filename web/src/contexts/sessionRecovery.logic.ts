@@ -120,6 +120,21 @@ export function shouldOfferRecoveryAction(outcome: RecoveryOutcome): boolean {
   return outcome.kind === 'unrecoverable' && outcome.retryable;
 }
 
+/**
+ * Whether recovery must rebuild the socket after hydrating the transcript.
+ *
+ * A socket opened while the prior turn was still running owns an Agent seeded
+ * from pre-turn history, so it must be replaced after that turn settles. An
+ * ordinary initial open that observes an already-idle session was seeded from
+ * current history and should not incur an unnecessary second connection.
+ */
+export function shouldRecycleSocketAfterRecovery(params: {
+  observedRunning: boolean;
+  alreadyVerified: boolean;
+}): boolean {
+  return params.observedRunning && !params.alreadyVerified;
+}
+
 /** i18n key for the message shown for a terminal recovery outcome. */
 export function recoveryMessageKey(reason: RecoveryFailureReason): string {
   if (reason === 'rejected') return 'agent.session_recovery_rejected';
