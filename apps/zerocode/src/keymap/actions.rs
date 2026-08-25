@@ -360,6 +360,8 @@ keyactions! {
     pub enum FileExplorerAction ("file_explorer") {
         Up           [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
         Down         [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
+        PageUp       [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown     [Chord::key(KeyCode::PageDown)] => "page down",
         JumpStart    [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
         JumpEnd      [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",
         EnterDir     [Chord::char('l'), Chord::key(KeyCode::Right)] => "enter dir",
@@ -378,6 +380,10 @@ keyactions! {
         Accept    [Chord::key(KeyCode::Enter)] => "accept",
         Cancel    [Chord::key(KeyCode::Esc)] => "cancel",
         Backspace [Chord::key(KeyCode::Backspace)] => "backspace",
+        Up        [Chord::key(KeyCode::Up)] => "prev",
+        Down      [Chord::key(KeyCode::Down)] => "next",
+        PageUp    [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown  [Chord::key(KeyCode::PageDown)] => "page down",
     }
 }
 
