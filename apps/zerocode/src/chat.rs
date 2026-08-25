@@ -982,7 +982,7 @@ impl Chat {
                 if let Some(sid) = resumed_sid
                     && let Ok(msgs) = self.rpc.session_messages(&sid).await
                 {
-                    state.load_history(msgs.messages);
+                    state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
                 }
                 if let Some(entry) = resume {
                     state.restore_reconnect_state(entry.queue, entry.interrupted);
@@ -1106,7 +1106,7 @@ impl Chat {
         state.cwd = session.workspace_dir;
         Self::refresh_model_identity(&self.rpc, &mut state).await;
         if let Ok(msgs) = self.rpc.session_messages(session_id).await {
-            state.load_history(msgs.messages);
+            state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
         }
         Ok(state)
     }
@@ -1316,11 +1316,12 @@ impl Chat {
     fn apply_session_resync_result(&mut self, update: SessionResyncResult) {
         match update.result {
             Ok(messages) => {
+                let strip_runtime_enrichment = self.pane_kind == PaneKind::Acp;
                 let Some(state) = self.state_for_session_mut(&update.session_id) else {
                     self.session_resync_in_flight.remove(&update.session_id);
                     return;
                 };
-                state.replace_history_after_notification_resync(messages);
+                state.replace_history_after_notification_resync(messages, strip_runtime_enrichment);
                 self.session_resync_in_flight.remove(&update.session_id);
                 self.pump_all_queues();
             }
@@ -8224,6 +8225,7 @@ impl ChatState {
     fn replace_history_after_notification_resync(
         &mut self,
         messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
     ) {
         self.entries.clear();
         self.first_message = None;
@@ -8236,7 +8238,7 @@ impl ChatState {
         self.cached_render_width = 0;
         self.cached_total_rows = 0;
         self.clear_transcript_selection();
-        self.load_history(messages);
+        self.load_history(messages, strip_runtime_enrichment);
         self.entries
             .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
                 "zc-chat-resynced",
@@ -8246,12 +8248,21 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
+    fn load_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) {
         for m in messages {
             match m.role() {
                 crate::client::MessageRole::User => {
-                    if self.first_message.is_none() {
-                        self.first_message = Some(m.content.clone());
+                    let display = if strip_runtime_enrichment {
+                        strip_enrichment_prefix(&m.content)
+                    } else {
+                        &m.content
+                    };
+                    if self.first_message.is_none() && !display.trim().is_empty() {
+                        self.first_message = Some(display.to_string());
                     }
                     self.entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
@@ -8327,6 +8338,20 @@ impl ChatState {
         self.todo_tracker.reset_for_session(todo_settings);
         self.clear_queue();
     }
+}
+
+/// Strip the runtime's date/time enrichment prefix from an ACP-persisted user
+/// message. ACP stores the Agent's provider-visible history, while normal Chat
+/// sessions store raw prompts and must preserve an identical user-authored
+/// prefix. Content without the runtime envelope passes through unchanged.
+fn strip_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    rest[bracket_end + 1..].trim_start()
 }
 
 /// Body-only clipboard text.
@@ -10504,10 +10529,13 @@ mod tests {
         chat.commit_reconnect_handoff();
 
         let mut rebuilt = state_for("sess-r", "alpha");
-        rebuilt.load_history(vec![crate::client::MessageEntry {
-            role: "assistant".to_string(),
-            content: "durable answer".to_string(),
-        }]);
+        rebuilt.load_history(
+            vec![crate::client::MessageEntry {
+                role: "assistant".to_string(),
+                content: "durable answer".to_string(),
+            }],
+            false,
+        );
         rebuilt.restore_reconnect_state(entry.queue, entry.interrupted);
         assert_eq!(rebuilt.queue_len(), 1);
         assert!(rebuilt.queue_paused());
@@ -14423,28 +14451,104 @@ mod tests {
             crate::todo_tracker::TodoTrackerSettings::default(),
         );
         let before = s.entries.len();
-        s.load_history(vec![
-            MessageEntry {
-                role: "user".to_string(),
-                content: "first ask".to_string(),
-            },
-            MessageEntry {
-                role: "assistant".to_string(),
-                content: "reply".to_string(),
-            },
-            MessageEntry {
-                role: "system".to_string(),
-                content: "ignored".to_string(),
-            },
-            MessageEntry {
-                role: "user".to_string(),
-                content: "second ask".to_string(),
-            },
-        ]);
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "first ask".to_string(),
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "reply".to_string(),
+                },
+                MessageEntry {
+                    role: "system".to_string(),
+                    content: "ignored".to_string(),
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "second ask".to_string(),
+                },
+            ],
+            false,
+        );
         // User + assistant + user replayed; system dropped.
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn load_history_strips_enrichment_prefix_from_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+            }],
+            true,
+        );
+        // The pinned row renders a single line; it must show the message
+        // text, not the runtime's timestamp prefix.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
+        // The transcript entry keeps the persisted content untouched.
+        assert!(matches!(
+            &s.entries[s.entries.len() - 1],
+            ChatEntry::UserMessage { text: Some(t), .. }
+                if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
+        ));
+    }
+
+    #[test]
+    fn load_history_skips_prefix_only_content_when_seeding_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+            }],
+            true,
+        );
+        // A message that strips to nothing must not claim the pinned row —
+        // Some("") would block a later real message from ever seeding it.
+        assert!(s.first_message.is_none());
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+            }],
+            true,
+        );
+        assert_eq!(s.first_message.as_deref(), Some("real ask"));
+    }
+
+    #[test]
+    fn load_history_preserves_literal_timestamp_example_for_chat_sessions() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        let literal = "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nthis is user-authored";
+
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: literal.to_string(),
+            }],
+            false,
+        );
+
+        assert_eq!(s.first_message.as_deref(), Some(literal));
     }
 
     // ── Elicitation modal ────────────────────────────────────────
