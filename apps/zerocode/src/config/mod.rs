@@ -216,12 +216,6 @@ impl Default for TodoTrackerSection {
     }
 }
 
-impl SidebarSection {
-    fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
 fn default_sidebar_visible() -> bool {
     true
 }
@@ -346,7 +340,7 @@ pub(crate) struct ZerocodeConfig {
     pub theme: ThemeSection,
     #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
     pub connection: ConnectionSection,
-    #[serde(default, skip_serializing_if = "SidebarSection::is_default")]
+    #[serde(default)]
     pub sidebar: SidebarSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
@@ -1519,6 +1513,7 @@ mod tests {
 
     #[test]
     fn sidebar_section_round_trips() {
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "[sidebar]\nvisible = false\nwidth = 30\n");
         let cfg = ensure_and_load(dir.path()).unwrap();
@@ -1528,6 +1523,7 @@ mod tests {
 
     #[test]
     fn sidebar_partial_section_fills_field_defaults() {
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "[sidebar]\nvisible = false\n");
         let cfg = ensure_and_load(dir.path()).unwrap();
@@ -1537,6 +1533,7 @@ mod tests {
 
     #[test]
     fn bad_sidebar_does_not_blank_theme() {
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -1548,16 +1545,17 @@ mod tests {
     }
 
     #[test]
-    fn default_config_emits_no_sidebar_scaffolding() {
+    fn default_config_serializes_sidebar_for_env_overrides() {
         let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
         assert!(
-            !body.contains("sidebar"),
-            "default config must not scaffold [sidebar]; got:\n{body}"
+            body.contains("[sidebar]") && body.contains("visible = true"),
+            "the default document must materialize [sidebar] so schema-mirror env overrides resolve; got:\n{body}"
         );
     }
 
     #[test]
     fn persist_sidebar_visible_preserves_other_sections() {
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -2004,6 +2002,19 @@ mod tests {
 
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert_eq!(cfg.resolve_todo_tracker().width, 41);
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_default_sidebar_field() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_sidebar__visible", "false");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.sidebar.visible,
+            "a default config must materialize [sidebar] before schema-mirror overrides apply"
+        );
     }
 
     #[test]

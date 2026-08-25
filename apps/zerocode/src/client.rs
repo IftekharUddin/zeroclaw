@@ -89,6 +89,7 @@ pub mod method {
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
+    pub const SESSION_STATE: &str = "session/state";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_CLOSE: &str = "session/close";
@@ -210,15 +211,6 @@ pub struct RpcInboundRequest {
     pub method: String,
     pub params: Value,
 }
-
-/// Buffer capacity for the server-initiated inbound-request broadcast.
-///
-/// These frames are response-bearing (today: `elicitation/create`): a dropped
-/// one parks the daemon's tool call until the session timeout. The buffer is
-/// sized generously so a busy TUI draw loop does not lag the receiver and lose
-/// an elicitation. The Chat pane additionally surfaces a `Lagged` overflow so
-/// the rare drop is diagnosable rather than a silent hang.
-pub const INBOUND_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 
 /// Buffer size for the `session/update` notification broadcast.
 ///
@@ -613,7 +605,7 @@ async fn request_initialize(
 fn route_inbound_frame(
     rpc: &Arc<RpcOutbound>,
     notif_tx: &broadcast::Sender<RpcNotification>,
-    inbound_tx: &broadcast::Sender<RpcInboundRequest>,
+    inbound_tx: &mpsc::UnboundedSender<RpcInboundRequest>,
     frame: Value,
 ) {
     let id = frame.get(field::ID).cloned();
@@ -659,11 +651,10 @@ pub struct RpcClient {
     /// OS process ID reported by the daemon during initialize.
     pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
-    /// Broadcast channel for server-initiated requests that expect a
-    /// response (today: `elicitation/create`). The Chat widget for the
-    /// targeted session subscribes and answers via
-    /// [`RpcClient::respond_to_inbound_request`].
-    inbound_requests_bcast: broadcast::Sender<RpcInboundRequest>,
+    /// Single-consumer queue for server-initiated requests that expect a
+    /// response (today: `elicitation/create`). Keeping the receiver here until
+    /// the app claims it preserves requests that arrive during pane startup.
+    inbound_requests_rx: Mutex<Option<mpsc::UnboundedReceiver<RpcInboundRequest>>>,
     connection_state: Arc<Mutex<ConnectionState>>,
     /// TUI session UID assigned by the daemon during initialize.
     pub tui_id: Option<String>,
@@ -708,8 +699,7 @@ impl RpcClient {
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) =
-            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
@@ -806,7 +796,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -858,8 +848,7 @@ impl RpcClient {
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) =
-            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
@@ -963,7 +952,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -1070,12 +1059,16 @@ impl RpcClient {
         self.notifications_bcast.subscribe()
     }
 
-    /// Get a receiver for server-initiated JSON-RPC requests that
-    /// expect a response (today: `elicitation/create`). The app owns one
-    /// subscriber, resolves `params.sessionId` to the owning pane, and answers
-    /// via [`Self::respond_to_inbound_request`].
-    pub fn subscribe_inbound_requests(&self) -> broadcast::Receiver<RpcInboundRequest> {
-        self.inbound_requests_bcast.subscribe()
+    /// Claim the sole receiver for server-initiated JSON-RPC requests that
+    /// expect a response (today: `elicitation/create`). The app resolves
+    /// `params.sessionId` to the owning pane and answers via
+    /// [`Self::respond_to_inbound_request`].
+    pub fn take_inbound_requests(&self) -> Result<mpsc::UnboundedReceiver<RpcInboundRequest>> {
+        self.inbound_requests_rx
+            .lock()
+            .map_err(|_| anyhow::Error::msg("inbound request receiver mutex poisoned"))?
+            .take()
+            .context("inbound request receiver already claimed")
     }
 
     /// Send a JSON-RPC response back to the daemon for a previously
@@ -1580,6 +1573,14 @@ impl RpcClient {
         .await
     }
 
+    pub async fn session_state(&self, session_id: &str) -> Result<SessionStateResult> {
+        self.call(
+            method::SESSION_STATE,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
     /// Apply session-scoped overrides (model, model_provider, temperature) to a
     /// live session. The daemon applies them immediately and returns the merged
     /// set. A `model_provider` override triggers a live provider-box rebuild
@@ -1830,7 +1831,7 @@ impl RpcClient {
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(64);
-        let (inbound_tx, _) = tokio::sync::broadcast::channel(64);
+        let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             rpc: outbound,
             _read_task: tokio::spawn(async {}),
@@ -1838,7 +1839,7 @@ impl RpcClient {
             server_version: "test".to_string(),
             server_pid: None,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
@@ -3040,6 +3041,12 @@ pub struct SessionNewResult {
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionStateResult {
+    pub state: String,
+}
+
 /// Session-scoped overrides mirror of
 /// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
 /// `session/configure`; every field is optional and omitted when `None`.
@@ -3884,6 +3891,35 @@ mod session_method_tests {
     }
 
     #[tokio::test]
+    async fn session_state_sends_session_id_and_returns_lifecycle() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.session_state("s1").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_state must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/state");
+        assert_eq!(req["params"]["session_id"], "s1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s1","state":"running"})),
+            None,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_state must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.state, "running");
+    }
+
+    #[tokio::test]
     async fn cron_runs_sends_job_id_and_limit() {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
@@ -4045,8 +4081,8 @@ mod notification_tests {
         Arc<RpcOutbound>,
         broadcast::Sender<RpcNotification>,
         broadcast::Receiver<RpcNotification>,
-        broadcast::Sender<RpcInboundRequest>,
-        broadcast::Receiver<RpcInboundRequest>,
+        mpsc::UnboundedSender<RpcInboundRequest>,
+        mpsc::UnboundedReceiver<RpcInboundRequest>,
         mpsc::Receiver<String>,
     );
 
@@ -4058,7 +4094,7 @@ mod notification_tests {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, notif_rx) = broadcast::channel::<RpcNotification>(16);
-        let (inbound_tx, inbound_rx) = broadcast::channel::<RpcInboundRequest>(16);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         (rpc, notif_tx, notif_rx, inbound_tx, inbound_rx, writer_rx)
     }
 
@@ -4148,6 +4184,44 @@ mod notification_tests {
         route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
         let req = inbound_rx.try_recv().expect("inbound request routed");
         assert_eq!(req.id, serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn response_bearing_requests_are_lossless_beyond_old_broadcast_capacity() {
+        let (rpc, notif_tx, _notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
+        for index in 0..2048 {
+            route_inbound_frame(
+                &rpc,
+                &notif_tx,
+                &inbound_tx,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "elicitation/create",
+                    "params": { "sessionId": "session-1" }
+                }),
+            );
+        }
+
+        for index in 0..2048 {
+            let request = inbound_rx.try_recv().expect("request retained in order");
+            assert_eq!(request.id, serde_json::json!(index));
+        }
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn response_bearing_request_queue_has_exactly_one_owner() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(writer_tx)));
+
+        let _owner = client
+            .take_inbound_requests()
+            .expect("first app owner claims the receiver");
+        let error = client
+            .take_inbound_requests()
+            .expect_err("a second owner must be rejected");
+        assert!(error.to_string().contains("already claimed"));
     }
 
     fn make_notification(method: &str, params: serde_json::Value) -> RpcNotification {

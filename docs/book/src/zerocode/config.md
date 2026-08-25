@@ -44,9 +44,19 @@ width = 32               # side-panel target column width (left/right)
 max_height = 5           # bottom-strip maximum height in rows
 ```
 
-Values are re-read at every session boundary, so an edit made in the Config pane
-applies to the next session you start, restart, or switch to, with no zerocode
-restart needed.
+The shell-level agent sidebar is stored in the same file. The default section
+is serialized explicitly so environment overrides have a schema node to
+target:
+
+```toml
+[sidebar]
+visible = true # show the agent/session sidebar at launch
+width = 24     # target width in terminal columns
+```
+
+TodoWrite values are re-read at every session boundary, so an edit made in the
+Config pane applies to the next session you start, restart, or switch to, with
+no zerocode restart needed.
 
 ### Environment overrides
 
@@ -57,6 +67,7 @@ as `__`:
 ```sh
 ZEROCODE_todotracker__enabled=false zerocode
 ZEROCODE_todotracker__location=bottom zerocode
+ZEROCODE_sidebar__visible=false zerocode
 ```
 
 These overrides are process-transient: they affect the running instance only and

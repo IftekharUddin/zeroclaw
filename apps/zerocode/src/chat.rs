@@ -37,6 +37,8 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+const SESSION_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SESSION_RECOVERY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(35);
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -317,33 +319,47 @@ impl Chat {
     /// Every session this pane tracks, in sidebar order, for the app layer to
     /// carry across a reconnect rebuild. Durable transcript is intentionally
     /// not copied: the rebuilt pane reloads it from `session/messages`.
-    pub(crate) fn resume_entries(&mut self) -> Vec<ResumeEntry> {
-        let rpc = self.rpc.clone();
+    pub(crate) fn resume_entries(&self) -> Vec<ResumeEntry> {
         let summaries = self.session_summaries();
         let mut entries = Vec::with_capacity(summaries.len());
         for summary in summaries {
-            let Some(state) = self.state_for_session_mut(&summary.session_id) else {
+            let Some(state) = self.state_for_session(&summary.session_id) else {
                 continue;
             };
-            let pending_approval = state.pending_approval.take();
-            let pending_elicitation = state.pending_elicitation.take();
-            let interrupted =
-                state.turn_in_flight || pending_approval.is_some() || pending_elicitation.is_some();
-            if let Some(approval) = pending_approval {
-                Self::reject_stale_approval(&rpc, state.session_id.clone(), approval.request_id);
-            }
-            if let Some(elicitation) = pending_elicitation {
-                Self::answer_cancel(&rpc, elicitation.request_id);
-            }
             entries.push(ResumeEntry {
                 session_id: summary.session_id,
                 agent_alias: summary.agent_alias,
                 was_focused: summary.focused,
                 queue: state.reconnect_queue_state(),
-                interrupted,
+                interrupted: state.turn_in_flight
+                    || state.pending_approval.is_some()
+                    || state.pending_elicitation.is_some(),
             });
         }
         entries
+    }
+
+    /// Finalize the old pane only after every replacement pane has built.
+    /// Snapshotting resume entries is deliberately read-only, so a failed
+    /// rebuild leaves queues and interaction owners intact for the next retry.
+    pub(crate) fn commit_reconnect_handoff(&mut self) {
+        let rpc = self.rpc.clone();
+        let session_ids = self
+            .session_summaries()
+            .into_iter()
+            .map(|summary| summary.session_id)
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            let Some(state) = self.state_for_session_mut(&session_id) else {
+                continue;
+            };
+            if let Some(approval) = state.pending_approval.take() {
+                Self::reject_stale_approval(&rpc, state.session_id.clone(), approval.request_id);
+            }
+            if let Some(elicitation) = state.pending_elicitation.take() {
+                Self::answer_cancel(&rpc, elicitation.request_id);
+            }
+        }
     }
 
     /// One summary per tracked session, in stable creation order, for the
@@ -419,6 +435,15 @@ impl Chat {
         self.background
             .iter_mut()
             .find(|s| s.session_id == session_id)
+    }
+
+    fn state_for_session(&self, session_id: &str) -> Option<&ChatState> {
+        if let ChatPhase::Active(ref state) = self.phase
+            && state.session_id == session_id
+        {
+            return Some(state);
+        }
+        self.background.iter().find(|s| s.session_id == session_id)
     }
 
     /// Park the focused session (if any) in `background`, remembering it as
@@ -690,7 +715,11 @@ impl Chat {
                 self.pick_or_start_session(&prior).await;
                 return Ok(());
             }
-            self.resume_focused = None;
+            self.phase = ChatPhase::Error(crate::i18n::t_args(
+                "zc-chat-resume-dropped",
+                &[("count", "1")],
+            ));
+            return Ok(());
         }
 
         if agents.len() == 1 {
@@ -859,6 +888,8 @@ impl Chat {
     pub(crate) async fn refresh_if_inactive(&mut self) {
         if should_retry_on_entry(&self.phase) {
             let _ = self.init().await;
+        } else if !self.resume_backgrounds.is_empty() {
+            self.after_session_start().await;
         }
     }
 
@@ -898,7 +929,7 @@ impl Chat {
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
         // the daemon-retained session, its persisted history, and its cwd.
-        let resume = self.resume_focused.take();
+        let resume = self.resume_focused.clone();
         let resume_id = resume.as_ref().map(|entry| entry.session_id.as_str());
         // A resume must not re-point the session at the TUI's launch directory:
         // pass no cwd so the daemon keeps the retained session's own cwd. Only
@@ -929,7 +960,11 @@ impl Chat {
         };
         match result {
             Ok(session) => {
+                self.resume_focused = None;
                 let resumed_sid = resume.as_ref().map(|_| session.session_id.clone());
+                let recovery_session_id = session.session_id.clone();
+                let needs_terminal_recovery =
+                    resume.as_ref().is_some_and(|entry| entry.interrupted);
                 // `todo_settings` is resolved fresh at this boundary from
                 // `zerocode-config.toml` (the canonical owner); the removed
                 // `self.todo_settings` cache was the stale cross-session copy.
@@ -956,6 +991,9 @@ impl Chat {
                     self.session_order.push(state.session_id.clone());
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
+                if needs_terminal_recovery {
+                    self.begin_session_resync(recovery_session_id);
+                }
             }
             Err(e) => {
                 self.phase = ChatPhase::Error(crate::i18n::t_args(
@@ -972,27 +1010,12 @@ impl Chat {
     /// guarantee that a failed start never strands live background sessions
     /// behind an `Error` screen.
     async fn after_session_start(&mut self) {
-        // The focused resume entry failed (e.g. daemon restarted and lost
-        // it): promote the first background entry that still attaches.
-        while matches!(self.phase, ChatPhase::Error(_)) && !self.resume_backgrounds.is_empty() {
-            let entry = self.resume_backgrounds.remove(0);
-            match self.attach_resume_entry(&entry).await {
-                Ok(state) => {
-                    if !self.session_order.contains(&entry.session_id) {
-                        self.session_order.push(entry.session_id.clone());
-                    }
-                    self.phase = ChatPhase::Active(Box::new(state));
-                }
-                Err(_) => continue,
-            }
-        }
-
         if matches!(self.phase, ChatPhase::Active(_)) {
             let entries = std::mem::take(&mut self.resume_backgrounds);
-            let mut dropped = 0usize;
+            let mut retained = Vec::new();
             for entry in entries {
                 if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
-                    dropped += 1;
+                    retained.push(entry);
                     continue;
                 }
                 if self
@@ -1004,24 +1027,29 @@ impl Chat {
                 }
                 match self.attach_resume_entry(&entry).await {
                     Ok(state) => {
+                        let session_id = state.session_id.clone();
+                        let needs_terminal_recovery = entry.interrupted;
                         if !self.session_order.contains(&entry.session_id) {
                             self.session_order.push(entry.session_id.clone());
                         }
                         self.background.push(state);
+                        if needs_terminal_recovery {
+                            self.begin_session_resync(session_id);
+                        }
                     }
-                    Err(_) => dropped += 1,
+                    Err(_) => retained.push(entry),
                 }
             }
-            if dropped > 0
+            let retained_count = retained.len();
+            self.resume_backgrounds = retained;
+            if retained_count > 0
                 && let ChatPhase::Active(ref mut state) = self.phase
             {
                 state.set_info_notice(crate::i18n::t_args(
                     "zc-chat-resume-dropped",
-                    &[("count", &dropped.to_string())],
+                    &[("count", &retained_count.to_string())],
                 ));
             }
-        } else {
-            self.resume_backgrounds.clear();
         }
 
         if matches!(self.phase, ChatPhase::Active(_)) {
@@ -1224,53 +1252,92 @@ impl Chat {
             .map(|summary| summary.session_id)
             .collect::<Vec<_>>();
         for session_id in session_ids {
-            if !self.session_resync_in_flight.insert(session_id.clone()) {
-                continue;
-            }
-
-            let rpc = self.rpc.clone();
-            let tx = self.session_resync_tx.clone();
-            if let Some(state) = self.state_for_session_mut(&session_id) {
-                let approval = state.pending_approval.take();
-                let elicitation = state.pending_elicitation.take();
-                state.prepare_for_notification_resync();
-                if let Some(approval) = approval {
-                    Self::reject_stale_approval(&rpc, session_id.clone(), approval.request_id);
-                }
-                if let Some(elicitation) = elicitation {
-                    Self::answer_cancel(&rpc, elicitation.request_id);
-                }
-            }
-
-            tokio::spawn(async move {
-                let result = rpc
-                    .session_messages(&session_id)
-                    .await
-                    .map(|messages| messages.messages)
-                    .map_err(|error| error.to_string());
-                let _ = tx.send(SessionResyncResult { session_id, result }).await;
-            });
+            self.begin_session_resync(session_id);
         }
     }
 
-    fn apply_session_resync_result(&mut self, update: SessionResyncResult) {
-        self.session_resync_in_flight.remove(&update.session_id);
-        let Some(state) = self.state_for_session_mut(&update.session_id) else {
+    fn begin_session_resync(&mut self, session_id: String) {
+        if !self.session_resync_in_flight.insert(session_id.clone()) {
             return;
-        };
+        }
+
+        let rpc = self.rpc.clone();
+        let tx = self.session_resync_tx.clone();
+        if let Some(state) = self.state_for_session_mut(&session_id) {
+            let approval = state.pending_approval.take();
+            let elicitation = state.pending_elicitation.take();
+            state.prepare_for_notification_resync();
+            if let Some(approval) = approval {
+                Self::reject_stale_approval(&rpc, session_id.clone(), approval.request_id);
+            }
+            if let Some(elicitation) = elicitation {
+                Self::answer_cancel(&rpc, elicitation.request_id);
+            }
+        }
+
+        tokio::spawn(async move {
+            let result = Self::cancel_confirm_and_reload(&rpc, &session_id).await;
+            let _ = tx.send(SessionResyncResult { session_id, result }).await;
+        });
+    }
+
+    async fn cancel_confirm_and_reload(
+        rpc: &Arc<RpcClient>,
+        session_id: &str,
+    ) -> Result<Vec<crate::client::MessageEntry>, String> {
+        // Cancellation is best effort: an already-idle session reports that
+        // no active turn exists. The state query below is the authoritative
+        // terminal confirmation in either case.
+        let _ = rpc.session_cancel(session_id).await;
+        let deadline = Instant::now() + SESSION_RECOVERY_TERMINAL_TIMEOUT;
+        loop {
+            let state = rpc
+                .session_state(session_id)
+                .await
+                .map_err(|error| format!("terminal-state check failed: {error}"))?;
+            if state.state != "running" {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "turn did not reach a terminal state within {} seconds",
+                    SESSION_RECOVERY_TERMINAL_TIMEOUT.as_secs()
+                ));
+            }
+            tokio::time::sleep(SESSION_RECOVERY_POLL_INTERVAL).await;
+        }
+
+        rpc.session_messages(session_id)
+            .await
+            .map(|messages| messages.messages)
+            .map_err(|error| format!("transcript reload failed: {error}"))
+    }
+
+    fn apply_session_resync_result(&mut self, update: SessionResyncResult) {
         match update.result {
             Ok(messages) => {
+                let Some(state) = self.state_for_session_mut(&update.session_id) else {
+                    self.session_resync_in_flight.remove(&update.session_id);
+                    return;
+                };
                 state.replace_history_after_notification_resync(messages);
+                self.session_resync_in_flight.remove(&update.session_id);
                 self.pump_all_queues();
             }
             Err(error) => {
-                state.last_error = Some(SessionError::SessionLost);
+                let Some(state) = self.state_for_session_mut(&update.session_id) else {
+                    self.session_resync_in_flight.remove(&update.session_id);
+                    return;
+                };
                 state
                     .entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(
                         crate::i18n::t_args("zc-chat-resync-failed", &[("error", &error)]),
                     )));
                 state.mark_dirty_append();
+                // Keep the id in `session_resync_in_flight`: queue dispatch
+                // remains fail-closed until a later reconnect/retry can prove
+                // the old turn terminal and reload its transcript.
             }
         }
     }
@@ -10240,7 +10307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_session_id_dropped_when_init_lands_in_multi_agent_picker() {
+    async fn unmatched_resume_is_retained_for_reconnect_retry() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -10270,21 +10337,64 @@ mod tests {
             None,
         );
 
-        // With the stale resume dropped, ACP init falls through to the
-        // recent-session lookup; none stored → agent picker.
-        let request = next_rpc_request(&mut rx, "init should check recent ACP sessions").await;
-        assert_eq!(request["method"], method::SESSION_LIST_ACP);
-        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
-
         let chat = tokio::time::timeout(Duration::from_secs(2), init)
             .await
             .expect("init should finish")
             .unwrap();
-        // A carried resume id with no matching agent must not survive into the
-        // picker, or a manual pick of a different agent would reattach a
-        // mismatched session.
-        assert!(chat.resume_focused.is_none());
-        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unmatched resume must not be replaced by a fresh session"
+        );
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-prev"),
+            "failed resume entries stay available for a later reconnect retry"
+        );
+        assert!(matches!(chat.phase, ChatPhase::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_focused_resume_is_retained_for_reconnect_retry() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.set_resume_sessions(vec![resume_entry("sess-prev", "alpha", true)]);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 1, "persisted_sessions": 1}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "resume should reattach the retained id").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-prev");
+        respond_err(&rpc, &request, -32000, "controlled reattach failure");
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("failed resume should return")
+            .unwrap();
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-prev")
+        );
+        assert!(matches!(chat.phase, ChatPhase::Error(_)));
     }
 
     #[tokio::test]
@@ -10381,6 +10491,17 @@ mod tests {
         assert!(entry.interrupted);
         assert_eq!(entry.queue.messages.len(), 1);
         assert!(entry.queue.paused);
+        let ChatPhase::Active(prior) = &chat.phase else {
+            panic!("old pane remains active until replacement construction succeeds");
+        };
+        assert!(prior.pending_approval.is_some());
+        assert!(prior.pending_elicitation.is_some());
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "snapshotting reconnect state must not mutate or answer old interactions"
+        );
+
+        chat.commit_reconnect_handoff();
 
         let mut rebuilt = state_for("sess-r", "alpha");
         rebuilt.load_history(vec![crate::client::MessageEntry {
@@ -10642,35 +10763,66 @@ mod tests {
         assert!(state.pending_elicitation.is_none());
         assert!(chat.session_resync_in_flight.contains("sess-1"));
 
-        let mut saw_messages = false;
-        for _ in 0..3 {
+        let mut saw_cancel = false;
+        let mut saw_approval = false;
+        let mut saw_elicitation = false;
+        while !(saw_cancel && saw_approval && saw_elicitation) {
             let frame =
-                next_rpc_request(&mut writer_rx, "resync should invalidate and reload").await;
+                next_rpc_request(&mut writer_rx, "resync should cancel and invalidate").await;
             match frame.get("method").and_then(serde_json::Value::as_str) {
-                Some(method::SESSION_MESSAGES) => {
-                    saw_messages = true;
+                Some(method::SESSION_CANCEL) => {
+                    saw_cancel = true;
                     respond_ok(
                         &outbound,
                         &frame,
-                        serde_json::json!({
-                            "messages": [
-                                { "role": "user", "content": "in flight" },
-                                { "role": "assistant", "content": "durable answer" }
-                            ]
-                        }),
+                        serde_json::json!({ "session_id": "sess-1", "cancelled": true }),
                     );
                 }
                 Some(method::SESSION_APPROVE) => {
+                    saw_approval = true;
                     respond_ok(&outbound, &frame, serde_json::json!({ "approved": false }));
                 }
                 None => {
+                    saw_elicitation = true;
                     assert_eq!(frame["id"], "elicitation-lag");
                     assert_eq!(frame["result"]["action"], "cancel");
                 }
                 other => panic!("unexpected recovery frame: {other:?}"),
             }
         }
-        assert!(saw_messages);
+
+        let running = next_rpc_request(&mut writer_rx, "resync must confirm terminal state").await;
+        assert_eq!(running["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &running,
+            serde_json::json!({ "session_id": "sess-1", "state": "running" }),
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "overflow recovery must not reload or dispatch while the old turn is running"
+        );
+
+        let idle = next_rpc_request(&mut writer_rx, "resync should poll until terminal").await;
+        assert_eq!(idle["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &idle,
+            serde_json::json!({ "session_id": "sess-1", "state": "idle" }),
+        );
+
+        let messages = next_rpc_request(&mut writer_rx, "terminal resync reloads transcript").await;
+        assert_eq!(messages["method"], method::SESSION_MESSAGES);
+        respond_ok(
+            &outbound,
+            &messages,
+            serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": "in flight" },
+                    { "role": "assistant", "content": "durable answer" }
+                ]
+            }),
+        );
         assert!(
             writer_rx.try_recv().is_err(),
             "queue dispatch stays gated until transcript reload completes"
@@ -11010,6 +11162,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_background_resume_is_retained_for_reconnect_retry() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state_for("sess-f", "beta")));
+        chat.session_order.push("sess-f".to_string());
+        chat.resume_backgrounds
+            .push(resume_entry("sess-bg", "alpha", false));
+
+        let retry = tokio::spawn(async move {
+            chat.after_session_start().await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "background resume should reattach").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-bg");
+        respond_err(&rpc, &request, -32000, "controlled background failure");
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), retry)
+            .await
+            .expect("background retry should return")
+            .unwrap();
+        assert_eq!(
+            chat.resume_backgrounds
+                .iter()
+                .map(|entry| entry.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess-bg"]
+        );
+        assert_eq!(chat.current_session_id(), Some("sess-f"));
+    }
+
+    #[tokio::test]
     async fn acp_init_opens_recent_session_picker() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -11285,7 +11471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_init_clears_stale_carried_resume_for_disabled_agent() {
+    async fn acp_init_retains_carried_resume_for_disabled_agent() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -11309,43 +11495,21 @@ mod tests {
             }),
         );
 
-        let request = next_rpc_request(
-            &mut rx,
-            "stale carried resume should fall back to session picker",
-        )
-        .await;
-        assert_eq!(request["method"], method::SESSION_LIST_ACP);
-        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
-
-        let request =
-            next_rpc_request(&mut rx, "stale carried resume should not be sent for alpha").await;
-        assert_eq!(request["method"], method::SESSION_NEW);
-        assert_eq!(request["params"]["agent_alias"], "alpha");
-        assert!(request["params"]["session_id"].is_null());
-        respond_ok(
-            &rpc,
-            &request,
-            serde_json::json!({
-                "session_id": "sess-fresh",
-                "workspace_dir": "/tmp/fresh"
-            }),
-        );
-
-        let request =
-            next_rpc_request(&mut rx, "fresh fallback should refresh model identity").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "agents.alpha.model_provider");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let chat = tokio::time::timeout(Duration::from_secs(2), init)
             .await
             .expect("init should finish")
             .unwrap();
-        let ChatPhase::Active(state) = chat.phase else {
-            panic!("stale carried resume should still enter a fresh ACP session");
-        };
-        assert_eq!(state.session_id, "sess-fresh");
-        assert_eq!(state.agent_alias, "alpha");
+        assert!(
+            rx.try_recv().is_err(),
+            "a missing owner must not replace the retained session with a fresh one"
+        );
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| (entry.session_id.as_str(), entry.agent_alias.as_str())),
+            Some(("sess-prev", "beta"))
+        );
+        assert!(matches!(chat.phase, ChatPhase::Error(_)));
     }
 
     #[tokio::test]

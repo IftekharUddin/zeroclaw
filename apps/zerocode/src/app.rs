@@ -12,7 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::acp;
 use crate::chat;
@@ -66,7 +66,7 @@ const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
 /// preventing a non-owner pane from racing the real owner with a cancellation.
 struct InboundRequestRouter {
     rpc: Arc<RpcClient>,
-    rx: broadcast::Receiver<crate::client::RpcInboundRequest>,
+    rx: mpsc::UnboundedReceiver<crate::client::RpcInboundRequest>,
     deferred: Vec<DeferredInboundRequest>,
 }
 
@@ -76,25 +76,16 @@ struct DeferredInboundRequest {
 }
 
 impl InboundRequestRouter {
-    fn new(rpc: Arc<RpcClient>) -> Self {
-        Self {
-            rx: rpc.subscribe_inbound_requests(),
+    fn new(rpc: Arc<RpcClient>) -> Result<Self> {
+        Ok(Self {
+            rx: rpc.take_inbound_requests()?,
             rpc,
             deferred: Vec::new(),
-        }
+        })
     }
 
     fn drain(&mut self, chat_pane: &mut chat::Chat, acp_pane: &mut acp::Acp) {
-        loop {
-            let request = match self.rx.try_recv() {
-                Ok(request) => request,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    chat_pane.note_elicitation_drop();
-                    acp_pane.note_elicitation_drop();
-                    continue;
-                }
-                Err(_) => break,
-            };
+        while let Ok(request) = self.rx.try_recv() {
             if let Some(request) = self.route(request, chat_pane, acp_pane) {
                 self.deferred.push(DeferredInboundRequest {
                     request,
@@ -266,6 +257,7 @@ const MODES: &[Mode] = &[
     Mode::Chat,
     Mode::Logs,
     Mode::Doctor,
+    Mode::Quickstart,
     Mode::Sop,
 ];
 
@@ -418,8 +410,7 @@ impl Mode {
 
     fn cycle(self, offset: isize) -> Mode {
         let len = MODES.len() as isize;
-        // Modes outside the nav bar (Quickstart via the sidebar) cycle onto a
-        // bar edge instead of panicking.
+        // Defensive for future modes outside the nav bar.
         let Some(cur) = MODES.iter().position(|m| *m == self) else {
             return if offset >= 0 {
                 MODES[0]
@@ -583,7 +574,7 @@ pub async fn run(
     // Subscribe before pane initialization. A reconnect can resume a live
     // daemon turn, so an elicitation may arrive while the panes are still
     // reattaching and must already have one app-level receiver waiting.
-    let mut inbound_router = InboundRequestRouter::new(rpc.clone());
+    let mut inbound_router = InboundRequestRouter::new(rpc.clone())?;
     let (
         mut dashboard_pane,
         mut config_app,
@@ -923,12 +914,21 @@ pub async fn run(
                         .await
                     {
                         rpc = Arc::new(new_client);
-                        let next_inbound_router = InboundRequestRouter::new(rpc.clone());
+                        let Ok(next_inbound_router) = InboundRequestRouter::new(rpc.clone()) else {
+                            continue;
+                        };
                         let resume_chat = chat_pane.resume_entries();
                         let resume_acp = acp_pane.resume_entries();
                         match build_panes!(resume_chat, resume_acp) {
                             Ok(mut panes) => {
                                 refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
+                                // Resume snapshots are read-only. Commit the
+                                // old panes' transport-bound interaction
+                                // cleanup only after every replacement pane
+                                // built, so a mid-build failure cannot consume
+                                // queues or their retry state.
+                                chat_pane.commit_reconnect_handoff();
+                                acp_pane.commit_reconnect_handoff();
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
                                 doctor_pane = panes.2;
@@ -1234,6 +1234,16 @@ pub async fn run(
                     }
                     continue;
                 }
+                // The sidebar picker owns all mouse input while open. Handle
+                // it before mode-bar/help dispatch so confirming the captured
+                // target can never yank the user back from a tab they clicked
+                // behind the modal.
+                if sidebar.picker_open() {
+                    if let Some(event) = sidebar.handle_mouse(&mouse) {
+                        apply_sidebar_event!(event, conn_state);
+                    }
+                    continue;
+                }
                 // Mode bar clicks
                 if matches!(mouse.kind, MouseEventKind::Down(_))
                     && let Some(next) = mode_bar_layout.mode_at(mouse.column, mouse.row)
@@ -1260,14 +1270,7 @@ pub async fn run(
                     help_overlay = Some(HelpOverlayState::default());
                     continue;
                 }
-                // Sidebar "+" picker is modal to the mouse while open; then
-                // clicks and wheel inside the sidebar itself.
-                if sidebar.picker_open() {
-                    if let Some(event) = sidebar.handle_mouse(&mouse) {
-                        apply_sidebar_event!(event, conn_state);
-                    }
-                    continue;
-                }
+                // Clicks and wheel inside the sidebar itself.
                 if sidebar.contains(mouse.column, mouse.row) {
                     if let Some(event) = sidebar.handle_mouse(&mouse) {
                         apply_sidebar_event!(event, conn_state);
@@ -1422,8 +1425,8 @@ fn draw_mode_bar(
 ) -> ModeBarLayout {
     use ratatui::widgets::Tabs;
 
-    // A mode outside the bar (Quickstart via the sidebar) highlights no tab
-    // rather than falsely lighting the first one.
+    // Keep the active navigation target visible even when the terminal is too
+    // narrow to show the complete mode list.
     let active_idx = MODES.iter().position(|m| *m == active);
     let window_anchor = active_idx.unwrap_or(0);
     let base_titles: Vec<String> = MODES
@@ -2181,7 +2184,7 @@ mod tests {
         let (tx, mut writer_rx) = mpsc::channel::<String>(16);
         let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(outbound));
-        let router = InboundRequestRouter::new(client.clone());
+        let router = InboundRequestRouter::new(client.clone()).unwrap();
         let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
         let mut acp_pane = acp::Acp::new(client);
         chat_pane.activate_session_for_test("chat-session");
@@ -2208,7 +2211,7 @@ mod tests {
         let (tx, mut writer_rx) = mpsc::channel::<String>(16);
         let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(outbound));
-        let mut router = InboundRequestRouter::new(client.clone());
+        let mut router = InboundRequestRouter::new(client.clone()).unwrap();
         let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
         let mut acp_pane = acp::Acp::new(client);
         router.deferred.push(DeferredInboundRequest {
@@ -2534,20 +2537,48 @@ mod tests {
     }
 
     #[test]
-    fn quickstart_left_the_mode_bar_but_stays_reachable() {
+    fn narrow_mode_bar_renders_keyboard_reachable_quickstart() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let backend = TestBackend::new(24, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut layout = ModeBarLayout::default();
+        terminal
+            .draw(|frame| {
+                layout = draw_mode_bar(frame, frame.area(), Mode::Quickstart, None);
+            })
+            .expect("draw narrow mode bar");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
         assert!(
-            !MODES.contains(&Mode::Quickstart),
-            "Quickstart is launched from the agent sidebar, not the mode bar"
+            rendered.contains("Quickstart"),
+            "rendered bar: {rendered:?}"
+        );
+        let quickstart = layout
+            .entries
+            .iter()
+            .find(|entry| entry.mode == Mode::Quickstart)
+            .expect("selected Quickstart tab must stay visible at narrow widths");
+        assert_eq!(
+            layout.mode_at(quickstart.hit_rect.x, quickstart.hit_rect.y),
+            Some(Mode::Quickstart)
         );
     }
 
     #[test]
-    fn cycle_from_off_bar_modes_lands_on_a_bar_edge() {
-        // Quickstart is sidebar-launched, so cycling from it must not panic and
-        // must land on a bar edge.
-        assert_eq!(Mode::Quickstart.cycle(1), MODES[0]);
-        assert_eq!(Mode::Quickstart.cycle(-1), MODES[MODES.len() - 1]);
-        // Regular members still rotate.
+    fn mode_cycle_includes_quickstart_and_wraps() {
+        let quickstart = MODES
+            .iter()
+            .position(|mode| *mode == Mode::Quickstart)
+            .expect("Quickstart stays in keyboard navigation");
+        assert_eq!(Mode::Quickstart.cycle(1), MODES[quickstart + 1]);
+        assert_eq!(Mode::Quickstart.cycle(-1), MODES[quickstart - 1]);
         assert_eq!(MODES[0].cycle(1), MODES[1]);
         assert_eq!(MODES[0].cycle(-1), MODES[MODES.len() - 1]);
     }

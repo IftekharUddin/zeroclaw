@@ -26,8 +26,12 @@ impl Acp {
         self.inner.set_resume_sessions(entries);
     }
 
-    pub(crate) fn resume_entries(&mut self) -> Vec<chat::ResumeEntry> {
+    pub(crate) fn resume_entries(&self) -> Vec<chat::ResumeEntry> {
         self.inner.resume_entries()
+    }
+
+    pub(crate) fn commit_reconnect_handoff(&mut self) {
+        self.inner.commit_reconnect_handoff();
     }
 
     pub(crate) fn session_summaries(&self) -> Vec<chat::SidebarSessionSummary> {
