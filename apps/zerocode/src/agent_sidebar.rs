@@ -29,7 +29,7 @@ pub(crate) const SIDEBAR_COLS_MAX: u16 = 40;
 /// for the frame instead of squeezing the pane.
 pub(crate) const CONTENT_MIN_COLS: u16 = 40;
 /// Row width at which the right-aligned pane tag is shown.
-const PANE_TAG_MIN_COLS: u16 = 24;
+const PANE_TAG_MIN_COLS: u16 = 16;
 
 /// Per-frame shell context the sidebar renders against.
 pub(crate) struct SidebarCtx {
@@ -442,7 +442,11 @@ impl AgentSidebar {
                 picker.loading = false;
                 picker.error = Some(e);
             }
-            Err(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                picker.loading = false;
+                picker.error = Some(t("zc-sidebar-picker-disconnected"));
+            }
         }
     }
 
@@ -781,5 +785,32 @@ mod tests {
         let confirm = KeyEvent::from(crossterm::event::KeyCode::Enter);
         assert_eq!(s.handle_picker_key(&confirm), None);
         assert!(!s.picker_open(), "confirm on an error row closes");
+    }
+
+    #[test]
+    fn disconnected_picker_fetch_becomes_a_terminal_error_row() {
+        let mut s = sidebar();
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Vec<String>, String>>();
+        s.picker = Some(SidebarPicker {
+            target: PaneKind::Chat,
+            state: widgets::PickerState::default(),
+            aliases: Vec::new(),
+            open_by_alias: HashMap::new(),
+            loading: true,
+            error: None,
+            rx,
+            double_click: mouse::DoubleClickTracker::new(),
+            modal_rect: Rect::default(),
+        });
+        drop(tx);
+
+        s.drain_picker_fetch();
+
+        let picker = s.picker.as_ref().unwrap();
+        assert!(!picker.loading);
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(t("zc-sidebar-picker-disconnected").as_str())
+        );
     }
 }

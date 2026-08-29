@@ -499,6 +499,17 @@ impl SessionStore {
             .contains_key(id)
     }
 
+    /// Generation of the runtime-owned turn currently executing for a
+    /// session. This is the authoritative live-turn identity for RPC status;
+    /// persisted session metadata is not updated on every RPC turn.
+    pub fn inflight_turn_generation(&self, id: &str) -> Option<u64> {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .map(|(generation, _)| *generation)
+    }
+
     pub async fn kill_session(&self, id: &str) -> bool {
         if let Some((_, token)) = self
             .cancel_tokens

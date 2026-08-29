@@ -2479,6 +2479,31 @@ impl RpcDispatcher {
 
     async fn handle_session_state(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        if self.ctx.sessions.get_agent(&req.session_id).await.is_some() {
+            let turn_generation = self.ctx.sessions.inflight_turn_generation(&req.session_id);
+            let queued = self
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(&req.session_id)
+                .await
+                > 0;
+            return to_result(SessionStateResult {
+                session_id: req.session_id,
+                state: if turn_generation.is_some() || queued {
+                    "running"
+                } else {
+                    "idle"
+                }
+                .to_string(),
+                turn_id: turn_generation.map(|generation| generation.to_string()),
+                turn_started_at: None,
+            });
+        }
+
+        // Gateway/legacy sessions that are not live in the RPC session store
+        // retain their persisted-state fallback. Chat and ACP sessions above
+        // must never use this metadata as a live-turn barrier.
         let backend = self
             .ctx
             .session_backend
@@ -7765,6 +7790,68 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    #[tokio::test]
+    async fn session_state_uses_runtime_actor_for_chat_and_acp_turns() {
+        for (session_id, chat_mode) in [
+            ("live-chat-state", crate::rpc::types::ChatMode::Chat),
+            ("live-acp-state", crate::rpc::types::ChatMode::Acp),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let (dispatcher, sessions, _chat_backend, _acp_store) =
+                make_persistence_test_dispatcher(config, tmp.path());
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(DummyModelProvider))
+                .tools(vec![])
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .build()
+                .unwrap();
+            sessions
+                .insert(
+                    session_id.to_string(),
+                    crate::rpc::session::RpcSession::new(
+                        agent,
+                        "test-agent",
+                        tmp.path().to_str().unwrap(),
+                        chat_mode.clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+
+            let read_state = || async {
+                dispatcher
+                    .handle_session_state(&json!({"session_id": session_id}))
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(read_state().await["state"], "idle");
+
+            let queue_guard = sessions
+                .session_queue
+                .acquire(session_id)
+                .await
+                .expect("test should acquire the production session actor queue");
+            assert_eq!(
+                read_state().await["state"],
+                "running",
+                "queued/running {chat_mode:?} work must be visible without persisted metadata"
+            );
+            drop(queue_guard);
+
+            let token = tokio_util::sync::CancellationToken::new();
+            let generation = sessions.register_cancel_token(session_id, token);
+            let running = read_state().await;
+            assert_eq!(running["state"], "running");
+            assert_eq!(running["turn_id"], generation.to_string());
+            sessions.remove_cancel_token(session_id, generation);
+            assert_eq!(read_state().await["state"], "idle");
+        }
     }
 
     #[tokio::test]

@@ -1622,12 +1622,22 @@ impl RpcClient {
         self.call(method::SESSION_APPROVE, params).await
     }
 
-    pub async fn session_close(&self, session_id: &str) -> Result<Value> {
-        self.call(
+    pub async fn session_close(&self, session_id: &str) -> Result<()> {
+        let request = self.rpc.request(
             method::SESSION_CLOSE,
             serde_json::json!({ "session_id": session_id }),
-        )
-        .await
+        );
+        match tokio::time::timeout(Duration::from_secs(5), request).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) if error.code == jsonrpc::error_codes::SESSION_NOT_FOUND => Ok(()),
+            Ok(Err(error)) => anyhow::bail!(
+                "RPC {}: {} ({})",
+                method::SESSION_CLOSE,
+                error.message,
+                error.code
+            ),
+            Err(_) => anyhow::bail!("RPC {}: timed out after 5s", method::SESSION_CLOSE),
+        }
     }
 
     pub async fn session_kill(&self, session_id: &str) -> Result<()> {

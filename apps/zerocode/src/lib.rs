@@ -8,6 +8,7 @@
 #![allow(clippy::disallowed_methods)]
 
 mod color_depth;
+mod display_width;
 #[cfg(test)]
 mod test_support;
 mod theme;

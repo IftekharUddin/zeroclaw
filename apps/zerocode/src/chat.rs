@@ -516,7 +516,15 @@ impl Chat {
         if !was_focused && in_background.is_none() {
             return false;
         }
-        let _ = self.rpc.session_close(session_id).await;
+        if let Err(error) = self.rpc.session_close(session_id).await {
+            if let Some(state) = self.state_for_session_mut(session_id) {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-close-error",
+                    &[("error", &error.to_string())],
+                ));
+            }
+            return false;
+        }
         self.session_order.retain(|sid| sid != session_id);
         if self
             .last_focused_sid
@@ -1793,8 +1801,14 @@ impl Chat {
     /// The app calls this for both Chat and Code every frame so background
     /// sessions cannot silently fall behind while another screen is active.
     pub(crate) fn tick_transport_events(&mut self) {
-        self.drain_session_resync_results();
+        // The daemon enqueues a turn's terminal notification before its
+        // runtime-owned session/state can become idle. Drain that same-stream
+        // notification queue while the resync gate is still installed, then
+        // apply the terminal barrier result and release queued prompts. This
+        // is the correlation fence that prevents an old TurnComplete from
+        // settling the first post-resync prompt.
         self.drain_notifications();
+        self.drain_session_resync_results();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
@@ -8219,6 +8233,10 @@ impl ChatState {
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.resume_override = false;
+        // A lost Plan notification makes the current projection
+        // non-authoritative. Clear it before the transcript barrier releases;
+        // a later authoritative Plan update will repopulate the tracker.
+        self.todo_tracker.set_plan(Vec::new());
         self.set_info_notice(crate::i18n::t("zc-chat-resyncing"));
     }
 
@@ -9716,14 +9734,6 @@ mod tests {
         chat.apply_session_reattach_result(update);
     }
 
-    async fn apply_next_resync_result(chat: &mut Chat, reason: &str) {
-        let update = tokio::time::timeout(Duration::from_secs(2), chat.session_resync_rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{reason}"))
-            .expect("session resync result channel should stay open");
-        chat.apply_session_resync_result(update);
-    }
-
     #[test]
     fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
         let mut s = state();
@@ -10856,7 +10866,27 @@ mod tests {
             "queue dispatch stays gated until transcript reload completes"
         );
 
-        apply_next_resync_result(&mut chat, "session/messages should finish resync").await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session/messages should finish resync");
+        // The daemon's authoritative idle response is ordered after this old
+        // terminal notification on the same RPC stream. Exercise the real
+        // frame-tick order: the resync gate must discard the old completion
+        // before its result releases the queued follow-up.
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "turn_complete",
+                "session_id": "sess-1",
+                "outcome": "completed",
+                "content": "stale late completion",
+            }),
+        );
+        chat.tick_transport_events();
         let prompt = next_rpc_request(&mut writer_rx, "recovery should release queued input").await;
         assert_eq!(prompt["method"], method::SESSION_PROMPT);
         assert_eq!(prompt["params"]["prompt"], "send after recovery");
@@ -10865,6 +10895,10 @@ mod tests {
         };
         assert_eq!(state.queue_len(), 0);
         assert!(state.turn_in_flight, "queued follow-up is now in flight");
+        assert!(state.entries.iter().all(|entry| !matches!(
+            entry,
+            ChatEntry::AgentMessage(message) if message.as_ref() == "stale late completion"
+        )));
         assert!(matches!(
             state.entries.get(1),
             Some(ChatEntry::AgentMessage(message)) if message.as_ref() == "durable answer"
@@ -10977,6 +11011,58 @@ mod tests {
         let summaries = chat.session_summaries();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].session_id, "sess-b");
+    }
+
+    #[tokio::test]
+    async fn failed_close_keeps_session_tracked_for_retry() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let chat = two_session_chat(&rpc);
+
+        let handle = tokio::spawn(async move {
+            let mut chat = chat;
+            assert!(!chat.close_session("sess-a").await);
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "close must tell the daemon").await;
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "temporary failure",
+        );
+
+        let chat = handle.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-a"));
+        assert_eq!(chat.session_summaries().len(), 2);
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("failed close must retain the focused session");
+        };
+        assert!(state.info_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn close_not_found_removes_stale_local_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let chat = two_session_chat(&rpc);
+
+        let handle = tokio::spawn(async move {
+            let mut chat = chat;
+            assert!(chat.close_session("sess-a").await);
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "close must tell the daemon").await;
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_NOT_FOUND,
+            "Session not found",
+        );
+
+        let chat = handle.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-b"));
+        assert_eq!(chat.session_summaries().len(), 1);
     }
 
     #[tokio::test]
