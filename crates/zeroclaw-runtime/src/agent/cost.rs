@@ -222,21 +222,34 @@ fn merge_config_and_live_rates(config_rates: ModelRates, live: Option<ModelRates
     config_rates.or(live.unwrap_or_default())
 }
 
-fn pricing_available_for_usage(
+fn normalized_rates(rates: ModelRates) -> ModelRates {
+    let valid = |rate: Option<f64>| rate.filter(|value| value.is_finite() && *value >= 0.0);
+    ModelRates {
+        input_per_mtok: valid(rates.input_per_mtok),
+        output_per_mtok: valid(rates.output_per_mtok),
+        cached_input_per_mtok: valid(rates.cached_input_per_mtok),
+    }
+}
+
+fn unpriced_tokens_for_usage(
     rates: ModelRates,
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
-) -> bool {
+) -> u64 {
     let cached_input_tokens = cached_input_tokens.min(input_tokens);
     let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
-    let uncached_input_priced = uncached_input_tokens == 0 || rates.input_per_mtok.is_some();
-    let cached_input_priced = cached_input_tokens == 0
-        || rates.cached_input_per_mtok.is_some()
-        || rates.input_per_mtok.is_some();
-    let output_priced = output_tokens == 0 || rates.output_per_mtok.is_some();
-
-    uncached_input_priced && cached_input_priced && output_priced
+    let mut unpriced = 0_u64;
+    if rates.input_per_mtok.is_none() {
+        unpriced = unpriced.saturating_add(uncached_input_tokens);
+    }
+    if rates.cached_input_per_mtok.is_none() && rates.input_per_mtok.is_none() {
+        unpriced = unpriced.saturating_add(cached_input_tokens);
+    }
+    if rates.output_per_mtok.is_none() {
+        unpriced = unpriced.saturating_add(output_tokens);
+    }
+    unpriced
 }
 
 /// A model with token usage whose ledger records explicitly report that one
@@ -355,9 +368,11 @@ fn record_tool_loop_cost_usage_inner(
         .ok()
         .flatten()?;
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let config_rates = pricing
-        .map(|map| resolve_rates_opt(map, model))
-        .unwrap_or_default();
+    let config_rates = normalized_rates(
+        pricing
+            .map(|map| resolve_rates_opt(map, model))
+            .unwrap_or_default(),
+    );
 
     // Live-price FALLBACK fills only the dimensions config left unset; never
     // fetches on this path (reads a cached snapshot, empty unless a provider
@@ -365,7 +380,7 @@ fn record_tool_loop_cost_usage_inner(
     let live = (!config_rates.is_complete())
         .then(|| live_pricing_for(model_provider_name, model))
         .flatten();
-    let mut rates = merge_config_and_live_rates(config_rates, live);
+    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
 
     if rates.input_per_mtok.is_none()
         && rates.output_per_mtok.is_none()
@@ -379,8 +394,9 @@ fn record_tool_loop_cost_usage_inner(
         });
     }
 
-    let pricing_available =
-        pricing_available_for_usage(rates, input_tokens, cached_input_tokens, output_tokens);
+    rates = normalized_rates(rates);
+    let unpriced_tokens =
+        unpriced_tokens_for_usage(rates, input_tokens, cached_input_tokens, output_tokens);
     let input_rate = rates.input_per_mtok.unwrap_or(0.0);
     let output_rate = rates.output_per_mtok.unwrap_or(0.0);
     let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
@@ -394,9 +410,10 @@ fn record_tool_loop_cost_usage_inner(
         cached_rate,
         output_rate,
     );
-    cost_usage.pricing_available = pricing_available;
+    cost_usage.unpriced_tokens = unpriced_tokens;
+    cost_usage.pricing_available = unpriced_tokens == 0;
 
-    if ctx.tracker.is_some() && !pricing_available {
+    if ctx.tracker.is_some() && unpriced_tokens > 0 {
         warn_once_missing_pricing(model_provider_name, model);
     }
 
@@ -792,23 +809,36 @@ mod tests {
     }
 
     #[test]
-    fn pricing_availability_requires_each_token_bearing_dimension() {
+    fn unpriced_count_tracks_each_token_bearing_dimension() {
         let input_only = ModelRates {
             input_per_mtok: Some(0.0),
             output_per_mtok: None,
             cached_input_per_mtok: None,
         };
-        assert!(pricing_available_for_usage(input_only, 100, 0, 0));
-        assert!(!pricing_available_for_usage(input_only, 100, 0, 1));
-        assert!(pricing_available_for_usage(input_only, 100, 100, 0));
+        assert_eq!(unpriced_tokens_for_usage(input_only, 100, 0, 0), 0);
+        assert_eq!(unpriced_tokens_for_usage(input_only, 100, 0, 1), 1);
+        assert_eq!(unpriced_tokens_for_usage(input_only, 100, 100, 0), 0);
 
         let cached_only = ModelRates {
             input_per_mtok: None,
             output_per_mtok: None,
             cached_input_per_mtok: Some(0.0),
         };
-        assert!(pricing_available_for_usage(cached_only, 100, 100, 0));
-        assert!(!pricing_available_for_usage(cached_only, 100, 99, 0));
+        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 100, 0), 0);
+        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 99, 0), 1);
+    }
+
+    #[test]
+    fn invalid_rates_are_removed_without_erasing_configured_zero() {
+        let normalized = normalized_rates(ModelRates {
+            input_per_mtok: Some(-1.0),
+            output_per_mtok: Some(f64::INFINITY),
+            cached_input_per_mtok: Some(0.0),
+        });
+        assert_eq!(normalized.input_per_mtok, None);
+        assert_eq!(normalized.output_per_mtok, None);
+        assert_eq!(normalized.cached_input_per_mtok, Some(0.0));
+        assert_eq!(unpriced_tokens_for_usage(normalized, 100, 80, 20), 40);
     }
 
     #[test]
@@ -1248,6 +1278,77 @@ mod tests {
         assert_eq!(records[0].usage.cost_usd, 0.0);
         assert!(!records[1].usage.pricing_available);
         assert_eq!(records[1].usage.total_tokens, 150);
+        assert_eq!(records[1].usage.unpriced_tokens, 150);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_persists_partial_and_invalid_exposure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let mut config = Config::default();
+        config.providers.models.deepseek.insert(
+            "invalid".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("invalid-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.cost.rates.providers.models.deepseek.insert(
+            "invalid-model".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(-1.0),
+                output_per_mtok: Some(f64::INFINITY),
+                cached_input_per_mtok: None,
+            },
+        );
+        let mut pricing = build_model_provider_pricing(&config);
+        pricing.insert(
+            "partial".to_string(),
+            HashMap::from([("partial-model.input".to_string(), 2.0)]),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cached_input_tokens: Some(0),
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (provider, model) in [
+                ("partial", "partial-model"),
+                ("deepseek.invalid", "invalid-model"),
+            ] {
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(Some(ctx.clone()), async {
+                        record_tool_loop_cost_usage(provider, model, &usage)
+                    })
+                    .await
+                    .expect("usage should be recorded");
+            }
+        });
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let records: Vec<zeroclaw_config::cost::types::CostRecord> = stored
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[0].usage.unpriced_tokens, 20);
+        assert!(!records[0].usage.pricing_available);
+        assert_eq!(records[1].usage.unpriced_tokens, 120);
+        assert!(!records[1].usage.pricing_available);
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.by_model["partial-model"].unpriced_tokens, 20);
+        assert_eq!(summary.by_model["invalid-model"].unpriced_tokens, 120);
     }
 
     #[test]

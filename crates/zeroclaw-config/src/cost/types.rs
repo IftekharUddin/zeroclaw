@@ -18,6 +18,12 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     /// Calculated cost in USD
     pub cost_usd: f64,
+    /// Token-bearing dimensions that had no valid resolved price when this
+    /// record was created. This is the canonical exposure count for new rows;
+    /// `pricing_available` remains as a compatibility projection for older
+    /// ledgers written before dimension-level provenance existed.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub unpriced_tokens: u64,
     #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
     pub pricing_available: bool,
     /// Timestamp of the request
@@ -108,6 +114,7 @@ impl TokenUsage {
             cached_input_tokens,
             total_tokens,
             cost_usd,
+            unpriced_tokens: 0,
             pricing_available: true,
             timestamp: chrono::Utc::now(),
         }
@@ -422,5 +429,6 @@ mod tests {
 
         assert_eq!(parsed.task_id.as_deref(), Some("task-123"));
         assert!(parsed.usage.pricing_available);
+        assert_eq!(parsed.usage.unpriced_tokens, 0);
     }
 }

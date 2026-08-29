@@ -41,6 +41,18 @@ fn usage_record(
     })
 }
 
+fn usage_record_with_unpriced_tokens(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    unpriced_tokens: u64,
+) -> Value {
+    let mut record = usage_record(model, input_tokens, output_tokens, cost_usd, Some(false));
+    record["usage"]["unpriced_tokens"] = json!(unpriced_tokens);
+    record
+}
+
 fn run_status(records: &[Value]) -> Output {
     let config_dir = tempfile::tempdir().unwrap();
     write_config(config_dir.path());
@@ -110,6 +122,22 @@ fn mixed_status_fixture_counts_only_the_unpriced_subset() {
     assert!(stderr.contains("Pricing unavailable for 1 model(s) (100 tokens uncosted)"));
     assert!(stderr.contains("mixed-model"));
     assert!(!stderr.contains("250 tokens uncosted"));
+}
+
+#[test]
+fn partially_priced_status_fixture_reports_only_missing_dimension() {
+    let output = run_status(&[usage_record_with_unpriced_tokens(
+        "partial-model",
+        100,
+        20,
+        0.0002,
+        20,
+    )]);
+    let (stdout, stderr) = output_text(&output);
+    assert!(stdout.contains("Spent today:       $0.0002 / $10.00"));
+    assert!(stderr.contains("Pricing unavailable for 1 model(s) (20 tokens uncosted)"));
+    assert!(stderr.contains("partial-model"));
+    assert!(!stderr.contains("120 tokens uncosted"));
 }
 
 #[test]

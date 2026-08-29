@@ -566,7 +566,14 @@ fn add_usage_to_model_stats(entry: &mut ModelStats, record: &CostRecord) {
     entry.input_tokens += record.usage.input_tokens;
     entry.output_tokens += record.usage.output_tokens;
     entry.cached_input_tokens += record.usage.cached_input_tokens;
-    if !record.usage.pricing_available {
+    if record.usage.unpriced_tokens > 0 {
+        entry.unpriced_tokens = entry
+            .unpriced_tokens
+            .saturating_add(record.usage.unpriced_tokens);
+    } else if !record.usage.pricing_available {
+        // Compatibility with rows written by the first provenance format,
+        // which had only a record-level boolean. Rows older than that omit the
+        // boolean too and deserialize as priced by the existing default.
         entry.unpriced_tokens = entry
             .unpriced_tokens
             .saturating_add(record.usage.total_tokens);
@@ -1041,6 +1048,22 @@ mod tests {
         assert_eq!(model.total_tokens, 425);
         assert_eq!(model.unpriced_tokens, 275);
         assert_eq!(model.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn model_summary_prefers_dimension_level_unpriced_count() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let mut partial = TokenUsage::new("test/model", 100, 20, 0, 2.0, 0.0, 0.0);
+        partial.unpriced_tokens = 20;
+        partial.pricing_available = false;
+
+        tracker.record_usage(partial).unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        let model = summary.by_model.get("test/model").unwrap();
+        assert_eq!(model.total_tokens, 120);
+        assert_eq!(model.unpriced_tokens, 20);
     }
 
     #[test]
