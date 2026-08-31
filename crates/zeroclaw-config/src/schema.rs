@@ -6804,12 +6804,13 @@ impl CostRatesConfig {
     pub fn validate(&self) -> Result<()> {
         fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
             if let Some(value) = value
-                && (!value.is_finite() || value < 0.0)
+                && !crate::cost::is_sane_usd_rate(value)
             {
+                let max = crate::cost::MAX_SANE_USD_RATE;
                 validation_bail!(
                     InvalidNumericRange,
                     path.clone(),
-                    "{path} = {value} is invalid; cost rates must be finite and greater than or equal to 0"
+                    "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
                 );
             }
             Ok(())
@@ -33393,11 +33394,12 @@ group_policy = "disabled"
     }
 
     #[test]
-    async fn cost_rate_validation_rejects_negative_and_non_finite_typed_rates() {
+    async fn cost_rate_validation_rejects_out_of_range_typed_rates() {
         for (field, value) in [
             ("input_per_mtok", -0.01),
             ("output_per_mtok", f64::NAN),
             ("cached_input_per_mtok", f64::INFINITY),
+            ("input_per_mtok", f64::MAX),
         ] {
             let mut rates = CostRatesConfig::default();
             rates.providers.models.openai.insert(
@@ -33490,6 +33492,22 @@ group_policy = "disabled"
 
         validate_config_with_cost_rates(rates)
             .expect("0.0 is a deliberate free rate, not missing or invalid pricing");
+    }
+
+    #[test]
+    async fn cost_rate_validation_accepts_the_shared_safety_boundary() {
+        let mut rates = CostRatesConfig::default();
+        rates.providers.models.openai.insert(
+            "boundary-model".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+            },
+        );
+
+        validate_config_with_cost_rates(rates)
+            .expect("the canonical maximum cost rate must remain valid");
     }
 
     /// `cost.rates.providers.models.<type>` is a
