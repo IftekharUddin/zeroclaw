@@ -14198,7 +14198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_update_routes_callback_to_single_edit_and_advances_offset() {
+    async fn process_update_routes_callback_to_single_edit_and_returns_advanced() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use zeroclaw_api::channel::ChannelApprovalResponse;
@@ -14243,7 +14243,6 @@ mod tests {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
-        let mut offset = 0i64;
         let mut transient_retry = None;
         let update = serde_json::json!({
             "update_id": 41,
@@ -14255,11 +14254,8 @@ mod tests {
             }
         });
 
-        let outcome = ch
-            .process_update(&update, &tx, &mut offset, &mut transient_retry)
-            .await;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
         assert!(matches!(outcome, UpdateOutcome::Advanced));
-        assert_eq!(offset, 42);
         assert_eq!(resp_rx.await.unwrap(), ChannelApprovalResponse::Approve);
         assert!(
             rx.try_recv().is_err(),
