@@ -47,6 +47,8 @@ const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
 const SESSION_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SESSION_RECOVERY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(35);
+const SESSION_RECOVERY_MAX_ATTEMPTS: u8 = 4;
+const SESSION_RECOVERY_RETRY_BASE: Duration = Duration::from_millis(100);
 
 fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String {
     if let Some(cleanup) = cleanup {
@@ -1302,9 +1304,27 @@ impl Chat {
         }
 
         tokio::spawn(async move {
-            let result = Self::cancel_confirm_and_reload(&rpc, &session_id).await;
+            let result = Self::cancel_confirm_and_reload_with_retry(&rpc, &session_id).await;
             let _ = tx.send(SessionResyncResult { session_id, result }).await;
         });
+    }
+
+    async fn cancel_confirm_and_reload_with_retry(
+        rpc: &Arc<RpcClient>,
+        session_id: &str,
+    ) -> Result<Vec<crate::client::MessageEntry>, String> {
+        let mut last_error = String::new();
+        for attempt in 0..SESSION_RECOVERY_MAX_ATTEMPTS {
+            match Self::cancel_confirm_and_reload(rpc, session_id).await {
+                Ok(messages) => return Ok(messages),
+                Err(error) => last_error = error,
+            }
+            if attempt + 1 < SESSION_RECOVERY_MAX_ATTEMPTS {
+                let multiplier = 1_u32 << u32::from(attempt);
+                tokio::time::sleep(SESSION_RECOVERY_RETRY_BASE * multiplier).await;
+            }
+        }
+        Err(last_error)
     }
 
     async fn cancel_confirm_and_reload(
@@ -10755,6 +10775,83 @@ mod tests {
             ChatEntry::SystemMessage(message)
                 if message.as_ref() == crate::i18n::t("zc-chat-resynced")
         )));
+    }
+
+    #[tokio::test]
+    async fn notification_resync_retries_a_transient_rpc_failure() {
+        let (tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.push_user_message(Some("interrupted".to_string()), Vec::new());
+        active
+            .enqueue_message("send after retry".to_string(), Vec::new())
+            .expect("queue follow-up");
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.session_order = vec!["sess-1".to_string()];
+
+        chat.begin_session_resync("sess-1".to_string());
+        let cancel = next_rpc_request(&mut writer_rx, "first resync cancels the turn").await;
+        assert_eq!(cancel["method"], method::SESSION_CANCEL);
+        respond_ok(
+            &outbound,
+            &cancel,
+            serde_json::json!({ "session_id": "sess-1", "cancelled": true }),
+        );
+        let state_request =
+            next_rpc_request(&mut writer_rx, "first resync checks terminal state").await;
+        assert_eq!(state_request["method"], method::SESSION_STATE);
+        respond_err(
+            &outbound,
+            &state_request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "transient state lookup failure",
+        );
+
+        assert!(chat.session_resync_in_flight.contains("sess-1"));
+        let retry_cancel =
+            next_rpc_request(&mut writer_rx, "resync must retry after a transient error").await;
+        assert_eq!(retry_cancel["method"], method::SESSION_CANCEL);
+        respond_ok(
+            &outbound,
+            &retry_cancel,
+            serde_json::json!({ "session_id": "sess-1", "cancelled": false }),
+        );
+        let retry_state =
+            next_rpc_request(&mut writer_rx, "retry checks terminal state again").await;
+        assert_eq!(retry_state["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &retry_state,
+            serde_json::json!({ "session_id": "sess-1", "state": "idle" }),
+        );
+        let messages = next_rpc_request(&mut writer_rx, "retry reloads the transcript").await;
+        assert_eq!(messages["method"], method::SESSION_MESSAGES);
+        respond_ok(
+            &outbound,
+            &messages,
+            serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": "interrupted" },
+                    { "role": "assistant", "content": "durable answer" }
+                ]
+            }),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retry must finish resynchronization");
+        chat.tick_transport_events();
+
+        let prompt = next_rpc_request(&mut writer_rx, "retry releases queued input").await;
+        assert_eq!(prompt["method"], method::SESSION_PROMPT);
+        assert_eq!(prompt["params"]["prompt"], "send after retry");
+        assert!(!chat.session_resync_in_flight.contains("sess-1"));
     }
 
     #[tokio::test]

@@ -1105,6 +1105,38 @@ impl RpcDispatcher {
         self.process_line(line).await;
     }
 
+    fn rebind_rpc_approval_channel(
+        &self,
+        agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        session_id: String,
+    ) {
+        let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
+            "rpc",
+            session_id,
+            Arc::clone(&self.rpc),
+            Arc::clone(&self.ctx.approval_pending),
+            self.client_elicitation_caps,
+        ));
+        if let Ok(mut guard) = agent.try_lock() {
+            guard.set_channel_name("rpc".to_string());
+            guard
+                .channel_handles()
+                .register_channel("rpc", approval_channel);
+            return;
+        }
+
+        // An active turn owns the Agent mutex. Rebinding must not make the
+        // reconnect RPC wait for that turn; install the new back-channel as
+        // soon as the predecessor releases the canonical Agent.
+        tokio::spawn(async move {
+            let mut guard = agent.lock().await;
+            guard.set_channel_name("rpc".to_string());
+            guard
+                .channel_handles()
+                .register_channel("rpc", approval_channel);
+        });
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         let resuming = req.session_id.is_some();
@@ -1117,6 +1149,41 @@ impl RpcDispatcher {
             .chat_mode
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
+
+        // A caller-supplied ID is a resume selector. The live RpcSession is
+        // the canonical in-process incarnation, including provider history;
+        // replacing it while its predecessor turn runs can publish an Agent
+        // that never observes the predecessor's completed turn.
+        if resuming
+            && let Some(existing) = self
+                .ctx
+                .sessions
+                .resume_existing(
+                    &session_id,
+                    &req.agent_alias,
+                    &chat_mode,
+                    self.tui_id.clone(),
+                )
+                .await
+                .map_err(|message| rpc_err(INVALID_PARAMS, message))?
+        {
+            self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
+            if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+                && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
+                && let Some(notification) = plan_replay_notification(&session_id, &plan)
+            {
+                let _ = self.rpc.send_raw(notification).await;
+            }
+            if let Some(ref hooks) = self.ctx.hooks {
+                hooks.fire_session_start(&session_id, "rpc").await;
+            }
+            return to_result(SessionNewResult {
+                session_id,
+                agent_alias: existing.agent_alias,
+                message_count: existing.message_count,
+                workspace_dir: existing.workspace_dir,
+            });
+        }
 
         // Resuming an ACP session with no caller cwd: recover the original
         // working directory from the persisted store so the rehydrated session
@@ -1217,13 +1284,19 @@ impl RpcDispatcher {
 
         self.ctx
             .sessions
-            .insert(
+            .insert_if_absent(
                 session_id.clone(),
                 super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
                     .with_owner(self.tui_id.clone()),
             )
             .await
-            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+            .map_err(|message| {
+                if message == "session already exists" {
+                    rpc_err(SESSION_BUSY, "Session resume already in progress")
+                } else {
+                    rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+                }
+            })?;
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -7847,7 +7920,9 @@ mod tests {
                 make_persistence_test_dispatcher(config, tmp.path());
             let agent = crate::agent::agent::Agent::builder()
                 .model_provider(Box::new(DummyModelProvider))
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
                 .observer(Arc::new(crate::observability::noop::NoopObserver))
                 .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -7894,6 +7969,72 @@ mod tests {
             assert_eq!(running["turn_id"], generation.to_string());
             sessions.remove_cancel_token(session_id, generation);
             assert_eq!(read_state().await["state"], "idle");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_id_resume_keeps_live_chat_and_acp_agent_incarnations() {
+        for (session_id, chat_mode) in [("live-chat-resume", "chat"), ("live-acp-resume", "acp")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let (dispatcher, sessions, _chat_backend, _acp_store) =
+                make_persistence_test_dispatcher(config, tmp.path());
+            let params = json!({
+                "agent_alias": "test-agent",
+                "chat_mode": chat_mode,
+                "session_id": session_id,
+            });
+            dispatcher
+                .handle_session_new_for_test(&params)
+                .await
+                .expect("initial session/new must succeed");
+
+            let predecessor = sessions
+                .get_agent(session_id)
+                .await
+                .expect("live session must own an Agent");
+            let generation = sessions
+                .get_generation(session_id)
+                .await
+                .expect("live session must have a generation");
+            let mut predecessor_guard = predecessor.lock().await;
+            predecessor_guard.seed_conversation_history(vec![
+                zeroclaw_api::model_provider::ConversationMessage::Chat(ChatMessage::assistant(
+                    "predecessor turn",
+                )),
+            ]);
+            let turn_generation = sessions
+                .register_cancel_token(session_id, tokio_util::sync::CancellationToken::new());
+
+            let resumed = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                dispatcher.handle_session_new_for_test(&params),
+            )
+            .await
+            .expect("reattach must not wait for the active predecessor Agent")
+            .expect("same-ID reattach must succeed");
+            assert_eq!(resumed["session_id"], session_id);
+            assert_eq!(
+                sessions.get_generation(session_id).await,
+                Some(generation),
+                "same-ID reattach must not publish a successor generation"
+            );
+            let resumed_agent = sessions
+                .get_agent(session_id)
+                .await
+                .expect("reattached session must remain live");
+            assert!(
+                Arc::ptr_eq(&predecessor, &resumed_agent),
+                "the next prompt must use the predecessor Agent and its provider history"
+            );
+            assert!(predecessor_guard.history().iter().any(|message| matches!(
+                message,
+                zeroclaw_api::model_provider::ConversationMessage::Chat(chat)
+                    if chat.content == "predecessor turn"
+            )));
+
+            sessions.remove_cancel_token(session_id, turn_generation);
+            drop(predecessor_guard);
         }
     }
 
@@ -11169,14 +11310,14 @@ mod tests {
     //
     // These tests use a SessionStore test-only gate to pause stale work
     // after the generation is captured but before the gated method commits,
-    // then replace the session through session/new while the stale work is
-    // paused. After releasing the gate they wait for the gated method to
-    // exit (done notification), then assert the successor is untouched.
+    // then remove and recreate the session while stale work is paused. A
+    // live same-ID `session/new` is now an idempotent resume; explicit removal
+    // still creates a successor generation and exercises the stale-work gate.
 
     /// Deterministic race: `session/configure` captures the original
-    /// generation, enters the gated method, then the session is replaced
-    /// via `session/new` while the stale configure is paused. The stale
-    /// work must be rejected and the successor must remain untouched.
+    /// generation, enters the gated method, then the session is removed and
+    /// recreated while the stale configure is paused. The stale work must be
+    /// rejected and the successor must remain untouched.
     #[tokio::test]
     async fn session_configure_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11212,8 +11353,9 @@ mod tests {
         // commit pending).
         entered.notified().await;
 
-        // Replace the session via session/new while the stale configure
-        // is paused — this is caller-supplied same-ID replacement.
+        // Explicitly end the old incarnation before recreating the same ID.
+        // A live same-ID session/new must resume rather than replace it.
+        assert!(sessions.remove(&session_id).await);
         let dispatcher2 = make_shared_sessions_dispatcher(
             make_model_refresh_test_config(&tmp),
             Arc::clone(&sessions),
@@ -11227,7 +11369,7 @@ mod tests {
             .await;
         assert!(
             replace_res.is_ok(),
-            "session/new replacement must succeed: {replace_res:?}"
+            "session/new recreation must succeed: {replace_res:?}"
         );
 
         // Release the gate — stale work sees the generation mismatch.
@@ -11279,8 +11421,8 @@ mod tests {
     /// Deterministic race: config/set triggers an async refresh. The
     /// refresh snapshots the session identity, acquires the per-session
     /// lock, builds the provider, then blocks at `apply_model_provider`.
-    /// The session is replaced via `session/new` while paused. The stale
-    /// refresh must skip the successor.
+    /// The session is removed and recreated via `session/new` while paused.
+    /// The stale refresh must skip the successor.
     #[tokio::test]
     async fn config_set_refresh_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11308,8 +11450,8 @@ mod tests {
         // provider built, apply pending).
         entered.notified().await;
 
-        // Replace the session via session/new while the stale refresh is
-        // paused.
+        // Explicitly end the old incarnation before recreating the same ID.
+        assert!(sessions.remove(&session_id).await);
         let dispatcher2 = make_shared_sessions_dispatcher(
             make_model_refresh_test_config(&tmp),
             Arc::clone(&sessions),
@@ -11324,7 +11466,7 @@ mod tests {
             .await;
         assert!(
             replace_res.is_ok(),
-            "session/new replacement must succeed: {replace_res:?}"
+            "session/new recreation must succeed: {replace_res:?}"
         );
 
         // Release the gate — stale refresh sees generation mismatch.

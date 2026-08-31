@@ -54,6 +54,12 @@ visible = true # show the agent/session sidebar at launch
 width = 24     # target width in terminal columns
 ```
 
+Press `Ctrl+B` to show or hide the sidebar. Quickstart remains reachable from
+the keyboard mode bar and also appears as a sidebar launcher, including at
+narrow terminal widths. Selecting an existing agent from the sidebar starts a
+new Chat or Code session without replacing the other sessions already tracked
+by that pane.
+
 TodoWrite values are re-read at every session boundary, so an edit made in the
 Config pane applies to the next session you start, restart, or switch to, with
 no zerocode restart needed.
