@@ -1840,6 +1840,13 @@ impl RpcClient {
     /// tests to enqueue a burst before the pane drains it.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
+        Self::with_rpc_transport(outbound, Transport::Local)
+    }
+
+    /// Test-only constructor that also controls the transport-specific payload
+    /// encoding used by callers such as attachment dispatch.
+    #[cfg(test)]
+    pub fn with_rpc_transport(outbound: Arc<RpcOutbound>, transport: Transport) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(64);
         let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -1853,7 +1860,7 @@ impl RpcClient {
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
-            transport: Transport::Local,
+            transport,
             commands: Vec::new(),
         }
     }
