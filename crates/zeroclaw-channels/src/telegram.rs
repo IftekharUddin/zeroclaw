@@ -1382,6 +1382,8 @@ impl TelegramChannel {
     fn take_prior_media_groups_for_update(
         pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         update: &serde_json::Value,
+        now: Instant,
+        completed_poll_generation: u64,
     ) -> Vec<MediaGroupBatch> {
         let Some(message) = update.get("message") else {
             return Vec::new();
@@ -1406,6 +1408,9 @@ impl TelegramChannel {
         Self::take_media_groups_matching(pending, |key, group| {
             key.0 == chat_id
                 && !group.updates.is_empty()
+                && now.saturating_duration_since(group.last_seen)
+                    >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
+                && group.last_seen_poll_generation < completed_poll_generation
                 && group.updates.iter().all(|member| {
                     Self::update_id(member).is_some_and(|id| id < update_id)
                         && Self::update_message_id(member).is_some_and(|id| id < message_id)
@@ -2783,10 +2788,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .get("message_id")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
-        let thread_id = message
-            .get("message_thread_id")
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string());
+        let thread_id = Self::topic_thread_id(message);
         let reply_target = if let Some(ref tid) = thread_id {
             format!("{chat_id}:{tid}")
         } else {
@@ -4719,8 +4721,12 @@ impl TelegramChannel {
             let payload = queue[index].payload.clone();
             let outcome = match payload {
                 QueuedTelegramUpdatePayload::Ordinary(update) => {
-                    let prior_groups =
-                        Self::take_prior_media_groups_for_update(pending_media_groups, &update);
+                    let prior_groups = Self::take_prior_media_groups_for_update(
+                        pending_media_groups,
+                        &update,
+                        now,
+                        completed_poll_generation,
+                    );
                     let group_outcome = self
                         .dispatch_media_group_batches(
                             tx,
@@ -6292,7 +6298,22 @@ mod tests {
             }
         });
 
-        let batches = TelegramChannel::take_prior_media_groups_for_update(&mut pending, &ordinary);
+        assert!(
+            TelegramChannel::take_prior_media_groups_for_update(
+                &mut pending,
+                &ordinary,
+                now + Duration::from_millis(699),
+                2,
+            )
+            .is_empty(),
+            "an ordinary update must not flush an unsettled prior group"
+        );
+        let batches = TelegramChannel::take_prior_media_groups_for_update(
+            &mut pending,
+            &ordinary,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
         assert_eq!(batches.len(), 1);
         let ids: Vec<i64> = batches[0]
             .updates
@@ -6321,7 +6342,13 @@ mod tests {
             }
         });
         assert!(
-            TelegramChannel::take_prior_media_groups_for_update(&mut pending, &ordinary).is_empty()
+            TelegramChannel::take_prior_media_groups_for_update(
+                &mut pending,
+                &ordinary,
+                now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+                2,
+            )
+            .is_empty()
         );
         assert_eq!(pending.len(), 1);
 
@@ -6331,8 +6358,13 @@ mod tests {
             .unwrap()
             .remove("update_id");
         assert!(
-            TelegramChannel::take_prior_media_groups_for_update(&mut pending, &missing_update_id)
-                .is_empty()
+            TelegramChannel::take_prior_media_groups_for_update(
+                &mut pending,
+                &missing_update_id,
+                now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+                2,
+            )
+            .is_empty()
         );
         assert_eq!(pending.len(), 1);
     }
@@ -11214,8 +11246,8 @@ mod tests {
         let server = MockServer::start().await;
         // Poll 0: supported photo A for the album.
         let photo_a = media_group_update(10, 100, 100, "album");
-        // Poll 1: ordinary same-chat message B, then unsupported video C whose
-        // own update_id/message_id are LATER than B's.
+        // Poll 1: ordinary same-chat message B. Poll 2 carries unsupported
+        // video C, whose own update_id/message_id are LATER than B's.
         let ordinary = serde_json::json!({
             "update_id": 11,
             "message": {
@@ -11236,7 +11268,7 @@ mod tests {
                 "caption": "compare these"
             }
         });
-        // Poll 2: supported photo D completes the same album.
+        // Poll 3: supported photo D completes the same album.
         let photo_d = media_group_update(13, 103, 100, "album");
 
         let poll_index = Arc::new(AtomicUsize::new(0));
@@ -11252,13 +11284,14 @@ mod tests {
 
                 let result = match responder_index.fetch_add(1, Ordering::SeqCst) {
                     0 => vec![photo_a.clone()],
-                    1 => vec![ordinary.clone(), unsupported_video.clone()],
-                    2 => vec![photo_d.clone()],
+                    1 => vec![ordinary.clone()],
+                    2 => vec![unsupported_video.clone()],
+                    3 => vec![photo_d.clone()],
                     _ => Vec::new(),
                 };
                 let response = ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "ok": true, "result": result }));
-                if responder_index.load(Ordering::SeqCst) >= 3 {
+                if responder_index.load(Ordering::SeqCst) >= 4 {
                     response.set_delay(Duration::from_millis(750))
                 } else {
                     response
@@ -11357,6 +11390,27 @@ mod tests {
             "whole album delivered",
         )
         .await;
+
+        let poll_offsets: Vec<i64> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/botfake-token/getUpdates")
+            .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+            .filter(|body| {
+                body.get("timeout")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|timeout| timeout > 0)
+            })
+            .filter_map(|body| body.get("offset").and_then(serde_json::Value::as_i64))
+            .collect();
+        assert!(
+            poll_offsets
+                .iter()
+                .all(|offset| *offset == 0 || *offset >= 14),
+            "the listener must not acknowledge a partial album: {poll_offsets:?}"
+        );
 
         listener.abort();
         let _ = listener.await;
@@ -11692,13 +11746,13 @@ mod tests {
                     "ok": true,
                     "result": { "file_path": file_path }
                 })))
-                .expect(1)
+                .expect(2)
                 .mount(&server)
                 .await;
             Mock::given(method("GET"))
                 .and(path(format!("/file/botfake-token/{file_path}")))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-                .expect(1)
+                .expect(2)
                 .mount(&server)
                 .await;
         }
@@ -11719,9 +11773,10 @@ mod tests {
             "message": {
                 "message_id": 10,
                 "message_thread_id": 77,
+                "is_topic_message": true,
                 "media_group_id": "album-1",
                 "from": { "id": 7, "username": "alice" },
-                "chat": { "id": -100, "type": "group" },
+                "chat": { "id": -100, "type": "supergroup" },
                 "photo": [{ "file_id": "first-file", "file_size": 5 }],
                 "caption": "context"
             }
@@ -11731,9 +11786,10 @@ mod tests {
             "message": {
                 "message_id": 11,
                 "message_thread_id": 77,
+                "is_topic_message": true,
                 "media_group_id": "album-1",
                 "from": { "id": 7, "username": "alice" },
-                "chat": { "id": -100, "type": "group" },
+                "chat": { "id": -100, "type": "supergroup" },
                 "photo": [{ "file_id": "second-file", "file_size": 6 }],
                 "caption": "  @mybot compare these  "
             }
@@ -11743,9 +11799,10 @@ mod tests {
             "message": {
                 "message_id": 9,
                 "message_thread_id": 77,
+                "is_topic_message": true,
                 "media_group_id": "album-1",
                 "from": { "id": 7, "username": "alice" },
-                "chat": { "id": -100, "type": "group" },
+                "chat": { "id": -100, "type": "supergroup" },
                 "photo": [{
                     "file_id": "oversized-file",
                     "file_size": TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1
@@ -11764,7 +11821,10 @@ mod tests {
 
         let msg = expect_parsed_media_group(
             channel
-                .try_parse_media_group_with_unsupported(&[oversized, second, first], &[])
+                .try_parse_media_group_with_unsupported(
+                    &[oversized.clone(), second.clone(), first.clone()],
+                    &[],
+                )
                 .await,
             "valid siblings should survive one failed member",
         );
@@ -11803,6 +11863,23 @@ mod tests {
                 .count(),
             1
         );
+
+        let mut ordinary_reply_group = vec![oversized, second, first];
+        for update in &mut ordinary_reply_group {
+            update
+                .get_mut("message")
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .remove("is_topic_message");
+        }
+        let ordinary = expect_parsed_media_group(
+            channel
+                .try_parse_media_group_with_unsupported(&ordinary_reply_group, &[])
+                .await,
+            "ordinary reply-thread album should parse",
+        );
+        assert_eq!(ordinary.reply_target, "-100");
+        assert_eq!(ordinary.thread_ts, None);
     }
 
     #[tokio::test]
