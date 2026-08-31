@@ -1128,7 +1128,7 @@ impl RpcDispatcher {
         // An active turn owns the Agent mutex. Rebinding must not make the
         // reconnect RPC wait for that turn; install the new back-channel as
         // soon as the predecessor releases the canonical Agent.
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut guard = agent.lock().await;
             guard.set_channel_name("rpc".to_string());
             guard
