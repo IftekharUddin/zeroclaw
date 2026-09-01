@@ -408,10 +408,11 @@ fn record_tool_loop_cost_usage_inner(
         .flatten();
     let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
 
-    if rates.input_per_mtok.is_none()
-        && rates.output_per_mtok.is_none()
-        && let Some((cat_in, cat_out, cat_cached)) =
-            crate::agent::pricing_catalog::global_pricing_rates(model)
+    // The catalog is the final per-dimension fallback, not an all-or-nothing
+    // replacement. Preserve every configured/live value (including an
+    // explicit free 0.0) and fill only the dimensions still absent.
+    if let Some((cat_in, cat_out, cat_cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
     {
         rates = rates.or(ModelRates {
             input_per_mtok: (cat_in > 0.0).then_some(cat_in),
@@ -555,6 +556,16 @@ mod tests {
     use zeroclaw_providers::ProviderDispatch;
     use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
 
+    struct ResetGlobalPricingCatalog;
+
+    impl Drop for ResetGlobalPricingCatalog {
+        fn drop(&mut self) {
+            crate::agent::pricing_catalog::set_global_pricing_catalog(
+                crate::agent::pricing_catalog::GlobalPricingCatalog::default(),
+            );
+        }
+    }
+
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
     }
@@ -631,6 +642,7 @@ mod tests {
             GLOBAL_PRICING_CATALOG_TEST_LOCK, GlobalPricingCatalog, set_global_pricing_catalog,
         };
         let _catalog_lock = GLOBAL_PRICING_CATALOG_TEST_LOCK.lock();
+        let _catalog_reset = ResetGlobalPricingCatalog;
         let catalog: GlobalPricingCatalog = serde_json::from_str(
             r#"{"models":{"claude-haiku-4-5-20251001":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0,"cache_read_usd_per_mtok":0.1}}}"#,
         )
@@ -644,9 +656,57 @@ mod tests {
             Some((1.0, 5.0, 0.1)),
             "catalog must price the direct Anthropic model by its bare id"
         );
+    }
 
-        // Reset the process-global catalog so we don't leak into other tests.
-        set_global_pricing_catalog(GlobalPricingCatalog::default());
+    #[test]
+    fn global_catalog_fills_only_missing_configured_dimensions() {
+        use crate::agent::pricing_catalog::{
+            GLOBAL_PRICING_CATALOG_TEST_LOCK, GlobalPricingCatalog, set_global_pricing_catalog,
+        };
+        let _catalog_lock = GLOBAL_PRICING_CATALOG_TEST_LOCK.lock();
+        let _catalog_reset = ResetGlobalPricingCatalog;
+        let catalog: GlobalPricingCatalog = serde_json::from_str(
+            r#"{"models":{"partial-catalog-model":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0}}}"#,
+        )
+        .expect("catalog json parses");
+        set_global_pricing_catalog(catalog);
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "configured".to_string(),
+                HashMap::from([("partial-catalog-model.input".to_string(), 2.0)]),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cached_input_tokens: Some(0),
+        };
+
+        let (_, cost_usd) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                record_tool_loop_cost_usage("configured", "partial-catalog-model", &usage)
+            }))
+            .expect("partially configured usage");
+
+        let expected = (100.0 * 2.0 + 20.0 * 5.0) / 1_000_000.0;
+        assert!((cost_usd - expected).abs() < 1e-12);
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
+        assert!(record.usage.pricing_available);
+        assert_eq!(record.usage.unpriced_tokens, 0);
     }
 
     #[tokio::test]

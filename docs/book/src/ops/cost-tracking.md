@@ -284,11 +284,13 @@ v0.8.0+ it's a real bug: the dirty-path resolution lives in
 `crates/zeroclaw-config/src/schema.rs::apply_dirty_path`; file an
 issue with the daemon version and the path that drifted.
 
-**`missing_pricing` warns spam the log.** Emitted once per
-`(provider_type, model)` pair when `resolve_rates` returns `(0.0,
-0.0)`. Either the rate isn't configured for that model, or the
-upstream returned a different model id than what's in the rate
-sheet (some providers return versioned ids like
-`claude-3-5-sonnet-20241022` even when you configured
-`claude-3-5-sonnet`). Add the exact id the warn names, or set the
-unversioned id and rely on `resolve_rates`'s suffix-match path.
+**`missing_pricing` warns spam the log.** The runtime emits this once per
+`(provider_type, model)` pair when a token-bearing input, cached-input, or
+output dimension remains unpriced after `resolve_rates_opt` merges configured,
+live, and global-catalog rates. The warning names the incomplete dimensions; a
+partially configured model can therefore warn even though another dimension is
+already priced. Add only the missing dimensions for the exact model id named by
+the warning. Some providers return versioned ids such as
+`claude-3-5-sonnet-20241022` even when the configured id is
+`claude-3-5-sonnet`; the resolver also tries its documented path-suffix
+candidate before reporting the gap.
