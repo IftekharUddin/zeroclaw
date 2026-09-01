@@ -3933,6 +3933,12 @@ pub struct SessionCancelResult {}
 #[serde(rename_all = "snake_case")]
 pub struct SessionStateResult {
     pub state: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// `Some(empty)` is an authoritative cleared plan. `None` keeps
+    /// compatibility with older daemons that do not expose plan state.
+    #[serde(default)]
+    pub plan: Option<Vec<crate::wire::PlanEntry>>,
 }
 
 /// Session-scoped overrides mirror of

@@ -112,6 +112,36 @@ impl InboundRequestRouter {
         }
     }
 
+    /// Resolve every response-bearing request still owned by this router
+    /// before its transport is replaced. Parsed elicitations must not vanish
+    /// with the old router, and requests that arrived during pane rebuilding
+    /// need the same terminal answer before the old socket is closed.
+    async fn cancel_pending(&mut self) {
+        let mut pending = self
+            .deferred
+            .drain(..)
+            .map(|deferred| deferred.request)
+            .collect::<Vec<_>>();
+        while let Ok(request) = self.rx.try_recv() {
+            pending.push(request);
+        }
+        for request in pending {
+            let response = if request.method == "elicitation/create" {
+                Ok(serde_json::json!({ "action": "cancel" }))
+            } else {
+                Err(crate::jsonrpc::JsonRpcError {
+                    code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                    message: format!("Method not found: {}", request.method),
+                    data: None,
+                })
+            };
+            let _ = self
+                .rpc
+                .respond_to_inbound_request(request.id, response)
+                .await;
+        }
+    }
+
     /// Return the request only when no pane owns its session yet. The caller
     /// keeps that genuinely orphaned request for the bounded grace period.
     fn route(
@@ -680,6 +710,12 @@ async fn switch_mode(
     *mode = next;
 }
 
+fn remember_quickstart_return(current: Mode, next: Mode, return_mode: &mut Mode) {
+    if next == Mode::Quickstart && current != Mode::Quickstart {
+        *return_mode = current;
+    }
+}
+
 fn take_pending_quickstart_chat(
     reconnect_state: &SharedReconnectState,
     drain: QuickstartChatDrain,
@@ -925,7 +961,7 @@ pub async fn run(
                     }
                 }
                 crate::agent_sidebar::SidebarEvent::OpenQuickstart if mode != Mode::Quickstart => {
-                    quickstart_return = mode;
+                    remember_quickstart_return(mode, Mode::Quickstart, &mut quickstart_return);
                     switch_mode(
                         &mut mode,
                         Mode::Quickstart,
@@ -962,7 +998,7 @@ pub async fn run(
             let previous = Arc::clone(&rpc);
             rpc = Arc::new($new_client);
             match InboundRequestRouter::new(rpc.clone()) {
-                Ok(next_inbound_router) => {
+                Ok(mut next_inbound_router) => {
                     let resume_chat = chat_pane.resume_entries();
                     let resume_acp = acp_pane.resume_entries();
                     match build_panes!(resume_chat, resume_acp) {
@@ -974,6 +1010,7 @@ pub async fn run(
                             // failure cannot consume queues or retry state.
                             chat_pane.commit_reconnect_handoff();
                             acp_pane.commit_reconnect_handoff();
+                            inbound_router.cancel_pending().await;
                             // Assigned as one tuple: every pane the builder
                             // produces is adopted, and a later pane addition
                             // cannot stay bound to the old client silently.
@@ -993,6 +1030,7 @@ pub async fn run(
                             true
                         }
                         Err(_) => {
+                            next_inbound_router.cancel_pending().await;
                             let abandoned = std::mem::replace(&mut rpc, previous);
                             abandoned.shutdown();
                             false
@@ -1464,6 +1502,7 @@ pub async fn run(
                 )
                 .map(|delta| mode.cycle(delta));
                 if let Some(next) = switch_to {
+                    remember_quickstart_return(mode, next, &mut quickstart_return);
                     switch_mode(
                         &mut mode,
                         next,
@@ -1571,6 +1610,7 @@ pub async fn run(
                 if matches!(mouse.kind, MouseEventKind::Down(_))
                     && let Some(next) = mode_bar_layout.mode_at(mouse.column, mouse.row)
                 {
+                    remember_quickstart_return(mode, next, &mut quickstart_return);
                     switch_mode(
                         &mut mode,
                         next,
@@ -2578,6 +2618,81 @@ mod tests {
         assert!(
             writer_rx.try_recv().is_err(),
             "a centrally handled orphan must not be answered twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_replacement_resolves_deferred_and_queued_requests_once() {
+        let (tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound));
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let mut router = InboundRequestRouter {
+            rpc: client,
+            rx: inbound_rx,
+            deferred: Vec::new(),
+        };
+        router.deferred.push(DeferredInboundRequest {
+            request: inbound_elicitation("e-deferred", "missing-session"),
+            first_seen: Instant::now(),
+        });
+        inbound_tx
+            .send(inbound_elicitation(
+                "e-arrived-during-rebuild",
+                "missing-session",
+            ))
+            .unwrap();
+
+        router.cancel_pending().await;
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let line = tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
+                .await
+                .expect("router handoff must answer every owned request")
+                .expect("writer channel remains open");
+            let response: serde_json::Value = serde_json::from_str(&line).expect("valid response");
+            ids.push(response["id"].as_str().unwrap().to_string());
+            assert_eq!(response["result"]["action"], "cancel");
+        }
+        ids.sort();
+        assert_eq!(ids, vec!["e-arrived-during-rebuild", "e-deferred"]);
+        assert!(router.deferred.is_empty());
+
+        router.cancel_pending().await;
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a retired router must not answer the same request twice"
+        );
+    }
+
+    #[test]
+    fn quickstart_return_tracks_every_entry_surface() {
+        let mut return_mode = Mode::Dashboard;
+        remember_quickstart_return(Mode::Chat, Mode::Quickstart, &mut return_mode);
+        assert_eq!(
+            return_mode,
+            Mode::Chat,
+            "keyboard cycling records its source"
+        );
+
+        remember_quickstart_return(Mode::Acp, Mode::Quickstart, &mut return_mode);
+        assert_eq!(
+            return_mode,
+            Mode::Acp,
+            "mode-bar clicks record their source"
+        );
+
+        remember_quickstart_return(Mode::Quickstart, Mode::Quickstart, &mut return_mode);
+        assert_eq!(
+            return_mode,
+            Mode::Acp,
+            "re-entry never points back to Quickstart"
+        );
+        remember_quickstart_return(Mode::Logs, Mode::Sop, &mut return_mode);
+        assert_eq!(
+            return_mode,
+            Mode::Acp,
+            "ordinary tab changes do not rewrite it"
         );
     }
 

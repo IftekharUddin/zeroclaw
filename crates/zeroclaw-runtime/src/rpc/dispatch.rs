@@ -2822,6 +2822,7 @@ impl RpcDispatcher {
         let req: SessionIdParams = parse_params(params)?;
         if self.ctx.sessions.get_agent(&req.session_id).await.is_some() {
             let turn_generation = self.ctx.sessions.inflight_turn_generation(&req.session_id);
+            let plan = self.ctx.sessions.get_plan(&req.session_id).await;
             let queued = self
                 .ctx
                 .sessions
@@ -2839,6 +2840,7 @@ impl RpcDispatcher {
                 .to_string(),
                 turn_id: turn_generation.map(|generation| generation.to_string()),
                 turn_started_at: None,
+                plan,
             });
         }
 
@@ -2863,6 +2865,7 @@ impl RpcDispatcher {
                         state: ss.state,
                         turn_id: ss.turn_id,
                         turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
+                        plan: None,
                     });
                 }
                 Ok(None) => continue,
@@ -8978,6 +8981,17 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            sessions
+                .set_plan(
+                    session_id,
+                    vec![zeroclaw_api::plan::PlanEntry {
+                        content: "Recover canonical plan".to_string(),
+                        status: zeroclaw_api::plan::PlanStatus::InProgress,
+                        priority: zeroclaw_api::plan::PlanPriority::High,
+                        active_form: Some("Recovering canonical plan".to_string()),
+                    }],
+                )
+                .await;
 
             let read_state = || async {
                 dispatcher
@@ -8985,7 +8999,10 @@ mod tests {
                     .await
                     .unwrap()
             };
-            assert_eq!(read_state().await["state"], "idle");
+            let idle = read_state().await;
+            assert_eq!(idle["state"], "idle");
+            assert_eq!(idle["plan"][0]["content"], "Recover canonical plan");
+            assert_eq!(idle["plan"][0]["status"], "in_progress");
 
             let queue_guard = sessions
                 .session_queue

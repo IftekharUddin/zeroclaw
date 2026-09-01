@@ -439,6 +439,7 @@ zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-error-resume-history = The session reattached, but its durable transcript could not be loaded: { $error }
 zc-chat-session-switch-error = Failed to switch session: { $error }
 zc-chat-session-close-error = Failed to close session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
