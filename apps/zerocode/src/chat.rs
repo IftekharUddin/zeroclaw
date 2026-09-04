@@ -1263,11 +1263,13 @@ impl Chat {
         );
         state.cwd = session.workspace_dir;
         Self::refresh_model_identity(&self.rpc, &mut state).await;
-        let msgs = self
-            .rpc
-            .session_messages(session_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let msgs = match self.rpc.session_messages(session_id).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                let _ = self.rpc.session_close(session_id).await;
+                return Err(error.to_string());
+            }
+        };
         state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
         Ok(state)
     }
@@ -2846,6 +2848,7 @@ impl Chat {
             }
             Some(ChatTabAction::TodoToggle) => {
                 state.todo_tracker.toggle();
+                state.todo_close_hit_rect = None;
                 state.mark_dirty_full();
             }
             Some(ChatTabAction::BrowseEnter) => {
@@ -3502,6 +3505,19 @@ impl Chat {
                     | MouseEventKind::Up(MouseButton::Left) => return,
                     _ => {}
                 }
+            }
+
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && !state.input_bar.has_attachment_manager()
+                && state.todo_tracker.is_visible()
+                && state
+                    .todo_close_hit_rect
+                    .is_some_and(|rect| mouse::in_rect(mouse.column, mouse.row, rect))
+            {
+                state.todo_tracker.hide();
+                state.todo_close_hit_rect = None;
+                state.mark_dirty_full();
+                return;
             }
 
             let input_bar_consumed = state.input_bar.handle_mouse(mouse);
@@ -4292,9 +4308,10 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
     // rest of the pane (queue sidebar, transcript, input) lays out in the
     // remaining body. When the tracker wants no space, `body == area` and
     // the existing layout is untouched.
+    state.todo_close_hit_rect = None;
     let (area, todo_area) = carve_todo_area(&state.todo_tracker, area);
     if let Some(panel) = todo_area {
-        state.todo_tracker.render(f, panel);
+        state.todo_close_hit_rect = state.todo_tracker.render(f, panel);
     }
 
     let area = if state.queue_sidebar_open() {
@@ -6576,6 +6593,8 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
+    /// Exact close-cell target from the last Todo panel draw.
+    todo_close_hit_rect: Option<ratatui::layout::Rect>,
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
@@ -6665,6 +6684,7 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
+            todo_close_hit_rect: None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
         }
     }
@@ -8595,6 +8615,7 @@ impl ChatState {
         // Rebuilding from freshly resolved settings also applies any Config-pane
         // edit made since this pane's `ChatState` was constructed.
         self.todo_tracker.reset_for_session(todo_settings);
+        self.todo_close_hit_rect = None;
         cleanup_report.merge(self.cleanup_active_turn_attachments());
         cleanup_report.merge(self.clear_queue());
         self.surface_cleanup_report(cleanup_report);
@@ -8752,6 +8773,142 @@ mod tests {
             interrupted: false,
             recovery_required: false,
         }
+    }
+
+    fn active_chat() -> Chat {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        )));
+        chat
+    }
+
+    fn draw_todo_close(chat: &mut Chat) -> Rect {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| chat.draw(frame, frame.area()))
+            .unwrap();
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected an active session");
+        };
+        let close = state.todo_close_hit_rect.expect("rendered close control");
+        assert_eq!(
+            terminal.backend().buffer()[(close.x, close.y)].symbol(),
+            "✕"
+        );
+        close
+    }
+
+    #[tokio::test]
+    async fn todo_ctrl_p_reopens_latest_plan_after_hidden_update() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut chat = active_chat();
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            unreachable!()
+        };
+        state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+            content: "first".to_string(),
+            status: crate::wire::PlanStatus::Pending,
+            priority: crate::wire::PlanPriority::Medium,
+            active_form: None,
+        }]);
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !chat
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    &mut term,
+                )
+                .await
+        );
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            unreachable!()
+        };
+        assert!(!state.todo_tracker.is_visible());
+        state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+            content: "updated while hidden".to_string(),
+            status: crate::wire::PlanStatus::InProgress,
+            priority: crate::wire::PlanPriority::Medium,
+            active_form: None,
+        }]);
+        assert!(!state.todo_tracker.is_visible());
+
+        assert!(
+            !chat
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    &mut term,
+                )
+                .await
+        );
+        let ChatPhase::Active(state) = &chat.phase else {
+            unreachable!()
+        };
+        assert!(state.todo_tracker.is_visible());
+        assert_eq!(
+            state.todo_tracker.entries()[0].content,
+            "updated while hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_close_uses_rendered_hit_target_without_clearing_session_state() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut chat = active_chat();
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 1, row: 2 },
+            head: CellPoint { column: 4, row: 2 },
+            dragged: true,
+        };
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            unreachable!()
+        };
+        state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+            content: "keep this plan".to_string(),
+            status: crate::wire::PlanStatus::Pending,
+            priority: crate::wire::PlanPriority::Medium,
+            active_form: None,
+        }]);
+        state.input_bar.insert_text("keep this input");
+        state.transcript_selection = Some(selection);
+        assert!(state.composer_owns_text_input());
+
+        let close = draw_todo_close(&mut chat);
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 40),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("close must keep the session active");
+        };
+        assert!(!state.todo_tracker.is_visible());
+        assert_eq!(state.todo_tracker.entries()[0].content, "keep this plan");
+        assert_eq!(state.input_bar.input(), "keep this input");
+        assert_eq!(state.transcript_selection, Some(selection));
+        assert!(state.composer_owns_text_input());
+        assert!(state.todo_close_hit_rect.is_none());
     }
 
     fn command_action_from_initialize(
@@ -12611,15 +12768,6 @@ mod tests {
             }),
         );
 
-        let request = next_rpc_request(&mut rx, "successful switch should close old session").await;
-        assert_eq!(request["method"], method::SESSION_CLOSE);
-        assert_eq!(request["params"]["session_id"], "sess-old");
-        respond_ok(&rpc, &request, serde_json::json!({}));
-
-        let request = next_rpc_request(&mut rx, "double-click should refresh model identity").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let chat = tokio::time::timeout(Duration::from_secs(2), switch)
             .await
             .expect("double-click switch should finish")
@@ -12768,6 +12916,14 @@ mod tests {
                 "workspace_dir": "/tmp/broken"
             }),
         );
+
+        let request = next_rpc_request(
+            &mut rx,
+            "switch should refresh model identity before history",
+        )
+        .await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let request =
             next_rpc_request(&mut rx, "switch should load history before replacing state").await;
