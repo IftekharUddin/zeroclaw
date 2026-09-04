@@ -840,10 +840,13 @@ async fn switch_mode(
     if *mode == Mode::Sop && next != Mode::Sop {
         sop_pane.on_pane_blur();
     }
+    if *mode == Mode::Chat && next != Mode::Chat {
+        chat_pane.on_pane_blur();
+    }
     if dispatch_state.rpc_allowed() {
         match next {
             Mode::Acp => acp_pane.refresh_if_inactive().await,
-            Mode::Chat => chat_pane.refresh_if_inactive().await,
+            Mode::Chat => chat_pane.start_entry_retry(),
             Mode::Sop => sop_pane.refresh(),
             _ => {}
         }
@@ -4015,6 +4018,107 @@ mod tests {
         assert!(rendered.contains(&cancel));
         assert!(!rendered.contains("Action 0"));
         assert!(rendered.contains("Action 9"));
+    }
+
+    #[tokio::test]
+    async fn switching_to_chat_returns_before_agent_status_response() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+        let reconnect_state = SharedReconnectState::default();
+        let mut dashboard = dashboard::Dashboard::new(Arc::clone(&rpc), "", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop = sop_pane::SopPane::new(rpc);
+        let mut mode = Mode::Logs;
+        let dispatch_state = PostPollDispatchState::new(ConnectionState::Connected);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            switch_mode(
+                &mut mode,
+                Mode::Chat,
+                &dispatch_state,
+                &mut dashboard,
+                &mut quickstart,
+                &mut acp,
+                &mut chat,
+                &mut sop,
+            ),
+        )
+        .await
+        .expect("switching to Chat must not wait for agent status");
+
+        assert_eq!(mode, Mode::Chat);
+        let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Chat entry should start the background request")
+            .expect("RPC request channel should stay open");
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], crate::client::method::AGENTS_STATUS);
+        assert_eq!(rpc_out.pending_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn switching_away_from_chat_invalidates_entry_retry() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+        let reconnect_state = SharedReconnectState::default();
+        let mut dashboard = dashboard::Dashboard::new(Arc::clone(&rpc), "", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop = sop_pane::SopPane::new(Arc::clone(&rpc));
+        let mut mode = Mode::Chat;
+        let dispatch_state = PostPollDispatchState::new(ConnectionState::Connected);
+
+        chat.start_entry_retry();
+        let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Chat entry should request agents/status")
+            .expect("RPC request channel should stay open");
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+        switch_mode(
+            &mut mode,
+            Mode::Logs,
+            &dispatch_state,
+            &mut dashboard,
+            &mut quickstart,
+            &mut acp,
+            &mut chat,
+            &mut sop,
+        )
+        .await;
+
+        assert_eq!(mode, Mode::Logs);
+        let id = request["id"].as_str().unwrap();
+        rpc_out.dispatch_response(
+            id,
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: -32000,
+                message: "cancelled by test".to_string(),
+                data: None,
+            }),
+        );
+        for _ in 0..16 {
+            if rpc_out.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rpc_out.pending_count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "a blurred Chat pane must not continue into session creation"
+        );
     }
 
     #[test]
