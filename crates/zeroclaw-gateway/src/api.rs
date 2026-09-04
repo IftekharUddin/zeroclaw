@@ -1718,18 +1718,26 @@ pub async fn handle_api_sessions_list(
 /// 1. exact `id` if it already exists as a session/cancel key
 /// 2. `gw_{id}` if that exists
 /// 3. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise prefix `gw_`
-fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
-    if exists(id) {
-        return id.to_string();
-    }
-    if !id.starts_with("gw_") {
-        let prefixed = format!("gw_{id}");
-        if exists(&prefixed) {
-            return prefixed;
+fn resolve_gateway_session_key(
+    id: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Result<String, crate::session_identity::SessionIdError> {
+    match crate::session_identity::validate_and_canonicalize_gateway_session_id(id) {
+        Ok(ident) => {
+            if exists(id) {
+                Ok(id.to_string())
+            } else {
+                Ok(ident.session_key().to_string())
+            }
         }
-        return prefixed;
+        Err(e) => {
+            if exists(id) {
+                Ok(id.to_string())
+            } else {
+                Err(e)
+            }
+        }
     }
-    id.to_string()
 }
 
 /// Resolve one existing REST-write target and capture its lifecycle snapshot
@@ -1737,31 +1745,29 @@ fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> Strin
 ///
 /// `resolve_gateway_session_key` is appropriate for read-only lookups, but a
 /// writer cannot first observe existence and only later capture a generation:
-/// DELETE could land between those steps. Probe each candidate while holding
-/// that candidate's lifecycle authority, preserving the same exact-key-first
+/// DELETE could land between those steps. Probe candidate while holding
+/// its lifecycle authority, preserving the same exact-key-first
 /// resolution contract without pairing facts from different incarnations.
 fn capture_existing_gateway_writer(
     state: &AppState,
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     id: &str,
-) -> Option<(
-    String,
-    crate::session_lifecycle::DeletionGeneration,
-    crate::session_lifecycle::PersistenceGeneration,
-)> {
-    let mut candidates = vec![id.to_string()];
-    if !id.starts_with("gw_") {
-        candidates.push(format!("gw_{id}"));
+) -> Result<
+    Option<(
+        String,
+        crate::session_lifecycle::DeletionGeneration,
+        crate::session_lifecycle::PersistenceGeneration,
+    )>,
+    crate::session_identity::SessionIdError,
+> {
+    let session_key = resolve_gateway_session_key(id, |key| backend.session_exists(key))?;
+    if let Some((deletion, persistence)) = state
+        .session_lifecycle
+        .capture_existing_writer(&session_key, || backend.session_exists(&session_key))
+    {
+        return Ok(Some((session_key, deletion, persistence)));
     }
-    for session_key in candidates {
-        if let Some((deletion, persistence)) = state
-            .session_lifecycle
-            .capture_existing_writer(&session_key, || backend.session_exists(&session_key))
-        {
-            return Some((session_key, deletion, persistence));
-        }
-    }
-    None
+    Ok(None)
 }
 
 /// Display session id used by WebSocket `?session_id=` / event filters.
@@ -1788,7 +1794,16 @@ pub async fn handle_api_session_messages(
         .into_response();
     };
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+            )
+                .into_response();
+        }
+    };
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1836,15 +1851,24 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let Some((session_key, deletion_generation, persistence_generation)) =
-        capture_existing_gateway_writer(&state, backend.as_ref(), &id)
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
-    };
+    let (session_key, deletion_generation, persistence_generation) =
+        match capture_existing_gateway_writer(&state, backend.as_ref(), &id) {
+            Ok(Some(captured)) => captured,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Session not found"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+                )
+                    .into_response();
+            }
+        };
 
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
@@ -1991,7 +2015,16 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     // Take the cancel-token lock and record the deletion under it, then
     // evict the token — all in one critical section. `register_turn_if_current`
@@ -2102,24 +2135,22 @@ pub async fn handle_api_session_rename(
     // the session authority across both the existence probe and the mutation:
     // DELETE, which takes the same authority, cannot land in between.
     //
-    // Candidate order matches `resolve_gateway_session_key` — exact key first,
-    // then the `gw_` form — so the resolution contract is unchanged.
-    let mut candidates = vec![id.to_string()];
-    if !id.starts_with("gw_") {
-        candidates.push(format!("gw_{id}"));
-    }
-
-    let mut renamed = None;
-    for session_key in candidates {
-        renamed = state.session_lifecycle.with_existing_incarnation(
-            &session_key,
-            || backend.session_exists(&session_key),
-            || backend.set_session_name(&session_key, name),
-        );
-        if renamed.is_some() {
-            break;
+    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+            )
+                .into_response();
         }
-    }
+    };
+
+    let renamed = state.session_lifecycle.with_existing_incarnation(
+        &session_key,
+        || backend.session_exists(&session_key),
+        || backend.set_session_name(&session_key, name),
+    );
 
     match renamed {
         Some(Ok(())) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
@@ -2208,6 +2239,13 @@ pub async fn handle_api_session_state(
     // that on-demand view so reconnecting clients can remain read-only until a
     // detached turn finishes; do not invent a second session-state store.
     let Some(ref backend) = state.session_backend else {
+        if let Err(e) = crate::session_identity::validate_and_canonicalize_gateway_session_id(&id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+            )
+                .into_response();
+        }
         return Json(serde_json::json!({
             "session_id": id,
             "state": if turn_is_live(&id) { "running" } else { "idle" },
@@ -2218,7 +2256,16 @@ pub async fn handle_api_session_state(
 
     // Resolve the durable key the same way the other session endpoints do, so
     // the persisted row and the live-turn probe describe one session.
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+            )
+                .into_response();
+        }
+    };
     let turn_is_live = turn_is_live(&session_key);
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
@@ -2293,7 +2340,16 @@ pub async fn handle_api_session_abort(
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned");
-        let session_key = resolve_gateway_session_key(&id, |key| tokens.contains_key(key));
+        let session_key = match resolve_gateway_session_key(&id, |key| tokens.contains_key(key)) {
+            Ok(k) => k,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+                )
+                    .into_response();
+            }
+        };
         let token = tokens.get(&session_key).cloned();
         (session_key, token)
     };
@@ -3949,42 +4005,58 @@ pub(crate) mod tests {
     fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
         let none = |_key: &str| false;
         assert_eq!(
-            resolve_gateway_session_key("operator-1", none),
+            resolve_gateway_session_key("operator-1", none).unwrap(),
             "gw_operator-1"
         );
         assert_eq!(
-            resolve_gateway_session_key("gw_operator-1", none),
+            resolve_gateway_session_key("gw_operator-1", none).unwrap(),
             "gw_operator-1"
         );
         // Underscore-bearing display ids must still map into the gw_ namespace
         // when no exact key exists (punctuation is not a session namespace).
         assert_eq!(
-            resolve_gateway_session_key("team_alpha", none),
+            resolve_gateway_session_key("team_alpha", none).unwrap(),
             "gw_team_alpha"
         );
 
         let gateway_only = |key: &str| key == "gw_team_alpha";
         assert_eq!(
-            resolve_gateway_session_key("team_alpha", gateway_only),
+            resolve_gateway_session_key("team_alpha", gateway_only).unwrap(),
             "gw_team_alpha"
         );
         assert_eq!(
-            resolve_gateway_session_key("gw_team_alpha", gateway_only),
+            resolve_gateway_session_key("gw_team_alpha", gateway_only).unwrap(),
             "gw_team_alpha"
         );
 
         let channel_only = |key: &str| key == "discord.clamps_room";
         assert_eq!(
-            resolve_gateway_session_key("discord.clamps_room", channel_only),
+            resolve_gateway_session_key("discord.clamps_room", channel_only).unwrap(),
             "discord.clamps_room"
         );
 
         // Exact match wins when both the bare id and gw_ form exist.
         let both = |key: &str| key == "team_alpha" || key == "gw_team_alpha";
         assert_eq!(
-            resolve_gateway_session_key("team_alpha", both),
+            resolve_gateway_session_key("team_alpha", both).unwrap(),
             "team_alpha"
         );
+
+        // Invalid IDs are rejected with appropriate error
+        assert!(matches!(
+            resolve_gateway_session_key("a.b", none),
+            Err(crate::session_identity::SessionIdError::InvalidCharacter(
+                '.'
+            ))
+        ));
+        assert!(matches!(
+            resolve_gateway_session_key("gw_gw_alpha", none),
+            Err(crate::session_identity::SessionIdError::DoublePrefix)
+        ));
+        assert!(matches!(
+            resolve_gateway_session_key("", none),
+            Err(crate::session_identity::SessionIdError::Empty)
+        ));
     }
 
     #[test]
@@ -6897,5 +6969,210 @@ pub(crate) mod tests {
                 .contains_key(&session_key),
             "DELETE must evict the version published by the serialized writer"
         );
+    }
+
+    #[tokio::test]
+    async fn jsonl_identity_rejects_punctuation_collisions() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+
+        // 1. Punctuation-bearing ID "a.b" must be rejected at API boundaries
+        let post_res = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("a.b".to_string()),
+            Json(SessionMessagePostBody {
+                content: "invalid id message".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(post_res.status(), StatusCode::BAD_REQUEST);
+
+        let get_res = handle_api_session_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("a.b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(get_res.status(), StatusCode::BAD_REQUEST);
+
+        let del_res = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("a.b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(del_res.status(), StatusCode::BAD_REQUEST);
+
+        // Verify no colliding JSONL file was created
+        let jsonl_path = tmp.path().join("sessions").join("gw_a_b.jsonl");
+        assert!(
+            !jsonl_path.exists(),
+            "rejected punctuation ID must not create JSONL file"
+        );
+
+        // 2. Legitimate ID "a_b" succeeds and creates the canonical storage file
+        store
+            .append(
+                "gw_a_b",
+                &zeroclaw_providers::ChatMessage::user("hello a_b"),
+            )
+            .expect("seed legitimate session");
+        assert!(jsonl_path.exists());
+
+        // 3. Punctuation ID "a.b" still fails closed and cannot mutate or delete "a_b"'s file
+        let del_colliding = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("a.b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(del_colliding.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            jsonl_path.exists(),
+            "colliding ID delete must not touch legitimate session storage"
+        );
+        assert_eq!(store.load("gw_a_b").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn jsonl_identity_canonicalizes_gw_prefix_without_doubling() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+
+        // Seed with bare ID "team_alpha" -> canonical key "gw_team_alpha"
+        store
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("welcome"),
+            )
+            .expect("seed session");
+
+        let canonical_file = tmp.path().join("sessions").join("gw_team_alpha.jsonl");
+        let doubled_file = tmp.path().join("sessions").join("gw_gw_team_alpha.jsonl");
+        assert!(canonical_file.exists());
+        assert!(!doubled_file.exists());
+
+        // Reading via bare ID "team_alpha" returns the transcript
+        let res_bare = handle_api_session_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res_bare.status(), StatusCode::OK);
+
+        // Reading via prefixed ID "gw_team_alpha" returns the EXACT SAME transcript
+        let res_prefixed = handle_api_session_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("gw_team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res_prefixed.status(), StatusCode::OK);
+
+        // Deleting via prefixed ID "gw_team_alpha" removes the canonical file
+        let del_res = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("gw_team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(del_res.status(), StatusCode::OK);
+        assert!(!canonical_file.exists());
+        assert!(!doubled_file.exists());
+    }
+
+    #[tokio::test]
+    async fn jsonl_identity_rejects_empty_and_double_prefix_and_invalid_ids() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+
+        let invalid_ids = [
+            "",
+            "gw_",
+            "gw_gw_alpha",
+            "team alpha",
+            "team/alpha",
+            "team@alpha",
+        ];
+
+        for invalid_id in invalid_ids {
+            let res = handle_api_session_messages(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::extract::Path(invalid_id.to_string()),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "invalid id {invalid_id:?} must be rejected with BAD_REQUEST"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jsonl_identity_delete_and_completion_isolation_across_ids() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+
+        // Create session_one and session_two
+        store
+            .append(
+                "gw_session_one",
+                &zeroclaw_providers::ChatMessage::user("msg one"),
+            )
+            .expect("seed one");
+        store
+            .append(
+                "gw_session_two",
+                &zeroclaw_providers::ChatMessage::user("msg two"),
+            )
+            .expect("seed two");
+
+        // Delete session_one
+        let del_res = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("session_one".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(del_res.status(), StatusCode::OK);
+
+        // session_one is gone
+        assert!(!store.session_exists("gw_session_one"));
+        assert!(store.load("gw_session_one").is_empty());
+
+        // session_two remains intact and untouched
+        assert!(store.session_exists("gw_session_two"));
+        let msgs_two = store.load("gw_session_two");
+        assert_eq!(msgs_two.len(), 1);
+        assert_eq!(msgs_two[0].content, "msg two");
     }
 }

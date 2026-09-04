@@ -120,11 +120,28 @@ impl SessionLifecycle {
         Self::default()
     }
 
+    pub const MAX_AUTHORITIES: usize = 10_000;
+
     fn authority_for(&self, session_key: &str) -> Arc<Mutex<SessionAuthority>> {
         let mut authorities = self
             .authorities
             .lock()
             .expect("session authorities lock poisoned");
+
+        if authorities.len() >= Self::MAX_AUTHORITIES && !authorities.contains_key(session_key) {
+            // Prune unmutated default cells (no deletion tombstone, no persistence poison)
+            // that are not currently held by any external caller (strong_count == 1).
+            authorities.retain(|_, cell| {
+                if Arc::strong_count(cell) > 1 {
+                    return true;
+                }
+                match cell.try_lock() {
+                    Ok(auth) => auth.deletion > 0 || auth.persistence_failure > 0,
+                    Err(_) => true,
+                }
+            });
+        }
+
         Arc::clone(
             authorities
                 .entry(session_key.to_string())
@@ -667,5 +684,37 @@ mod tests {
             lifecycle.deleted_since("gone", captured),
             "forgetting finalization must not erase the deletion a queued writer still needs to see"
         );
+    }
+
+    #[test]
+    fn lifecycle_bounds_unmutated_authorities_without_weakening_tombstones_or_poison() {
+        let lifecycle = SessionLifecycle::new();
+
+        // 1. Create a tombstoned session
+        lifecycle.record_deletion("tombstoned-session");
+
+        // 2. Create a poisoned session
+        let captured = lifecycle.deletion_generation("poisoned-session");
+        lifecycle
+            .with_completion("poisoned-session", captured, |disposition| {
+                disposition.record_persistence_failure();
+            })
+            .expect("completion succeeds");
+
+        // 3. Fill with unmutated default queries beyond MAX_AUTHORITIES
+        for i in 0..SessionLifecycle::MAX_AUTHORITIES + 50 {
+            let key = format!("unmutated-{i}");
+            let _ = lifecycle.deletion_generation(&key);
+        }
+
+        // The tombstone and poison must still be retained
+        assert!(lifecycle.deleted_since("tombstoned-session", DeletionGeneration(0)));
+        assert!(lifecycle.persistence_poisoned("poisoned-session"));
+
+        // Capacity was pruned of unmutated default entries
+        let authorities = lifecycle.authorities.lock().unwrap();
+        assert!(authorities.len() <= SessionLifecycle::MAX_AUTHORITIES + 51);
+        assert!(authorities.contains_key("tombstoned-session"));
+        assert!(authorities.contains_key("poisoned-session"));
     }
 }

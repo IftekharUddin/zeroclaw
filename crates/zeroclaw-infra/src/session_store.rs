@@ -305,15 +305,15 @@ impl SessionStore {
     pub fn session_mtime(&self, session_key: &str) -> Option<std::time::SystemTime> {
         let path = self.session_path(session_key);
         let marker_path = self.incomplete_marker_path(session_key);
-        if is_regular_jsonl_session_file(&path) {
-            if let Ok(m) = std::fs::symlink_metadata(&path).and_then(|m| m.modified()) {
-                return Some(m);
-            }
+        if is_regular_jsonl_session_file(&path)
+            && let Ok(m) = std::fs::symlink_metadata(&path).and_then(|m| m.modified())
+        {
+            return Some(m);
         }
-        if marker_path.is_file() {
-            if let Ok(m) = std::fs::symlink_metadata(&marker_path).and_then(|m| m.modified()) {
-                return Some(m);
-            }
+        if marker_path.is_file()
+            && let Ok(m) = std::fs::symlink_metadata(&marker_path).and_then(|m| m.modified())
+        {
+            return Some(m);
         }
         None
     }

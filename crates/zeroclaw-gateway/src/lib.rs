@@ -38,6 +38,7 @@ pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 pub mod security_headers;
+pub mod session_identity;
 pub mod session_lifecycle;
 pub mod session_queue;
 pub mod sse;
@@ -7909,6 +7910,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

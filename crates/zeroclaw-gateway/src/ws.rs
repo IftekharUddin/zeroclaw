@@ -11,7 +11,7 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -180,7 +180,22 @@ pub async fn handle_ws_chat(
         }
     }
 
-    let session_id = params.session_id;
+    let session_identity = match params.session_id.as_deref() {
+        Some(raw) => {
+            match crate::session_identity::validate_and_canonicalize_gateway_session_id(raw) {
+                Ok(ident) => ident,
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, format!("Invalid session ID: {e}"))
+                        .into_response();
+                }
+            }
+        }
+        None => {
+            let generated_id = uuid::Uuid::new_v4().to_string();
+            crate::session_identity::validate_and_canonicalize_gateway_session_id(&generated_id)
+                .expect("generated uuid is always valid gateway session id")
+        }
+    };
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
     ws.on_upgrade(move |socket| {
@@ -188,7 +203,7 @@ pub async fn handle_ws_chat(
             socket,
             state,
             agent_alias,
-            session_id,
+            session_identity,
             session_name,
             session_cwd,
             auth_subject,
@@ -197,8 +212,8 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-const GW_SESSION_PREFIX: &str = "gw_";
+#[cfg(test)]
+use crate::session_identity::GW_SESSION_PREFIX;
 
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
@@ -337,7 +352,7 @@ async fn handle_socket(
     socket: WebSocket,
     state: AppState,
     agent_alias: String,
-    session_id: Option<String>,
+    session_identity: crate::session_identity::GatewaySessionIdentity,
     session_name: Option<String>,
     session_cwd: Option<String>,
     // The transport-authenticated approval subject (paired-token hash), if the
@@ -347,15 +362,14 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Resolve session ID: use provided or generate a new UUID
-    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    let session_id = session_identity.bare_id().to_string();
+    let session_key = session_identity.session_key().to_string();
     // The connection-scoped Agent and every mutation it prepares belong to
     // this one incarnation. A delete requires a fresh connection/Agent rather
     // than letting the old in-memory history mutate a recreated session.
     let connection_incarnation = state.session_lifecycle.deletion_generation(&session_key);
-    // Match the sanitized form persisted by memory backend migrations.
-    let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
+    // Since bare_id is validated to contain only [A-Za-z0-9_-], sanitize is an identity.
+    let memory_session_id = session_id.clone();
 
     // Hydrate session metadata from persistence (if available). Agent
     // construction is deferred until after the optional `connect` frame so the
@@ -458,17 +472,41 @@ async fn handle_socket(
                     if cp.msg_type == "connect" {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": cp.session_id, "device_name": cp.device_name, "capabilities": cp.capabilities, "cwd": cp.cwd})), "WebSocket connect params received");
                         if let Some(sid) = &cp.session_id {
-                            memory_session_id =
-                                zeroclaw_api::session_keys::sanitize_session_key(sid);
-                            ::zeroclaw_log::record!(
-                                DEBUG,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(::serde_json::json!({"session_id": sid})),
-                                "WebSocket connect session override received"
-                            );
+                            match crate::session_identity::validate_and_canonicalize_gateway_session_id(sid) {
+                                Ok(override_ident) if override_ident == session_identity => {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"session_id": sid})),
+                                        "WebSocket connect session confirmed"
+                                    );
+                                }
+                                Ok(_) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"session_id": sid, "bound": session_id})),
+                                        "Ignoring mismatched session_id in WebSocket connect params; bound session identity preserved"
+                                    );
+                                }
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"session_id": sid, "error": format!("{e:#}")})),
+                                        "Ignoring invalid session_id in WebSocket connect params; bound session identity preserved"
+                                    );
+                                }
+                            }
                         }
                         if cp.cwd.is_some() {
                             requested_cwd = cp.cwd;
@@ -1755,8 +1793,20 @@ async fn process_chat_message<Snk, Rcv, RcvErr>(
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Ping(payload))) => {
                             if sender.send(Message::Pong(payload)).await.is_err() {
-                                cancel_token.cancel();
-                                break;
+                                let denied =
+                                    detach_ws_viewer(&mut client_attached, pending_approvals);
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note,
+                                    )
+                                    .with_attrs(::serde_json::json!({
+                                        "session_key": session_key,
+                                        "pending_approvals_denied": denied,
+                                    })),
+                                    "WebSocket viewer detached on failed Pong delivery; agent turn continues"
+                                );
                             }
                             continue;
                         }
@@ -3573,6 +3623,58 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
     }
 
+    #[tokio::test]
+    async fn failed_pong_send_detaches_viewer_and_drains_turn_without_cancelling() {
+        use axum::extract::ws::Message;
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let pending = new_pending_approvals();
+        let (approval_tx, approval_rx) = tokio::sync::oneshot::channel();
+        pending.lock().insert("approval-1".into(), approval_tx);
+
+        let mut client_attached = true;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+
+        // Simulate incoming Ping where sender.send(Pong) fails
+        let client_msg: Option<Result<Message, &'static str>> =
+            Some(Ok(Message::Ping(vec![0xAA, 0xBB].into())));
+        let send_pong_ok = false;
+
+        match client_msg {
+            Some(Ok(Message::Ping(_payload))) => {
+                let send_res = if send_pong_ok {
+                    Ok(())
+                } else {
+                    Err("connection reset by peer")
+                };
+                if send_res.is_err() {
+                    let denied = detach_ws_viewer(&mut client_attached, &pending);
+                    assert_eq!(denied, 1);
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        // 1. Client viewer must be marked detached
+        assert!(!client_attached);
+        // 2. Cancellation token must NOT be cancelled (turn continues)
+        assert!(!cancel_token.is_cancelled());
+        // 3. Pending approvals must have been denied immediately
+        assert_eq!(approval_rx.await.unwrap(), ChannelApprovalResponse::Deny);
+
+        // 4. In-flight and subsequent turn events continue to drain
+        event_tx.send("token-usage").await.unwrap();
+        event_tx.send("turn-done").await.unwrap();
+        drop(event_tx);
+
+        let mut drained = Vec::new();
+        while let Some(evt) = event_rx.recv().await {
+            drained.push(evt);
+        }
+        assert_eq!(drained, vec!["token-usage", "turn-done"]);
+        assert!(!cancel_token.is_cancelled());
+    }
+
     #[test]
     fn session_queue_errors_map_to_explicit_websocket_codes() {
         use crate::session_queue::SessionQueueError;
@@ -4254,7 +4356,9 @@ data: {\"type\":\"message_stop\"}\n\n",
     ) -> zeroclaw_runtime::agent::Agent {
         zeroclaw_runtime::agent::Agent::builder()
             .model_provider(model_provider)
-            .tools(Vec::new())
+            .tools(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new()),
+            )
             .memory(std::sync::Arc::new(zeroclaw_memory::NoneMemory::new(
                 "none",
             )))

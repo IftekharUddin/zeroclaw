@@ -3,6 +3,7 @@ import type {
   ApprovalDecision,
   PendingApproval,
   SessionMessagesResponse,
+  SessionStateResponse,
   WsMessage,
 } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
@@ -223,6 +224,7 @@ export interface SessionSocket {
 export interface AgentSessionRuntime {
   createSocket(options: { agentAlias: string; sessionId: string }): SessionSocket;
   getMessages(sessionId: string): Promise<SessionMessagesResponse>;
+  getState?(sessionId: string): Promise<SessionStateResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
@@ -231,6 +233,7 @@ export interface AgentSessionRuntime {
 const defaultSessionRuntime: AgentSessionRuntime = {
   createSocket: (options) => new WebSocketClient(options),
   getMessages: getSessionMessages,
+  getState: getSessionState,
   delete: deleteSession,
   rename: renameSession,
   mintId: newSessionId,
@@ -699,7 +702,10 @@ export function AgentProvider({
     const readSessionState = async () => {
       while (isCurrent()) {
         try {
-          const state = await getSessionState(activeSessionIdRef.current);
+          const runtime = sessionRuntimeRef.current;
+          const state = runtime.getState
+            ? await runtime.getState(activeSessionIdRef.current)
+            : await getSessionState(activeSessionIdRef.current);
           recoveryFailures = 0;
           recoveryDelayMs = SESSION_RECOVERY_POLL_MS;
           return state;
@@ -759,30 +765,32 @@ export function AgentProvider({
     }
     if (!isCurrent()) return;
 
-    try {
-      const res = await getSessionMessages(activeSessionIdRef.current);
-      if (!isCurrent()) return;
-      if (res.session_persistence) {
-        localMessageMutationVersionRef.current += 1;
-        setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+    if (observedRunning) {
+      try {
+        const res = await sessionRuntimeRef.current.getMessages(activeSessionIdRef.current);
+        if (!isCurrent()) return;
+        if (res.session_persistence) {
+          localMessageMutationVersionRef.current += 1;
+          setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+        }
+      } catch {
+        // The turn is already complete, so the local transcript is missing
+        // whatever it produced — stale, not merely incomplete. Accepting that
+        // silently would let a follow-up prompt be composed against history
+        // the operator never saw, so surface it as a retryable recovery state.
+        if (isCurrent()) {
+          clearTerminalRecoveryStream();
+          const outcome = hydrationFailureOutcome();
+          setError(t(recoveryMessageKey(outcome.reason)));
+          setTyping(shouldBlockSending(outcome));
+          setRecoveryAction(
+            shouldOfferRecoveryAction(outcome)
+              ? { label: t('agent.session_recovery_retry'), wsVersion }
+              : null,
+          );
+        }
+        return;
       }
-    } catch {
-      // The turn is already complete, so the local transcript is missing
-      // whatever it produced — stale, not merely incomplete. Accepting that
-      // silently would let a follow-up prompt be composed against history
-      // the operator never saw, so surface it as a retryable recovery state.
-      if (isCurrent()) {
-        clearTerminalRecoveryStream();
-        const outcome = hydrationFailureOutcome();
-        setError(t(recoveryMessageKey(outcome.reason)));
-        setTyping(shouldBlockSending(outcome));
-        setRecoveryAction(
-          shouldOfferRecoveryAction(outcome)
-            ? { label: t('agent.session_recovery_retry'), wsVersion }
-            : null,
-        );
-      }
-      return;
     }
 
     // Route the recovery cleanup through the canonical reducer instead of
