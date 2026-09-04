@@ -10994,6 +10994,7 @@ mod tests {
             vec![crate::client::MessageEntry {
                 role: "assistant".to_string(),
                 content: "durable answer".to_string(),
+                ..Default::default()
             }],
             false,
         );
@@ -11532,23 +11533,53 @@ mod tests {
         assert!(entry.recovery_required);
         assert!(!entry.interrupted);
 
-        // Reconstruct the client-owned state as a reconnect does. The failed
-        // recovery bit must remain the dispatch gate even though no active
-        // turn or modal survived the first reconciliation attempt.
-        let mut rebuilt = state();
-        rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
-        chat.phase = ChatPhase::Active(Box::new(rebuilt));
-        chat.pump_all_queues();
-        assert!(
-            writer_rx.try_recv().is_err(),
-            "reconnect must not dispatch before terminal and transcript reconciliation"
+        // Exercise the production reconnect path. Reattaching and loading the
+        // durable history must automatically reinstall the recovery barrier;
+        // the first post-reconnect operation is cancellation/reconciliation,
+        // never the retained queued prompt.
+        let mut reconnected = Chat::new(chat.rpc.clone(), PaneKind::Chat);
+        reconnected.set_resume_sessions(vec![entry]);
+        let reconnect = tokio::spawn(async move {
+            reconnected.start_session("myagent", None).await;
+            reconnected
+        });
+
+        let session_new = next_rpc_request(&mut writer_rx, "reconnect should reattach").await;
+        assert_eq!(session_new["method"], method::SESSION_NEW);
+        assert_eq!(session_new["params"]["session_id"], "sess-1");
+        respond_ok(
+            &outbound,
+            &session_new,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "workspace_dir": "/tmp/reconnected"
+            }),
+        );
+        let config = next_rpc_request(&mut writer_rx, "reconnect refreshes model identity").await;
+        assert_eq!(config["method"], method::CONFIG_LIST);
+        respond_ok(&outbound, &config, serde_json::json!([]));
+        let history = next_rpc_request(&mut writer_rx, "reconnect loads durable history").await;
+        assert_eq!(history["method"], method::SESSION_MESSAGES);
+        respond_ok(
+            &outbound,
+            &history,
+            serde_json::json!({ "messages": [], "total": 0, "start": 0 }),
         );
 
-        chat.retry_failed_resyncs_with_queued_input();
-        chat.pump_all_queues();
-        let cancel =
-            next_rpc_request(&mut writer_rx, "explicit queue action retries recovery").await;
+        let cancel = next_rpc_request(
+            &mut writer_rx,
+            "reconnect must reconcile before dispatching the queued prompt",
+        )
+        .await;
         assert_eq!(cancel["method"], method::SESSION_CANCEL);
+        let mut chat = reconnect.await.unwrap();
+        assert!(chat.session_resync_in_flight.contains("sess-1"));
+        assert_eq!(
+            chat.state_for_session("sess-1")
+                .expect("reattached session")
+                .queue_len(),
+            1
+        );
         respond_ok(
             &outbound,
             &cancel,
@@ -16000,7 +16031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_completion_settles_turn_when_terminal_update_is_lagged() {
+    async fn prompt_completion_settles_turn_when_terminal_update_is_missing() {
         let (mut chat, mut writer_rx) = test_chat();
         let mut active = state();
         active
@@ -16011,31 +16042,9 @@ mod tests {
         let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
         assert_eq!(request["method"], method::SESSION_PROMPT);
 
-        let (notif_tx, notif_rx) = broadcast::channel(1);
-        chat.notif_rx = notif_rx;
-        notif_tx
-            .send(RpcNotification {
-                method: "session/update".to_string(),
-                params: serde_json::json!({
-                    "type": "turn_complete",
-                    "session_id": "sess-1",
-                    "outcome": "completed",
-                    "content": "done"
-                }),
-            })
-            .unwrap();
-        notif_tx
-            .send(RpcNotification {
-                method: "unrelated".to_string(),
-                params: serde_json::Value::Null,
-            })
-            .unwrap();
-
-        chat.drain_notifications();
-
         assert!(
             active_state(&mut chat).turn_in_flight,
-            "the lagged terminal frame reproduces the stale in-flight state"
+            "without a terminal frame the local turn remains in flight"
         );
         active_state(&mut chat)
             .enqueue_message("wait for explicit resume".to_string(), Vec::new())
@@ -16063,6 +16072,12 @@ mod tests {
         let (tx, mut writer_rx) = mpsc::channel::<String>(16);
         let outbound = Arc::new(RpcOutbound::new(tx));
         let mut chat = two_session_chat(&outbound);
+        let focused = chat
+            .state_for_session_mut("sess-a")
+            .expect("focused session");
+        focused.turn_in_flight = true;
+        focused.turn_generation = 41;
+        focused.turn_status = TurnStatus::Working;
         chat.state_for_session_mut("sess-b")
             .expect("background session")
             .enqueue_message("background prompt".to_string(), Vec::new())
@@ -16088,12 +16103,9 @@ mod tests {
                 .turn_in_flight,
             "the matching background turn must settle"
         );
-        assert!(matches!(
-            chat.state_for_session("sess-a")
-                .expect("focused session")
-                .turn_status,
-            TurnStatus::Idle
-        ));
+        let focused = chat.state_for_session("sess-a").expect("focused session");
+        assert!(focused.turn_in_flight, "the focused turn must not settle");
+        assert!(matches!(focused.turn_status, TurnStatus::Working));
     }
 
     #[tokio::test]
