@@ -1408,6 +1408,21 @@ impl RpcDispatcher {
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
+        // Same-mode reconnects keep the live Agent below. A caller that
+        // deliberately reuses an ID for the other pane mode still replaces
+        // the old incarnation, but only after the shared admission guard has
+        // allowed its previous turn to finish all durable work.
+        if resuming
+            && self
+                .ctx
+                .sessions
+                .chat_mode(&session_id)
+                .await
+                .is_some_and(|existing_mode| existing_mode != chat_mode)
+        {
+            self.ctx.sessions.remove(&session_id).await;
+        }
+
         // A caller-supplied ID is a resume selector. The live RpcSession is
         // the canonical in-process incarnation, including provider history;
         // replacing it while its predecessor turn runs can publish an Agent
@@ -13168,14 +13183,11 @@ mod tests {
     }
 
     /// `session/new` with `chat_mode: "acp"` never creates a `session_backend`
-    /// row — ACP sessions live entirely in `acp_session_store` — and
-    /// `set_session_state` only `UPDATE`s an existing row. So the
-    /// running/idle/error write in `handle_session_prompt` is a silent no-op
-    /// for ACP-mode turns, and `session/state` (which probes `session_backend`
-    /// under the bare id, `rpc_{id}`, and `gw_{id}`) reports session-not-found
-    /// rather than idle or running, both before and after the turn.
+    /// row because ACP sessions live entirely in `acp_session_store`. Live
+    /// `session/state` is actor-backed, but ACP prompt lifecycle writes must
+    /// still leave every Chat persistence key untouched.
     #[tokio::test]
-    async fn acp_mode_session_prompt_leaves_session_backend_state_absent() {
+    async fn acp_mode_session_prompt_leaves_chat_backend_state_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
             zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
@@ -13248,12 +13260,9 @@ mod tests {
 
         let state_result = dispatcher
             .handle_session_state(&json!({ "session_id": sid }))
-            .await;
-        assert!(
-            state_result.is_err(),
-            "session/state must report the ACP session as not found rather than idle or \
-             running, since chat_mode: acp never populates session_backend"
-        );
+            .await
+            .expect("live ACP state must come from the runtime actor");
+        assert_eq!(state_result["state"], "idle");
     }
 
     /// Session IDs are caller-supplied and the Chat and ACP persistence modes
