@@ -144,6 +144,7 @@ pub(crate) struct ResumeEntry {
     pub was_focused: bool,
     queue: ReconnectQueueState,
     interrupted: bool,
+    recovery_required: bool,
 }
 
 /// Client-owned queue state that cannot be reconstructed from the daemon's
@@ -372,6 +373,7 @@ impl Chat {
                 interrupted: state.turn_in_flight
                     || state.pending_approval.is_some()
                     || state.pending_elicitation.is_some(),
+                recovery_required: state.last_error == Some(SessionError::ResyncFailed),
             });
         }
 
@@ -886,6 +888,7 @@ impl Chat {
             was_focused: true,
             queue: ReconnectQueueState::default(),
             interrupted: false,
+            recovery_required: false,
         });
         self.pick_or_start_session(&agent_alias).await;
     }
@@ -1038,8 +1041,9 @@ impl Chat {
             Ok(session) => {
                 let resumed_sid = resume.as_ref().map(|_| session.session_id.clone());
                 let recovery_session_id = session.session_id.clone();
-                let needs_terminal_recovery =
-                    resume.as_ref().is_some_and(|entry| entry.interrupted);
+                let needs_terminal_recovery = resume
+                    .as_ref()
+                    .is_some_and(|entry| entry.interrupted || entry.recovery_required);
                 // `todo_settings` is resolved fresh at this boundary from
                 // `zerocode-config.toml` (the canonical owner); the removed
                 // `self.todo_settings` cache was the stale cross-session copy.
@@ -1072,7 +1076,11 @@ impl Chat {
                 // and durable-history replay succeed.
                 self.resume_focused = None;
                 if let Some(entry) = resume {
-                    state.restore_reconnect_state(entry.queue, entry.interrupted);
+                    state.restore_reconnect_state(
+                        entry.queue,
+                        entry.interrupted,
+                        entry.recovery_required,
+                    );
                 }
                 if !self.session_order.contains(&state.session_id) {
                     self.session_order.push(state.session_id.clone());
@@ -1117,13 +1125,14 @@ impl Chat {
                 match self.attach_resume_entry(&entry).await {
                     Ok(state) => {
                         let session_id = state.session_id.clone();
-                        let interrupted = entry.interrupted;
+                        let needs_terminal_recovery =
+                            entry.interrupted || entry.recovery_required;
                         if !self.session_order.contains(&session_id) {
                             self.session_order.push(session_id.clone());
                         }
                         self.phase = ChatPhase::Active(Box::new(state));
                         retained.extend(entries);
-                        if interrupted {
+                        if needs_terminal_recovery {
                             self.begin_session_resync(session_id);
                         }
                         break;
@@ -1159,7 +1168,8 @@ impl Chat {
                 match self.attach_resume_entry(&entry).await {
                     Ok(state) => {
                         let session_id = state.session_id.clone();
-                        let needs_terminal_recovery = entry.interrupted;
+                        let needs_terminal_recovery =
+                            entry.interrupted || entry.recovery_required;
                         if !self.session_order.contains(&entry.session_id) {
                             self.session_order.push(entry.session_id.clone());
                         }
@@ -1258,7 +1268,11 @@ impl Chat {
         let mut state = self
             .attach_session(&entry.agent_alias, &entry.session_id)
             .await?;
-        state.restore_reconnect_state(entry.queue.clone(), entry.interrupted);
+        state.restore_reconnect_state(
+            entry.queue.clone(),
+            entry.interrupted,
+            entry.recovery_required,
+        );
         Ok(state)
     }
 
@@ -7933,7 +7947,12 @@ impl ChatState {
     /// Restore the only state the client owns across a transport rebuild.
     /// Transcript, pending interactions, and terminal turn state come from (or
     /// are reconciled with) the daemon instead of being snapshotted here.
-    fn restore_reconnect_state(&mut self, queue: ReconnectQueueState, interrupted: bool) {
+    fn restore_reconnect_state(
+        &mut self,
+        queue: ReconnectQueueState,
+        interrupted: bool,
+        recovery_required: bool,
+    ) {
         self.message_queue = queue.messages;
         self.next_queue_id = queue.next_id;
         self.queue_paused = queue.paused;
@@ -7941,6 +7960,9 @@ impl ChatState {
             .selected
             .filter(|id| self.message_queue.iter().any(|message| message.id == *id));
         self.resume_override = false;
+        if recovery_required {
+            self.last_error = Some(SessionError::ResyncFailed);
+        }
         if interrupted {
             self.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
@@ -8522,6 +8544,7 @@ mod tests {
             was_focused,
             queue: ReconnectQueueState::default(),
             interrupted: false,
+            recovery_required: false,
         }
     }
 
@@ -10695,7 +10718,11 @@ mod tests {
             }],
             false,
         );
-        rebuilt.restore_reconnect_state(entry.queue, entry.interrupted);
+        rebuilt.restore_reconnect_state(
+            entry.queue,
+            entry.interrupted,
+            entry.recovery_required,
+        );
         assert_eq!(rebuilt.queue_len(), 1);
         assert!(rebuilt.queue_paused());
         assert!(!rebuilt.turn_in_flight);
@@ -11151,7 +11178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_resync_stays_errored_and_retries_without_losing_queue_or_plan() {
+    async fn exhausted_resync_survives_reconnect_and_retries_without_losing_queue() {
         let (tx, mut writer_rx) = mpsc::channel::<String>(32);
         let outbound = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
@@ -11222,6 +11249,28 @@ mod tests {
         assert!(
             writer_rx.try_recv().is_err(),
             "routine transport ticks must neither apply partial state nor retry forever"
+        );
+
+        let mut resume = chat.resume_entries();
+        assert_eq!(resume.len(), 1);
+        let entry = resume.remove(0);
+        assert!(entry.recovery_required);
+        assert!(!entry.interrupted);
+
+        // Reconstruct the client-owned state as a reconnect does. The failed
+        // recovery bit must remain the dispatch gate even though no active
+        // turn or modal survived the first reconciliation attempt.
+        let mut rebuilt = state();
+        rebuilt.restore_reconnect_state(
+            entry.queue,
+            entry.interrupted,
+            entry.recovery_required,
+        );
+        chat.phase = ChatPhase::Active(Box::new(rebuilt));
+        chat.pump_all_queues();
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "reconnect must not dispatch before terminal and transcript reconciliation"
         );
 
         chat.retry_failed_resyncs_with_queued_input();

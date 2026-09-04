@@ -113,16 +113,17 @@ impl InboundRequestRouter {
     }
 
     /// Resolve every response-bearing request still owned by this router
-    /// before its transport is replaced. Parsed elicitations must not vanish
-    /// with the old router, and requests that arrived during pane rebuilding
-    /// need the same terminal answer before the old socket is closed.
+    /// before its transport is replaced. Quiescing the reader closes the sole
+    /// production sender before the final drain, while the writer remains
+    /// available for one terminal response to every accepted request.
     async fn cancel_pending(&mut self) {
+        self.rpc.quiesce_inbound_reader().await;
         let mut pending = self
             .deferred
             .drain(..)
             .map(|deferred| deferred.request)
             .collect::<Vec<_>>();
-        while let Ok(request) = self.rx.try_recv() {
+        while let Some(request) = self.rx.recv().await {
             pending.push(request);
         }
         for request in pending {
@@ -2636,14 +2637,18 @@ mod tests {
             request: inbound_elicitation("e-deferred", "missing-session"),
             first_seen: Instant::now(),
         });
-        inbound_tx
-            .send(inbound_elicitation(
-                "e-arrived-during-rebuild",
-                "missing-session",
-            ))
-            .unwrap();
+        let release_during_retirement = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            inbound_tx
+                .send(inbound_elicitation(
+                    "e-arrived-during-retirement",
+                    "missing-session",
+                ))
+                .unwrap();
+        });
 
         router.cancel_pending().await;
+        release_during_retirement.await.unwrap();
         let mut ids = Vec::new();
         for _ in 0..2 {
             let line = tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
@@ -2655,7 +2660,7 @@ mod tests {
             assert_eq!(response["result"]["action"], "cancel");
         }
         ids.sort();
-        assert_eq!(ids, vec!["e-arrived-during-rebuild", "e-deferred"]);
+        assert_eq!(ids, vec!["e-arrived-during-retirement", "e-deferred"]);
         assert!(router.deferred.is_empty());
 
         router.cancel_pending().await;

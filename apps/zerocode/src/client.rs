@@ -1906,6 +1906,18 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Stop accepting server-initiated requests without retiring the writer.
+    /// Router replacement uses this before its final receiver drain so every
+    /// request accepted by the old reader remains answerable on the old
+    /// transport. Full [`Self::shutdown`] follows after those responses have
+    /// been queued.
+    pub async fn quiesce_inbound_reader(&self) {
+        self.read_task.abort();
+        while !self.read_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Ask the daemon to start streaming log events as notifications.
     pub async fn logs_subscribe(&self) -> Result<()> {
         let _: Value = self.call("logs/subscribe", serde_json::json!({})).await?;
