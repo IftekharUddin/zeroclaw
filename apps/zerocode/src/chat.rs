@@ -545,8 +545,7 @@ impl Chat {
         else {
             return false;
         };
-        let mut incoming = self.background.remove(idx);
-        incoming.mark_dirty_full();
+        let incoming = self.background.remove(idx);
         // Swap with the focused session; a non-Active phase (picker, error)
         // is simply replaced — clicking a session row leaves those flows.
         match std::mem::replace(&mut self.phase, ChatPhase::Active(Box::new(incoming))) {
@@ -608,8 +607,7 @@ impl Chat {
             .or_else(|| (!self.background.is_empty()).then_some(0));
         match next_idx {
             Some(idx) => {
-                let mut incoming = self.background.remove(idx);
-                incoming.mark_dirty_full();
+                let incoming = self.background.remove(idx);
                 self.phase = ChatPhase::Active(Box::new(incoming));
             }
             None => {
@@ -11300,11 +11298,24 @@ mod tests {
         if let ChatPhase::Active(a) = &mut chat.phase {
             a.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from("from-a")));
+            a.rebuild_lines(40);
         }
         if let Some(b) = chat.background.first_mut() {
             b.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from("from-b")));
+            b.rebuild_lines(40);
         }
+
+        let cached_a = chat
+            .state_for_session("sess-a")
+            .expect("focused session")
+            .cached_lines
+            .clone();
+        let cached_b = chat
+            .state_for_session("sess-b")
+            .expect("background session")
+            .cached_lines
+            .clone();
 
         assert!(!chat.focus_session("nope").await, "unknown id is a no-op");
         assert!(chat.focus_session("sess-b").await);
@@ -11314,12 +11325,30 @@ mod tests {
             panic!("focus must activate the picked session");
         };
         assert!(matches!(&b.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-b"));
+        assert_eq!(b.dirty, LinesDirty::Clean);
+        assert_eq!(b.cached_lines, cached_b);
         let a = chat
             .background
             .iter()
             .find(|s| s.session_id == "sess-a")
             .expect("previous session stays tracked");
         assert!(matches!(&a.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-a"));
+        assert_eq!(a.dirty, LinesDirty::Clean);
+        assert_eq!(a.cached_lines, cached_a);
+
+        assert!(chat.focus_session("sess-a").await);
+        let ChatPhase::Active(a) = &chat.phase else {
+            panic!("round-trip focus must reactivate the original session");
+        };
+        assert_eq!(a.dirty, LinesDirty::Clean);
+        assert_eq!(a.cached_lines, cached_a);
+        let b = chat
+            .background
+            .iter()
+            .find(|s| s.session_id == "sess-b")
+            .expect("second session stays tracked after round-trip focus");
+        assert_eq!(b.dirty, LinesDirty::Clean);
+        assert_eq!(b.cached_lines, cached_b);
 
         // Sidebar order is stable across focus changes.
         let ids: Vec<_> = chat
@@ -11329,7 +11358,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![("sess-a".to_string(), false), ("sess-b".to_string(), true)]
+            vec![("sess-a".to_string(), true), ("sess-b".to_string(), false)]
         );
     }
 
@@ -11337,7 +11366,15 @@ mod tests {
     async fn close_focused_session_calls_daemon_and_promotes_next() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
-        let chat = two_session_chat(&rpc);
+        let mut chat = two_session_chat(&rpc);
+        let promoted_cache = {
+            let promoted = chat.background.first_mut().expect("background session");
+            promoted
+                .entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from("from-b")));
+            promoted.rebuild_lines(40);
+            promoted.cached_lines.clone()
+        };
 
         let handle = tokio::spawn(async move {
             let mut chat = chat;
@@ -11366,6 +11403,11 @@ mod tests {
         let summaries = chat.session_summaries();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].session_id, "sess-b");
+        let ChatPhase::Active(promoted) = &chat.phase else {
+            panic!("remaining session must be promoted");
+        };
+        assert_eq!(promoted.dirty, LinesDirty::Clean);
+        assert_eq!(promoted.cached_lines, promoted_cache);
     }
 
     #[tokio::test]
