@@ -31,6 +31,7 @@ const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "�
 const TELEGRAM_MEDIA_GROUP_SETTLE_DELAY: Duration = Duration::from_millis(700);
 const TELEGRAM_IDLE_POLL_TIMEOUT_SECS: u64 = 30;
 const TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS: u64 = 1;
+const TELEGRAM_POLL_LIMIT: usize = 100;
 
 type MediaGroupKey = (i64, String);
 
@@ -50,6 +51,7 @@ struct PendingMediaGroup {
     unsupported: Vec<UnsupportedMember>,
     last_seen: Instant,
     last_seen_poll_generation: u64,
+    trailing_saturated: bool,
 }
 
 /// The text-only residue of an album member that will never be downloaded.
@@ -89,6 +91,7 @@ struct MediaGroupBatch {
     unsupported: Vec<UnsupportedMember>,
     last_seen: Instant,
     last_seen_poll_generation: u64,
+    trailing_saturated: bool,
 }
 
 /// One unacknowledged update in Telegram's global delivery order.
@@ -1354,6 +1357,7 @@ impl TelegramChannel {
                 unsupported: Vec::new(),
                 last_seen: now,
                 last_seen_poll_generation: poll_generation,
+                trailing_saturated: false,
             });
             if Self::retain_unsupported_member(group, update) {
                 group.last_seen = now;
@@ -1367,6 +1371,7 @@ impl TelegramChannel {
             unsupported: Vec::new(),
             last_seen: now,
             last_seen_poll_generation: poll_generation,
+            trailing_saturated: false,
         });
         if group
             .updates
@@ -1388,7 +1393,9 @@ impl TelegramChannel {
         completed_poll_generation: u64,
     ) -> Vec<MediaGroupBatch> {
         Self::take_media_groups_matching(pending, |_, group| {
-            now.saturating_duration_since(group.last_seen) >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
+            !group.trailing_saturated
+                && now.saturating_duration_since(group.last_seen)
+                    >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
                 && group.last_seen_poll_generation < completed_poll_generation
         })
     }
@@ -1420,7 +1427,8 @@ impl TelegramChannel {
         };
 
         Self::take_media_groups_matching(pending, |key, group| {
-            key.0 == chat_id
+            !group.trailing_saturated
+                && key.0 == chat_id
                 && !group.updates.is_empty()
                 && now.saturating_duration_since(group.last_seen)
                     >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
@@ -1445,7 +1453,7 @@ impl TelegramChannel {
     ) -> Vec<MediaGroupBatch> {
         let mut matching_keys: Vec<(MediaGroupKey, i64)> = pending
             .iter()
-            .filter(|(key, group)| should_take(key, group))
+            .filter(|(key, group)| !group.trailing_saturated && should_take(key, group))
             .map(|(key, group)| {
                 let earliest_update_id = group
                     .updates
@@ -1474,6 +1482,7 @@ impl TelegramChannel {
                     unsupported: group.unsupported,
                     last_seen: group.last_seen,
                     last_seen_poll_generation: group.last_seen_poll_generation,
+                    trailing_saturated: group.trailing_saturated,
                 }
             })
             .collect()
@@ -4801,6 +4810,15 @@ impl TelegramChannel {
                 delivered: false,
             });
         }
+
+        let saturated_key = if updates.len() >= TELEGRAM_POLL_LIMIT {
+            updates.last().and_then(Self::extract_media_group_key)
+        } else {
+            None
+        };
+        for (key, group) in pending_media_groups.iter_mut() {
+            group.trailing_saturated = saturated_key.as_ref() == Some(key);
+        }
     }
 
     fn restore_media_group_batch(
@@ -4814,6 +4832,7 @@ impl TelegramChannel {
                 unsupported: batch.unsupported,
                 last_seen: batch.last_seen,
                 last_seen_poll_generation: batch.last_seen_poll_generation,
+                trailing_saturated: batch.trailing_saturated,
             },
         );
     }
@@ -4969,8 +4988,9 @@ impl TelegramChannel {
                 }
                 QueuedTelegramUpdatePayload::MediaGroup(key) => {
                     let is_settled = pending_media_groups.get(&key).is_some_and(|group| {
-                        now.saturating_duration_since(group.last_seen)
-                            >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
+                        !group.trailing_saturated
+                            && now.saturating_duration_since(group.last_seen)
+                                >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
                             && group.last_seen_poll_generation < completed_poll_generation
                     });
                     if !is_settled {
@@ -5507,6 +5527,7 @@ impl Channel for TelegramChannel {
             let url = self.api_url("getUpdates");
             let probe = serde_json::json!({
                 "offset": offset,
+                "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 0,
                 "allowed_updates": ["message", "callback_query"]
             });
@@ -5634,6 +5655,7 @@ impl Channel for TelegramChannel {
             let poll_timeout_secs = Self::media_group_poll_timeout_secs(&pending_media_groups);
             let body = serde_json::json!({
                 "offset": offset,
+                "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": poll_timeout_secs,
                 "allowed_updates": ["message", "callback_query"]
             });
@@ -11641,6 +11663,190 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn media_group_trailing_saturated_by_page_boundary_waits_for_next_page() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Build 101 updates:
+        // Update 1, 2: Album A (photos file-101, file-102)
+        // Updates 3..=98: text messages
+        // Updates 99..=101: Album B (photos file-199, file-200, file-201)
+        let mut all_updates = Vec::new();
+        all_updates.push(media_group_update(1, 101, 100, "album-a"));
+        all_updates.push(media_group_update(2, 102, 100, "album-a"));
+        for i in 3..=98 {
+            all_updates.push(serde_json::json!({
+                "update_id": i,
+                "message": {
+                    "message_id": 100 + i,
+                    "text": format!("msg {i}"),
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" }
+                }
+            }));
+        }
+        all_updates.push(media_group_update(99, 199, 100, "album-b"));
+        all_updates.push(media_group_update(100, 200, 100, "album-b"));
+        all_updates.push(media_group_update(101, 201, 100, "album-b"));
+
+        let updates_pool = Arc::new(all_updates);
+        let updates_ref = Arc::clone(&updates_pool);
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/getUpdates"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body.get("timeout").and_then(serde_json::Value::as_u64) == Some(0) {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": [] }));
+                }
+
+                let offset = body
+                    .get("offset")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100) as usize;
+
+                let page: Vec<serde_json::Value> = updates_ref
+                    .iter()
+                    .filter(|u| {
+                        u.get("update_id")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0)
+                            >= offset
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect();
+
+                let mut response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": page }));
+                response = response.set_delay(Duration::from_millis(50));
+                response
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMyCommands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        for (file_id, file_path) in [
+            ("file-101", "photos/101.jpg"),
+            ("file-102", "photos/102.jpg"),
+            ("file-199", "photos/199.jpg"),
+            ("file-200", "photos/200.jpg"),
+            ("file-201", "photos/201.jpg"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(|| vec!["alice".into()]),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_ack_reactions(true),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        // 1. Intermediate messages (3..=98) dispatch immediately, while the
+        // albums wait for their settlement delays.
+        for i in 3..=98 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("intermediate message should dispatch")
+                .expect("listener should remain connected");
+            assert_eq!(msg.content, format!("msg {i}"));
+        }
+
+        // 2. Album A arrives once settled
+        let album_a = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("album a should dispatch")
+            .expect("listener should remain connected");
+        assert_eq!(album_a.id, "telegram_100_101");
+        assert_eq!(album_a.content.matches("[IMAGE:").count(), 2);
+
+        // 3. Album B arrives as one single turn containing all 3 photos,
+        // because its settlement was held until the saturated page boundary
+        // was cleared by the next poll page returning update 101.
+        let album_b = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("album b should dispatch as a single combined turn")
+            .expect("listener should remain connected");
+        assert_eq!(album_b.id, "telegram_100_199");
+        assert_eq!(
+            album_b.content.matches("[IMAGE:").count(),
+            3,
+            "album b must include all 3 photos across the page boundary in a single turn"
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "album b must not be split into multiple dispatches"
+        );
+
+        telegram_expect_main_loop_offset(
+            &server,
+            102,
+            Duration::from_secs(3),
+            "delivered both albums and intermediate messages",
+        )
+        .await;
+
+        listener.abort();
+    }
+
     /// An ordinary same-chat message that arrives between a buffered photo and
     /// a later retained (text-only) album member must not flush the album: the
     /// unsupported member has its own ordering identity, so the group is not
@@ -14257,6 +14463,7 @@ mod tests {
             .and(path_regex(get_updates_path))
             .and(body_json(serde_json::json!({
                 "offset": 0,
+                "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 0,
                 "allowed_updates": allowed_updates.clone(),
             })))
@@ -14272,6 +14479,7 @@ mod tests {
             .and(path_regex(get_updates_path))
             .and(body_json(serde_json::json!({
                 "offset": 0,
+                "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 30,
                 "allowed_updates": allowed_updates,
             })))
