@@ -240,6 +240,7 @@ impl InboundRequestRouter {
                 .respond_to_inbound_request(request.id, response)
                 .await;
         }
+        let _ = self.rpc.flush_outbound().await;
     }
 
     /// Return the request only when no pane owns its session yet. The caller

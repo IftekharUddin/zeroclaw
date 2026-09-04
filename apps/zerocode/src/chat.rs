@@ -292,6 +292,7 @@ struct PromptCompletion {
     session_id: String,
     turn_generation: u64,
     error: Option<String>,
+    transport_closed: bool,
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -388,7 +389,8 @@ impl Chat {
                 interrupted: state.turn_in_flight
                     || state.pending_approval.is_some()
                     || state.pending_elicitation.is_some(),
-                recovery_required: state.last_error == Some(SessionError::ResyncFailed),
+                recovery_required: state.last_error == Some(SessionError::ResyncFailed)
+                    || self.session_resync_in_flight.contains(&state.session_id),
             });
         }
 
@@ -1266,7 +1268,6 @@ impl Chat {
         let msgs = match self.rpc.session_messages(session_id).await {
             Ok(messages) => messages,
             Err(error) => {
-                let _ = self.rpc.session_close(session_id).await;
                 return Err(error.to_string());
             }
         };
@@ -1432,6 +1433,11 @@ impl Chat {
                 continue;
             }
 
+            if completion.transport_closed {
+                // A closed transport cannot prove that the daemon completed
+                // this turn; retain the interrupted state for reconnect.
+                continue;
+            }
             // The response proves the handler returned, but only the missing
             // terminal notification distinguishes completed from cancelled or
             // failed. Settle conservatively so queued work cannot auto-run.
@@ -1943,6 +1949,7 @@ impl Chat {
         let turn_generation = state.turn_generation;
         Self::spawn_prompt_on(
             rpc_out,
+            rpc,
             prompt_completion_tx,
             sid,
             turn_generation,
@@ -1953,6 +1960,7 @@ impl Chat {
 
     fn spawn_prompt_on(
         rpc_out: &Arc<RpcOutbound>,
+        rpc: &Arc<RpcClient>,
         completion_tx: &mpsc::Sender<PromptCompletion>,
         sid: String,
         turn_generation: u64,
@@ -1960,6 +1968,7 @@ impl Chat {
         attachments_json: Vec<serde_json::Value>,
     ) {
         let rpc_arc = rpc_out.clone();
+        let client = rpc.clone();
         let completion_tx = completion_tx.clone();
         tokio::spawn(async move {
             let mut params = serde_json::json!({
@@ -1969,16 +1978,19 @@ impl Chat {
             if !attachments_json.is_empty() {
                 params["attachments"] = serde_json::Value::Array(attachments_json);
             }
-            let error = rpc_arc
-                .request(method::SESSION_PROMPT, params)
-                .await
-                .err()
-                .map(|e| format!("{} ({})", e.message, e.code));
+            let result = rpc_arc.request(method::SESSION_PROMPT, params).await;
+            let transport_closed = result.is_err()
+                && matches!(
+                    client.connection_state(),
+                    crate::client::ConnectionState::Disconnected { .. }
+                );
+            let error = result.err().map(|e| format!("{} ({})", e.message, e.code));
             let _ = completion_tx
                 .send(PromptCompletion {
                     session_id: sid,
                     turn_generation,
                     error,
+                    transport_closed,
                 })
                 .await;
         });
@@ -10992,11 +11004,6 @@ mod tests {
                     crate::jsonrpc::error_codes::INTERNAL_ERROR,
                     "controlled transcript failure",
                 );
-                let request =
-                    next_rpc_request(&mut rx, "failed resume closes the attached session").await;
-                assert_eq!(request["method"], method::SESSION_CLOSE);
-                assert_eq!(request["params"]["session_id"], session_id);
-                respond_ok(&rpc, &request, serde_json::json!({}));
             }
         }
 
@@ -11355,6 +11362,104 @@ mod tests {
         };
         assert_eq!(a.turn_status, TurnStatus::Idle, "focused session untouched");
         assert!(a.pending_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_snapshot_marks_inflight_resync_as_recovery_required() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order.push("sess-1".to_string());
+        chat.session_resync_in_flight.insert("sess-1".to_string());
+
+        let entries = chat.resume_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].recovery_required);
+    }
+
+    #[tokio::test]
+    async fn prompt_transport_closure_preserves_interrupted_resume_recovery() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client.clone(), PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message("in flight".to_string(), Vec::new())
+            .expect("first prompt");
+        active
+            .enqueue_message("queued after disconnect".to_string(), Vec::new())
+            .expect("queued follow-up");
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.session_order.push("sess-1".to_string());
+
+        chat.pump_all_queues();
+        let prompt = next_rpc_request(&mut rx, "first prompt should be sent").await;
+        assert_eq!(prompt["method"], method::SESSION_PROMPT);
+        client.disconnect_for_test("prompt transport closed");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while chat.prompt_completion_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport closure should complete the pending request");
+        chat.tick_transport_events();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("session remains active after transport closure");
+        };
+        assert!(
+            state.turn_in_flight,
+            "closure must retain the interrupted turn"
+        );
+        assert_eq!(state.queue_len(), 1, "queued work remains client-owned");
+        assert!(
+            rx.try_recv().is_err(),
+            "transport closure must not dispatch the queued follow-up"
+        );
+
+        let entry = chat
+            .resume_entries()
+            .into_iter()
+            .next()
+            .expect("interrupted session should be resumable");
+        assert!(entry.interrupted);
+
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel::<String>(16);
+        let reconnect_rpc = Arc::new(RpcOutbound::new(reconnect_tx));
+        let reconnect_client = Arc::new(RpcClient::with_rpc(reconnect_rpc.clone()));
+        let mut reconnected = Chat::new(reconnect_client, PaneKind::Chat);
+        reconnected.set_resume_sessions(vec![entry]);
+        let reconnect = tokio::spawn(async move {
+            reconnected.start_session("myagent", None).await;
+            reconnected
+        });
+
+        let session_new = next_rpc_request(&mut reconnect_rx, "reconnect should reattach").await;
+        respond_ok(
+            &reconnect_rpc,
+            &session_new,
+            serde_json::json!({ "session_id": "sess-1", "workspace_dir": "/tmp/reconnected" }),
+        );
+        let config = next_rpc_request(&mut reconnect_rx, "reconnect refreshes identity").await;
+        respond_ok(&reconnect_rpc, &config, serde_json::json!([]));
+        let history = next_rpc_request(&mut reconnect_rx, "reconnect reloads history").await;
+        respond_ok(
+            &reconnect_rpc,
+            &history,
+            serde_json::json!({ "messages": [] }),
+        );
+        let recovery = next_rpc_request(
+            &mut reconnect_rx,
+            "interrupted resume must recover before dispatch",
+        )
+        .await;
+        assert_eq!(recovery["method"], method::SESSION_CANCEL);
+        reconnect.abort();
     }
 
     #[tokio::test]
@@ -12940,16 +13045,14 @@ mod tests {
             "malformed ACP history",
         );
 
-        let request =
-            next_rpc_request(&mut rx, "failed restore should close resumed session").await;
-        assert_eq!(request["method"], method::SESSION_CLOSE);
-        assert_eq!(request["params"]["session_id"], "sess-broken");
-        respond_ok(&rpc, &request, serde_json::json!({}));
-
         let chat = tokio::time::timeout(Duration::from_secs(2), switch)
             .await
             .expect("failed history restore should finish")
             .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "failed history replay must not close a session that may be canonical"
+        );
         let ChatPhase::Active(state) = chat.phase else {
             panic!("failed history restore should keep the old session active");
         };

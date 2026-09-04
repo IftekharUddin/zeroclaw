@@ -20,6 +20,7 @@ use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionS
 const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTBOUND_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// ONE absolute budget for the entire client-side relay setup: the TCP connect,
 /// the outer TLS and WebSocket upgrade, the route request, the relay's `Opened`
@@ -1431,8 +1432,8 @@ impl RpcClient {
             .with_context(|| format!("connecting to {}", socket.display()))?;
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(64);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
@@ -1444,15 +1445,22 @@ impl RpcClient {
         let conn_state_for_writer = conn_state.clone();
         let writer_task = tokio::spawn(async move {
             let mut writer = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if let Err(error) = writer.write_all(line.as_bytes()).await {
-                    if let Some(rpc) = rpc_for_writer.upgrade() {
-                        disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(mut line) => {
+                        if !line.ends_with('\n') {
+                            line.push('\n');
+                        }
+                        if let Err(error) = writer.write_all(line.as_bytes()).await {
+                            if let Some(rpc) = rpc_for_writer.upgrade() {
+                                disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                            }
+                            break;
+                        }
                     }
-                    break;
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
@@ -1660,8 +1668,8 @@ impl RpcClient {
 
         let (mut sink, mut stream) = ws_stream.split();
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(64);
+        let rpc = Arc::new(jsonrpc::RpcOutbound::new_transport(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
@@ -1672,12 +1680,19 @@ impl RpcClient {
         let rpc_for_writer = Arc::downgrade(&rpc);
         let conn_state_for_writer = conn_state.clone();
         let writer_task = tokio::spawn(async move {
-            while let Some(line) = writer_rx.recv().await {
-                if let Err(error) = sink.send(Message::Text(line.into())).await {
-                    if let Some(rpc) = rpc_for_writer.upgrade() {
-                        disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(line) => {
+                        if let Err(error) = sink.send(Message::Text(line.into())).await {
+                            if let Some(rpc) = rpc_for_writer.upgrade() {
+                                disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                            }
+                            break;
+                        }
                     }
-                    break;
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
@@ -1873,6 +1888,23 @@ impl RpcClient {
     /// Current connection state. Cheap mutex read, safe to call on every frame.
     pub fn connection_state(&self) -> ConnectionState {
         clone_connection_state(&self.connection_state)
+    }
+
+    pub async fn flush_outbound(&self) -> bool {
+        self.flush_outbound_with_timeout(OUTBOUND_FLUSH_TIMEOUT)
+            .await
+    }
+
+    async fn flush_outbound_with_timeout(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.rpc.flush_outbound())
+            .await
+            .is_ok_and(|flushed| flushed)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn disconnect_for_test(&self, reason: &str) {
+        disconnect_rpc(&self.rpc, &self.connection_state, reason.to_string());
     }
 
     // ── Notifications ─────────────────────────────────────────────
@@ -5072,6 +5104,51 @@ mod notification_tests {
         assert_eq!(answer["pong"], true);
         assert!(inbound_rx.try_recv().is_err(), "inbound rx must stay empty");
         assert!(notif_rx.try_recv().is_err(), "notif rx must stay empty");
+    }
+
+    #[tokio::test]
+    async fn flush_outbound_waits_for_delayed_writer_before_shutdown() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered_by_writer = Arc::clone(&delivered);
+        let writer = tokio::spawn(async move {
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(_) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        delivered_by_writer.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        assert!(client.flush_outbound().await);
+        assert!(
+            delivered.load(std::sync::atomic::Ordering::Acquire),
+            "flush must wait for the delayed frame before the writer is retired"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn flush_outbound_times_out_when_writer_is_stalled() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(1);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let client = RpcClient::with_rpc(rpc);
+
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await,
+            "a stalled writer must not strand reconnect adoption"
+        );
     }
 
     async fn assert_disconnect_fails_pending_request(reason: &str) {

@@ -1384,6 +1384,30 @@ impl RpcDispatcher {
         });
     }
 
+    async fn finish_existing_session_resume(
+        &self,
+        session_id: String,
+        chat_mode: &crate::rpc::types::ChatMode,
+        existing: crate::rpc::session::ResumedRpcSession,
+    ) -> RpcResult {
+        self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
+            && let Some(notification) = plan_replay_notification(&session_id, &plan)
+        {
+            let _ = self.rpc.send_raw(notification).await;
+        }
+        if let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_start(&session_id, "rpc").await;
+        }
+        to_result(SessionNewResult {
+            session_id,
+            agent_alias: existing.agent_alias,
+            message_count: existing.message_count,
+            workspace_dir: existing.workspace_dir,
+        })
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         let resuming = req.session_id.is_some();
@@ -1391,9 +1415,41 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        // Session replacement and prompt execution share one admission
-        // permit. Resolve and install the new incarnation only after the
-        // previous same-ID turn has fully finalized its durable state.
+        let config = self.ctx.config.read().clone();
+        let chat_mode = req
+            .chat_mode
+            .clone()
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+
+        // A caller-supplied ID is a resume selector. The live RpcSession is
+        // the canonical in-process incarnation, including provider history;
+        // Same-mode reconnects only rebind the existing canonical session.
+        // Resolve them before queue admission so an active turn can retain its
+        // real permit while the reattach completes. New sessions and
+        // cross-mode replacements remain serialized below.
+        if resuming {
+            match self
+                .ctx
+                .sessions
+                .resume_existing(
+                    &session_id,
+                    &req.agent_alias,
+                    &chat_mode,
+                    self.tui_id.clone(),
+                )
+                .await
+            {
+                Ok(Some(existing)) => {
+                    return self
+                        .finish_existing_session_resume(session_id, &chat_mode, existing)
+                        .await;
+                }
+                Ok(None) | Err("session uses a different chat mode") => {}
+                Err(message) => return Err(rpc_err(INVALID_PARAMS, message)),
+            }
+        }
+
+        // Session replacement and prompt execution share one admission permit.
         let _guard = self
             .ctx
             .sessions
@@ -1402,32 +1458,11 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        let config = self.ctx.config.read().clone();
-        let chat_mode = req
-            .chat_mode
-            .clone()
-            .unwrap_or(crate::rpc::types::ChatMode::Chat);
-
-        // Same-mode reconnects keep the live Agent below. A caller that
-        // deliberately reuses an ID for the other pane mode still replaces
-        // the old incarnation, but only after the shared admission guard has
-        // allowed its previous turn to finish all durable work.
-        if resuming
-            && self
-                .ctx
-                .sessions
-                .chat_mode(&session_id)
-                .await
-                .is_some_and(|existing_mode| existing_mode != chat_mode)
-        {
-            self.ctx.sessions.remove(&session_id).await;
-        }
-
-        // A caller-supplied ID is a resume selector. The live RpcSession is
-        // the canonical in-process incarnation, including provider history;
-        // replacing it while its predecessor turn runs can publish an Agent
-        // that never observes the predecessor's completed turn.
-        if resuming
+        // The mode may have changed while this request waited for admission.
+        // Re-read under the permit so concurrent replacements cannot remove a
+        // newly installed same-mode canonical session based on stale state.
+        let admitted_mode = self.ctx.sessions.chat_mode(&session_id).await;
+        if admitted_mode.as_ref() == Some(&chat_mode)
             && let Some(existing) = self
                 .ctx
                 .sessions
@@ -1440,22 +1475,12 @@ impl RpcDispatcher {
                 .await
                 .map_err(|message| rpc_err(INVALID_PARAMS, message))?
         {
-            self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
-            if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
-                && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
-                && let Some(notification) = plan_replay_notification(&session_id, &plan)
-            {
-                let _ = self.rpc.send_raw(notification).await;
-            }
-            if let Some(ref hooks) = self.ctx.hooks {
-                hooks.fire_session_start(&session_id, "rpc").await;
-            }
-            return to_result(SessionNewResult {
-                session_id,
-                agent_alias: existing.agent_alias,
-                message_count: existing.message_count,
-                workspace_dir: existing.workspace_dir,
-            });
+            return self
+                .finish_existing_session_resume(session_id, &chat_mode, existing)
+                .await;
+        }
+        if admitted_mode.is_some() {
+            self.ctx.sessions.remove(&session_id).await;
         }
 
         // Resuming an ACP session with no caller cwd: recover the original
@@ -9244,14 +9269,20 @@ mod tests {
             ]);
             let turn_generation = sessions
                 .register_cancel_token(session_id, tokio_util::sync::CancellationToken::new());
+            let queue_guard = sessions
+                .session_queue
+                .acquire(session_id)
+                .await
+                .expect("the active turn should hold the production session permit");
 
             let resumed = tokio::time::timeout(
                 std::time::Duration::from_millis(250),
                 dispatcher.handle_session_new_for_test(&params),
             )
             .await
-            .expect("reattach must not wait for the active predecessor Agent")
+            .expect("same-mode reattach must not wait for the active session permit")
             .expect("same-ID reattach must succeed");
+            drop(queue_guard);
             assert_eq!(resumed["session_id"], session_id);
             assert_eq!(
                 sessions.get_generation(session_id).await,
@@ -9275,6 +9306,85 @@ mod tests {
             sessions.remove_cancel_token(session_id, turn_generation);
             drop(predecessor_guard);
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_target_replacements_keep_first_admitted_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, tmp.path());
+        let session_id = "concurrent-chat-to-acp-replacement";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+                "session_id": session_id,
+            }))
+            .await
+            .expect("initial Chat session must succeed");
+        let initial_generation = sessions
+            .get_generation(session_id)
+            .await
+            .expect("initial session must have a generation");
+
+        let admission_guard = sessions
+            .session_queue
+            .acquire(session_id)
+            .await
+            .expect("test should hold replacement admission");
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": session_id,
+        });
+
+        let first_handle = dispatcher.spawn_handle();
+        let first_params = params.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            first_handle
+                .handle_session_new_for_test(&first_params)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sessions.session_queue.queue_depth(session_id).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first replacement must queue behind the test permit");
+
+        let second_handle = dispatcher.spawn_handle();
+        let second = zeroclaw_spawn::spawn!(async move {
+            second_handle.handle_session_new_for_test(&params).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sessions.session_queue.queue_depth(session_id).await < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second replacement must snapshot the same predecessor and queue");
+
+        drop(admission_guard);
+        first
+            .await
+            .expect("first replacement task must not panic")
+            .expect("first replacement must succeed");
+        second
+            .await
+            .expect("second replacement task must not panic")
+            .expect("second replacement must resume the admitted incarnation");
+
+        assert_eq!(
+            sessions.chat_mode(session_id).await,
+            Some(crate::rpc::types::ChatMode::Acp)
+        );
+        assert_eq!(
+            sessions.get_generation(session_id).await,
+            Some(initial_generation.wrapping_add(1)),
+            "the queued follower must not replace the first admitted ACP incarnation"
+        );
     }
 
     #[tokio::test]
