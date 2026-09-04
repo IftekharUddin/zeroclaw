@@ -150,8 +150,8 @@ is populated; there's no retroactive repricing of past records.
 
 `CostTracker::record_usage_with_agent` appends one `CostRecord` per
 token-bearing response to `<workspace>/state/costs.jsonl`, one JSON object
-per line. The file is read on startup to seed `daily_records()` so
-the dashboard's per-agent rollup survives restarts.
+per line. The ledger is read on startup so the dashboard's current-month
+per-agent rollup survives restarts.
 
 Each `TokenUsage` record carries two pricing-provenance fields:
 
