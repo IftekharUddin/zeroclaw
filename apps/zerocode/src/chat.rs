@@ -10992,6 +10992,11 @@ mod tests {
                     crate::jsonrpc::error_codes::INTERNAL_ERROR,
                     "controlled transcript failure",
                 );
+                let request =
+                    next_rpc_request(&mut rx, "failed resume closes the attached session").await;
+                assert_eq!(request["method"], method::SESSION_CLOSE);
+                assert_eq!(request["params"]["session_id"], session_id);
+                respond_ok(&rpc, &request, serde_json::json!({}));
             }
         }
 
