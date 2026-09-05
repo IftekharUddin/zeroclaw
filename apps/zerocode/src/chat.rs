@@ -9297,13 +9297,7 @@ mod tests {
 
     #[tokio::test]
     async fn todo_primary_p_reopens_latest_plan_after_hidden_update() {
-        use crossterm::event::{KeyCode, KeyModifiers};
-
-        let primary = if cfg!(target_os = "macos") {
-            KeyModifiers::SUPER
-        } else {
-            KeyModifiers::CONTROL
-        };
+        use crossterm::event::KeyCode;
 
         let mut chat = active_chat();
         let ChatPhase::Active(state) = &mut chat.phase else {
@@ -9325,7 +9319,13 @@ mod tests {
 
         assert!(
             !chat
-                .handle_key(KeyEvent::new(KeyCode::Char('p'), primary), &mut term,)
+                .handle_key(
+                    KeyEvent::new(
+                        KeyCode::Char('p'),
+                        crate::keymap::Chord::primary('p').effective_modifiers(),
+                    ),
+                    &mut term,
+                )
                 .await
         );
         let ChatPhase::Active(state) = &mut chat.phase else {
@@ -9342,7 +9342,13 @@ mod tests {
 
         assert!(
             !chat
-                .handle_key(KeyEvent::new(KeyCode::Char('p'), primary), &mut term,)
+                .handle_key(
+                    KeyEvent::new(
+                        KeyCode::Char('p'),
+                        crate::keymap::Chord::primary('p').effective_modifiers(),
+                    ),
+                    &mut term,
+                )
                 .await
         );
         let ChatPhase::Active(state) = &chat.phase else {
