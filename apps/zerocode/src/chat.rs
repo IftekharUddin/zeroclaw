@@ -14965,7 +14965,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 chat.drain_entry_retry_results();
-                if chat.session_summaries().len() == 2 {
+                // Sidebar summaries also include sessions still waiting to resume.
+                if matches!(chat.phase, ChatPhase::Active(_)) && chat.background.len() == 1 {
                     break;
                 }
                 tokio::task::yield_now().await;
