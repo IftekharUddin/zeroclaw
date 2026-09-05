@@ -21,6 +21,7 @@ const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+const OUTBOUND_RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// ONE absolute budget for the entire client-side relay setup: the TCP connect,
 /// the outer TLS and WebSocket upgrade, the route request, the relay's `Opened`
@@ -1893,6 +1894,19 @@ impl RpcClient {
     pub async fn flush_outbound(&self) -> bool {
         self.flush_outbound_with_timeout(OUTBOUND_FLUSH_TIMEOUT)
             .await
+    }
+
+    /// Keep a replaced transport alive long enough to drain terminal replies
+    /// that missed the fast handoff deadline, then reclaim all of its tasks.
+    pub fn retire_after_outbound_flush(self: Arc<Self>) {
+        self.retire_after_outbound_flush_with_timeout(OUTBOUND_RETIRE_TIMEOUT);
+    }
+
+    fn retire_after_outbound_flush_with_timeout(self: Arc<Self>, timeout: Duration) {
+        tokio::spawn(async move {
+            let _ = self.flush_outbound_with_timeout(timeout).await;
+            self.shutdown();
+        });
     }
 
     async fn flush_outbound_with_timeout(&self, timeout: Duration) -> bool {
@@ -5207,6 +5221,92 @@ mod notification_tests {
                 .await,
             "a stalled writer must not strand reconnect adoption"
         );
+    }
+
+    #[tokio::test]
+    async fn retirement_keeps_timed_out_writer_alive_until_terminal_frame_drains() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_writer = Arc::clone(&release);
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered_writer = Arc::clone(&delivered);
+        let writer = tokio::spawn(async move {
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(_) => {
+                        release_writer.notified().await;
+                        delivered_writer.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+        let client = Arc::new(client);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await
+        );
+        Arc::clone(&client).retire_after_outbound_flush_with_timeout(Duration::from_secs(1));
+        tokio::task::yield_now().await;
+        assert!(
+            !client.writer_task.as_ref().unwrap().is_finished(),
+            "a missed fast flush must not abort the writer immediately"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !delivered.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal frame should drain during bounded retirement");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.writer_task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement should reclaim the writer after its flush");
+    }
+
+    #[tokio::test]
+    async fn retirement_reclaims_a_permanently_stalled_writer_after_deadline() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            if matches!(
+                writer_rx.recv().await,
+                Some(jsonrpc::OutboundMessage::Frame(_))
+            ) {
+                let _ = blocked_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+        let client = Arc::new(client);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        blocked_rx.await.expect("writer should stall on the frame");
+        Arc::clone(&client).retire_after_outbound_flush_with_timeout(Duration::from_millis(20));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.writer_task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement deadline should reclaim a permanently stalled writer");
     }
 
     async fn assert_disconnect_fails_pending_request(reason: &str) {

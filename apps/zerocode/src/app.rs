@@ -215,7 +215,7 @@ impl InboundRequestRouter {
     /// before its transport is replaced. Quiescing the reader closes the sole
     /// production sender before the final drain, while the writer remains
     /// available for one terminal response to every accepted request.
-    async fn cancel_pending(&mut self) {
+    async fn cancel_pending(&mut self) -> bool {
         self.rpc.quiesce_inbound_reader().await;
         let mut pending = self
             .deferred
@@ -240,7 +240,7 @@ impl InboundRequestRouter {
                 .respond_to_inbound_request(request.id, response)
                 .await;
         }
-        let _ = self.rpc.flush_outbound().await;
+        self.rpc.flush_outbound().await
     }
 
     /// Return the request only when no pane owns its session yet. The caller
@@ -1156,7 +1156,7 @@ pub async fn run(
                             // failure cannot consume queues or retry state.
                             chat_pane.commit_reconnect_handoff();
                             acp_pane.commit_reconnect_handoff();
-                            inbound_router.cancel_pending().await;
+                            let previous_flushed = inbound_router.cancel_pending().await;
                             // Assigned as one tuple: every pane the builder
                             // produces is adopted, and a later pane addition
                             // cannot stay bound to the old client silently.
@@ -1172,13 +1172,21 @@ pub async fn run(
                             ) = panes;
                             inbound_router = next_inbound_router;
                             // No pane holds the replaced connection any more.
-                            previous.shutdown();
+                            if previous_flushed {
+                                previous.shutdown();
+                            } else {
+                                previous.retire_after_outbound_flush();
+                            }
                             true
                         }
                         Err(_) => {
-                            next_inbound_router.cancel_pending().await;
+                            let abandoned_flushed = next_inbound_router.cancel_pending().await;
                             let abandoned = std::mem::replace(&mut rpc, previous);
-                            abandoned.shutdown();
+                            if abandoned_flushed {
+                                abandoned.shutdown();
+                            } else {
+                                abandoned.retire_after_outbound_flush();
+                            }
                             false
                         }
                     }

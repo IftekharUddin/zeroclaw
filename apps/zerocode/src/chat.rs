@@ -497,6 +497,9 @@ impl Chat {
         self.resume_focused = None;
         self.resume_backgrounds = Vec::new();
         for entry in entries {
+            if !self.session_order.contains(&entry.session_id) {
+                self.session_order.push(entry.session_id.clone());
+            }
             if entry.was_focused && self.resume_focused.is_none() {
                 self.resume_focused = Some(entry);
             } else {
@@ -596,8 +599,13 @@ impl Chat {
             ChatPhase::Active(state) => Some(state.as_ref()),
             _ => None,
         };
-        let mut out = Vec::with_capacity(self.background.len() + 1);
-        let mut summarize = |state: &ChatState, focused: bool| {
+        let mut out = Vec::with_capacity(
+            self.background.len()
+                + self.resume_backgrounds.len()
+                + usize::from(self.resume_focused.is_some())
+                + 1,
+        );
+        let summarize = |out: &mut Vec<SidebarSessionSummary>, state: &ChatState, focused: bool| {
             out.push(SidebarSessionSummary {
                 session_id: state.session_id.clone(),
                 agent_alias: state.agent_alias.clone(),
@@ -608,29 +616,42 @@ impl Chat {
         };
         for sid in &self.session_order {
             if let Some(state) = active.filter(|s| &s.session_id == sid) {
-                summarize(state, true);
+                summarize(&mut out, state, true);
             } else if let Some(state) = self.background.iter().find(|s| &s.session_id == sid) {
-                summarize(state, false);
+                summarize(&mut out, state, false);
+            } else if let Some(entry) = self
+                .resume_focused
+                .iter()
+                .chain(self.resume_backgrounds.iter())
+                .find(|entry| &entry.session_id == sid)
+            {
+                out.push(SidebarSessionSummary {
+                    session_id: entry.session_id.clone(),
+                    agent_alias: entry.agent_alias.clone(),
+                    status: SidebarStatus::Errored,
+                    pane_kind: self.pane_kind,
+                    focused: active.is_none() && entry.was_focused,
+                });
             }
         }
         // Defensive: surface live sessions that fell out of the order list
         // rather than hiding them.
         for state in &self.background {
             if !self.session_order.contains(&state.session_id) {
-                summarize(state, false);
+                summarize(&mut out, state, false);
             }
         }
         if let Some(state) = active
             && !self.session_order.contains(&state.session_id)
         {
-            summarize(state, true);
+            summarize(&mut out, state, true);
         }
         out
     }
 
-    /// Focused + background session count.
+    /// Count every live or retained session exposed through the sidebar.
     fn tracked_session_count(&self) -> usize {
-        self.background.len() + usize::from(matches!(self.phase, ChatPhase::Active(_)))
+        self.session_summaries().len()
     }
 
     /// Keep `session_order` current after an in-place session restart
@@ -703,6 +724,17 @@ impl Chat {
             self.ensure_session_alive(session_id).await;
             return true;
         }
+        if self
+            .resume_focused
+            .as_ref()
+            .is_some_and(|entry| entry.session_id == session_id)
+            || self
+                .resume_backgrounds
+                .iter()
+                .any(|entry| entry.session_id == session_id)
+        {
+            return self.retry_retained_session(session_id).await;
+        }
         let Some(idx) = self
             .background
             .iter()
@@ -726,6 +758,56 @@ impl Chat {
         true
     }
 
+    async fn retry_retained_session(&mut self, session_id: &str) -> bool {
+        let entry = if self
+            .resume_focused
+            .as_ref()
+            .is_some_and(|entry| entry.session_id == session_id)
+        {
+            self.resume_focused.take()
+        } else {
+            self.resume_backgrounds
+                .iter()
+                .position(|entry| entry.session_id == session_id)
+                .map(|idx| self.resume_backgrounds.remove(idx))
+        };
+        let Some(mut entry) = entry else {
+            return false;
+        };
+
+        match self.attach_resume_entry(&entry).await {
+            Ok(state) => {
+                let needs_terminal_recovery = entry.interrupted || entry.recovery_required;
+                let resumed_id = state.session_id.clone();
+                match std::mem::replace(&mut self.phase, ChatPhase::Active(Box::new(state))) {
+                    ChatPhase::Active(previous) => {
+                        self.last_focused_sid = Some(previous.session_id.clone());
+                        self.background.push(*previous);
+                    }
+                    _ => {
+                        self.last_focused_sid = Some(session_id.to_string());
+                    }
+                }
+                if needs_terminal_recovery {
+                    self.begin_session_resync(resumed_id);
+                }
+                self.pump_all_queues();
+                true
+            }
+            Err(error) => {
+                entry.was_focused = false;
+                self.resume_backgrounds.push(entry);
+                if let ChatPhase::Active(state) = &mut self.phase {
+                    state.set_info_notice(crate::i18n::t_args(
+                        "zc-chat-error-resume-history",
+                        &[("error", &error)],
+                    ));
+                }
+                false
+            }
+        }
+    }
+
     /// Close one tracked session: the daemon drops it (history persists) and
     /// the sidebar entry disappears. Focus moves to the next tracked session,
     /// or back to the agent picker when none remain. Returns false when the
@@ -739,7 +821,19 @@ impl Chat {
             .background
             .iter()
             .position(|s| s.session_id == session_id);
-        if !was_focused && in_background.is_none() {
+        let retained_was_focused = self
+            .resume_focused
+            .as_ref()
+            .is_some_and(|entry| entry.session_id == session_id);
+        let retained_background = self
+            .resume_backgrounds
+            .iter()
+            .position(|entry| entry.session_id == session_id);
+        if !was_focused
+            && in_background.is_none()
+            && !retained_was_focused
+            && retained_background.is_none()
+        {
             return false;
         }
         if let Err(error) = self.rpc.session_close(session_id).await {
@@ -762,6 +856,13 @@ impl Chat {
         if let Some(idx) = in_background {
             self.background.remove(idx);
             return true;
+        }
+        if let Some(idx) = retained_background {
+            self.resume_backgrounds.remove(idx);
+            return true;
+        }
+        if retained_was_focused {
+            self.resume_focused = None;
         }
         // Closed the focused session: promote the next tracked one (sidebar
         // order), else fall back to the agent picker.
@@ -12675,8 +12776,16 @@ mod tests {
         let mut chat = Chat::new(client, PaneKind::Chat);
         chat.phase = ChatPhase::Active(Box::new(state_for("sess-f", "beta")));
         chat.session_order.push("sess-f".to_string());
-        chat.resume_backgrounds
-            .push(resume_entry("sess-bg", "alpha", false));
+        chat.session_order.push("sess-bg".to_string());
+        let mut retained = resume_entry("sess-bg", "alpha", false);
+        retained.queue.messages.push_back(QueuedMessage {
+            id: 0,
+            text: "queued while disconnected".to_string(),
+            attachments: Vec::new(),
+            status: QueueItemStatus::Pending,
+        });
+        retained.queue.next_id = 1;
+        chat.resume_backgrounds.push(retained);
 
         let retry = tokio::spawn(async move {
             chat.after_session_start().await;
@@ -12687,7 +12796,7 @@ mod tests {
         assert_eq!(request["params"]["session_id"], "sess-bg");
         respond_err(&rpc, &request, -32000, "controlled background failure");
 
-        let chat = tokio::time::timeout(Duration::from_secs(2), retry)
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), retry)
             .await
             .expect("background retry should return")
             .unwrap();
@@ -12699,6 +12808,91 @@ mod tests {
             vec!["sess-bg"]
         );
         assert_eq!(chat.current_session_id(), Some("sess-f"));
+        assert_eq!(
+            chat.session_summaries()
+                .into_iter()
+                .map(|summary| (summary.session_id, summary.status, summary.focused))
+                .collect::<Vec<_>>(),
+            vec![
+                ("sess-f".to_string(), SidebarStatus::Ready, true),
+                ("sess-bg".to_string(), SidebarStatus::Errored, false),
+            ],
+            "a failed resume remains an explicit retryable sidebar row"
+        );
+
+        let retry = tokio::spawn(async move {
+            let focused = chat.focus_session("sess-bg").await;
+            (chat, focused)
+        });
+        let request =
+            next_rpc_request(&mut rx, "sidebar retry should reattach exact session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-bg");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-bg", "workspace_dir": "/w" }),
+        );
+        let request = next_rpc_request(&mut rx, "sidebar retry refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "sidebar retry reloads transcript").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        respond_ok(&rpc, &request, serde_json::json!({ "messages": [] }));
+
+        let (chat, focused) = tokio::time::timeout(Duration::from_secs(2), retry)
+            .await
+            .expect("explicit retry should finish")
+            .unwrap();
+        assert!(focused);
+        assert_eq!(chat.current_session_id(), Some("sess-bg"));
+        assert_eq!(chat.last_focused_sid.as_deref(), Some("sess-f"));
+        assert!(chat.resume_backgrounds.is_empty());
+        let request = next_rpc_request(&mut rx, "retained queue should dispatch after retry").await;
+        assert_eq!(request["method"], method::SESSION_PROMPT);
+        assert_eq!(request["params"]["session_id"], "sess-bg");
+        assert_eq!(request["params"]["prompt"], "queued while disconnected");
+    }
+
+    #[tokio::test]
+    async fn retained_resume_entries_count_toward_the_session_cap() {
+        let mut chat = active_chat();
+        chat.session_order = vec!["sess-1".to_string()];
+        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+            let session_id = format!("sess-{idx}");
+            chat.session_order.push(session_id.clone());
+            chat.resume_backgrounds
+                .push(resume_entry(&session_id, "agent", false));
+        }
+
+        assert_eq!(chat.tracked_session_count(), MAX_TRACKED_SESSIONS_PER_PANE);
+    }
+
+    #[tokio::test]
+    async fn closing_a_focused_retained_session_promotes_a_live_background() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("resume failed".to_string());
+        chat.background.push(state_for("sess-live", "beta"));
+        chat.session_order = vec!["sess-failed".to_string(), "sess-live".to_string()];
+        chat.resume_focused = Some(resume_entry("sess-failed", "alpha", true));
+
+        let close = tokio::spawn(async move {
+            let closed = chat.close_session("sess-failed").await;
+            (chat, closed)
+        });
+        let request = next_rpc_request(&mut rx, "retained close should reach the daemon").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-failed");
+        respond_ok(&rpc, &request, serde_json::Value::Null);
+
+        let (chat, closed) = close.await.unwrap();
+        assert!(closed);
+        assert!(chat.resume_focused.is_none());
+        assert_eq!(chat.current_session_id(), Some("sess-live"));
+        assert_eq!(chat.session_order, vec!["sess-live"]);
     }
 
     #[tokio::test]
