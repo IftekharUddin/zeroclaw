@@ -6,7 +6,7 @@
 //! picker). Session rows are derived per frame from the panes'
 //! `session_summaries()` — the panes stay the single source of truth.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -42,22 +42,10 @@ pub(crate) struct SidebarCtx {
 /// A user action the shell must route (mode switch + pane call).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidebarEvent {
-    FocusSession {
-        pane: PaneKind,
-        session_id: String,
-    },
-    CloseSession {
-        pane: PaneKind,
-        session_id: String,
-    },
+    FocusSession { pane: PaneKind, session_id: String },
+    CloseSession { pane: PaneKind, session_id: String },
     OpenPicker,
-    PickAgent {
-        pane: PaneKind,
-        alias: String,
-        /// The alias's session already open in the target pane, if any:
-        /// focus it instead of starting a duplicate.
-        existing_session: Option<String>,
-    },
+    PickAgent { pane: PaneKind, alias: String },
     OpenQuickstart,
 }
 
@@ -68,8 +56,8 @@ struct SidebarPicker {
     /// Display labels (alias + open-marker suffix), parallel to `aliases`.
     state: widgets::PickerState,
     aliases: Vec<String>,
-    /// alias -> session already open in `target`, from summaries at open time.
-    open_by_alias: HashMap<String, String>,
+    /// Informational only: selecting an open alias still creates a new session.
+    open_aliases: HashSet<String>,
     loading: bool,
     error: Option<String>,
     rx: mpsc::UnboundedReceiver<Result<Vec<String>, String>>,
@@ -329,7 +317,29 @@ impl AgentSidebar {
                 .unwrap_or(0);
 
             let name_width = (row_rect.width as usize).saturating_sub(2 + tag_width);
-            let name = widgets::truncate_to_width(&summary.agent_alias, name_width);
+            let duplicate = rows
+                .iter()
+                .filter(|row| row.agent_alias == summary.agent_alias)
+                .count()
+                > 1;
+            let name = if duplicate {
+                let ordinal = rows
+                    .iter()
+                    .take(self.scroll as usize + i + 1)
+                    .filter(|row| row.agent_alias == summary.agent_alias)
+                    .count();
+                let suffix = format!(" #{ordinal}");
+                format!(
+                    "{}{}",
+                    widgets::truncate_to_width(
+                        &summary.agent_alias,
+                        name_width.saturating_sub(suffix.len())
+                    ),
+                    suffix
+                )
+            } else {
+                widgets::truncate_to_width(&summary.agent_alias, name_width)
+            };
             let pad = name_width.saturating_sub(crate::display_width::display_width(&name));
 
             let mut spans = vec![
@@ -377,12 +387,11 @@ impl AgentSidebar {
     }
 
     /// Open the picker targeting `pane`, spawning a background agent fetch.
-    /// `open_by_alias` maps aliases already open in that pane to their
-    /// session ids (from the pane's summaries).
+    /// `open_aliases` marks aliases already open without changing launch behavior.
     pub(crate) fn open_picker(
         &mut self,
         target: PaneKind,
-        open_by_alias: HashMap<String, String>,
+        open_aliases: HashSet<String>,
         rpc: &Arc<RpcClient>,
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -403,7 +412,7 @@ impl AgentSidebar {
             target,
             state: widgets::PickerState::default(),
             aliases: Vec::new(),
-            open_by_alias,
+            open_aliases,
             loading: true,
             error: None,
             rx,
@@ -428,7 +437,7 @@ impl AgentSidebar {
                 let labels = aliases
                     .iter()
                     .map(|alias| {
-                        if picker.open_by_alias.contains_key(alias) {
+                        if picker.open_aliases.contains(alias) {
                             format!("{alias} {open_suffix}")
                         } else {
                             alias.clone()
@@ -483,7 +492,6 @@ impl AgentSidebar {
         let alias = picker.aliases.get(picker.state.cursor)?.clone();
         Some(SidebarEvent::PickAgent {
             pane: picker.target,
-            existing_session: picker.open_by_alias.get(&alias).cloned(),
             alias,
         })
     }
@@ -707,6 +715,34 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_alias_rows_have_distinct_labels_and_session_targets() {
+        let mut sidebar = sidebar();
+        let area = sidebar.carve(Rect::new(0, 0, 100, 10)).0.unwrap();
+        let rows = vec![summary("alpha", "s1", true), summary("alpha", "s2", false)];
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        for (idx, (_, sid, rect)) in sidebar.row_rects.clone().into_iter().enumerate() {
+            let text: String = (rect.x..rect.right())
+                .map(|x| term.backend().buffer()[(x, rect.y)].symbol())
+                .collect();
+            assert!(text.contains(&format!("alpha #{}", idx + 1)), "{text}");
+            assert_eq!(
+                sidebar.handle_mouse(&click(rect.x + 1, rect.y)),
+                Some(SidebarEvent::FocusSession {
+                    pane: PaneKind::Chat,
+                    session_id: sid,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn scroll_clamps_to_row_overflow() {
         let mut s = sidebar();
         let area = s.carve(Rect::new(0, 0, 100, 6)).0.unwrap();
@@ -729,14 +765,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn picker_labels_mark_open_aliases_and_confirm_dedupes() {
+    async fn picker_labels_mark_open_aliases_but_confirm_creates_a_session() {
         let mut s = sidebar();
         let (tx, rx) = mpsc::unbounded_channel();
         s.picker = Some(SidebarPicker {
             target: PaneKind::Chat,
             state: widgets::PickerState::default(),
             aliases: Vec::new(),
-            open_by_alias: HashMap::from([("alpha".to_string(), "s1".to_string())]),
+            open_aliases: HashSet::from(["alpha".to_string()]),
             loading: true,
             error: None,
             rx,
@@ -758,7 +794,6 @@ mod tests {
             Some(SidebarEvent::PickAgent {
                 pane: PaneKind::Chat,
                 alias: "alpha".into(),
-                existing_session: Some("s1".into()),
             })
         );
         assert!(!s.picker_open(), "confirm closes the picker");
@@ -772,7 +807,7 @@ mod tests {
             target: PaneKind::Acp,
             state: widgets::PickerState::default(),
             aliases: Vec::new(),
-            open_by_alias: HashMap::new(),
+            open_aliases: HashSet::new(),
             loading: true,
             error: None,
             rx,
@@ -795,7 +830,7 @@ mod tests {
             target: PaneKind::Chat,
             state: widgets::PickerState::default(),
             aliases: Vec::new(),
-            open_by_alias: HashMap::new(),
+            open_aliases: HashSet::new(),
             loading: true,
             error: None,
             rx,

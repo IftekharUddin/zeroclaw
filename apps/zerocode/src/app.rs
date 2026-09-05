@@ -1065,17 +1065,10 @@ pub async fn run(
                         chat::PaneKind::Chat => chat_pane.session_summaries(),
                         chat::PaneKind::Acp => acp_pane.session_summaries(),
                     };
-                    let open_by_alias = summaries
-                        .into_iter()
-                        .map(|s| (s.agent_alias, s.session_id))
-                        .collect();
-                    sidebar.open_picker(target, open_by_alias, &rpc);
+                    let open_aliases = summaries.into_iter().map(|s| s.agent_alias).collect();
+                    sidebar.open_picker(target, open_aliases, &rpc);
                 }
-                crate::agent_sidebar::SidebarEvent::PickAgent {
-                    pane,
-                    alias,
-                    existing_session,
-                } if connected => {
+                crate::agent_sidebar::SidebarEvent::PickAgent { pane, alias } if connected => {
                     let next = match pane {
                         chat::PaneKind::Chat => Mode::Chat,
                         chat::PaneKind::Acp => Mode::Acp,
@@ -1091,17 +1084,11 @@ pub async fn run(
                         &mut sop_pane,
                     )
                     .await;
-                    match (pane, existing_session) {
-                        (chat::PaneKind::Chat, Some(sid)) => {
-                            chat_pane.focus_session(&sid).await;
-                        }
-                        (chat::PaneKind::Chat, None) => {
+                    match pane {
+                        chat::PaneKind::Chat => {
                             chat_pane.add_agent_session(&alias).await;
                         }
-                        (chat::PaneKind::Acp, Some(sid)) => {
-                            acp_pane.focus_session(&sid).await;
-                        }
-                        (chat::PaneKind::Acp, None) => {
+                        chat::PaneKind::Acp => {
                             acp_pane.add_agent_session(&alias).await;
                         }
                     }

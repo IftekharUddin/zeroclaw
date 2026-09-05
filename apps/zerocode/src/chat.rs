@@ -1232,25 +1232,21 @@ impl Chat {
     /// agent." Used by the Quickstart pane on Stage 2 to route the
     /// user into the freshly-created agent's chat.
     pub(crate) async fn focus_agent(&mut self, agent_alias: &str) {
-        self.add_agent_session(agent_alias).await;
-    }
-
-    /// Sidebar "+" entry point: focus the agent's existing session in this
-    /// pane if one is tracked, else start a new one. The previously focused
-    /// session stays live in `background`.
-    pub(crate) async fn add_agent_session(&mut self, agent_alias: &str) {
         let summaries = self.session_summaries();
         let existing = summaries
             .iter()
             .find(|s| s.agent_alias == agent_alias && s.focused)
             .or_else(|| summaries.iter().find(|s| s.agent_alias == agent_alias));
         if let Some(existing) = existing {
-            if !existing.focused {
-                let sid = existing.session_id.clone();
-                self.focus_session(&sid).await;
-            }
+            let sid = existing.session_id.clone();
+            self.focus_session(&sid).await;
             return;
         }
+        self.add_agent_session(agent_alias).await;
+    }
+
+    /// Sidebar "+" always creates a new session, preserving existing siblings.
+    pub(crate) async fn add_agent_session(&mut self, agent_alias: &str) {
         if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
             if let ChatPhase::Active(ref mut state) = self.phase {
                 state.set_info_notice(crate::i18n::t_args(
@@ -1259,6 +1255,11 @@ impl Chat {
                 ));
             }
             return;
+        }
+        // A fresh launch must not consume a failed reconnect's stable ID or queue.
+        if let Some(mut retained) = self.resume_focused.take() {
+            retained.was_focused = false;
+            self.resume_backgrounds.push(retained);
         }
         self.stash_active();
         self.pick_or_start_session(agent_alias).await;
@@ -2645,7 +2646,7 @@ impl Chat {
                         if let Some(i) = list_state.selected()
                             && let Some(alias) = agents.get(i).cloned()
                         {
-                            self.add_agent_session(&alias).await;
+                            self.focus_agent(&alias).await;
                         }
                         return false;
                     }
@@ -3297,7 +3298,7 @@ impl Chat {
                 }
                 self.note_session_replaced(&old_sid);
             }
-            Some(ChatTabAction::SwitchSession) if !state.turn_in_flight => {
+            Some(ChatTabAction::SwitchSession) => {
                 // ACP and Chat live in separate stores and must not cross-pick:
                 //  • Chat → unified session_backend (filter out channel-backed
                 //    sessions; those are owned by the channels pane).
@@ -3880,14 +3881,13 @@ impl Chat {
                 }
             }
             if let Some(alias) = confirm_alias {
-                self.add_agent_session(&alias).await;
+                self.focus_agent(&alias).await;
             }
             return;
         }
 
         if let ChatPhase::Active(state) = &self.phase
             && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
-            && !state.turn_in_flight
             && !state.input_bar.has_file_explorer()
             && !state.input_bar.has_attachment_manager()
             && matches!(state.session_overlay, SessionOverlay::None)
@@ -13706,7 +13706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_agent_title_click_ignored_while_turn_in_flight() {
+    async fn active_agent_title_click_preserves_running_session_in_picker() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let (tx, mut rx) = mpsc::channel::<String>(16);
@@ -13730,16 +13730,173 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        chat.handle_mouse(click, area).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), rx.recv())
-                .await
-                .is_err(),
-            "in-flight agent title click must not call agents/status"
+        let open = tokio::spawn(async move {
+            chat.handle_mouse(click, area).await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "running session may open agent picker").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"agents": [
+                {"alias": "alpha", "enabled": true}, {"alias": "beta", "enabled": true}
+            ]}),
         );
+        let mut chat = open.await.unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
+        assert!(chat.background[0].turn_in_flight);
+        assert!(chat.restore_last_focused().await);
+        assert_eq!(chat.current_session_id(), Some("abcdef1234"));
+        assert!(chat.state_for_session("abcdef1234").unwrap().turn_in_flight);
         assert!(
-            matches!(chat.phase, ChatPhase::Active(_)),
-            "in-flight agent title click must leave the active session visible"
+            rx.try_recv().is_err(),
+            "navigation must not cancel or close the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_add_creates_same_agent_sibling_while_turn_runs() {
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+            let mut chat = Chat::new(client, pane);
+            let mut old = state_for("sess-old", "alpha");
+            old.turn_in_flight = true;
+            old.input_bar.insert_text("unsent draft");
+            chat.phase = ChatPhase::Active(Box::new(old));
+            chat.session_order.push("sess-old".into());
+            let add = tokio::spawn(async move {
+                chat.add_agent_session("alpha").await;
+                chat
+            });
+            let request = next_rpc_request(&mut rx, "add must create another session").await;
+            assert_eq!(request["method"], method::SESSION_NEW);
+            assert_eq!(request["params"]["agent_alias"], "alpha");
+            assert!(request["params"]["session_id"].is_null());
+            assert_eq!(request["params"]["keep_siblings"], true);
+            respond_ok(
+                &rpc,
+                &request,
+                serde_json::json!({"session_id": "sess-new", "workspace_dir": "/w"}),
+            );
+            let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
+            assert_eq!(request["method"], method::CONFIG_LIST);
+            respond_ok(&rpc, &request, serde_json::json!([]));
+            let mut chat = add.await.unwrap();
+            assert_eq!(chat.current_session_id(), Some("sess-new"));
+            assert_eq!(chat.session_summaries().len(), 2);
+            let old = chat.state_for_session("sess-old").unwrap();
+            assert!(old.turn_in_flight);
+            assert_eq!(old.input_bar.input(), "unsent draft");
+            assert!(chat.focus_session("sess-old").await);
+            assert!(chat.focus_session("sess-new").await);
+            assert!(
+                rx.try_recv().is_err(),
+                "focus must not send cancel/close/new"
+            );
+            chat.rpc.push_notification_for_test("session/update", serde_json::json!({
+                "type": "turn_complete", "session_id": "sess-old", "outcome": "completed", "content": "done"
+            }));
+            chat.drain_notifications();
+            assert!(!chat.state_for_session("sess-old").unwrap().turn_in_flight);
+            assert_eq!(chat.current_session_id(), Some("sess-new"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sidebar_add_does_not_consume_failed_resume_identity_or_queue() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut retained = resume_entry("sess-failed", "beta", true);
+        retained.queue.messages.push_back(QueuedMessage {
+            id: 0,
+            text: "retained queue".into(),
+            attachments: Vec::new(),
+            status: QueueItemStatus::Pending,
+        });
+        chat.set_resume_sessions(vec![retained]);
+        let add = tokio::spawn(async move {
+            chat.add_agent_session("alpha").await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "fresh add must not reuse failed resume ID").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        assert!(request["params"]["session_id"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/w"}),
+        );
+        let request = next_rpc_request(&mut rx, "new identity refresh").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "failed resume remains a separate owner").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "beta");
+        assert_eq!(request["params"]["session_id"], "sess-failed");
+        respond_err(&rpc, &request, -32000, "still unavailable");
+        let chat = add.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.resume_backgrounds[0].session_id, "sess-failed");
+        assert_eq!(
+            chat.resume_backgrounds[0].queue.messages[0].text,
+            "retained queue"
+        );
+        assert_eq!(chat.tracked_session_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn switch_session_shortcut_preserves_in_flight_turn() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            unreachable!()
+        };
+        state.turn_in_flight = true;
+        let switch = tokio::spawn(async move {
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &mut term,
+            )
+            .await;
+            let ChatPhase::Active(state) = &chat.phase else {
+                unreachable!()
+            };
+            assert!(matches!(state.session_overlay, SessionOverlay::List { .. }));
+            chat.handle_key(KeyEvent::from(KeyCode::Enter), &mut term)
+                .await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "Ctrl+S must work during a turn").await;
+        assert_eq!(request["method"], method::SESSION_LIST);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"sessions": [{
+                "session_id": "sess-b", "session_key": "sess-b", "agent_alias": "beta",
+                "created_at": "2026-09-05T00:00:00Z", "last_activity": "2026-09-05T00:00:00Z", "message_count": 0
+            }]}),
+        );
+        let chat = switch.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-b"));
+        assert!(chat.state_for_session("sess-a").unwrap().turn_in_flight);
+        assert!(
+            rx.try_recv().is_err(),
+            "switching must not cancel/close the old session"
         );
     }
 
