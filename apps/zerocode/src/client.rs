@@ -298,6 +298,8 @@ pub enum SessionUpdate {
         session_id: String,
         outcome: TurnEndOutcome,
         content: String,
+        client_turn_generation: Option<u64>,
+        message_count: Option<usize>,
     },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
@@ -394,6 +396,13 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
+            client_turn_generation: params
+                .get("client_turn_generation")
+                .and_then(|v| v.as_u64()),
+            message_count: params
+                .get("message_count")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();
@@ -4070,6 +4079,8 @@ mod logs_query_tests {
 pub struct SessionNewResult {
     pub session_id: String,
     #[serde(default)]
+    pub message_count: usize,
+    #[serde(default)]
     pub workspace_dir: Option<String>,
 }
 
@@ -5676,6 +5687,40 @@ mod notification_tests {
         });
         let update = parse_session_update(&params).unwrap();
         assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+    }
+
+    #[test]
+    fn parse_turn_complete_carries_optional_client_generation() {
+        let update = parse_session_update(&serde_json::json!({
+            "type": "turn_complete",
+            "session_id": "s1",
+            "outcome": "cancelled",
+            "content": "cancelled",
+            "client_turn_generation": 7,
+        }))
+        .expect("turn complete parses");
+        assert!(matches!(
+            update,
+            SessionUpdate::TurnComplete {
+                client_turn_generation: Some(7),
+                ..
+            }
+        ));
+
+        let legacy = parse_session_update(&serde_json::json!({
+            "type": "turn_complete",
+            "session_id": "s1",
+            "outcome": "completed",
+            "content": "done",
+        }))
+        .expect("legacy turn complete parses");
+        assert!(matches!(
+            legacy,
+            SessionUpdate::TurnComplete {
+                client_turn_generation: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

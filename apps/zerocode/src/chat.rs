@@ -132,6 +132,8 @@ pub(crate) enum SidebarStatus {
 pub(crate) struct SidebarSessionSummary {
     pub session_id: String,
     pub agent_alias: String,
+    /// Durable projected conversation-entry count, not visible bubbles.
+    pub message_count: usize,
     pub status: SidebarStatus,
     pub pane_kind: PaneKind,
     /// Whether this session is the pane's focused (rendered) session.
@@ -144,21 +146,26 @@ pub(crate) struct SidebarSessionSummary {
 pub(crate) struct ResumeEntry {
     pub session_id: String,
     pub agent_alias: String,
+    /// Durable projected conversation-entry count carried until reload.
+    pub message_count: usize,
     pub was_focused: bool,
     queue: ReconnectQueueState,
     interrupted: bool,
     recovery_required: bool,
 }
 
-/// Client-owned queue state that cannot be reconstructed from the daemon's
-/// durable transcript. This is the only live `ChatState` data carried across a
-/// transport rebuild; transcript and turn state are reloaded from the daemon.
+/// Client-owned queue and composer state that cannot be reconstructed from the
+/// daemon's durable transcript. This is the live `ChatState` data carried
+/// across a transport rebuild; transcript and turn state are reloaded from the
+/// daemon.
 #[derive(Debug, Clone, Default)]
 struct ReconnectQueueState {
     messages: VecDeque<QueuedMessage>,
     next_id: u64,
     paused: bool,
     selected: Option<u64>,
+    composer_text: String,
+    composer_attachments: Vec<PendingAttachment>,
 }
 
 /// Why a tracked session shows the red status dot.
@@ -296,6 +303,7 @@ struct SessionResyncResult {
 /// turn beside a newly reloaded transcript.
 struct SessionResyncSnapshot {
     messages: Vec<crate::client::MessageEntry>,
+    message_count: usize,
     plan: Option<Vec<crate::wire::PlanEntry>>,
 }
 
@@ -543,6 +551,7 @@ impl Chat {
             entries.push(ResumeEntry {
                 session_id: summary.session_id,
                 agent_alias: summary.agent_alias,
+                message_count: state.message_count,
                 was_focused: summary.focused,
                 queue: state.reconnect_queue_state(),
                 interrupted: state.turn_in_flight
@@ -597,7 +606,12 @@ impl Chat {
             if let Some(elicitation) = state.pending_elicitation.take() {
                 Self::answer_cancel(&rpc, elicitation.request_id);
             }
-            let cleanup_report = state.cleanup_active_turn_attachments();
+            let mut cleanup_report = state.cleanup_active_turn_attachments();
+            // Composer clipboard files are transport-local temporaries. Keep
+            // them alive until the replacement pane has built successfully,
+            // then reclaim them without affecting user-selected files.
+            state.input_bar.cleanup_temps();
+            cleanup_report.merge(state.input_bar.take_cleanup_report());
             state.surface_cleanup_report(cleanup_report);
         }
     }
@@ -619,6 +633,7 @@ impl Chat {
             out.push(SidebarSessionSummary {
                 session_id: state.session_id.clone(),
                 agent_alias: state.agent_alias.clone(),
+                message_count: state.message_count,
                 status: state.sidebar_status(),
                 pane_kind: self.pane_kind,
                 focused,
@@ -638,6 +653,7 @@ impl Chat {
                 out.push(SidebarSessionSummary {
                     session_id: entry.session_id.clone(),
                     agent_alias: entry.agent_alias.clone(),
+                    message_count: entry.message_count,
                     status: SidebarStatus::Errored,
                     pane_kind: self.pane_kind,
                     focused: active.is_none() && entry.was_focused,
@@ -1218,6 +1234,7 @@ impl Chat {
         self.resume_focused = Some(ResumeEntry {
             session_id: entry.session_id,
             agent_alias: agent_alias.clone(),
+            message_count: entry.message_count,
             was_focused: true,
             queue: ReconnectQueueState::default(),
             interrupted: false,
@@ -1569,6 +1586,7 @@ impl Chat {
                     todo_settings,
                     self.rpc.commands(),
                 );
+                state.message_count = session.message_count;
                 state.cwd = session.workspace_dir;
                 if is_cancelled(cancellation) {
                     close_stale_session_if_owned(
@@ -1604,6 +1622,7 @@ impl Chat {
                             return;
                         }
                     };
+                    state.message_count = msgs.total;
                     state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
                 }
                 // The carried entry remains canonical until both session/new
@@ -1792,6 +1811,7 @@ impl Chat {
             Self::resolve_todo_settings(todo_fallback),
             self.rpc.commands(),
         );
+        state.message_count = session.message_count;
         state.cwd = session.workspace_dir;
         Self::refresh_model_identity(&self.rpc, &mut state).await;
         let msgs = match self.rpc.session_messages(session_id).await {
@@ -1800,6 +1820,7 @@ impl Chat {
                 return Err(error.to_string());
             }
         };
+        state.message_count = msgs.total;
         state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
         Ok(state)
     }
@@ -1993,6 +2014,9 @@ impl Chat {
                 // this turn; retain the interrupted state for reconnect.
                 continue;
             }
+            if completion.error.is_some() {
+                state.remove_optimistic_user_message(completion.turn_generation);
+            }
             // The response proves the handler returned, but only the missing
             // terminal notification distinguishes completed from cancelled or
             // failed. Settle conservatively so queued work cannot auto-run.
@@ -2085,9 +2109,13 @@ impl Chat {
         let messages = rpc
             .session_messages(session_id)
             .await
-            .map(|messages| messages.messages)
+            .map(|messages| SessionResyncSnapshot {
+                message_count: messages.total,
+                messages: messages.messages,
+                plan,
+            })
             .map_err(|error| format!("transcript reload failed: {error}"))?;
-        Ok(SessionResyncSnapshot { messages, plan })
+        Ok(messages)
     }
 
     fn apply_session_resync_result(&mut self, update: SessionResyncResult) {
@@ -2102,6 +2130,7 @@ impl Chat {
                     snapshot.messages,
                     strip_runtime_enrichment,
                 );
+                state.message_count = snapshot.message_count;
                 if let Some(plan) = snapshot.plan {
                     state.todo_tracker.set_plan(plan);
                 }
@@ -2530,6 +2559,7 @@ impl Chat {
             let mut params = serde_json::json!({
                 "session_id": &sid,
                 "prompt": prompt,
+                "client_turn_generation": turn_generation,
             });
             if !attachments_json.is_empty() {
                 params["attachments"] = serde_json::Value::Array(attachments_json);
@@ -7007,6 +7037,8 @@ pub(crate) struct QueuedMessage {
 pub struct ChatState {
     pub session_id: String,
     pub agent_alias: String,
+    /// Durable projected conversation-entry count, not visible bubbles.
+    pub message_count: usize,
     session_name: Option<String>,
     model_provider_ref: Option<String>,
     model: Option<String>,
@@ -7044,6 +7076,11 @@ pub struct ChatState {
     /// Monotonic local turn identity. Prompt responses use it to avoid
     /// settling a newer queued turn after the prior terminal notification.
     turn_generation: u64,
+    /// Entry marker for the optimistic user row of the in-flight prompt.
+    /// Prompt RPC errors may remove only this generation's row; transport
+    /// closure and terminal notifications leave it intact.
+    /// `(generation, entry index, prior durable count)` for the optimistic row.
+    optimistic_user_message: Option<(u64, usize, usize)>,
     /// Set when any streaming text was flushed during the current turn.
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
@@ -7182,6 +7219,7 @@ impl ChatState {
         Self {
             session_id,
             agent_alias,
+            message_count: 0,
             session_name: None,
             model_provider_ref: None,
             model: None,
@@ -7200,6 +7238,7 @@ impl ChatState {
             last_error: None,
             turn_in_flight: false,
             turn_generation: 0,
+            optimistic_user_message: None,
             turn_had_streaming_text: false,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
@@ -8380,29 +8419,43 @@ impl ChatState {
                 self.mark_dirty_append();
             }
             SessionUpdate::TurnComplete {
-                outcome, content, ..
-            } => match outcome {
-                TurnEndOutcome::Completed => {
-                    self.last_error = None;
-                    self.commit_turn(content, true);
+                client_turn_generation,
+                message_count,
+                outcome,
+                content,
+                ..
+            } => {
+                if client_turn_generation
+                    .is_some_and(|generation| generation != self.turn_generation)
+                {
+                    return;
                 }
-                TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
-                    if outcome == TurnEndOutcome::Failed {
-                        // The daemon's session-loss sentinel (see
-                        // `handle_session_prompt`) means the session must be
-                        // re-attached before the next prompt can run.
-                        self.last_error = Some(if content.ends_with("session_not_found") {
-                            SessionError::SessionLost
-                        } else {
-                            SessionError::TurnFailed
-                        });
+                if let Some(message_count) = message_count {
+                    self.message_count = message_count;
+                }
+                match outcome {
+                    TurnEndOutcome::Completed => {
+                        self.last_error = None;
+                        self.commit_turn(content, true);
                     }
-                    self.entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
-                    self.mark_dirty_append();
-                    self.commit_turn(String::new(), false);
+                    TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
+                        if outcome == TurnEndOutcome::Failed {
+                            // The daemon's session-loss sentinel (see
+                            // `handle_session_prompt`) means the session must be
+                            // re-attached before the next prompt can run.
+                            self.last_error = Some(if content.ends_with("session_not_found") {
+                                SessionError::SessionLost
+                            } else {
+                                SessionError::TurnFailed
+                            });
+                        }
+                        self.entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
+                        self.mark_dirty_append();
+                        self.commit_turn(String::new(), false);
+                    }
                 }
-            },
+            }
             // Whole-list replace: hand the authoritative plan to the
             // tracker, which runs the auto-pop rule. Session routing is
             // already enforced by the session_id check above.
@@ -8457,6 +8510,7 @@ impl ChatState {
 
     fn settle_turn_lifecycle(&mut self, clean: bool) {
         self.turn_in_flight = false;
+        self.optimistic_user_message = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         let mut cleanup_report = self.cleanup_active_turn_attachments();
@@ -8512,13 +8566,18 @@ impl ChatState {
         {
             self.first_message = Some(t.clone());
         }
+        let entry_index = self.entries.len();
         self.entries.push(ChatEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
         });
         self.mark_dirty_append();
+        let prior_message_count = self.message_count;
+        self.message_count = prior_message_count.saturating_add(1);
         self.turn_in_flight = true;
         self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.optimistic_user_message =
+            Some((self.turn_generation, entry_index, prior_message_count));
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
@@ -8537,6 +8596,35 @@ impl ChatState {
 
     fn cleanup_active_turn_attachments(&mut self) -> CleanupReport {
         cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
+    }
+
+    fn remove_optimistic_user_message(&mut self, generation: u64) {
+        let Some((marked_generation, entry_index, prior_message_count)) =
+            self.optimistic_user_message.take()
+        else {
+            return;
+        };
+        if marked_generation != generation {
+            return;
+        }
+        self.message_count = prior_message_count;
+        if matches!(
+            self.entries.get(entry_index),
+            Some(ChatEntry::UserMessage { .. })
+        ) {
+            self.entries.remove(entry_index);
+            self.first_message = self.entries.iter().find_map(|entry| {
+                let ChatEntry::UserMessage {
+                    text: Some(text), ..
+                } = entry
+                else {
+                    return None;
+                };
+                let display = strip_enrichment_prefix(text.as_ref());
+                (!display.trim().is_empty()).then(|| display.to_string())
+            });
+            self.mark_dirty_full();
+        }
     }
 
     const QUEUE_CAP: usize = 32;
@@ -8681,12 +8769,14 @@ impl ChatState {
             next_id: self.next_queue_id,
             paused: self.queue_paused,
             selected: self.queue_sel,
+            composer_text: self.input_bar.input().to_string(),
+            composer_attachments: self.input_bar.reconnect_file_attachments(),
         }
     }
 
-    /// Restore the only state the client owns across a transport rebuild.
-    /// Transcript, pending interactions, and terminal turn state come from (or
-    /// are reconciled with) the daemon instead of being snapshotted here.
+    /// Restore the queue and composer state the client owns across a transport
+    /// rebuild. Transcript, pending interactions, and terminal turn state come
+    /// from (or are reconciled with) the daemon instead of being snapshotted.
     fn restore_reconnect_state(
         &mut self,
         queue: ReconnectQueueState,
@@ -8699,6 +8789,8 @@ impl ChatState {
         self.queue_sel = queue
             .selected
             .filter(|id| self.message_queue.iter().any(|message| message.id == *id));
+        self.input_bar
+            .load_for_edit(queue.composer_text, queue.composer_attachments);
         self.resume_override = false;
         if recovery_required {
             self.last_error = Some(SessionError::ResyncFailed);
@@ -9004,6 +9096,7 @@ impl ChatState {
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.turn_in_flight = false;
+        self.optimistic_user_message = None;
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
@@ -9154,6 +9247,7 @@ impl ChatState {
         self.pending_elicitation = None;
         self.last_error = None;
         self.turn_in_flight = false;
+        self.message_count = 0;
         self.turn_generation = self.turn_generation.wrapping_add(1);
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -9331,6 +9425,7 @@ mod tests {
         ResumeEntry {
             session_id: session_id.to_string(),
             agent_alias: agent_alias.to_string(),
+            message_count: 0,
             was_focused,
             queue: ReconnectQueueState::default(),
             interrupted: false,
@@ -11671,6 +11766,24 @@ mod tests {
         let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
         let mut chat = Chat::new(client, PaneKind::Chat);
         let mut prior = state_for("sess-r", "alpha");
+        let attachment_dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let file_path = attachment_dir.path().join("keep.txt");
+        let clipboard_path = attachment_dir.path().join("drop.png");
+        std::fs::write(&file_path, b"keep").expect("write user attachment");
+        std::fs::write(&clipboard_path, b"drop").expect("write clipboard attachment");
+        prior.input_bar.load_for_edit(
+            "draft survives reconnect".to_string(),
+            vec![
+                PendingAttachment {
+                    path: file_path.clone(),
+                    mime_type: "text/plain".to_string(),
+                    filename: "keep.txt".to_string(),
+                    size_bytes: 4,
+                    source: crate::attachment::AttachmentSource::File,
+                },
+                clipboard_att(&clipboard_path, "drop.png"),
+            ],
+        );
         prior
             .enqueue_message("keep queued".to_string(), Vec::new())
             .expect("queue message");
@@ -11703,6 +11816,17 @@ mod tests {
         assert!(entry.interrupted);
         assert_eq!(entry.queue.messages.len(), 1);
         assert!(entry.queue.paused);
+        assert_eq!(entry.queue.composer_text, "draft survives reconnect");
+        assert_eq!(entry.queue.composer_attachments.len(), 1);
+        assert_eq!(entry.queue.composer_attachments[0].filename, "keep.txt");
+        assert_eq!(
+            entry.queue.composer_attachments[0].source,
+            crate::attachment::AttachmentSource::File
+        );
+        assert!(
+            clipboard_path.exists(),
+            "snapshotting must not clean temporary attachments before commit"
+        );
         let ChatPhase::Active(prior) = &chat.phase else {
             panic!("old pane remains active until replacement construction succeeds");
         };
@@ -11714,6 +11838,14 @@ mod tests {
         );
 
         chat.commit_reconnect_handoff();
+        assert!(
+            !clipboard_path.exists(),
+            "clipboard attachment must be cleaned at commit"
+        );
+        assert!(
+            file_path.exists(),
+            "user-selected file must remain untouched"
+        );
 
         let mut rebuilt = state_for("sess-r", "alpha");
         rebuilt.load_history(
@@ -11727,6 +11859,12 @@ mod tests {
         rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
         assert_eq!(rebuilt.queue_len(), 1);
         assert!(rebuilt.queue_paused());
+        assert_eq!(rebuilt.input_bar.input(), "draft survives reconnect");
+        assert_eq!(rebuilt.input_bar.pending_attachments().len(), 1);
+        assert_eq!(
+            rebuilt.input_bar.pending_attachments()[0].filename,
+            "keep.txt"
+        );
         assert!(!rebuilt.turn_in_flight);
         assert!(rebuilt.pending_approval.is_none());
         assert!(rebuilt.pending_elicitation.is_none());
@@ -11777,6 +11915,8 @@ mod tests {
             session_id: sid.to_string(),
             outcome,
             content: content.to_string(),
+            client_turn_generation: None,
+            message_count: None,
         }
     }
 
@@ -18320,6 +18460,138 @@ mod tests {
                 .count(),
             1,
             "the surviving terminal notification must commit exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_correlated_terminal_does_not_settle_promoted_turn() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("first".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let first_generation = active_state(&mut chat).turn_generation;
+        let first_request =
+            next_rpc_request(&mut writer_rx, "first prompt request should be sent").await;
+        assert_eq!(
+            first_request["params"]["client_turn_generation"],
+            serde_json::json!(first_generation)
+        );
+        active_state(&mut chat).enter_cancelling();
+        active_state(&mut chat)
+            .inject_message("second".to_string(), Vec::new())
+            .unwrap();
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "cancelled",
+                    "content": "old turn cancelled",
+                    "client_turn_generation": first_generation,
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        let second_generation = active_state(&mut chat).turn_generation;
+        assert_ne!(second_generation, first_generation);
+        let second_request =
+            next_rpc_request(&mut writer_rx, "promoted prompt request should be sent").await;
+        assert_eq!(
+            second_request["params"]["client_turn_generation"],
+            serde_json::json!(second_generation)
+        );
+        assert!(active_state(&mut chat).turn_in_flight);
+        let current_count = active_state(&mut chat).message_count;
+
+        // A delayed terminal from the cancelled first request carries its old
+        // generation and must not settle the newly promoted second request.
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "cancelled",
+                    "content": "stale old terminal",
+                    "client_turn_generation": first_generation,
+                    "message_count": 999,
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        assert!(
+            active_state(&mut chat).turn_in_flight,
+            "the new turn must remain in flight after a stale old terminal"
+        );
+        assert_eq!(
+            active_state(&mut chat).message_count,
+            current_count,
+            "a stale terminal must not replace the current turn's count"
+        );
+
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "new turn completed",
+                    "client_turn_generation": second_generation,
+                    "message_count": 7,
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        assert!(!active_state(&mut chat).turn_in_flight);
+        assert_eq!(active_state(&mut chat).message_count, 7);
+    }
+
+    #[tokio::test]
+    async fn prompt_session_busy_error_removes_only_optimistic_user_row() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("busy prompt".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "busy prompt should be sent").await;
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_BUSY,
+            "Session busy",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert!(!active.turn_in_flight);
+        assert!(
+            active.first_message.is_none(),
+            "a failed first prompt must not remain pinned above an empty transcript"
+        );
+        assert!(
+            active
+                .entries()
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::UserMessage { .. })),
+            "a connected prompt error must not leave a duplicate optimistic user row"
+        );
+        assert!(
+            active.info_message.is_some(),
+            "the dispatch error must be surfaced"
         );
     }
 

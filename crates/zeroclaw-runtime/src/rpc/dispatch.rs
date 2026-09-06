@@ -1776,7 +1776,7 @@ impl RpcDispatcher {
                                 "ACP session belongs to a different agent",
                             ));
                         }
-                        message_count = data.messages.len();
+                        message_count = conversation_message_entries(&data.messages).len();
                         let seed_event = self
                             .ctx
                             .sessions
@@ -2260,6 +2260,8 @@ impl RpcDispatcher {
                         sid,
                         crate::rpc::types::TurnCompletionOutcome::Failed,
                         "turn cancelled by daemon: session_not_found".to_string(),
+                        req.client_turn_generation,
+                        None,
                     )
                     .await;
                     return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -2540,6 +2542,23 @@ impl RpcDispatcher {
             }
         }
 
+        // Keep the terminal count aligned with session/new and session/messages:
+        // it is the durable projected conversation length, not the number of
+        // visible TUI bubbles or local user turns.
+        let message_count = match chat_mode {
+            crate::rpc::types::ChatMode::Acp => self
+                .ctx
+                .acp_session_store
+                .as_ref()
+                .and_then(|store| store.load_session(&req.session_id).ok().flatten())
+                .map(|data| conversation_message_entries(&data.messages).len()),
+            crate::rpc::types::ChatMode::Chat => self
+                .ctx
+                .session_backend
+                .as_ref()
+                .map(|backend| backend.load(&session_key).len()),
+        };
+
         match outcome {
             Ok(TurnOutcome::Completed { text, .. }) => {
                 if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
@@ -2549,6 +2568,8 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
                     text.clone(),
+                    req.client_turn_generation,
+                    message_count,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -2595,6 +2616,8 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Cancelled,
                     cancel_message,
+                    req.client_turn_generation,
+                    message_count,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -2629,6 +2652,8 @@ impl RpcDispatcher {
                     user_message
                         .clone()
                         .unwrap_or_else(|| format!("turn failed: {e}")),
+                    req.client_turn_generation,
+                    message_count,
                 )
                 .await;
                 Err(rpc_err(
@@ -2647,11 +2672,15 @@ impl RpcDispatcher {
         session_id: &str,
         outcome: crate::rpc::types::TurnCompletionOutcome,
         content: String,
+        client_turn_generation: Option<u64>,
+        message_count: Option<usize>,
     ) {
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
             outcome,
             content,
+            client_turn_generation,
+            message_count,
         };
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
@@ -12356,6 +12385,7 @@ mod tests {
             .handle_session_prompt(&json!({
                 "session_id": "gone-id",
                 "prompt": "anything",
+                "client_turn_generation": 41,
             }))
             .await;
         assert!(
@@ -12377,6 +12407,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).expect("notification must be JSON");
         assert_eq!(v["method"], notification::SESSION_UPDATE);
         assert_eq!(v["params"]["session_id"], "gone-id");
+        assert_eq!(v["params"]["client_turn_generation"], 41);
         assert_eq!(
             v["params"]["outcome"], "failed",
             "missing-session is not Completed and not Cancelled — it is a \
