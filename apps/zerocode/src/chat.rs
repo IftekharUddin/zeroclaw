@@ -1085,6 +1085,36 @@ impl Chat {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_transcript_drag_for_test(&mut self, move_pointer: bool) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            state.transcript_snapshot = Some(TranscriptSnapshot {
+                area: Rect::new(0, 0, 5, 1),
+                cells: "hello"
+                    .chars()
+                    .enumerate()
+                    .map(|(column, ch)| TranscriptCell {
+                        symbol: ch.to_string(),
+                        span_start: column as u16,
+                    })
+                    .collect(),
+                row_breaks: vec![TranscriptRowBreak::Hard],
+            });
+            assert!(state.begin_transcript_drag(0, 0));
+            if move_pointer {
+                assert!(state.update_transcript_drag(4, 0));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_selected_text_for_test(&self) -> Option<String> {
+        match &self.phase {
+            ChatPhase::Active(state) => state.transcript_selected_text(),
+            _ => None,
+        }
+    }
+
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
     /// show the CWD picker first on WSS ACP connections).
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
@@ -3901,7 +3931,17 @@ impl Chat {
         };
     }
 
+    pub(crate) fn finish_transcript_drag_if_released(&mut self, mouse: &MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && let ChatPhase::Active(state) = &mut self.phase
+        {
+            state.finish_transcript_drag();
+        }
+    }
+
     pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.finish_transcript_drag_if_released(&mouse);
+
         // Dir-picker explorer handles its own mouse events.
         if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
             explorer.handle_mouse(mouse);
@@ -4268,9 +4308,6 @@ impl Chat {
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         state.update_transcript_drag(col, row);
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        state.finish_transcript_drag();
                     }
                     _ => {}
                 }

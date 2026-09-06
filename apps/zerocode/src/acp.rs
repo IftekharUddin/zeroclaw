@@ -59,12 +59,26 @@ impl Acp {
     }
 
     #[cfg(test)]
+    pub(crate) fn begin_transcript_drag_for_test(&mut self, move_pointer: bool) {
+        self.inner.begin_transcript_drag_for_test(move_pointer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_selected_text_for_test(&self) -> Option<String> {
+        self.inner.transcript_selected_text_for_test()
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_pending_elicitation_for_test(&self) -> bool {
         self.inner.has_pending_elicitation_for_test()
     }
 
     pub(crate) async fn focus_session(&mut self, session_id: &str) -> bool {
         self.inner.focus_session(session_id).await
+    }
+
+    pub(crate) fn finish_transcript_drag_if_released(&mut self, mouse: &MouseEvent) {
+        self.inner.finish_transcript_drag_if_released(mouse);
     }
 
     pub(crate) async fn add_agent_session(&mut self, agent_alias: &str) {

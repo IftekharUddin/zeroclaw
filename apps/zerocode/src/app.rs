@@ -1799,8 +1799,15 @@ pub async fn run(
                     continue;
                 }
                 // Clicks and wheel inside the sidebar itself.
-                if sidebar.contains(mouse.column, mouse.row) {
-                    if let Some(event) = sidebar.handle_mouse(&mouse) {
+                let (sidebar_consumed, sidebar_event) = route_agent_sidebar_mouse(
+                    mode,
+                    &mut chat_pane,
+                    &mut acp_pane,
+                    &mut sidebar,
+                    &mouse,
+                );
+                if sidebar_consumed {
+                    if let Some(event) = sidebar_event {
                         apply_sidebar_event!(event, dispatch_state);
                     }
                     continue;
@@ -1978,6 +1985,26 @@ fn resolve_agent_overrides(
         }
     }
     out
+}
+
+fn route_agent_sidebar_mouse(
+    mode: Mode,
+    chat_pane: &mut chat::Chat,
+    acp_pane: &mut acp::Acp,
+    sidebar: &mut crate::agent_sidebar::AgentSidebar,
+    mouse: &crossterm::event::MouseEvent,
+) -> (bool, Option<crate::agent_sidebar::SidebarEvent>) {
+    if !sidebar.contains(mouse.column, mouse.row) {
+        return (false, None);
+    }
+
+    match mode {
+        Mode::Chat => chat_pane.finish_transcript_drag_if_released(mouse),
+        Mode::Acp => acp_pane.finish_transcript_drag_if_released(mouse),
+        _ => {}
+    }
+
+    (true, sidebar.handle_mouse(mouse))
 }
 
 // ── Mode bar ─────────────────────────────────────────────────────
@@ -2719,6 +2746,102 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn sidebar_mouse_up_finishes_chat_and_code_transcript_drags() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut acp_pane = acp::Acp::new(client);
+        chat_pane.activate_session_for_test("chat-session");
+        acp_pane.activate_session_for_test("code-session");
+
+        let config_dir = tempfile::tempdir().expect("temporary config directory");
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::from_config_dir(config_dir.path());
+        let sidebar_area = sidebar
+            .carve(Rect::new(0, 0, 100, 20))
+            .0
+            .expect("default sidebar is visible");
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                sidebar.draw(
+                    frame,
+                    sidebar_area,
+                    &[],
+                    &crate::agent_sidebar::SidebarCtx {
+                        active_pane: Some(chat::PaneKind::Chat),
+                        quickstart_active: false,
+                        connected: true,
+                    },
+                )
+            })
+            .expect("draw sidebar hit geometry");
+
+        let mouse = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: sidebar_area.x,
+            row: sidebar_area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        chat_pane.begin_transcript_drag_for_test(false);
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        assert_eq!(chat_pane.transcript_selected_text_for_test(), None);
+
+        chat_pane.begin_transcript_drag_for_test(true);
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        assert_eq!(
+            chat_pane.transcript_selected_text_for_test().as_deref(),
+            Some("hello")
+        );
+
+        acp_pane.begin_transcript_drag_for_test(false);
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Acp,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        assert_eq!(acp_pane.transcript_selected_text_for_test(), None);
+
+        acp_pane.begin_transcript_drag_for_test(true);
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Acp,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        assert_eq!(
+            acp_pane.transcript_selected_text_for_test().as_deref(),
+            Some("hello")
+        );
+    }
 
     fn inbound_elicitation(request_id: &str, session_id: &str) -> crate::client::RpcInboundRequest {
         crate::client::RpcInboundRequest {
