@@ -225,21 +225,22 @@ impl InboundRequestRouter {
         while let Some(request) = self.rx.recv().await {
             pending.push(request);
         }
-        for request in pending {
-            let response = if request.method == "elicitation/create" {
-                Ok(serde_json::json!({ "action": "cancel" }))
-            } else {
-                Err(crate::jsonrpc::JsonRpcError {
-                    code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
-                    message: format!("Method not found: {}", request.method),
-                    data: None,
-                })
-            };
-            let _ = self
-                .rpc
-                .respond_to_inbound_request(request.id, response)
-                .await;
-        }
+        let responses = pending
+            .into_iter()
+            .map(|request| {
+                let response = if request.method == "elicitation/create" {
+                    Ok(serde_json::json!({ "action": "cancel" }))
+                } else {
+                    Err(crate::jsonrpc::JsonRpcError {
+                        code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                        message: format!("Method not found: {}", request.method),
+                        data: None,
+                    })
+                };
+                (request.id, response)
+            })
+            .collect();
+        self.rpc.respond_to_inbound_requests(responses);
         self.rpc.flush_outbound().await
     }
 
@@ -254,19 +255,14 @@ impl InboundRequestRouter {
         if request.method != "elicitation/create" {
             let method_name = request.method.clone();
             let request_id = request.id;
-            let rpc = self.rpc.clone();
-            tokio::spawn(async move {
-                let _ = rpc
-                    .respond_to_inbound_request(
-                        request_id,
-                        Err(crate::jsonrpc::JsonRpcError {
-                            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
-                            message: format!("Method not found: {method_name}"),
-                            data: None,
-                        }),
-                    )
-                    .await;
-            });
+            self.rpc.respond_to_inbound_request(
+                request_id,
+                Err(crate::jsonrpc::JsonRpcError {
+                    code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                    message: format!("Method not found: {method_name}"),
+                    data: None,
+                }),
+            );
             return None;
         }
 

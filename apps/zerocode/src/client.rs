@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
@@ -698,6 +699,10 @@ pub struct RpcClient {
     /// response (today: `elicitation/create`). Keeping the receiver here until
     /// the app claims it preserves requests that arrive during pane startup.
     inbound_requests_rx: Mutex<Option<mpsc::UnboundedReceiver<RpcInboundRequest>>>,
+    /// Responses accepted by the app but not yet enqueued to the bounded
+    /// writer. Registration is synchronous so an ordered retirement flush
+    /// cannot overtake a responder that Tokio has not polled yet.
+    inbound_responses: Arc<InboundResponseTracker>,
     connection_state: Arc<Mutex<ConnectionState>>,
     /// TUI session UID assigned by the daemon during initialize.
     pub tui_id: Option<String>,
@@ -708,6 +713,45 @@ pub struct RpcClient {
     /// Shared TUI command metadata received from the daemon's canonical
     /// command catalogue during initialization.
     commands: Vec<crate::wire::CommandDescriptor>,
+}
+
+#[derive(Debug, Default)]
+struct InboundResponseTracker {
+    pending: AtomicUsize,
+    idle: Notify,
+}
+
+impl InboundResponseTracker {
+    fn register(self: &Arc<Self>) -> InboundResponseGuard {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        InboundResponseGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+struct InboundResponseGuard {
+    tracker: Arc<InboundResponseTracker>,
+}
+
+impl Drop for InboundResponseGuard {
+    fn drop(&mut self) {
+        if self.tracker.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.idle.notify_waiters();
+        }
+    }
 }
 
 /// Dial the daemon through a nominated relay instead of connecting directly.
@@ -1556,6 +1600,7 @@ impl RpcClient {
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
+            inbound_responses: Arc::new(InboundResponseTracker::default()),
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -1800,6 +1845,7 @@ impl RpcClient {
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
+            inbound_responses: Arc::new(InboundResponseTracker::default()),
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -1910,9 +1956,12 @@ impl RpcClient {
     }
 
     async fn flush_outbound_with_timeout(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, self.rpc.flush_outbound())
-            .await
-            .is_ok_and(|flushed| flushed)
+        tokio::time::timeout(timeout, async {
+            self.inbound_responses.wait_until_idle().await;
+            self.rpc.flush_outbound().await
+        })
+        .await
+        .is_ok_and(|flushed| flushed)
     }
 
     #[cfg(test)]
@@ -1940,19 +1989,35 @@ impl RpcClient {
             .context("inbound request receiver already claimed")
     }
 
-    /// Send a JSON-RPC response back to the daemon for a previously
-    /// received server-initiated request. The `id` must be the same
-    /// `Value` carried by the originating `RpcInboundRequest`.
-    pub async fn respond_to_inbound_request(
+    /// Schedule a JSON-RPC response to a previously received server request.
+    /// The registration happens before the task is spawned, so reconnect
+    /// retirement cannot flush and stop this writer ahead of an unpolled task.
+    pub fn respond_to_inbound_request(
         &self,
         id: Value,
         result: std::result::Result<Value, JsonRpcError>,
-    ) -> Result<()> {
-        let sent = self.rpc.respond(id, result).await;
-        if !sent {
-            anyhow::bail!("writer task closed before response could be sent");
+    ) {
+        self.respond_to_inbound_requests(vec![(id, result)]);
+    }
+
+    /// Register one retirement-owned batch before spawning its serial enqueue
+    /// loop. A large drained inbound backlog therefore parks at most one task
+    /// on writer capacity while remaining visible to the flush barrier.
+    pub(crate) fn respond_to_inbound_requests(
+        &self,
+        responses: Vec<(Value, std::result::Result<Value, JsonRpcError>)>,
+    ) {
+        if responses.is_empty() {
+            return;
         }
-        Ok(())
+        let guard = self.inbound_responses.register();
+        let rpc = Arc::clone(&self.rpc);
+        tokio::spawn(async move {
+            let _guard = guard;
+            for (id, result) in responses {
+                let _ = rpc.respond(id, result).await;
+            }
+        });
     }
 
     /// Stop accepting server-initiated requests without retiring the writer.
@@ -2761,6 +2826,7 @@ impl RpcClient {
             server_pid: None,
             notifications_bcast: notif_tx,
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
+            inbound_responses: Arc::new(InboundResponseTracker::default()),
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
@@ -5179,6 +5245,69 @@ mod notification_tests {
     }
 
     #[tokio::test]
+    async fn inbound_response_batch_registration_precedes_flush_marker() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(3);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        client.respond_to_inbound_requests(vec![
+            (
+                serde_json::json!("elicitation-1"),
+                Ok(serde_json::json!({ "action": "cancel" })),
+            ),
+            (
+                serde_json::json!("elicitation-2"),
+                Ok(serde_json::json!({ "action": "cancel" })),
+            ),
+        ]);
+
+        let writer = tokio::spawn(async move {
+            for expected_id in ["elicitation-1", "elicitation-2"] {
+                let response = writer_rx.recv().await.expect("response frame");
+                let jsonrpc::OutboundMessage::Frame(frame) = response else {
+                    panic!("flush overtook the registered response batch");
+                };
+                let response: Value = serde_json::from_str(&frame).expect("valid response");
+                assert_eq!(response["id"], expected_id);
+            }
+
+            let flush = writer_rx.recv().await.expect("flush marker");
+            let jsonrpc::OutboundMessage::Flush(ack) = flush else {
+                panic!("response batch must be followed by one flush marker");
+            };
+            let _ = ack.send(());
+        });
+
+        assert!(
+            client
+                .flush_outbound_with_timeout(Duration::from_secs(1))
+                .await
+        );
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_inbound_response_is_bounded_when_writer_queue_is_full() {
+        let (writer_tx, writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(1);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        assert!(rpc.send_raw("occupied".to_string()).await);
+        client.respond_to_inbound_request(
+            serde_json::json!("elicitation-2"),
+            Ok(serde_json::json!({ "action": "cancel" })),
+        );
+
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await,
+            "a response blocked on writer capacity must share the retirement budget"
+        );
+
+        drop(writer_rx);
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
     async fn flush_outbound_waits_for_delayed_writer_before_shutdown() {
         let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
         let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
@@ -5229,14 +5358,16 @@ mod notification_tests {
         let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
         let release = Arc::new(tokio::sync::Notify::new());
         let release_writer = Arc::clone(&release);
-        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_writer = Arc::clone(&delivered);
         let writer = tokio::spawn(async move {
             while let Some(message) = writer_rx.recv().await {
                 match message {
-                    jsonrpc::OutboundMessage::Frame(_) => {
+                    jsonrpc::OutboundMessage::Frame(frame) => {
                         release_writer.notified().await;
-                        delivered_writer.store(true, std::sync::atomic::Ordering::Release);
+                        let response: Value = serde_json::from_str(&frame).expect("valid response");
+                        assert_eq!(response["id"], "elicitation-retiring");
+                        delivered_writer.fetch_add(1, Ordering::AcqRel);
                     }
                     jsonrpc::OutboundMessage::Flush(ack) => {
                         let _ = ack.send(());
@@ -5248,7 +5379,10 @@ mod notification_tests {
         client.writer_task = Some(writer);
         let client = Arc::new(client);
 
-        assert!(rpc.send_raw("terminal response".to_string()).await);
+        client.respond_to_inbound_request(
+            serde_json::json!("elicitation-retiring"),
+            Ok(serde_json::json!({ "action": "cancel" })),
+        );
         assert!(
             !client
                 .flush_outbound_with_timeout(Duration::from_millis(20))
@@ -5263,7 +5397,7 @@ mod notification_tests {
 
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !delivered.load(std::sync::atomic::Ordering::Acquire) {
+            while delivered.load(Ordering::Acquire) == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -5276,6 +5410,11 @@ mod notification_tests {
         })
         .await
         .expect("retirement should reclaim the writer after its flush");
+        assert_eq!(
+            delivered.load(Ordering::Acquire),
+            1,
+            "retirement must deliver exactly one terminal response"
+        );
     }
 
     #[tokio::test]

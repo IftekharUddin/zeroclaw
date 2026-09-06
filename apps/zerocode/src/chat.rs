@@ -2138,12 +2138,7 @@ impl Chat {
     /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
     /// calling tool takes its non-channel fallback path.
     pub(crate) fn answer_cancel(rpc: &Arc<RpcClient>, id: serde_json::Value) {
-        let rpc = rpc.clone();
-        tokio::spawn(async move {
-            let _ = rpc
-                .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
-                .await;
-        });
+        rpc.respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })));
     }
 
     /// A reconnect rebuild invalidates approval UI tied to the old transport.
@@ -2934,18 +2929,13 @@ impl Chat {
                     if let Some((id, content)) = payload {
                         state.pending_elicitation = None;
                         state.mark_dirty_full();
-                        let rpc = self.rpc.clone();
-                        tokio::spawn(async move {
-                            let _ = rpc
-                                .respond_to_inbound_request(
-                                    id,
-                                    Ok(serde_json::json!({
-                                        "action": "accept",
-                                        "content": content
-                                    })),
-                                )
-                                .await;
-                        });
+                        self.rpc.respond_to_inbound_request(
+                            id,
+                            Ok(serde_json::json!({
+                                "action": "accept",
+                                "content": content
+                            })),
+                        );
                     }
                     // else: invalid selection — swallow, leave modal up.
                     return false;
@@ -2954,15 +2944,10 @@ impl Chat {
                     if let Some(e) = state.pending_elicitation.take() {
                         state.mark_dirty_full();
                         let id = e.request_id;
-                        let rpc = self.rpc.clone();
-                        tokio::spawn(async move {
-                            let _ = rpc
-                                .respond_to_inbound_request(
-                                    id,
-                                    Ok(serde_json::json!({ "action": "cancel" })),
-                                )
-                                .await;
-                        });
+                        self.rpc.respond_to_inbound_request(
+                            id,
+                            Ok(serde_json::json!({ "action": "cancel" })),
+                        );
                     }
                     return false;
                 }
