@@ -80,6 +80,7 @@ the operating system:
 | `session/close` | client -> daemon | Close and clean up a session |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
+| `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |

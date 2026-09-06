@@ -857,11 +857,16 @@ impl Chat {
             }
         }
         if let Err(error) = self.rpc.session_close(session_id).await {
+            let notice = crate::i18n::t_args(
+                "zc-chat-session-close-error",
+                &[("error", &error.to_string())],
+            );
             if let Some(state) = self.state_for_session_mut(session_id) {
-                state.set_info_notice(crate::i18n::t_args(
-                    "zc-chat-session-close-error",
-                    &[("error", &error.to_string())],
-                ));
+                state.set_info_notice(notice);
+            } else if let ChatPhase::Active(state) = &mut self.phase {
+                state.set_info_notice(notice);
+            } else {
+                self.phase = ChatPhase::Error(notice);
             }
             return false;
         }
@@ -1861,7 +1866,13 @@ impl Chat {
         let alias = state.agent_alias.clone();
         if pane_kind == PaneKind::Acp && rpc.transport() == crate::client::Transport::Wss {
             // For WSS ACP, go through the CWD picker for new sessions too.
-            let _ = rpc.session_close(&state.session_id).await;
+            if let Err(error) = rpc.session_close(&state.session_id).await {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-close-error",
+                    &[("error", &error.to_string())],
+                ));
+                return None;
+            }
             // Remote ACP picker must start from a path the daemon understands.
             let start_dir = std::path::PathBuf::from("/");
             return Some(ChatPhase::PickCwd {
@@ -1882,7 +1893,27 @@ impl Chat {
         match new_session {
             Ok(s) => {
                 let old_session_id = state.session_id.clone();
-                let _ = rpc.session_close(&old_session_id).await;
+                if let Err(error) = rpc.session_close(&old_session_id).await {
+                    // The old session remains the local owner when the daemon
+                    // cannot confirm its close. Best-effort cleanup prevents
+                    // the unused replacement from accumulating server-side.
+                    let close_notice = crate::i18n::t_args(
+                        "zc-chat-session-close-error",
+                        &[("error", &error.to_string())],
+                    );
+                    let cleanup_notice =
+                        rpc.session_close(&s.session_id)
+                            .await
+                            .err()
+                            .map(|cleanup_error| {
+                                crate::i18n::t_args(
+                                    "zc-chat-session-close-error",
+                                    &[("error", &cleanup_error.to_string())],
+                                )
+                            });
+                    state.set_info_notice(append_cleanup_notice(close_notice, cleanup_notice));
+                    return None;
+                }
                 let current = state.todo_tracker.settings();
                 state.reset_for_session(s.session_id, None, Self::resolve_todo_settings(current));
                 state.cwd = s.workspace_dir;
@@ -12959,6 +12990,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_session_close_failure_surfaces_on_the_active_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state_for("sess-live", "beta")));
+        chat.session_order = vec!["sess-live".to_string(), "sess-failed".to_string()];
+        chat.resume_backgrounds
+            .push(resume_entry("sess-failed", "alpha", false));
+
+        let close = tokio::spawn(async move {
+            let closed = chat.close_session("sess-failed").await;
+            (chat, closed)
+        });
+        let request = next_rpc_request(&mut rx, "retained close should reach the daemon").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "controlled close failure",
+        );
+
+        let (chat, closed) = close.await.unwrap();
+        assert!(!closed);
+        assert_eq!(chat.resume_backgrounds.len(), 1);
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("the live session should remain active");
+        };
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("controlled close failure")),
+            "a retained-row close failure must be visible on the surviving session"
+        );
+    }
+
+    #[tokio::test]
     async fn acp_init_opens_recent_session_picker() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -13396,6 +13466,154 @@ mod tests {
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_close_failure_keeps_the_old_session_and_cleans_the_replacement() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            let phase = Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+            (state, phase)
+        });
+
+        let request = next_rpc_request(&mut rx, "restart should start a replacement").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/tmp/alpha" }),
+        );
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "controlled old close failure",
+        );
+        let request =
+            next_rpc_request(&mut rx, "failed restart should clean the replacement").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-fresh");
+        respond_ok(&rpc, &request, serde_json::Value::Null);
+
+        let (state, phase) = restart.await.unwrap();
+        assert!(phase.is_none());
+        assert_eq!(state.session_id, "sess-old");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("controlled old close failure"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "failed restart must not refresh identity for the discarded replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_replacement_close_failure_is_visible_on_the_retained_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            let phase = Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+            (state, phase)
+        });
+
+        let request = next_rpc_request(&mut rx, "restart should start a replacement").await;
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/tmp/alpha" }),
+        );
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "controlled old close failure",
+        );
+        let request =
+            next_rpc_request(&mut rx, "failed restart should clean the replacement").await;
+        respond_err(
+            &rpc,
+            &request,
+            -32001,
+            "controlled replacement cleanup failure",
+        );
+
+        let (state, phase) = restart.await.unwrap();
+        assert!(phase.is_none());
+        assert_eq!(state.session_id, "sess-old");
+        let notice = &state.info_message.as_ref().unwrap().text;
+        assert!(notice.contains("controlled old close failure"));
+        assert!(notice.contains("controlled replacement cleanup failure"));
+    }
+
+    #[tokio::test]
+    async fn wss_acp_restart_close_failure_keeps_the_old_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            let phase = Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await;
+            (state, phase)
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "WSS ACP restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "controlled WSS close failure",
+        );
+
+        let (state, phase) = restart.await.unwrap();
+        assert!(phase.is_none());
+        assert_eq!(state.session_id, "sess-old");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("controlled WSS close failure"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "failed WSS ACP restart must not open a CWD picker session"
+        );
     }
 
     #[tokio::test]
