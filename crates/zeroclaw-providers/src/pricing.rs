@@ -36,8 +36,10 @@ impl ModelRates {
     }
 
     /// Per-dimension precedence merge: `self` wins, `fallback` fills only the
-    /// dimensions `self` left unset (`Option::or`). A `Some(0.0)` in `self`
-    /// (a deliberately-free rate) is preserved, never overridden.
+    /// dimensions `self` left unset (`Option::or`). A `Some(0.0)` in `self` is
+    /// an explicitly configured rate and is preserved, never overridden: free
+    /// for input and output, and the "no cache discount" sentinel for cached
+    /// input, which the cost constructor bills at the standard input rate.
     #[must_use]
     pub fn or(self, fallback: ModelRates) -> ModelRates {
         ModelRates {

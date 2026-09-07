@@ -80,11 +80,13 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
    form for `provider/model` strings (so `anthropic/claude-opus-4-7`
    degrades to `claude-opus-4-7` if the operator stored only the
    short form). It retains one `Option` per dimension so live pricing and the
-   global catalog fill only gaps. Deliberate `0.0` values remain configured and
-   free. Negative, non-finite, or implausibly large rates (above the shared
-   `$1,000,000` per configured unit safety bound) are treated as unavailable at
-   the recording boundary even if an older or permissive config-load path let
-   them through.
+   global catalog fill only gaps. A deliberate `0.0` input or output rate
+   remains configured and free. A `0.0` cached-input rate is also configured,
+   but it is not free: the existing cost constructor treats it as "no cache
+   discount" and bills cached tokens at the standard input rate. Negative,
+   non-finite, or implausibly large rates (above the shared `$1,000,000` per
+   configured unit safety bound) are treated as unavailable at the recording
+   boundary even if an older or permissive config-load path let them through.
 
    Missing input, cached-input, and output dimensions are evaluated only when
    that dimension carries tokens. The one-shot runtime warning identifies the
@@ -156,8 +158,9 @@ per-agent rollup survives restarts.
 Each `TokenUsage` record carries two pricing-provenance fields:
 
 - `unpriced_tokens`: the input, cached-input, or output token subset whose
-  effective rate was unavailable. It is `0` for fully priced calls and for
-  deliberately free rates configured as `0.0`.
+  effective rate was unavailable. It is `0` for fully priced calls, including
+  calls priced at a deliberately free `0.0` input or output rate and calls
+  whose `0.0` cached-input rate fell back to the standard input rate.
 - `pricing_available`: compatibility summary of that provenance. New records
   set it to `false` when `unpriced_tokens > 0`.
 
@@ -214,15 +217,19 @@ profiles; the trade-off is losing the per-agent dimension everywhere.
 ### CLI status
 
 `zeroclaw status` prints today's and the current month's spend from the ledger.
-When any current-month model rollup has `unpriced_tokens > 0`, it also prints a
-pricing-unavailable warning naming each model and its uncosted token count. The
-warning is intentionally independent of the aggregate dollar total: mixed
-priced/unpriced rows remain visible, while a fully configured free model stays
-quiet.
+When any model recorded `unpriced_tokens > 0` anywhere in the current UTC
+month, it also prints a pricing-unavailable warning listing the affected models
+and the total uncosted token count across them. The warning reads a
+month-scoped model rollup (`CostTracker::get_current_month_model_stats`), not
+the daily `by_model` breakdown the dashboard uses, so unpriced usage from an
+earlier day of the month stays visible after UTC day rollover and after a
+restart. The warning is intentionally independent of the aggregate dollar
+total: mixed priced/unpriced rows remain visible, while a fully configured free
+model stays quiet.
 
-This warning means the displayed spend and cap headroom are lower bounds, not
-complete accounting. Legacy rows cannot trigger it because their historical
-pricing provenance is unknown.
+This warning means the displayed spend is a lower bound and the remaining cap
+headroom is an upper bound, not complete accounting. Legacy rows cannot trigger
+it because their historical pricing provenance is unknown.
 
 ### Config UI
 
@@ -274,8 +281,10 @@ after the daemon reload and check **Cost overview > Session** plus
 **`zeroclaw status` says pricing is unavailable even though some rates are configured.**
 Pricing is resolved per token-bearing dimension. For example, an input rate
 does not price output tokens, and a cached-input rate does not price uncached
-input. Add the dimensions named by the runtime warning. A configured `0.0` is a
-valid free rate and does not trigger the status warning.
+input. Add the dimensions named by the runtime warning. A configured `0.0`
+input or output rate is a valid free rate and does not trigger the status
+warning; a configured `0.0` cached-input rate bills cached tokens at the
+standard input rate and does not trigger it either.
 
 **Drift detected against `cost.rates.*` paths after save.** A pre
 v0.8.0 daemon mangled hyphenated HashMap keys in the dirty-save path,
