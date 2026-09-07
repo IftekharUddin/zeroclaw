@@ -722,6 +722,70 @@ impl WssFlushAck {
     }
 }
 
+fn handle_wss_reader_message(
+    message: Option<
+        std::result::Result<
+            tokio_tungstenite::tungstenite::Message,
+            tokio_tungstenite::tungstenite::Error,
+        >,
+    >,
+    rpc: &Arc<RpcOutbound>,
+    notif_tx: &broadcast::Sender<RpcNotification>,
+    inbound_tx: Option<&mpsc::UnboundedSender<RpcInboundRequest>>,
+    conn_state: &Arc<Mutex<ConnectionState>>,
+    flush_ack: &WssFlushAck,
+) -> bool {
+    use tokio_tungstenite::tungstenite::Message;
+
+    match message {
+        Some(Ok(Message::Text(text))) => {
+            let frame: Value = match serde_json::from_str(&text) {
+                Ok(value) => value,
+                Err(_) => return true,
+            };
+            route_inbound_frame(rpc, notif_tx, inbound_tx, frame);
+        }
+        Some(Ok(Message::Close(frame))) => {
+            let reason = frame
+                .map(|frame| frame.reason.to_string())
+                .unwrap_or_else(|| "server closed connection".to_string());
+            disconnect_rpc(rpc, conn_state, reason);
+            return false;
+        }
+        Some(Ok(Message::Pong(payload))) => {
+            flush_ack.acknowledge(payload.as_ref());
+        }
+        Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
+        Some(Ok(Message::Binary(_))) => {}
+        Some(Err(error)) => {
+            disconnect_rpc(rpc, conn_state, error.to_string());
+            return false;
+        }
+        None => {
+            disconnect_rpc(rpc, conn_state, "EOF (WSS connection closed)".to_string());
+            return false;
+        }
+    }
+    true
+}
+
+fn drain_ready_wss_messages<S, F>(stream: &mut S, mut handle: F) -> bool
+where
+    S: futures_util::Stream + Unpin,
+    F: FnMut(Option<S::Item>) -> bool,
+{
+    use futures_util::{FutureExt, StreamExt};
+
+    loop {
+        let Some(message) = stream.next().now_or_never() else {
+            return true;
+        };
+        if !handle(message) {
+            return false;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RpcClient {
     pub(crate) rpc: Arc<RpcOutbound>,
@@ -1825,49 +1889,34 @@ impl RpcClient {
                         let Some(WssReaderControl::Quiesce(ack)) = control else {
                             break;
                         };
+                        let keep_reading = drain_ready_wss_messages(&mut stream, |message| {
+                            handle_wss_reader_message(
+                                message,
+                                &rpc_for_reader,
+                                &notif_tx_for_reader,
+                                inbound_tx_for_reader.as_ref(),
+                                &conn_state_for_reader,
+                                &flush_ack,
+                            )
+                        });
                         inbound_tx_for_reader.take();
                         let _ = ack.send(());
+                        if !keep_reading {
+                            break;
+                        }
                         continue;
                     }
                     message = stream.next() => message,
                 };
-                match message {
-                    Some(Ok(Message::Text(text))) => {
-                        let frame: Value = match serde_json::from_str(&text) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        route_inbound_frame(
-                            &rpc_for_reader,
-                            &notif_tx_for_reader,
-                            inbound_tx_for_reader.as_ref(),
-                            frame,
-                        );
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        let reason = frame
-                            .map(|f| f.reason.to_string())
-                            .unwrap_or_else(|| "server closed connection".to_string());
-                        disconnect_rpc(&rpc_for_reader, &conn_state_for_reader, reason);
-                        break;
-                    }
-                    Some(Ok(Message::Pong(payload))) => {
-                        flush_ack.acknowledge(payload.as_ref());
-                    }
-                    Some(Ok(Message::Ping(_) | Message::Frame(_))) => continue,
-                    Some(Ok(Message::Binary(_))) => continue,
-                    Some(Err(e)) => {
-                        disconnect_rpc(&rpc_for_reader, &conn_state_for_reader, e.to_string());
-                        break;
-                    }
-                    None => {
-                        disconnect_rpc(
-                            &rpc_for_reader,
-                            &conn_state_for_reader,
-                            "EOF (WSS connection closed)".to_string(),
-                        );
-                        break;
-                    }
+                if !handle_wss_reader_message(
+                    message,
+                    &rpc_for_reader,
+                    &notif_tx_for_reader,
+                    inbound_tx_for_reader.as_ref(),
+                    &conn_state_for_reader,
+                    &flush_ack,
+                ) {
+                    break;
                 }
             }
         });
@@ -5312,6 +5361,56 @@ mod notification_tests {
         let (notif_tx, notif_rx) = broadcast::channel::<RpcNotification>(16);
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         (rpc, notif_tx, notif_rx, inbound_tx, inbound_rx, writer_rx)
+    }
+
+    #[tokio::test]
+    async fn rtg_9739_ready_wss_request_is_routed_before_quiesce_cut_and_answered_once() {
+        use futures_util::{StreamExt, future, stream};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (rpc, notif_tx, _notif_rx, inbound_tx, mut inbound_rx, mut writer_rx) = route_fixture();
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let flush_ack = WssFlushAck::default();
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "ready-during-quiesce",
+            "method": "elicitation/create",
+            "params": { "sessionId": "retiring-session" }
+        });
+        let ready = future::ready(Ok::<_, tokio_tungstenite::tungstenite::Error>(
+            Message::Text(frame.to_string().into()),
+        ));
+        let mut stream = stream::once(ready).chain(stream::pending());
+        let mut reader_sender = Some(inbound_tx);
+
+        assert!(drain_ready_wss_messages(&mut stream, |message| {
+            handle_wss_reader_message(
+                message,
+                &rpc,
+                &notif_tx,
+                reader_sender.as_ref(),
+                &conn_state,
+                &flush_ack,
+            )
+        }));
+        reader_sender.take();
+
+        let request = inbound_rx
+            .recv()
+            .await
+            .expect("ready request must reach router");
+        assert!(inbound_rx.recv().await.is_none());
+        let client = RpcClient::with_rpc(rpc);
+        client
+            .respond_to_inbound_request(request.id, Ok(serde_json::json!({ "action": "cancel" })));
+        let response = writer_rx.recv().await.expect("one terminal response");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "ready-during-quiesce");
+        assert_eq!(response["result"]["action"], "cancel");
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "request must be answered once"
+        );
     }
 
     /// Response frames — id + result/error, no method — should reach the

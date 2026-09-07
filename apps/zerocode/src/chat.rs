@@ -3202,8 +3202,10 @@ impl Chat {
 
         use crate::keymap::ChatTabAction;
         let chat_action = ChatTabAction::from_chord(&key);
-        let chat_action_bypasses_text_input = chat_action
-            .is_some_and(|action| crate::keymap::action_bypasses_text_input(action, &key));
+        let chat_action_bypasses_text_input = chat_action.is_some_and(|action| {
+            !matches!(action, ChatTabAction::ApprovalApprove)
+                && crate::keymap::action_bypasses_text_input(action, &key)
+        });
 
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
@@ -14334,6 +14336,91 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "switching must not cancel/close the old session"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtg_9739_composer_enter_and_primary_enter_dispatch_without_approval() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for (key, prompt) in [
+                (KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), "submit"),
+                (
+                    KeyEvent::new(
+                        KeyCode::Enter,
+                        crate::keymap::Chord::with_primary(KeyCode::Enter, KeyModifiers::NONE)
+                            .effective_modifiers(),
+                    ),
+                    "inject",
+                ),
+            ] {
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let outbound = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+                let mut chat = Chat::new(client, kind);
+                let mut active = state();
+                active.input_bar.insert_text(prompt);
+                chat.phase = ChatPhase::Active(Box::new(active));
+                let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                    crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                    },
+                )
+                .unwrap();
+
+                chat.handle_key(key, &mut term).await;
+
+                let request =
+                    next_rpc_request(&mut rx, "composer key must dispatch a prompt").await;
+                assert_eq!(request["method"], method::SESSION_PROMPT);
+                assert_eq!(request["params"]["prompt"], prompt);
+                assert!(active_state(&mut chat).input_bar.input().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rtg_9739_approval_enter_approves_without_submitting_composer() {
+        use crossterm::event::KeyCode;
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut active = state();
+        active.input_bar.insert_text("keep draft");
+        active.pending_approval = Some(PendingApproval {
+            request_id: "approval-enter".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+        chat.phase = ChatPhase::Active(Box::new(active));
+        let approve = tokio::spawn(async move {
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(KeyEvent::from(KeyCode::Enter), &mut term)
+                .await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "approval Enter must answer the modal").await;
+        assert_eq!(request["method"], method::SESSION_APPROVE);
+        assert_eq!(request["params"]["request_id"], "approval-enter");
+        respond_ok(&outbound, &request, serde_json::json!({}));
+        let mut chat = approve.await.unwrap();
+
+        assert_eq!(active_state(&mut chat).input_bar.input(), "keep draft");
+        assert!(active_state(&mut chat).pending_approval.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "approval Enter must not submit a prompt"
         );
     }
 
