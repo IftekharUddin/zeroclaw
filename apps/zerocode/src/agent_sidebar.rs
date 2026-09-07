@@ -316,14 +316,7 @@ impl AgentSidebar {
                 .map(|(s, _)| crate::display_width::display_width(s) + 1)
                 .unwrap_or(0);
 
-            let count = if summary.message_count > 999 {
-                "999+".to_string()
-            } else {
-                summary.message_count.to_string()
-            };
-            let count_label = format!(" ({count})");
-            let count_width = crate::display_width::display_width(&count_label);
-            let name_width = (row_rect.width as usize).saturating_sub(2 + tag_width + count_width);
+            let name_width = (row_rect.width as usize).saturating_sub(2 + tag_width);
             let duplicate = rows
                 .iter()
                 .filter(|row| row.agent_alias == summary.agent_alias)
@@ -356,7 +349,6 @@ impl AgentSidebar {
             let mut spans = vec![
                 Span::styled(status_glyph, status_style(summary.status)),
                 Span::styled(name, theme::body_style()),
-                Span::styled(count_label, theme::dim_style()),
             ];
             if let Some((label, is_close)) = tag {
                 spans.push(Span::raw(" ".repeat(pad + 1)));
@@ -756,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn running_row_is_explicit_and_count_is_capped_without_losing_close_target() {
+    fn running_row_is_explicit_without_showing_count_or_losing_close_target() {
         let mut sidebar = sidebar();
         sidebar.width = SIDEBAR_COLS_MIN;
         let area = sidebar
@@ -765,7 +757,7 @@ mod tests {
             .unwrap();
         let mut row = summary("long-agent-name", "s1", true);
         row.status = SidebarStatus::Running;
-        row.message_count = 12_345;
+        row.message_count = 42;
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
             quickstart_active: false,
@@ -789,8 +781,8 @@ mod tests {
             "running state must not rely on color: {text}"
         );
         assert!(
-            text.contains("(999+)"),
-            "large counts stay width-bounded: {text}"
+            !text.contains("(42)"),
+            "message counts are not session identity: {text}"
         );
         let (_, _, close) = sidebar.close_rect.clone().expect("close target retained");
         assert_eq!(close.right(), rect.right());
