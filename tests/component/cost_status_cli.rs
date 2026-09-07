@@ -1,3 +1,4 @@
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::{Command, Output};
@@ -23,13 +24,31 @@ fn usage_record(
     cost_usd: f64,
     pricing_available: Option<bool>,
 ) -> Value {
+    usage_record_at(
+        model,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+        pricing_available,
+        Utc::now(),
+    )
+}
+
+fn usage_record_at(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    pricing_available: Option<bool>,
+    timestamp: DateTime<Utc>,
+) -> Value {
     let mut usage = json!({
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "cost_usd": cost_usd,
-        "timestamp": chrono::Utc::now(),
+        "timestamp": timestamp,
     });
     if let Some(pricing_available) = pricing_available {
         usage["pricing_available"] = json!(pricing_available);
@@ -146,4 +165,39 @@ fn legacy_status_fixture_keeps_missing_provenance_compatible() {
     let (stdout, stderr) = output_text(&output);
     assert!(stdout.contains("Spent today:       $0.0000 / $10.00"));
     assert!(!stderr.contains("Pricing unavailable"));
+}
+
+#[test]
+fn earlier_month_unpriced_usage_still_warns_after_day_rollover() {
+    // The warning qualifies the monthly spend line, so unpriced usage from an
+    // earlier UTC day of the current month must stay visible after reload,
+    // while a previous-month row stays outside the monthly cap window. On the
+    // first day of a UTC month the earlier row coincides with today and this
+    // fixture cannot distinguish the day and month scopes; the tracker unit
+    // test with a fixed reporting period covers that case deterministically.
+    let now = Utc::now();
+    let month_start = Utc.from_utc_datetime(
+        &now.date_naive()
+            .with_day(1)
+            .expect("day 1 exists in every month")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid time"),
+    );
+    let previous_month = month_start - Duration::seconds(1);
+
+    let output = run_status(&[
+        usage_record_at("earlier-model", 100, 50, 0.0, Some(false), month_start),
+        usage_record_at("today-model", 100, 50, 0.1, Some(true), now),
+        usage_record_at("stale-model", 200, 100, 0.0, Some(false), previous_month),
+    ]);
+    let (stdout, stderr) = output_text(&output);
+    assert!(stdout.contains("Spent today:       $0.1000 / $10.00"));
+    assert!(stdout.contains("Spent this month:  $0.1000 / $100.00"));
+    assert!(
+        stderr.contains("Pricing unavailable for 1 model(s) (150 tokens uncosted)"),
+        "earlier-this-month unpriced usage must still warn\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("earlier-model"));
+    assert!(!stderr.contains("stale-model"));
+    assert!(!stderr.contains("450 tokens uncosted"));
 }

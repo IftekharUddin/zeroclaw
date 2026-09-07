@@ -285,6 +285,30 @@ impl CostTracker {
         self.get_summary_filtered(None)
     }
 
+    /// Per-model rollup over every record in the current UTC month.
+    ///
+    /// [`CostSummary::by_model`] stays daily-scoped for dashboard and RPC
+    /// consumers. Operator surfaces that qualify the monthly total, such as
+    /// the `zeroclaw status` pricing-unavailable warning, need the whole
+    /// month's recorded provenance so unpriced usage from an earlier day
+    /// does not disappear at UTC day rollover while the monthly spend still
+    /// omits its cost. Derived from the persisted ledger on demand; nothing
+    /// is cached or duplicated.
+    pub fn get_current_month_model_stats(&self) -> Result<HashMap<String, ModelStats>> {
+        self.get_current_month_model_stats_at_period(ReportingPeriod::current())
+    }
+
+    fn get_current_month_model_stats_at_period(
+        &self,
+        period: ReportingPeriod,
+    ) -> Result<HashMap<String, ModelStats>> {
+        let mut storage = self.lock_storage();
+        storage.ensure_period_cache_current_at(period)?;
+        let period = storage.reporting_period();
+        let records = storage.current_month_records(period)?;
+        Ok(build_model_stats(records.iter()))
+    }
+
     pub fn get_summary_in_bounds(
         &self,
         from: Option<DateTime<Utc>>,
@@ -1091,6 +1115,30 @@ mod tests {
         )
     }
 
+    fn unpriced_record_at(
+        model: &str,
+        unpriced_tokens: u64,
+        timestamp: DateTime<Utc>,
+    ) -> CostRecord {
+        let usage = TokenUsage {
+            model: model.to_string(),
+            input_tokens: unpriced_tokens,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            total_tokens: unpriced_tokens,
+            cost_usd: 0.0,
+            pricing_available: false,
+            unpriced_tokens,
+            timestamp,
+        };
+        CostRecord::with_attribution(
+            "fixture-session",
+            Some("fixture-agent".to_string()),
+            None,
+            usage,
+        )
+    }
+
     fn write_records(path: &Path, records: &[CostRecord]) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -1600,6 +1648,70 @@ mod tests {
         assert!(filtered.by_model.contains_key("today/model"));
         assert!(!filtered.by_model.contains_key("earlier-month/model"));
         assert!(!filtered.by_model.contains_key("prior-month/model"));
+    }
+
+    #[test]
+    fn current_month_model_stats_keep_earlier_month_unpriced_usage_visible() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let period = ReportingPeriod {
+            day: NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+            year: 2025,
+            month: 6,
+        };
+        let month_start = period.day.with_day(1).unwrap();
+        let prior_month = month_start - Duration::days(1);
+        write_records(
+            &storage_path,
+            &[
+                record_at(
+                    "today/model",
+                    1.0,
+                    Utc.from_utc_datetime(&period.day.and_hms_opt(12, 0, 0).unwrap()),
+                    None,
+                ),
+                unpriced_record_at(
+                    "earlier-month/model",
+                    150,
+                    Utc.from_utc_datetime(&month_start.and_hms_opt(0, 0, 0).unwrap()),
+                ),
+                unpriced_record_at(
+                    "prior-month/model",
+                    75,
+                    Utc.from_utc_datetime(&prior_month.and_hms_opt(23, 59, 59).unwrap()),
+                ),
+            ],
+        );
+
+        // A fresh tracker reloads the ledger from disk the same way the
+        // status command does after a restart.
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+
+        let summary = tracker
+            .get_summary_filtered_at_period(None, period)
+            .unwrap();
+        assert_eq!(
+            summary.by_model.len(),
+            1,
+            "the daily by_model contract for other consumers is unchanged"
+        );
+        assert!(summary.by_model.contains_key("today/model"));
+        assert!((summary.monthly_cost_usd - 1.0).abs() < f64::EPSILON);
+
+        let month = tracker
+            .get_current_month_model_stats_at_period(period)
+            .unwrap();
+        assert_eq!(month.len(), 2);
+        assert_eq!(month["today/model"].unpriced_tokens, 0);
+        assert!((month["today/model"].cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(
+            month["earlier-month/model"].unpriced_tokens, 150,
+            "earlier-this-month unpriced usage must stay visible after day rollover"
+        );
+        assert!(
+            !month.contains_key("prior-month/model"),
+            "previous-month rows are outside the monthly cap window"
+        );
     }
 
     #[test]
