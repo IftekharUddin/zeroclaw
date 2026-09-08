@@ -1760,9 +1760,18 @@ pub async fn handle_api_sessions_list(
 /// 1. exact `id` if it already exists as a session/cancel key
 /// 2. `gw_{id}` if that exists
 /// 3. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise prefix `gw_`
+///
+/// An id the gateway identity validator rejects never reaches the `exists`
+/// probe, because that probe is lossy: `SessionStore` sanitizes a key before
+/// deriving its filename, so `gw_a.b` reports the file of the unrelated
+/// canonical session `gw_a_b` and would then be carried as its own lifecycle
+/// key. Legacy non-gateway keys stay reachable through `stored_verbatim`,
+/// which must compare against stored keys exactly and never sanitize; ids
+/// inside the `gw_` namespace are rejected outright so no alias can enter it.
 fn resolve_gateway_session_key(
     id: &str,
     exists: impl Fn(&str) -> bool,
+    stored_verbatim: impl Fn(&str) -> bool,
 ) -> Result<String, crate::session_identity::SessionIdError> {
     match crate::session_identity::validate_and_canonicalize_gateway_session_id(id) {
         Ok(ident) => {
@@ -1773,13 +1782,45 @@ fn resolve_gateway_session_key(
             }
         }
         Err(e) => {
-            if exists(id) {
+            if id.starts_with(crate::session_identity::GW_SESSION_PREFIX) {
+                return Err(e);
+            }
+            if stored_verbatim(id) {
                 Ok(id.to_string())
             } else {
                 Err(e)
             }
         }
     }
+}
+
+/// Exact, non-sanitizing existence check for one stored session key.
+///
+/// `SessionBackend::session_exists` derives a filename on the JSONL backend
+/// and therefore answers for the sanitized key rather than the requested one.
+/// `list_sessions` reports keys exactly as they are stored, so an equality
+/// match against it proves the caller named that session and no other. On the
+/// JSONL backend the stored key is the sanitized file name, so a punctuated
+/// legacy id is reported as not stored: under that backend the punctuated and
+/// sanitized forms are one file, and admitting either as its own lifecycle key
+/// is the alias this check exists to refuse.
+fn backend_stores_key_verbatim(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    key: &str,
+) -> bool {
+    backend.list_sessions().iter().any(|stored| stored == key)
+}
+
+/// Resolve a REST path `{id}` against a persistence backend.
+fn resolve_backend_session_key(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    id: &str,
+) -> Result<String, crate::session_identity::SessionIdError> {
+    resolve_gateway_session_key(
+        id,
+        |key| backend.session_exists(key),
+        |key| backend_stores_key_verbatim(backend, key),
+    )
 }
 
 /// Resolve one existing REST-write target and capture its lifecycle snapshot
@@ -1802,7 +1843,7 @@ fn capture_existing_gateway_writer(
     )>,
     crate::session_identity::SessionIdError,
 > {
-    let session_key = resolve_gateway_session_key(id, |key| backend.session_exists(key))?;
+    let session_key = resolve_backend_session_key(backend, id)?;
     if let Some((deletion, persistence)) = state
         .session_lifecycle
         .capture_existing_writer(&session_key, || backend.session_exists(&session_key))
@@ -1836,7 +1877,7 @@ pub async fn handle_api_session_messages(
         .into_response();
     };
 
-    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+    let session_key = match resolve_backend_session_key(backend.as_ref(), &id) {
         Ok(k) => k,
         Err(e) => {
             return (
@@ -2057,7 +2098,7 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+    let session_key = match resolve_backend_session_key(backend.as_ref(), &id) {
         Ok(k) => k,
         Err(e) => {
             return (
@@ -2177,7 +2218,7 @@ pub async fn handle_api_session_rename(
     // the session authority across both the existence probe and the mutation:
     // DELETE, which takes the same authority, cannot land in between.
     //
-    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+    let session_key = match resolve_backend_session_key(backend.as_ref(), &id) {
         Ok(k) => k,
         Err(e) => {
             return (
@@ -2298,7 +2339,7 @@ pub async fn handle_api_session_state(
 
     // Resolve the durable key the same way the other session endpoints do, so
     // the persisted row and the live-turn probe describe one session.
-    let session_key = match resolve_gateway_session_key(&id, |key| backend.session_exists(key)) {
+    let session_key = match resolve_backend_session_key(backend.as_ref(), &id) {
         Ok(k) => k,
         Err(e) => {
             return (
@@ -2382,7 +2423,13 @@ pub async fn handle_api_session_abort(
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned");
-        let session_key = match resolve_gateway_session_key(&id, |key| tokens.contains_key(key)) {
+        // The cancel-token map is keyed exactly, so the same probe serves as
+        // the non-sanitizing legacy lookup.
+        let session_key = match resolve_gateway_session_key(
+            &id,
+            |key| tokens.contains_key(key),
+            |key| tokens.contains_key(key),
+        ) {
             Ok(k) => k,
             Err(e) => {
                 return (
@@ -4113,58 +4160,126 @@ pub(crate) mod tests {
     fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
         let none = |_key: &str| false;
         assert_eq!(
-            resolve_gateway_session_key("operator-1", none).unwrap(),
+            resolve_gateway_session_key("operator-1", none, none).unwrap(),
             "gw_operator-1"
         );
         assert_eq!(
-            resolve_gateway_session_key("gw_operator-1", none).unwrap(),
+            resolve_gateway_session_key("gw_operator-1", none, none).unwrap(),
             "gw_operator-1"
         );
         // Underscore-bearing display ids must still map into the gw_ namespace
         // when no exact key exists (punctuation is not a session namespace).
         assert_eq!(
-            resolve_gateway_session_key("team_alpha", none).unwrap(),
+            resolve_gateway_session_key("team_alpha", none, none).unwrap(),
             "gw_team_alpha"
         );
 
         let gateway_only = |key: &str| key == "gw_team_alpha";
         assert_eq!(
-            resolve_gateway_session_key("team_alpha", gateway_only).unwrap(),
+            resolve_gateway_session_key("team_alpha", gateway_only, gateway_only).unwrap(),
             "gw_team_alpha"
         );
         assert_eq!(
-            resolve_gateway_session_key("gw_team_alpha", gateway_only).unwrap(),
+            resolve_gateway_session_key("gw_team_alpha", gateway_only, gateway_only).unwrap(),
             "gw_team_alpha"
         );
 
         let channel_only = |key: &str| key == "discord.clamps_room";
         assert_eq!(
-            resolve_gateway_session_key("discord.clamps_room", channel_only).unwrap(),
+            resolve_gateway_session_key("discord.clamps_room", channel_only, channel_only).unwrap(),
             "discord.clamps_room"
         );
 
         // Exact match wins when both the bare id and gw_ form exist.
         let both = |key: &str| key == "team_alpha" || key == "gw_team_alpha";
         assert_eq!(
-            resolve_gateway_session_key("team_alpha", both).unwrap(),
+            resolve_gateway_session_key("team_alpha", both, both).unwrap(),
             "team_alpha"
         );
 
         // Invalid IDs are rejected with appropriate error
         assert!(matches!(
-            resolve_gateway_session_key("a.b", none),
+            resolve_gateway_session_key("a.b", none, none),
             Err(crate::session_identity::SessionIdError::InvalidCharacter(
                 '.'
             ))
         ));
         assert!(matches!(
-            resolve_gateway_session_key("gw_gw_alpha", none),
+            resolve_gateway_session_key("gw_gw_alpha", none, none),
             Err(crate::session_identity::SessionIdError::DoublePrefix)
         ));
         assert!(matches!(
-            resolve_gateway_session_key("", none),
+            resolve_gateway_session_key("", none, none),
             Err(crate::session_identity::SessionIdError::Empty)
         ));
+    }
+
+    /// A malformed id in the gateway namespace must never be excused by an
+    /// existence probe. `SessionStore::session_exists` sanitizes before it
+    /// derives a filename, so `gw_a.b` reports the file that belongs to the
+    /// canonical session `gw_a_b`; accepting it would hand the caller a
+    /// second lifecycle key over one transcript.
+    #[test]
+    fn resolve_gateway_session_key_rejects_gateway_aliases_that_a_lossy_probe_admits() {
+        // The lossy probe answers for the sanitized key, as the JSONL backend does.
+        let sanitized_probe =
+            |key: &str| zeroclaw_api::session_keys::sanitize_session_key(key) == "gw_a_b";
+        let stored_verbatim = |key: &str| key == "gw_a_b";
+        assert!(
+            sanitized_probe("gw_a.b"),
+            "the lossy probe must answer yes for the alias, or this test proves nothing"
+        );
+        assert!(matches!(
+            resolve_gateway_session_key("gw_a.b", sanitized_probe, stored_verbatim),
+            Err(crate::session_identity::SessionIdError::InvalidCharacter(
+                '.'
+            ))
+        ));
+        // Over-length and double-prefix aliases take the same path.
+        assert!(matches!(
+            resolve_gateway_session_key("gw_gw_a.b", sanitized_probe, stored_verbatim),
+            Err(crate::session_identity::SessionIdError::DoublePrefix)
+        ));
+    }
+
+    /// A legacy non-gateway key keeps working only when the backend stores it
+    /// exactly as requested. A sanitizing probe must not resurrect the escape
+    /// hatch for an id that merely collides with a stored key.
+    #[test]
+    fn resolve_gateway_session_key_admits_legacy_keys_only_on_exact_storage() {
+        let sanitized_probe =
+            |key: &str| zeroclaw_api::session_keys::sanitize_session_key(key) == "discord_room";
+        let stored_verbatim = |key: &str| key == "discord.clamps_room";
+
+        assert_eq!(
+            resolve_gateway_session_key("discord.clamps_room", sanitized_probe, stored_verbatim)
+                .unwrap(),
+            "discord.clamps_room"
+        );
+        assert!(matches!(
+            resolve_gateway_session_key("discord.room", sanitized_probe, stored_verbatim),
+            Err(crate::session_identity::SessionIdError::InvalidCharacter(
+                '.'
+            ))
+        ));
+    }
+
+    /// `backend_stores_key_verbatim` must not inherit the JSONL sanitization
+    /// that makes `session_exists` lossy.
+    #[test]
+    fn backend_stores_key_verbatim_does_not_sanitize() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append("gw_a_b", &zeroclaw_providers::ChatMessage::user("hello"))
+            .unwrap();
+
+        assert!(
+            backend.session_exists("gw_a.b"),
+            "probe is lossy as assumed"
+        );
+        assert!(backend_stores_key_verbatim(backend.as_ref(), "gw_a_b"));
+        assert!(!backend_stores_key_verbatim(backend.as_ref(), "gw_a.b"));
     }
 
     #[test]
@@ -7149,6 +7264,117 @@ pub(crate) mod tests {
             "colliding ID delete must not touch legitimate session storage"
         );
         assert_eq!(store.load("gw_a_b").len(), 1);
+    }
+
+    /// A malformed *full* key aliases a canonical session under the JSONL
+    /// backend: `session_exists("gw_a.b")` probes `gw_a_b.jsonl`, so an
+    /// existence-based escape hatch would hand `gw_a.b` back as its own
+    /// lifecycle key while every storage call landed on `gw_a_b`. GET could
+    /// read the canonical transcript, POST could append to it under a second
+    /// authority, and DELETE could remove the file while fencing the wrong
+    /// key. All three must fail closed with 400 instead.
+    #[tokio::test]
+    async fn jsonl_identity_full_key_alias_cannot_read_append_or_delete_canonical_session() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+
+        store
+            .append(
+                "gw_a_b",
+                &zeroclaw_providers::ChatMessage::user("hello a_b"),
+            )
+            .expect("seed canonical session");
+        let jsonl_path = tmp.path().join("sessions").join("gw_a_b.jsonl");
+        assert!(jsonl_path.exists());
+        assert!(
+            store.session_exists("gw_a.b"),
+            "the JSONL existence probe is lossy for the alias, or this test proves nothing"
+        );
+
+        let get_res = handle_api_session_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("gw_a.b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            get_res.status(),
+            StatusCode::BAD_REQUEST,
+            "alias GET must not read the canonical transcript"
+        );
+
+        let post_res = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("gw_a.b".to_string()),
+            Json(SessionMessagePostBody {
+                content: "alias append".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            post_res.status(),
+            StatusCode::BAD_REQUEST,
+            "alias POST must not append to the canonical transcript"
+        );
+        assert_eq!(
+            store.load("gw_a_b").len(),
+            1,
+            "alias POST must leave the canonical transcript untouched"
+        );
+
+        let del_res = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("gw_a.b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            del_res.status(),
+            StatusCode::BAD_REQUEST,
+            "alias DELETE must not remove the canonical session"
+        );
+        assert!(
+            jsonl_path.exists(),
+            "alias DELETE must not remove the canonical JSONL file"
+        );
+        assert_eq!(store.load("gw_a_b").len(), 1);
+
+        // The alias must not have taken a deletion tombstone or a turn
+        // version under its own lifecycle key either.
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key("gw_a.b"),
+            "a rejected alias must not publish lifecycle state"
+        );
+
+        // The canonical key still works after the rejected alias traffic.
+        let canonical_get = handle_api_session_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("gw_a_b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(canonical_get.status(), StatusCode::OK);
+        let canonical_get = response_json(canonical_get).await;
+        assert_eq!(
+            canonical_get["messages"]
+                .as_array()
+                .expect("messages array")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
