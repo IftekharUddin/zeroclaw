@@ -1322,3 +1322,52 @@ test('detached turn: a turn that commits before the first state answer is still 
 
   await unmount(mounted.renderer);
 });
+
+test('detached turn: a switch carries no verification from the conversation it left', async () => {
+  const runtime = new FakeSessionRuntime();
+  // A's connection watches a detached turn finish, hydrates, and recycles, so
+  // it ends the switch marked as a verified recovery.
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['A prompt'])));
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'running', session_persistence: true }));
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['A prompt', 'A answer'])));
+
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  await wait(550);
+  assert.equal(runtime.sockets.length, 2);
+  await openSocket(runtime, 1);
+  await settle();
+  assert.equal(mounted.context().typing, false);
+
+  // B is switched to while a detached turn of its own is still running: its
+  // mount hydration predates that turn's answer, exactly as A's did.
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['B prompt'])));
+  runtime.queueState('B', () => Promise.resolve({ session_id: 'B', state: 'running', session_persistence: true }));
+  runtime.queueState('B', () => Promise.resolve({ session_id: 'B', state: 'idle', session_persistence: true }));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['B prompt', 'B answer'])));
+
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  assert.equal(runtime.sockets[2]?.sessionId, 'B');
+  await openSocket(runtime, 2);
+  await settle();
+  assert.equal(mounted.context().typing, true);
+
+  await wait(550);
+
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['B prompt', 'B answer'],
+    'the incoming conversation owes its own authoritative fetch',
+  );
+  assert.equal(mounted.context().typing, true, 'the lock is held across the recycle B owes');
+  assert.equal(runtime.sockets.length, 4, 'B watched a running turn, so its socket is recycled too');
+  await openSocket(runtime, 3);
+  await settle();
+  assert.equal(mounted.context().typing, false);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+
+  await unmount(mounted.renderer);
+});

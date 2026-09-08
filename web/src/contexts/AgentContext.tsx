@@ -1337,6 +1337,14 @@ export function AgentProvider({
     activeSessionIdRef.current = nextSessionId;
     sessionPersistenceRef.current = null;
     typingRef.current = false;
+    // Recovery facts describe one connection to one conversation. The socket
+    // for the incoming conversation may itself be seeded during a detached
+    // turn, so a pass verified on the outgoing one must not excuse it from the
+    // authoritative history fetch or from the recycle. The socket effect's
+    // teardown deliberately detaches callbacks, so no Close frame clears these.
+    recoveryVerifiedRef.current = false;
+    detachedTurnObservedRef.current = false;
+    hydrationPendingRef.current = false;
     // The pointer records the alias's most recently selected conversation, so a
     // deep link or a fresh workspace resumes there. With the same agent open in
     // two panes the last switch wins, which is why a pane that has an owner
