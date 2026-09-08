@@ -525,6 +525,9 @@ test('switch resets capability, hydrates the target, and ignores the old socket'
   const bHydration = new Deferred<SessionMessagesResponse>();
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['from A'])));
   runtime.queueMessages('B', () => bHydration.promise);
+  // Recovery re-reads the transcript once per connection, so B is fetched
+  // again when its socket opens; the same server answers the same way.
+  runtime.queueMessages('B', () => bHydration.promise);
   const mounted = await mountChat(runtime);
   await openSocket(runtime, 0);
   await settle();
@@ -841,6 +844,8 @@ test('a late active delete cannot replace a newer selected session', async () =>
   runtime.queueDelete('A', () => deleteA.promise);
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
   runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['B survives'])));
+  // Second answer for B's connection-level recovery fetch.
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['B survives'])));
   const mounted = await mountChat(runtime);
   await openSocket(runtime, 0);
   await settle();
@@ -902,6 +907,8 @@ test('a deferred delete replaces its target after an A to B to A round trip', as
   const cHydration = new Deferred<SessionMessagesResponse>();
   runtime.mintedIds.push('C');
   runtime.queueDelete('A', () => deleteA.promise);
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  // A's first connection also performs the connection-level recovery fetch.
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
   runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true)));
   runtime.queueMessages('A', () => secondAHydration.promise);
@@ -1198,6 +1205,120 @@ test('detached turn: recovery failure locks composer and offers retry which reco
   assert.equal(textarea(mounted.renderer).props.disabled, false);
   const sendBtn = mounted.renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === 'Send');
   assert.ok(sendBtn);
+
+  await unmount(mounted.renderer);
+});
+
+test('detached turn: a failed hydration keeps the composer locked until a retry refetches the answer', async () => {
+  const runtime = new FakeSessionRuntime();
+  // Mount hydration: the transcript the operator can see, missing the answer.
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['First prompt'])));
+  // Recovery watches the detached turn finish.
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'running', session_persistence: true }));
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+  // The authoritative post-completion fetch fails.
+  runtime.queueMessages('A', () => Promise.reject(new HttpError(503, 'Service Unavailable')));
+
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  assert.equal(mounted.context().typing, true);
+
+  await wait(550);
+
+  // Hydration failed: sending stays fail-closed and an explicit Retry appears.
+  assert.equal(mounted.context().typing, true);
+  assert.equal(mounted.context().recoveryActionLabel, 'Retry');
+  assert.equal(textarea(mounted.renderer).props.disabled, true);
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['First prompt'],
+    'the stale transcript must not be presented as complete',
+  );
+
+  const findRetry = () => mounted.renderer.root.findAllByType('button')
+    .find((b) => nodeText(b) === 'Retry');
+  assert.ok(findRetry(), 'Retry button must be visible after a failed hydration');
+
+  // The retry finds the session already idle, and its refetch fails again.
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+  runtime.queueMessages('A', () => Promise.reject(new HttpError(503, 'Service Unavailable')));
+  await act(async () => { findRetry()!.props.onClick(); });
+  await settle();
+
+  assert.equal(
+    mounted.context().typing,
+    true,
+    'an idle retry whose refetch fails must stay locked, not unlock on the stale transcript',
+  );
+  assert.equal(mounted.context().recoveryActionLabel, 'Retry');
+  assert.equal(textarea(mounted.renderer).props.disabled, true);
+
+  // A retry whose refetch succeeds is what unlocks, and it shows the answer.
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+  runtime.queueMessages(
+    'A',
+    () => Promise.resolve(messagesResponse('A', true, ['First prompt', 'Persisted answer'])),
+  );
+  await act(async () => { findRetry()!.props.onClick(); });
+  await settle();
+
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['First prompt', 'Persisted answer'],
+    'the completed answer must be present before input is enabled',
+  );
+  // This connection watched the turn run, so its socket Agent was seeded from
+  // pre-turn history: the lock is held across the one recycle that rebuilds it.
+  assert.equal(mounted.context().typing, true);
+  assert.equal(runtime.sockets.length, 2, 'a verified recovery recycles the socket exactly once');
+  await openSocket(runtime, 1);
+  await settle();
+
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['First prompt', 'Persisted answer'],
+  );
+  assert.equal(mounted.context().typing, false);
+  assert.equal(mounted.context().error, null);
+  assert.equal(mounted.context().recoveryActionLabel, null);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+
+  await unmount(mounted.renderer);
+});
+
+test('detached turn: a turn that commits before the first state answer is still hydrated', async () => {
+  const runtime = new FakeSessionRuntime();
+  // The replacement socket is seeded, and the browser's mount hydration lands,
+  // while the detached turn is still running: both predate its answer.
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['First prompt'])));
+  // The turn commits before this first state answer is delivered, so recovery
+  // never observes `running` at all.
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+  // The committed transcript recovery must fetch anyway.
+  runtime.queueMessages(
+    'A',
+    () => Promise.resolve(messagesResponse('A', true, ['First prompt', 'Persisted answer'])),
+  );
+
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['First prompt', 'Persisted answer'],
+    'an idle first answer must not skip authoritative hydration',
+  );
+  assert.equal(mounted.context().typing, false);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+  const sendBtn = mounted.renderer.root.findAllByType('button')
+    .find((b) => b.props['aria-label'] === 'Send');
+  assert.ok(sendBtn, 'input is enabled only after the completed answer is present');
+
+  // Exactly one recovery fetch beyond the mount hydration: the obligation is
+  // discharged, not re-armed on the same connection.
+  assert.equal(runtime.messageCalls.filter((id) => id === 'A').length, 2);
 
   await unmount(mounted.renderer);
 });

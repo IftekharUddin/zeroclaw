@@ -127,6 +127,11 @@ export function shouldOfferRecoveryAction(outcome: RecoveryOutcome): boolean {
  * from pre-turn history, so it must be replaced after that turn settles. An
  * ordinary initial open that observes an already-idle session was seeded from
  * current history and should not incur an unnecessary second connection.
+ *
+ * `observedRunning` is a fact about the *connection*, not about one recovery
+ * pass: a retry that only ever sees the idle tail of a turn an earlier pass
+ * watched still owns the stale Agent, so the caller carries the observation
+ * across retries rather than recomputing it per attempt.
  */
 export function shouldRecycleSocketAfterRecovery(params: {
   observedRunning: boolean;

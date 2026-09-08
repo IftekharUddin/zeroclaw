@@ -306,6 +306,21 @@ export function AgentProvider({
   const wsVersionRef = useRef(0);
   const recoveryGenerationRef = useRef(0);
   const recoveryVerifiedRef = useRef(false);
+  // Outstanding obligation to re-read the committed transcript before the
+  // composer is released. It is a connection-scoped fact, not something a
+  // single recovery pass can derive: a detached turn can commit before the
+  // first session-state answer arrives (leaving that answer `idle` on a
+  // socket that was seeded mid-turn), and a retry after a failed fetch also
+  // starts from an already-idle session. Deriving the obligation from what
+  // one pass observed therefore unlocks against a transcript missing the
+  // detached answer. Raised once per connection, cleared only by a fetch that
+  // actually succeeded.
+  const hydrationPendingRef = useRef(false);
+  // Whether this connection ever saw a turn it was not attached to. Carried
+  // for the same reason: the socket recycle that rebuilds the gateway Agent
+  // must still happen on a retry that only ever observes the idle tail of
+  // that turn.
+  const detachedTurnObservedRef = useRef(false);
   // Socket generation that delivered the live `approval_request`, or null.
   // A parked approval dies with the socket that carried it (the gateway
   // auto-denies the request_id when that socket closes), so only that socket's
@@ -677,7 +692,11 @@ export function AgentProvider({
   // constructed socket's Agent was seeded before the final messages existed.
   // Stay read-only until the canonical session state reaches idle, hydrate the
   // committed transcript, then recycle the socket exactly once so its Agent is
-  // rebuilt from that completed history.
+  // rebuilt from that completed history. The hydration is owed by the
+  // connection rather than by whichever pass happened to see `running`: the
+  // turn can commit before the first state answer arrives, and a retry after a
+  // failed fetch starts from an idle session, so both would otherwise unlock
+  // over a transcript missing the detached answer.
   const recoverDetachedTurn = useCallback(async (wsVersion: number) => {
     const recoveryGeneration = ++recoveryGenerationRef.current;
     const isCurrent = () => (
@@ -696,6 +715,14 @@ export function AgentProvider({
     setTyping(true);
     // Any prior lockout affordance belongs to a superseded attempt.
     setRecoveryAction(null);
+    // A connection that has not yet completed a recovery pass may have been
+    // constructed and seeded while a detached turn was still running, and the
+    // transcript on screen may predate that turn's committed answer. Neither
+    // this socket nor the first state response can rule that out, so owe the
+    // authoritative fetch from here rather than only after observing
+    // `running`. A pass that already verified this connection keeps its
+    // cleared obligation, so the post-recycle socket does not refetch.
+    if (!recoveryVerifiedRef.current) hydrationPendingRef.current = true;
 
     let recoveryFailures = 0;
     let recoveryDelayMs = SESSION_RECOVERY_POLL_MS;
@@ -749,9 +776,8 @@ export function AgentProvider({
 
     let sessionState = await readSessionState();
     if (!sessionState || !isCurrent()) return;
-    let observedRunning = false;
     if (sessionState.state === 'running') {
-      observedRunning = true;
+      detachedTurnObservedRef.current = true;
       setPendingApproval(null);
 
       while (isCurrent() && sessionState.state === 'running') {
@@ -765,7 +791,7 @@ export function AgentProvider({
     }
     if (!isCurrent()) return;
 
-    if (observedRunning) {
+    if (hydrationPendingRef.current) {
       try {
         const res = await sessionRuntimeRef.current.getMessages(activeSessionIdRef.current);
         if (!isCurrent()) return;
@@ -773,11 +799,15 @@ export function AgentProvider({
           localMessageMutationVersionRef.current += 1;
           setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
         }
+        // Only a fetch that landed discharges the obligation; a retry that
+        // finds the session idle must still refetch until one does.
+        hydrationPendingRef.current = false;
       } catch {
-        // The turn is already complete, so the local transcript is missing
-        // whatever it produced — stale, not merely incomplete. Accepting that
-        // silently would let a follow-up prompt be composed against history
-        // the operator never saw, so surface it as a retryable recovery state.
+        // Any turn this connection missed is already complete, so the local
+        // transcript is missing whatever it produced — stale, not merely
+        // incomplete. Accepting that silently would let a follow-up prompt be
+        // composed against history the operator never saw, so surface it as a
+        // retryable recovery state with the obligation still outstanding.
         if (isCurrent()) {
           clearTerminalRecoveryStream();
           const outcome = hydrationFailureOutcome();
@@ -799,13 +829,14 @@ export function AgentProvider({
     clearTerminalRecoveryStream();
 
     if (isCurrent() && shouldRecycleSocketAfterRecovery({
-      observedRunning,
+      observedRunning: detachedTurnObservedRef.current,
       alreadyVerified: recoveryVerifiedRef.current,
     })) {
       // Keep typing=true across the recycle. The replacement socket will run
       // this same state check and clear it only after confirming idle, so no
       // prompt can slip through the stale Agent between hydration and cleanup.
       recoveryVerifiedRef.current = true;
+      detachedTurnObservedRef.current = false;
       setSocketGeneration((generation) => generation + 1);
     } else if (isCurrent()) {
       setTyping(false);
@@ -858,6 +889,9 @@ export function AgentProvider({
       }
       if (version !== wsVersionRef.current) return;
       recoveryVerifiedRef.current = false;
+      // A turn this connection watched belongs to this connection. The
+      // replacement socket re-observes the session from scratch.
+      detachedTurnObservedRef.current = false;
       setConnected(false);
 
       if (
