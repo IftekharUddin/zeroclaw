@@ -4825,7 +4825,13 @@ impl TelegramChannel {
         // duplicates never refresh the debounce, and settling now would dispatch
         // a partial album and turn the members past the page into a second turn.
         // Groups the offset is already free to move past are left eligible, so
-        // the oldest work still settles and pagination keeps advancing.
+        // the oldest work still settles and pagination keeps advancing. That
+        // eligibility is what the rule can promise: an album settles only after
+        // a page that began at or before its earliest member, so every member
+        // within one page of that member has been seen. An album spread across
+        // more than a full page of updates is out of reach, because nothing
+        // older is left to release the offset and holding it would stall
+        // polling instead of completing the album.
         let page_saturated = updates.len() >= TELEGRAM_POLL_LIMIT;
         for group in pending_media_groups.values_mut() {
             group.saturated_page_blocked = page_saturated
