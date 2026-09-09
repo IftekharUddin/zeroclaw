@@ -227,18 +227,7 @@ impl InboundRequestRouter {
         }
         let responses = pending
             .into_iter()
-            .map(|request| {
-                let response = if request.method == "elicitation/create" {
-                    Ok(serde_json::json!({ "action": "cancel" }))
-                } else {
-                    Err(crate::jsonrpc::JsonRpcError {
-                        code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
-                        message: format!("Method not found: {}", request.method),
-                        data: None,
-                    })
-                };
-                (request.id, response)
-            })
+            .map(crate::client::terminal_inbound_response)
             .collect();
         self.rpc.respond_to_inbound_requests(responses);
         self.rpc.flush_outbound().await
