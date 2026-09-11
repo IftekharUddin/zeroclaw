@@ -1868,7 +1868,19 @@ pub async fn handle_api_session_messages(
         return e.into_response();
     }
 
+    // The identity contract is a property of the REST boundary, not of the
+    // storage mode: an id the WebSocket upgrade and the persisted routes
+    // reject must be rejected here too, or the same id answers 400 on one
+    // deployment and 200 on another. With no backend there is no stored key
+    // to resolve against, so the pure validator is the whole check.
     let Some(ref backend) = state.session_backend else {
+        if let Err(e) = crate::session_identity::validate_and_canonicalize_gateway_session_id(&id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid session ID: {e}")})),
+            )
+                .into_response();
+        }
         return Json(serde_json::json!({
             "session_id": id,
             "messages": [],
@@ -2774,6 +2786,44 @@ pub(crate) mod tests {
         let running = response_json(running).await;
         assert_eq!(running["state"], "running");
         assert_eq!(running["session_persistence"], false);
+    }
+
+    #[tokio::test]
+    async fn session_messages_without_persistence_still_reject_malformed_ids() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        assert!(
+            state.session_backend.is_none(),
+            "this regression describes the no-persistence branch"
+        );
+
+        for invalid_id in ["gw_a.b", "gw_gw_alpha", "gw_", "team alpha"] {
+            let res = handle_api_session_messages(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::extract::Path(invalid_id.to_string()),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "id {invalid_id:?} is rejected at the WebSocket upgrade and the persisted \
+                 REST routes, so disabling persistence must not turn it into a 200"
+            );
+        }
+
+        // A well-formed id keeps the documented empty no-persistence answer.
+        let ok = handle_api_session_messages(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path("gw_a_b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let ok = response_json(ok).await;
+        assert_eq!(ok["session_persistence"], false);
+        assert_eq!(ok["messages"], serde_json::json!([]));
     }
 
     /// A `SessionBackend` whose `get_session_state` always returns a fixed
