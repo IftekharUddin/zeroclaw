@@ -9384,6 +9384,7 @@ mod tests {
             backend
                 .append(&rpc_key, &zeroclaw_providers::ChatMessage::user("rpc seed"))
                 .unwrap();
+            let rpc_before = serde_json::to_value(backend.load(&rpc_key)).unwrap();
             assert_eq!(
                 backend.load(alias).len(),
                 1,
@@ -9397,8 +9398,8 @@ mod tests {
             assert_eq!(backend.load("gw_operator")[0].content, "partial");
             assert!(backend.transcript_incomplete("gw_operator").unwrap());
             assert_eq!(
-                backend.load(&rpc_key).len(),
-                1,
+                serde_json::to_value(backend.load(&rpc_key)).unwrap(),
+                rpc_before,
                 "refusal precedes all deletes"
             );
         }
