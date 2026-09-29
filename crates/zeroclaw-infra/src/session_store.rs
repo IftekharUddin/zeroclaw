@@ -499,6 +499,10 @@ pub(crate) fn forget_session_directory_migration_state_for_test(
 }
 
 impl SessionBackend for SessionStore {
+    fn effective_session_key<'a>(&self, session_key: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Owned(sanitize_session_key(session_key))
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         self.load(session_key)
     }

@@ -472,9 +472,9 @@ impl SqliteSessionBackend {
             let file_name = entry.file_name();
             let file_path = Path::new(&file_name);
             // Durable JSONL transcript intent markers (`<key>.jsonl.incomplete`)
-            // are migrated into the SQLite marker column after their session
-            // import, or on their own when a failed first append left only the
-            // marker behind.
+            // are committed with their session import, or on their own when
+            // a failed first append left only the marker behind. Archive the
+            // marker only after its incomplete disposition is durable.
             let is_incomplete_marker = file_path
                 .extension()
                 .is_some_and(|extension| extension == "incomplete")
@@ -695,11 +695,17 @@ impl SqliteSessionBackend {
                 if inserted == 0 && has_non_whitespace_source {
                     bail!("JSONL session {name} contains no valid messages to import");
                 }
+                // Completeness must commit with the transcript and receipt,
+                // before archive handoff can fail or make the source inactive.
+                let incomplete = sessions_dir
+                    .join(format!("{key}.jsonl.incomplete"))
+                    .try_exists()
+                    .with_context(|| format!("Failed to inspect transcript marker for {name}"))?;
                 tx.execute(
                     "INSERT INTO session_metadata \
-                     (session_key, created_at, last_activity, message_count) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![key, now, now, inserted],
+                     (session_key, created_at, last_activity, message_count, transcript_incomplete) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![key, now, now, inserted, incomplete],
                 )
                 .with_context(|| format!("Failed to record metadata for JSONL session {name}"))?;
                 tx.execute(
@@ -791,9 +797,8 @@ impl SqliteSessionBackend {
             if !marker_path.exists() {
                 continue;
             }
-            if self.mark_transcript_incomplete(&key).is_err() {
-                continue;
-            }
+            self.mark_transcript_incomplete(&key)
+                .with_context(|| format!("Failed to import transcript marker for {key}"))?;
             let migrated_marker = marker_path.with_extension("incomplete.migrated");
             if std::fs::rename(&marker_path, &migrated_marker).is_err() {
                 continue;
@@ -2948,6 +2953,113 @@ mod tests {
                 .join("poisoned.jsonl.incomplete.migrated")
                 .exists()
         );
+    }
+
+    #[test]
+    fn migrate_incomplete_marker_failure_rolls_back_transcript_and_receipt() {
+        for with_transcript in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let store = SessionStore::new(tmp.path()).unwrap();
+            if with_transcript {
+                store
+                    .append("poisoned", &ChatMessage::user("partial"))
+                    .unwrap();
+            }
+            store.mark_transcript_incomplete("poisoned").unwrap();
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend
+                .conn
+                .lock()
+                .execute_batch(
+                    "CREATE TRIGGER reject_incomplete BEFORE INSERT ON session_metadata
+                 WHEN NEW.transcript_incomplete = 1 BEGIN
+                    SELECT RAISE(ABORT, 'injected marker failure');
+                 END;",
+                )
+                .unwrap();
+            let error = backend.migrate_from_jsonl(tmp.path()).unwrap_err();
+            assert!(format!("{error:#}").contains("injected marker failure"));
+            assert!(backend.load("poisoned").is_empty());
+            let conn = backend.conn.lock();
+            let metadata: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_metadata", [], |r| r.get(0))
+                .unwrap();
+            let receipts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM jsonl_import_receipts", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(metadata, 0);
+            assert_eq!(receipts, 0);
+            drop(conn);
+            let dir = tmp.path().join("sessions");
+            assert!(dir.join("poisoned.jsonl.incomplete").exists());
+            assert!(!dir.join("poisoned.jsonl.incomplete.migrated").exists());
+            if with_transcript {
+                assert!(dir.join("poisoned.jsonl").exists());
+                assert!(!dir.join("poisoned.jsonl.migrated").exists());
+                assert!(!dir.join("poisoned.jsonl.importing").exists());
+            }
+            backend
+                .conn
+                .lock()
+                .execute_batch("DROP TRIGGER reject_incomplete")
+                .unwrap();
+            backend.migrate_from_jsonl(tmp.path()).unwrap();
+            assert!(backend.transcript_incomplete("poisoned").unwrap());
+            assert_eq!(backend.load("poisoned").len(), usize::from(with_transcript));
+        }
+    }
+
+    #[test]
+    fn migrate_archive_failure_keeps_imported_transcript_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        store
+            .append("poisoned", &ChatMessage::user("partial"))
+            .unwrap();
+        store.mark_transcript_incomplete("poisoned").unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let error = backend
+            .migrate_from_jsonl_with_archive(tmp.path(), |_, _, _| {
+                anyhow::bail!("injected archive failure")
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected archive failure"));
+        assert_eq!(backend.load("poisoned").len(), 1);
+        assert!(backend.transcript_incomplete("poisoned").unwrap());
+        assert!(
+            tmp.path()
+                .join("sessions/poisoned.jsonl.incomplete")
+                .exists()
+        );
+        drop(backend);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(reopened.transcript_incomplete("poisoned").unwrap());
+        reopened.migrate_from_jsonl(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.load("poisoned").len(),
+            1,
+            "receipt prevents duplicate import"
+        );
+        assert!(reopened.transcript_incomplete("poisoned").unwrap());
+    }
+
+    #[test]
+    fn migrate_marker_archive_failure_keeps_durable_incomplete_disposition() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        store.mark_transcript_incomplete("marker_only").unwrap();
+        let marker = tmp.path().join("sessions/marker_only.jsonl.incomplete");
+        // A directory prevents renaming the marker to its archive destination.
+        std::fs::create_dir(marker.with_extension("incomplete.migrated")).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.migrate_from_jsonl(tmp.path()).unwrap();
+        assert!(marker.exists());
+        assert!(backend.transcript_incomplete("marker_only").unwrap());
+        drop(backend);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(reopened.transcript_incomplete("marker_only").unwrap());
     }
 
     #[test]

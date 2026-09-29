@@ -3119,7 +3119,13 @@ impl RpcDispatcher {
         // refused before any mutation runs: deleting it here would evict the
         // transcript without the gateway's cancellation token, lifecycle
         // generation, transcript-intent marker, queue, or version eviction.
-        if req.session_id.starts_with(GATEWAY_SESSION_KEY_PREFIX) {
+        // JSONL normalizes punctuation into underscores; SQLite keeps exact
+        // keys. Ask the backend rather than imposing JSONL policy on both.
+        let effective_key = self.ctx.session_backend.as_ref().map_or_else(
+            || std::borrow::Cow::Borrowed(req.session_id.as_str()),
+            |backend| backend.effective_session_key(&req.session_id),
+        );
+        if effective_key.starts_with(GATEWAY_SESSION_KEY_PREFIX) {
             return Err(rpc_err(
                 SESSION_NOT_OWNED,
                 "Gateway sessions are deleted through the gateway lifecycle owner",
@@ -3145,8 +3151,8 @@ impl RpcDispatcher {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
         // The bare and `rpc_` forms are the only keys this transport owns.
-        // `gw_` is unreachable here: prefixed IDs are rejected above, and the
-        // bare id can never synthesize one.
+        // `gw_` is unreachable here: backend-effective gateway IDs were
+        // rejected above, before cancellation or any durable mutation.
         if let Some(ref backend) = self.ctx.session_backend {
             for key in &[req.session_id.clone(), format!("rpc_{}", req.session_id)] {
                 let _ = backend.delete_session(key);
@@ -9344,6 +9350,79 @@ mod tests {
             1,
             "runtime RPC must leave gw_ sessions to the gateway lifecycle owner"
         );
+    }
+
+    #[tokio::test]
+    async fn rpc_session_delete_rejects_jsonl_gateway_alias_before_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let backend =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(&config.data_dir).unwrap());
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            sessions,
+            Some(backend.clone() as Arc<dyn SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        backend
+            .append(
+                "gw_operator",
+                &zeroclaw_providers::ChatMessage::user("partial"),
+            )
+            .unwrap();
+        backend.mark_transcript_incomplete("gw_operator").unwrap();
+        for alias in ["gw.operator", "gw/operator", "gw@operator"] {
+            let rpc_key = format!("rpc_{alias}");
+            backend
+                .append(&rpc_key, &zeroclaw_providers::ChatMessage::user("rpc seed"))
+                .unwrap();
+            assert_eq!(
+                backend.load(alias).len(),
+                1,
+                "alias must reach the gateway file"
+            );
+            let error = dispatcher
+                .handle_session_delete(&json!({"session_id": alias}))
+                .await
+                .expect_err("JSONL alias must be refused");
+            assert_eq!(error.code, SESSION_NOT_OWNED);
+            assert_eq!(backend.load("gw_operator")[0].content, "partial");
+            assert!(backend.transcript_incomplete("gw_operator").unwrap());
+            assert_eq!(
+                backend.load(&rpc_key).len(),
+                1,
+                "refusal precedes all deletes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_session_delete_preserves_exact_sqlite_punctuation_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        for key in ["gw.operator", "gw_operator"] {
+            backend
+                .append(key, &zeroclaw_providers::ChatMessage::user("seed"))
+                .unwrap();
+        }
+        backend.mark_transcript_incomplete("gw_operator").unwrap();
+        dispatcher
+            .handle_session_delete(&json!({"session_id":"gw.operator"}))
+            .await
+            .expect("exact non-gateway SQLite key remains deletable");
+        assert!(backend.load("gw.operator").is_empty());
+        assert_eq!(backend.load("gw_operator").len(), 1);
+        assert!(backend.transcript_incomplete("gw_operator").unwrap());
     }
 
     #[tokio::test]

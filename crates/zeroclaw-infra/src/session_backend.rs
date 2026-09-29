@@ -68,6 +68,13 @@ pub struct TimestampedMessage {
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Resolve the storage identity used by this backend, without reading or
+    /// mutating a session. Namespace guards must check this identity before
+    /// mutation because filesystem backends may normalize the requested key.
+    fn effective_session_key<'a>(&self, session_key: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Borrowed(session_key)
+    }
+
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
