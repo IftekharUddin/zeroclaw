@@ -126,7 +126,7 @@ use zeroclaw_providers::{
 };
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
+    SenderRoleActionBudget, ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
     scope_session_key, scope_thread_id, scrub_credentials,
 };
@@ -679,6 +679,11 @@ struct ChannelRuntimeContext {
     /// `[autonomy]` config; auto-denies tools that would need interactive
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
+    /// The agent's security policy, built once per agent at channel start
+    /// (the same `Arc` the agent's tools were assembled with). A sender-role
+    /// turn keeps its sender's action-budget bucket in this policy's action
+    /// tracker, beside the agent's own buckets.
+    security: Arc<SecurityPolicy>,
     activated_tools:
         Option<std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>>,
     cost_tracking: Option<ChannelCostTrackingState>,
@@ -3140,6 +3145,18 @@ fn normalize_peer_username(raw: &str) -> String {
 struct SenderRoleTurn {
     group: String,
     risk_profile: String,
+    /// Tool and approval narrowing, present when the role names a risk
+    /// profile other than the agent's own. `None` leaves the turn's tools and
+    /// approvals exactly as the agent's own turn has them.
+    narrowing: Option<SenderRoleNarrowing>,
+    /// The sender's action budget, present when the role names a runtime
+    /// profile. It is scoped around the turn's tool loop, so every action
+    /// the turn takes must fit it as well as the agent's own budget.
+    action_budget: Option<SenderRoleActionBudget>,
+}
+
+/// How a role whose risk profile differs from the agent's narrows a turn.
+struct SenderRoleNarrowing {
     /// Tools the role removes, applied on top of the agent's own per-turn
     /// exclusions at every autonomy level. A role is an explicit narrowing,
     /// so an agent running at `full` must not quietly undo it.
@@ -3153,7 +3170,7 @@ struct SenderRoleTurn {
 }
 
 enum SenderRoleOutcome {
-    /// No role, or a role naming the agent's own profile.
+    /// No role, or a role naming the agent's own profile and no budget.
     AgentProfile,
     Role(Box<SenderRoleTurn>),
     /// The sender cannot be placed safely, so the turn must not run.
@@ -3161,13 +3178,41 @@ enum SenderRoleOutcome {
         reason: &'static str,
         groups: Vec<String>,
         risk_profiles: Vec<String>,
+        /// The budget runtime profiles involved. `None` stands for a group
+        /// that names no budget.
+        runtime_profiles: Vec<Option<String>>,
     },
+}
+
+/// The bucket key of a sender-role action budget: the channel scope and the
+/// sender's identity, each length-prefixed as in
+/// [`interruption_scope_key`] so no two components can run together. The
+/// platform's immutable sender id wins over the name in `sender`, the same
+/// precedence [`channel_ingress_context`] uses, and a name is normalized the
+/// way role matching normalizes it. The two kinds are tagged apart, so a name
+/// that spells someone's id never shares that id's bucket.
+///
+/// Every budget key comes from this one function, so moving the budget to a
+/// principal id later is one edit.
+fn sender_role_budget_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    let scope = channel_scope(msg);
+    let (kind, id) = match msg
+        .platform_sender_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => ("id", id.to_owned()),
+        None => ("name", normalize_peer_username(&msg.sender)),
+    };
+    format!("{}:{scope}:{kind}:{}:{id}", scope.len(), id.len())
 }
 
 /// Resolve the sender's role for this turn from `[peer_groups]`, matching
 /// peers the way [`is_agent_scope_authorized`] does. Fails closed: a
-/// conflicting match or a profile that no longer resolves refuses the turn
-/// instead of falling back to the agent's broader profile.
+/// conflicting match, a budget with no role, a risk or budget profile that
+/// no longer resolves, or a budget profile that differs from the agent's
+/// runtime profile beyond its cap refuses the turn instead of falling back
+/// to the agent's broader profile or running without the budget as written.
 fn resolve_sender_role_turn(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -3192,13 +3237,18 @@ fn resolve_sender_role_turn(
                 reason: "conflicting sender roles",
                 groups: conflict.groups,
                 risk_profiles: conflict.risk_profiles,
+                runtime_profiles: conflict.runtime_profiles,
             };
         }
-        Err(zeroclaw_config::schema::SenderRoleError::BudgetWithoutRole { groups, .. }) => {
+        Err(zeroclaw_config::schema::SenderRoleError::BudgetWithoutRole {
+            groups,
+            runtime_profiles,
+        }) => {
             return SenderRoleOutcome::Refused {
                 reason: "sender role budget names no role",
                 groups,
                 risk_profiles: Vec::new(),
+                runtime_profiles: runtime_profiles.into_iter().map(Some).collect(),
             };
         }
     };
@@ -3207,36 +3257,87 @@ fn resolve_sender_role_turn(
         .get(agent_alias)
         .map(|agent| agent.risk_profile.trim())
         .unwrap_or_default();
-    if role.risk_profile == agent_profile_alias {
+    // A role naming the agent's own risk profile narrows nothing, but it may
+    // still carry a budget.
+    let narrowing = if role.risk_profile == agent_profile_alias {
+        None
+    } else {
+        let (Some(agent_profile), Some(role_profile)) = (
+            config.risk_profile_for_agent(agent_alias),
+            config.risk_profiles.get(&role.risk_profile),
+        ) else {
+            return SenderRoleOutcome::Refused {
+                reason: "sender role profile does not resolve",
+                groups: vec![role.group],
+                risk_profiles: vec![role.risk_profile],
+                runtime_profiles: vec![role.runtime_profile],
+            };
+        };
+        let narrowed = agent_profile.narrowed_for_sender_role(role_profile);
+        Some(SenderRoleNarrowing {
+            excluded_tools: role_profile.excluded_tools.clone(),
+            approval_manager: ctx.approval_manager.derive_for_risk_profile(&narrowed),
+            approval_route: narrowed.approval_route,
+        })
+    };
+    let action_budget = match role.runtime_profile.as_deref() {
+        None => None,
+        Some(budget_alias) => {
+            let Some(budget_profile) = config.runtime_profiles.get(budget_alias) else {
+                return SenderRoleOutcome::Refused {
+                    reason: "sender role budget does not resolve",
+                    groups: vec![role.group],
+                    risk_profiles: vec![role.risk_profile],
+                    runtime_profiles: vec![Some(budget_alias.to_owned())],
+                };
+            };
+            // Only the cap applies per turn; every other field was fixed when
+            // the agent was built. Validation rejects a budget profile that
+            // differs there, and a snapshot that holds one anyway must not
+            // run with only its cap applied.
+            let fixed_field_mismatches = match config.runtime_profile_for_agent(agent_alias) {
+                Some(agent_runtime_profile) => {
+                    agent_runtime_profile.sender_role_fixed_field_mismatches(budget_profile)
+                }
+                None => zeroclaw_config::schema::RuntimeProfileConfig::default()
+                    .sender_role_fixed_field_mismatches(budget_profile),
+            };
+            if !fixed_field_mismatches.is_empty() {
+                return SenderRoleOutcome::Refused {
+                    reason: "sender role budget differs from the agent's runtime profile",
+                    groups: vec![role.group],
+                    risk_profiles: vec![role.risk_profile],
+                    runtime_profiles: vec![Some(budget_alias.to_owned())],
+                };
+            }
+            // The role bucket lives in the agent's own action tracker, so
+            // the role budget and the agent's budget share one store.
+            Some(SenderRoleActionBudget::new(
+                &ctx.security.tracker,
+                sender_role_budget_key(msg),
+                budget_profile.max_actions_per_hour,
+                format!("{}/{budget_alias}", role.group),
+            ))
+        }
+    };
+    if narrowing.is_none() && action_budget.is_none() {
         return SenderRoleOutcome::AgentProfile;
     }
-    let (Some(agent_profile), Some(role_profile)) = (
-        config.risk_profile_for_agent(agent_alias),
-        config.risk_profiles.get(&role.risk_profile),
-    ) else {
-        return SenderRoleOutcome::Refused {
-            reason: "sender role profile does not resolve",
-            groups: vec![role.group],
-            risk_profiles: vec![role.risk_profile],
-        };
-    };
-    let narrowed = agent_profile.narrowed_for_sender_role(role_profile);
     SenderRoleOutcome::Role(Box::new(SenderRoleTurn {
         group: role.group,
         risk_profile: role.risk_profile,
-        excluded_tools: role_profile.excluded_tools.clone(),
-        approval_manager: ctx.approval_manager.derive_for_risk_profile(&narrowed),
-        approval_route: narrowed.approval_route,
+        narrowing,
+        action_budget,
     }))
 }
 
 /// The tools a channel turn may not call: the agent's non-CLI exclusions
 /// (skipped for CLI and `full` autonomy, as before), plus everything the
-/// sender's role removes.
+/// sender's role narrowing removes.
 fn channel_turn_excluded_tools(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    sender_role: Option<&SenderRoleTurn>,
+    narrowing: Option<&SenderRoleNarrowing>,
 ) -> Vec<String> {
     let mut excluded: Vec<String> =
         if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
@@ -3244,8 +3345,8 @@ fn channel_turn_excluded_tools(
         } else {
             ctx.non_cli_excluded_tools.as_ref().clone()
         };
-    if let Some(role) = sender_role {
-        for tool in &role.excluded_tools {
+    if let Some(narrowing) = narrowing {
+        for tool in &narrowing.excluded_tools {
             if !excluded.contains(tool) {
                 excluded.push(tool.clone());
             }
@@ -8746,6 +8847,7 @@ async fn process_channel_message_body(
             reason,
             groups,
             risk_profiles,
+            runtime_profiles,
         } => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -8758,6 +8860,7 @@ async fn process_channel_message_body(
                         "reason": reason,
                         "peer_groups": groups,
                         "risk_profiles": risk_profiles,
+                        "runtime_profiles": runtime_profiles,
                     })),
                 "channel turn refused: sender role is ambiguous or unresolvable"
             );
@@ -8777,19 +8880,31 @@ async fn process_channel_message_body(
         }
     };
     if let Some(role) = sender_role.as_deref() {
+        let mut attrs = ::serde_json::json!({
+            "sender": msg.sender.as_str(),
+            "agent": ctx.agent_alias.as_str(),
+            "peer_group": role.group.as_str(),
+            "risk_profile": role.risk_profile.as_str(),
+        });
+        if let Some(budget) = role.action_budget.as_ref() {
+            attrs["action_budget"] = budget.label().into();
+            attrs["max_actions_per_hour"] = budget.max_actions_per_hour().into();
+        }
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "sender": msg.sender.as_str(),
-                    "agent": ctx.agent_alias.as_str(),
-                    "peer_group": role.group.as_str(),
-                    "risk_profile": role.risk_profile.as_str(),
-                })
-            ),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(attrs),
             "channel turn narrowed by sender role"
         );
     }
+    // A role that only adds a budget narrows nothing, so its turn keeps the
+    // agent's own tools, approval manager and approval channel.
+    let sender_role_narrowing = sender_role
+        .as_deref()
+        .and_then(|role| role.narrowing.as_ref());
+    let sender_role_budget = sender_role
+        .as_deref()
+        .and_then(|role| role.action_budget.as_ref());
 
     // A picker selection whose bounded delivery-ack wait elapsed was
     // already reported as unavailable with its keyboard cohort restored;
@@ -9129,7 +9244,7 @@ async fn process_channel_message_body(
     }
 
     let per_turn_excluded_tools_owned =
-        channel_turn_excluded_tools(ctx.as_ref(), &msg, sender_role.as_deref());
+        channel_turn_excluded_tools(ctx.as_ref(), &msg, sender_role_narrowing);
     let per_turn_excluded_tools: &[String] = &per_turn_excluded_tools_owned;
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
@@ -9647,9 +9762,8 @@ async fn process_channel_message_body(
     // A role with an approval route sends its prompts to the approver, never
     // to the room the request came from: in a shared room anyone the channel
     // admits could otherwise answer a prompt for a turn they started.
-    let routed_role_approval = sender_role
-        .as_deref()
-        .and_then(|role| role.approval_route.clone())
+    let routed_role_approval = sender_role_narrowing
+        .and_then(|narrowing| narrowing.approval_route.clone())
         .map(|route| {
             let handles: zeroclaw_runtime::tools::PerToolChannelHandle =
                 Arc::new(RwLock::new(ctx.channels_by_name.as_ref().clone()));
@@ -9797,9 +9911,9 @@ async fn process_channel_message_body(
                         observer: notify_observer.as_ref() as &dyn Observer,
                         silent: true,
                         approval: Some(
-                            sender_role
-                                .as_deref()
-                                .map_or(&*ctx.approval_manager, |role| &role.approval_manager),
+                            sender_role_narrowing.map_or(&*ctx.approval_manager, |narrowing| {
+                                &narrowing.approval_manager
+                            }),
                         ),
                         multimodal_config: &ctx.multimodal,
                         // Full config for the vision route to resolve the
@@ -9885,6 +9999,10 @@ async fn process_channel_message_body(
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            // The thread ID keys the agent's own action bucket; the sender's
+            // role budget, when the role names one, is a second bucket every
+            // action in the loop must also fit.
+            let tool_loop = SenderRoleActionBudget::scope(sender_role_budget.cloned(), tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
 
@@ -16540,6 +16658,7 @@ pub async fn start_channels_with_plugin_webhooks(
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),
+            security: Arc::clone(&security),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
@@ -17130,6 +17249,7 @@ fn concurrent_persist_lock_serialization() {
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        security: Arc::new(SecurityPolicy::default()),
     });
     ctx.conversation_histories
         .lock()
@@ -17309,6 +17429,7 @@ fn test_channel_ctx_with_backend(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        security: Arc::new(SecurityPolicy::default()),
     })
 }
 
@@ -17427,6 +17548,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        security: Arc::new(SecurityPolicy::default()),
     })
 }
 
@@ -20376,6 +20498,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         })
     }
 
@@ -21340,6 +21463,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         }
     }
 
@@ -21818,6 +21942,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -21921,6 +22046,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -22042,6 +22168,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -22167,6 +22294,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         };
 
         assert!(rollback_orphan_user_turn(
@@ -24070,6 +24198,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         })
     }
 
@@ -24176,6 +24305,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         })
     }
 
@@ -27018,6 +27148,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         })
     }
 
@@ -27178,6 +27309,22 @@ BTC is currently around $65,000 based on latest tool output."#
         channels: Vec<Arc<dyn Channel>>,
         executions: Arc<AtomicUsize>,
     ) -> Arc<ChannelRuntimeContext> {
+        sender_role_runtime_ctx_with(
+            prompt_config,
+            channels,
+            Box::new(CountingPriceTool(executions)),
+            Arc::new(SecurityPolicy::default()),
+        )
+    }
+
+    /// [`sender_role_runtime_ctx`] with `price_tool` as the agent's only tool
+    /// and `security` as the agent's own policy.
+    fn sender_role_runtime_ctx_with(
+        prompt_config: zeroclaw_config::schema::Config,
+        channels: Vec<Arc<dyn Channel>>,
+        price_tool: Box<dyn Tool>,
+        security: Arc<SecurityPolicy>,
+    ) -> Arc<ChannelRuntimeContext> {
         let channels_by_name: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|channel| (channel.name().to_string(), channel))
@@ -27202,7 +27349,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             tools_registry: Arc::new(
                 zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-                    Box::new(CountingPriceTool(executions)),
+                    price_tool,
                 ]),
             ),
             observer: Arc::new(NoopObserver),
@@ -27266,6 +27413,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security,
         })
     }
 
@@ -27463,9 +27611,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut ctx = channel_runtime_context_with_peer_groups(tmp.path(), HashMap::new());
         ctx.autonomy_level = AutonomyLevel::Full;
         ctx.non_cli_excluded_tools = Arc::new(vec!["agent_only".into()]);
-        let role = SenderRoleTurn {
-            group: "everyone".into(),
-            risk_profile: "guest".into(),
+        let narrowing = SenderRoleNarrowing {
             excluded_tools: vec!["shell".into()],
             approval_manager: ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -27475,13 +27621,13 @@ BTC is currently around $65,000 based on latest tool output."#
         let msg = sender_role_msg("mallory");
         // `full` still skips the agent's own list, as before, but keeps the role's.
         assert_eq!(
-            channel_turn_excluded_tools(&ctx, &msg, Some(&role)),
+            channel_turn_excluded_tools(&ctx, &msg, Some(&narrowing)),
             vec!["shell".to_string()]
         );
         assert!(channel_turn_excluded_tools(&ctx, &msg, None).is_empty());
         ctx.autonomy_level = AutonomyLevel::Supervised;
         assert_eq!(
-            channel_turn_excluded_tools(&ctx, &msg, Some(&role)),
+            channel_turn_excluded_tools(&ctx, &msg, Some(&narrowing)),
             vec!["agent_only".to_string(), "shell".to_string()]
         );
     }
@@ -27515,11 +27661,19 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(role.group, "everyone");
         assert_eq!(role.risk_profile, "guest");
         assert!(
+            role.action_budget.is_none(),
+            "the guest role names no budget"
+        );
+        let narrowing = role
+            .narrowing
+            .as_ref()
+            .expect("a guest role narrows the turn");
+        assert!(
             !ctx.approval_manager.needs_approval("other_tool"),
             "the agent's own manager keeps its session answer"
         );
         assert!(
-            role.approval_manager.needs_approval("other_tool"),
+            narrowing.approval_manager.needs_approval("other_tool"),
             "a guest turn starts with no session answers"
         );
         // Alice's group names the agent's own profile: no narrowing at all.
@@ -27548,6 +27702,703 @@ BTC is currently around $65,000 based on latest tool output."#
             resolve_sender_role_turn(&ctx, &sender_role_msg("mallory")),
             SenderRoleOutcome::Refused { .. }
         ));
+    }
+
+    // ── Sender-role action budget ────────────────────────────
+
+    /// How often the tool loop called `mock_price`, and how many of those
+    /// calls the action budgets admitted.
+    #[derive(Default)]
+    struct BudgetedPriceCalls {
+        attempted: AtomicUsize,
+        ran: AtomicUsize,
+    }
+
+    impl BudgetedPriceCalls {
+        fn attempted(&self) -> usize {
+            self.attempted.load(Ordering::SeqCst)
+        }
+
+        fn ran(&self) -> usize {
+            self.ran.load(Ordering::SeqCst)
+        }
+    }
+
+    /// `mock_price` that charges the agent's action budget through the
+    /// context's own policy before it runs, as production tools do. A
+    /// refusal comes back as a failed tool result, the way the production
+    /// rate-limit wrapper reports one, so the turn carries on to a reply.
+    struct BudgetedPriceTool {
+        security: Arc<SecurityPolicy>,
+        calls: Arc<BudgetedPriceCalls>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for BudgetedPriceTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "mock_price"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BudgetedPriceTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+
+        fn description(&self) -> &str {
+            "Return a mocked BTC price"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "symbol": { "type": "string" } },
+                "required": ["symbol"]
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.attempted.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = self
+                .security
+                .enforce_tool_operation(zeroclaw_config::policy::ToolOperation::Act, "mock_price")
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
+                });
+            }
+            self.calls.ran.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Asks for `mock_price` twice in one response, for two symbols so the
+    /// loop does not fold the calls into one, then replies once the tool
+    /// results are in.
+    struct BatchedPriceCallsModelProvider;
+
+    const BATCHED_PRICE_CALLS: &str = r#"<tool_call>
+{"name":"mock_price","arguments":{"symbol":"BTC"}}
+</tool_call>
+<tool_call>
+{"name":"mock_price","arguments":{"symbol":"ETH"}}
+</tool_call>"#;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for BatchedPriceCallsModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(BATCHED_PRICE_CALLS.to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
+            } else {
+                Ok(BATCHED_PRICE_CALLS.to_string())
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for BatchedPriceCallsModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "BatchedPriceCallsModelProvider"
+        }
+    }
+
+    /// The agent's own policy in budget tests: an agent cap of 100, far above
+    /// every role cap used here, so only a role budget refuses an action.
+    fn sender_role_budget_agent_policy() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// [`sender_role_prompt_config`] with a guest budget:
+    /// `[peer_groups.everyone]` also names `runtime_profile = "guest"`, and
+    /// `[runtime_profiles.guest]` equals the built-in defaults the agent runs
+    /// on (it names no runtime profile) except for `max_actions_per_hour`.
+    /// The guest role auto-approves `mock_price`, so only the budget can
+    /// stop it.
+    fn sender_role_budget_config(max_actions_per_hour: u32) -> zeroclaw_config::schema::Config {
+        let mut config = sender_role_prompt_config(zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["mock_price".into()],
+            ..Default::default()
+        });
+        config.runtime_profiles.insert(
+            "guest".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_actions_per_hour,
+                ..Default::default()
+            },
+        );
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .runtime_profile = Some("guest".into());
+        config
+    }
+
+    /// A sender-role context whose `mock_price` charges `security`, which is
+    /// also the context's own policy, so role buckets and the agent's buckets
+    /// share one tracker as they do in production.
+    fn sender_role_budget_ctx(
+        prompt_config: zeroclaw_config::schema::Config,
+        room: &Arc<SenderRoleTestChannel>,
+        security: Arc<SecurityPolicy>,
+    ) -> (Arc<ChannelRuntimeContext>, Arc<BudgetedPriceCalls>) {
+        let calls = Arc::new(BudgetedPriceCalls::default());
+        let tool = BudgetedPriceTool {
+            security: Arc::clone(&security),
+            calls: Arc::clone(&calls),
+        };
+        let ctx = sender_role_runtime_ctx_with(
+            prompt_config,
+            vec![Arc::clone(room) as Arc<dyn Channel>],
+            Box::new(tool),
+            security,
+        );
+        (ctx, calls)
+    }
+
+    /// A top-level message from `sender` with message id `id`. For a
+    /// top-level message the id also keys the agent's own action bucket.
+    fn sender_role_budget_msg(sender: &str, id: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: id.to_string(),
+            ..sender_role_msg(sender)
+        }
+    }
+
+    /// The same message inside thread `thread`, which then keys the agent's
+    /// own action bucket instead of the message id.
+    fn sender_role_budget_thread_msg(
+        sender: &str,
+        id: &str,
+        thread: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            thread_ts: Some(thread.to_string()),
+            interruption_scope_id: Some(thread.to_string()),
+            ..sender_role_budget_msg(sender, id)
+        }
+    }
+
+    async fn run_sender_role_budget_turn(
+        ctx: &Arc<ChannelRuntimeContext>,
+        msg: zeroclaw_api::channel::ChannelMessage,
+    ) {
+        process_channel_message(Arc::clone(ctx), msg, CancellationToken::new()).await;
+    }
+
+    #[test]
+    fn sender_role_budget_key_prefers_the_platform_id_and_keeps_components_apart() {
+        let msg = |channel: &str, alias: Option<&str>, sender: &str, platform_id: Option<&str>| {
+            zeroclaw_api::channel::ChannelMessage {
+                channel: channel.to_string(),
+                channel_alias: alias.map(str::to_string),
+                sender: sender.to_string(),
+                platform_sender_id: platform_id.map(str::to_string),
+                ..Default::default()
+            }
+        };
+
+        // The platform id wins over the name, so a new display name keeps
+        // the same bucket and a shared display name does not merge two ids.
+        assert_eq!(
+            sender_role_budget_key(&msg("telegram", Some("main"), "Alice", Some("42"))),
+            sender_role_budget_key(&msg("telegram", Some("main"), "@renamed", Some("42"))),
+        );
+        assert_ne!(
+            sender_role_budget_key(&msg("telegram", Some("main"), "Alice", Some("42"))),
+            sender_role_budget_key(&msg("telegram", Some("main"), "Alice", Some("43"))),
+        );
+        // Without an id, or with an empty one, the name is normalized the way
+        // role matching normalizes it.
+        assert_eq!(
+            sender_role_budget_key(&msg("discord", None, "@Alice", None)),
+            sender_role_budget_key(&msg("discord", None, "alice", None)),
+        );
+        assert_eq!(
+            sender_role_budget_key(&msg("discord", None, "@Alice", Some(""))),
+            sender_role_budget_key(&msg("discord", None, "alice", None)),
+        );
+        // A name that spells someone's id does not share that id's bucket.
+        assert_ne!(
+            sender_role_budget_key(&msg("telegram", Some("main"), "42", None)),
+            sender_role_budget_key(&msg("telegram", Some("main"), "someone", Some("42"))),
+        );
+        // Length prefixes keep a component boundary from moving, including
+        // when a component carries the separator itself.
+        assert_ne!(
+            sender_role_budget_key(&msg("ab", None, "c", None)),
+            sender_role_budget_key(&msg("a", None, "bc", None)),
+        );
+        assert_ne!(
+            sender_role_budget_key(&msg("x", Some("a:name:b"), "c", None)),
+            sender_role_budget_key(&msg("x", Some("a"), "b:name:c", None)),
+        );
+        // The channel alias is part of the key.
+        assert_ne!(
+            sender_role_budget_key(&msg("discord", Some("main"), "alice", None)),
+            sender_role_budget_key(&msg("discord", Some("side"), "alice", None)),
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_is_charged_per_sender_not_per_message() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let (ctx, calls) = sender_role_budget_ctx(
+            sender_role_budget_config(1),
+            &room,
+            sender_role_budget_agent_policy(),
+        );
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-2")).await;
+
+        assert_eq!(
+            calls.attempted(),
+            2,
+            "the model called the tool on both turns"
+        );
+        assert_eq!(
+            calls.ran(),
+            1,
+            "the second message has a new id, so a fresh agent bucket, but the same guest's budget of one is spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_of_one_guest_leaves_another_guest_alone() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let (ctx, calls) = sender_role_budget_ctx(
+            sender_role_budget_config(1),
+            &room,
+            sender_role_budget_agent_policy(),
+        );
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-2")).await;
+        assert_eq!(calls.ran(), 1, "mallory's budget is spent");
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("trent", "msg-3")).await;
+        assert_eq!(calls.attempted(), 3);
+        assert_eq!(calls.ran(), 2, "trent has a budget of his own");
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_follows_a_guest_across_threads() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let (ctx, calls) = sender_role_budget_ctx(
+            sender_role_budget_config(1),
+            &room,
+            sender_role_budget_agent_policy(),
+        );
+
+        run_sender_role_budget_turn(
+            &ctx,
+            sender_role_budget_thread_msg("mallory", "msg-1", "thread-1"),
+        )
+        .await;
+        run_sender_role_budget_turn(
+            &ctx,
+            sender_role_budget_thread_msg("mallory", "msg-2", "thread-2"),
+        )
+        .await;
+
+        assert_eq!(
+            calls.attempted(),
+            2,
+            "the model called the tool in both threads"
+        );
+        assert_eq!(
+            calls.ran(),
+            1,
+            "each thread has an agent bucket of its own, but both charge the guest's one budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_leaves_a_named_owner_alone() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let (ctx, calls) = sender_role_budget_ctx(
+            sender_role_budget_config(1),
+            &room,
+            sender_role_budget_agent_policy(),
+        );
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-2")).await;
+        assert_eq!(calls.ran(), 1, "mallory's budget is spent");
+
+        // `alice` is named in `owners`, which carries the agent's own profile
+        // and no budget.
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("alice", "msg-3")).await;
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("alice", "msg-4")).await;
+        assert_eq!(calls.attempted(), 4);
+        assert_eq!(
+            calls.ran(),
+            3,
+            "an owner runs on the agent's budget alone, however spent a guest's is"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_of_zero_runs_no_action_but_still_replies() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let (ctx, calls) = sender_role_budget_ctx(
+            sender_role_budget_config(0),
+            &room,
+            sender_role_budget_agent_policy(),
+        );
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+
+        assert_eq!(calls.attempted(), 1, "the model called the tool");
+        assert_eq!(calls.ran(), 0, "a budget of zero admits no action");
+        let sent = room.sent.lock().await;
+        assert_eq!(sent.len(), 1, "one reply and no refusal notice: {sent:?}");
+        assert!(
+            sent[0].starts_with("room-1:") && sent[0].contains("BTC is currently around"),
+            "the model's reply still reaches the room: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_conflict_refuses_the_turn_before_any_tool_runs() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let mut config = sender_role_budget_config(5);
+        config.runtime_profiles.insert(
+            "visitor".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_actions_per_hour: 10,
+                ..Default::default()
+            },
+        );
+        // A second wildcard group, of the same rank as `everyone`, with the
+        // same risk profile but a different budget.
+        config.peer_groups.insert(
+            "visitors".into(),
+            PeerGroupConfig {
+                channel: zeroclaw_config::providers::ChannelRef("test-channel".into()),
+                external_peers: vec![PeerUsername("*".into())],
+                risk_profile: Some("guest".into()),
+                runtime_profile: Some("visitor".into()),
+                ..Default::default()
+            },
+        );
+        let (ctx, calls) = sender_role_budget_ctx(config, &room, sender_role_budget_agent_policy());
+
+        let SenderRoleOutcome::Refused {
+            reason,
+            risk_profiles,
+            runtime_profiles,
+            ..
+        } = resolve_sender_role_turn(&ctx, &sender_role_msg("mallory"))
+        else {
+            panic!("groups naming different budgets must refuse the sender");
+        };
+        assert_eq!(reason, "conflicting sender roles");
+        assert_eq!(risk_profiles, vec!["guest".to_string()]);
+        assert_eq!(
+            runtime_profiles,
+            vec![Some("guest".to_string()), Some("visitor".to_string())]
+        );
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+
+        assert_eq!(
+            calls.attempted(),
+            0,
+            "the refused turn never reaches the tool"
+        );
+        let sent = room.sent.lock().await;
+        assert_eq!(sent.len(), 1, "only the refusal is sent: {sent:?}");
+        assert!(
+            sent[0].starts_with("room-1:") && sent[0].contains("single sender role"),
+            "got: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_that_no_longer_resolves_refuses_the_turn() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let mut config = sender_role_budget_config(5);
+        // Load-time validation rejects a missing budget profile. A snapshot
+        // that lacks it anyway must fail closed, not run the guest uncapped.
+        config.runtime_profiles.remove("guest");
+        let (ctx, calls) = sender_role_budget_ctx(config, &room, sender_role_budget_agent_policy());
+
+        let SenderRoleOutcome::Refused {
+            reason,
+            runtime_profiles,
+            ..
+        } = resolve_sender_role_turn(&ctx, &sender_role_msg("mallory"))
+        else {
+            panic!("a budget that does not resolve must refuse the sender");
+        };
+        assert_eq!(reason, "sender role budget does not resolve");
+        assert_eq!(runtime_profiles, vec![Some("guest".to_string())]);
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+
+        assert_eq!(
+            calls.attempted(),
+            0,
+            "the refused turn never reaches the tool"
+        );
+        let sent = room.sent.lock().await;
+        assert_eq!(sent.len(), 1, "only the refusal is sent: {sent:?}");
+        assert!(sent[0].contains("single sender role"), "got: {sent:?}");
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_without_a_role_refuses_the_turn() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let mut config = sender_role_budget_config(5);
+        // Load-time validation rejects a budget on a group with no role. A
+        // snapshot that holds one anyway must refuse the senders the group
+        // would place, not run them uncapped on the agent's own profile.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .risk_profile = None;
+        let (ctx, calls) = sender_role_budget_ctx(config, &room, sender_role_budget_agent_policy());
+
+        let SenderRoleOutcome::Refused {
+            reason,
+            groups,
+            risk_profiles,
+            runtime_profiles,
+        } = resolve_sender_role_turn(&ctx, &sender_role_msg("mallory"))
+        else {
+            panic!("a budget with no role must refuse the sender");
+        };
+        assert_eq!(reason, "sender role budget names no role");
+        assert_eq!(groups, vec!["everyone".to_string()]);
+        assert!(risk_profiles.is_empty(), "got: {risk_profiles:?}");
+        assert_eq!(runtime_profiles, vec![Some("guest".to_string())]);
+        assert!(
+            matches!(
+                resolve_sender_role_turn(&ctx, &sender_role_msg("alice")),
+                SenderRoleOutcome::AgentProfile
+            ),
+            "a named owner outranks the wildcard group and is unaffected"
+        );
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+
+        assert_eq!(
+            calls.attempted(),
+            0,
+            "the refused turn never reaches the tool"
+        );
+        let sent = room.sent.lock().await;
+        assert_eq!(sent.len(), 1, "only the refusal is sent: {sent:?}");
+        assert!(
+            sent[0].starts_with("room-1:") && sent[0].contains("single sender role"),
+            "got: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_that_changes_a_fixed_field_refuses_the_turn() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let mut config = sender_role_budget_config(5);
+        // The agent names no runtime profile, so it runs on the built-in
+        // defaults. Load-time validation rejects a budget profile that
+        // differs from them beyond the cap; only the cap would apply per
+        // turn, so a snapshot that holds one anyway must refuse the guest.
+        config
+            .runtime_profiles
+            .get_mut("guest")
+            .expect("guest budget profile")
+            .max_tool_iterations = 3;
+        let (ctx, calls) = sender_role_budget_ctx(config, &room, sender_role_budget_agent_policy());
+
+        let SenderRoleOutcome::Refused {
+            reason,
+            groups,
+            runtime_profiles,
+            ..
+        } = resolve_sender_role_turn(&ctx, &sender_role_msg("mallory"))
+        else {
+            panic!("a budget that changes a fixed field must refuse the sender");
+        };
+        assert_eq!(
+            reason,
+            "sender role budget differs from the agent's runtime profile"
+        );
+        assert_eq!(groups, vec!["everyone".to_string()]);
+        assert_eq!(runtime_profiles, vec![Some("guest".to_string())]);
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+
+        assert_eq!(
+            calls.attempted(),
+            0,
+            "the refused turn never reaches the tool"
+        );
+        let sent = room.sent.lock().await;
+        assert_eq!(sent.len(), 1, "only the refusal is sent: {sent:?}");
+        assert!(sent[0].contains("single sender role"), "got: {sent:?}");
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_admits_one_call_of_a_batch_past_the_cap() {
+        // The model asks for two actions in one response against a role cap
+        // of one, both with the batch run one call at a time and with its
+        // calls run together.
+        for parallel_tools in [false, true] {
+            let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+            let (mut ctx, calls) = sender_role_budget_ctx(
+                sender_role_budget_config(1),
+                &room,
+                sender_role_budget_agent_policy(),
+            );
+            {
+                let ctx = Arc::get_mut(&mut ctx).expect("the new context is not shared");
+                ctx.model_provider = Arc::new(BatchedPriceCallsModelProvider);
+                let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+                agent_cfg.resolved.parallel_tools = parallel_tools;
+                ctx.agent_cfg = Arc::new(agent_cfg);
+            }
+
+            run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+
+            assert_eq!(
+                calls.attempted(),
+                2,
+                "the batch reached the tool twice (parallel_tools = {parallel_tools})"
+            );
+            assert_eq!(
+                calls.ran(),
+                1,
+                "a role cap of one admits one call of the batch (parallel_tools = {parallel_tools})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_only_role_keeps_the_agents_approvals_but_is_capped() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let mut config = sender_role_budget_config(1);
+        // `owners` names the agent's own risk profile and adds only a budget.
+        config
+            .peer_groups
+            .get_mut("owners")
+            .expect("owners group")
+            .runtime_profile = Some("guest".into());
+        // The agent's profile no longer auto-approves `mock_price`: the
+        // "Always" answered below, held only by the agent's own approval
+        // manager, is what lets it run. A turn on any other manager would
+        // prompt the room, which has no approval UI, and be denied.
+        config
+            .risk_profiles
+            .get_mut("owner")
+            .expect("owner profile")
+            .auto_approve
+            .clear();
+        let (ctx, calls) = sender_role_budget_ctx(config, &room, sender_role_budget_agent_policy());
+        ctx.approval_manager.record_decision(
+            "mock_price",
+            &serde_json::json!({}),
+            &zeroclaw_runtime::approval::ApprovalResponse::Always,
+            "test",
+        );
+
+        let SenderRoleOutcome::Role(role) =
+            resolve_sender_role_turn(&ctx, &sender_role_msg("alice"))
+        else {
+            panic!("a group that adds a budget must resolve to a role");
+        };
+        assert!(
+            role.narrowing.is_none(),
+            "the agent's own risk profile narrows nothing"
+        );
+        let budget = role
+            .action_budget
+            .as_ref()
+            .expect("the role carries a budget");
+        assert_eq!(budget.max_actions_per_hour(), 1);
+        assert_eq!(budget.label(), "owners/guest");
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("alice", "msg-1")).await;
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("alice", "msg-2")).await;
+
+        assert!(
+            room.approvals.lock().await.is_empty(),
+            "the agent's own session answer covers the tool, so nobody is asked"
+        );
+        assert_eq!(
+            calls.attempted(),
+            2,
+            "the model called the tool on both turns"
+        );
+        assert_eq!(
+            calls.ran(),
+            1,
+            "a role that narrows nothing is still capped by its budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_absent_without_role_groups() {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        let mut config = sender_role_budget_config(1);
+        config.peer_groups.clear();
+        // An agent cap of one. With no role only the agent's own bucket
+        // applies, and a top-level message keys it by message id, so each
+        // message starts on a fresh agent budget, as before role budgets.
+        let security = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let (ctx, calls) = sender_role_budget_ctx(config, &room, security);
+        assert!(matches!(
+            resolve_sender_role_turn(&ctx, &sender_role_msg("mallory")),
+            SenderRoleOutcome::AgentProfile
+        ));
+
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-1")).await;
+        run_sender_role_budget_turn(&ctx, sender_role_budget_msg("mallory", "msg-2")).await;
+
+        assert_eq!(calls.attempted(), 2);
+        assert_eq!(calls.ran(), 2, "both messages run the tool");
     }
 
     #[tokio::test]
@@ -27640,6 +28491,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -27814,6 +28666,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -28018,6 +28871,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -28205,6 +29059,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -28401,6 +29256,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -28971,6 +29827,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29119,6 +29976,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -29245,6 +30103,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -29549,6 +30408,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -29674,6 +30534,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -29824,6 +30685,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29960,6 +30822,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -30081,6 +30944,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -30220,6 +31084,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -30383,6 +31248,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -30570,6 +31436,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -31059,6 +31926,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -31178,6 +32046,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -31304,6 +32173,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -32777,6 +33647,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -32927,6 +33798,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33092,6 +33964,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33254,6 +34127,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33413,6 +34287,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33619,6 +34494,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33855,6 +34731,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33995,6 +34872,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -34528,6 +35406,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -34661,6 +35540,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -34798,6 +35678,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -34927,6 +35808,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -35056,6 +35938,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -35472,6 +36355,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -36998,6 +37882,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -42902,6 +43787,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -43087,6 +43973,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         // Keep all three futures heap-backed to fit the Windows test-thread stack.
@@ -43611,6 +44498,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         })
     }
 
@@ -44105,6 +44993,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -44265,6 +45154,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -47793,6 +48683,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -47914,6 +48805,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -48079,6 +48971,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
@@ -48393,6 +49286,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -48552,6 +49446,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -48703,6 +49598,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -48874,6 +49770,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -50046,6 +50943,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
