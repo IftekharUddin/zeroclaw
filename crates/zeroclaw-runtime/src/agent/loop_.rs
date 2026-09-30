@@ -483,6 +483,44 @@ where
     TOOL_LOOP_THREAD_ID.scope(thread_id, future).await
 }
 
+pub use zeroclaw_config::policy::SenderRoleActionBudget;
+
+/// The task-locals that action-budget admission reads: the thread ID that
+/// keys the agent's bucket and the turn's sender-role budget.
+///
+/// Spawned tasks start with empty task-locals. A spawn that keeps work inside
+/// the turn captures both before spawning and restores both around the
+/// spawned work; restoring only one would let that work charge the fallback
+/// `__global__` bucket or escape the sender-role budget.
+#[derive(Clone)]
+pub struct ActionBudgetScope {
+    thread_id: Option<String>,
+    sender_role_budget: Option<SenderRoleActionBudget>,
+}
+
+impl ActionBudgetScope {
+    /// Capture the running task's thread ID and sender-role budget.
+    pub fn capture() -> Self {
+        Self {
+            thread_id: TOOL_LOOP_THREAD_ID.try_with(Clone::clone).ok().flatten(),
+            sender_role_budget: SenderRoleActionBudget::current(),
+        }
+    }
+
+    /// Run `future` with both captured values in scope.
+    pub async fn scope<F>(self, future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        TOOL_LOOP_THREAD_ID
+            .scope(
+                self.thread_id,
+                SenderRoleActionBudget::scope(self.sender_role_budget, future),
+            )
+            .await
+    }
+}
+
 /// Run a future with the session key set in task-local storage.
 /// The scope wraps the entire agent turn, so all tools invoked during
 /// the turn (including nested calls) see the same session key.
