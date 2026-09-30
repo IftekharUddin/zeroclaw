@@ -161,13 +161,31 @@ pub struct AcceptedAuthState {
 /// The parts of a configuration an accepted authorization state is compiled
 /// from: the OIDC, roster, and permission-profile sections and the daemon-uid
 /// trust posture. The pairing authority is shared live state, not config.
-fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
+///
+/// Public so a surface that edits configuration outside the daemon can tell
+/// whether its edit changes the policy a running daemon enforces, by the same
+/// comparison [`RpcInboundAuth::publish_accepted`] makes.
+pub fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::Value::Array(vec![
         serde_json::to_value(&config.oidc)?,
         serde_json::to_value(&config.users)?,
         serde_json::to_value(&config.permission_profiles)?,
         serde_json::Value::Bool(config.security.trust_daemon_uid),
     ]))
+}
+
+/// Whether the dotted property `path` writes one of the [`auth_inputs`]: the
+/// `oidc`, `users` or `permission_profiles` section or anything under it, or
+/// `security.trust_daemon_uid`.
+///
+/// A surface that edits configuration outside the daemon uses this where
+/// comparing [`auth_inputs`] before and after the edit is not enough: a write
+/// that re-asserts the value already in the file changes nothing there, yet
+/// the running daemon may still enforce another one.
+pub fn is_auth_input_path(path: &str) -> bool {
+    let section = path.split_once('.').map_or(path, |(section, _)| section);
+    matches!(section, "oidc" | "users" | "permission_profiles")
+        || path == "security.trust_daemon_uid"
 }
 
 impl AcceptedAuthState {
@@ -1555,6 +1573,99 @@ mod tests {
                 .publish_accepted(&changed, 1)
                 .unwrap_or_else(|e| panic!("{input}: the change publishes: {e}"));
             assert!(moved > generation, "{input} must move the generation");
+        }
+    }
+
+    /// `auth_inputs` is what a client compares to decide whether an edit must
+    /// reach the running daemon, and `is_auth_input_path` is how it tells a
+    /// write to those inputs by its path, so both have to cover every
+    /// authorization section and nothing else.
+    #[test]
+    fn auth_inputs_change_only_with_the_authorization_sections() {
+        let base = base_config();
+        let inputs = auth_inputs(&base).expect("the default config encodes");
+
+        let mut unrelated = base.clone();
+        unrelated.gateway.host = "0.0.0.0".into();
+        assert_eq!(
+            auth_inputs(&unrelated).expect("the edited config encodes"),
+            inputs,
+            "a gateway edit is not an authorization input"
+        );
+        assert!(!is_auth_input_path("gateway.host"));
+
+        type Mutation = fn(&mut Config);
+        let mutations: [(&str, Mutation); 4] = [
+            ("security.trust_daemon_uid", |config| {
+                config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
+            }),
+            ("users.alice.uid", |config| {
+                config.users.insert(
+                    "alice".into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(4242),
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }),
+            ("permission_profiles.operator", |config| {
+                config
+                    .permission_profiles
+                    .insert("operator".into(), PermissionProfileConfig::default());
+            }),
+            ("oidc.corp", |config| {
+                config.oidc.insert("corp".into(), OidcConfig::default());
+            }),
+        ];
+        for (path, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                auth_inputs(&changed).expect("the edited config encodes"),
+                inputs,
+                "a write to {path} must change the authorization inputs"
+            );
+            assert!(
+                is_auth_input_path(path),
+                "{path} must name an authorization input"
+            );
+        }
+    }
+
+    /// Every path that writes a section `auth_inputs` reads is an
+    /// authorization input path, and nothing else is, however close its name.
+    #[test]
+    fn is_auth_input_path_names_exactly_the_authorization_sections() {
+        for path in [
+            "oidc",
+            "oidc.corp",
+            "oidc.corp.client_secret",
+            "users",
+            "users.me.uid",
+            "users.me.permission_profiles",
+            "permission_profiles",
+            "permission_profiles.admin.admin",
+            "security.trust_daemon_uid",
+        ] {
+            assert!(is_auth_input_path(path), "{path} is an authorization input");
+        }
+        for path in [
+            "",
+            "gateway.host",
+            "security",
+            "security.trust_daemon_uid_extra",
+            "security.sandbox.enabled",
+            "usersx.me.uid",
+            "oidc_providers.corp",
+            "permission_profiles_extra",
+            "agents.users.model",
+            "trust_daemon_uid",
+        ] {
+            assert!(
+                !is_auth_input_path(path),
+                "{path} is not an authorization input"
+            );
         }
     }
 
