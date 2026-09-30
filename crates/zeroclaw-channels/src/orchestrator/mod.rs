@@ -3187,11 +3187,18 @@ fn resolve_sender_role_turn(
     let role = match resolved {
         Ok(None) => return SenderRoleOutcome::AgentProfile,
         Ok(Some(role)) => role,
-        Err(conflict) => {
+        Err(zeroclaw_config::schema::SenderRoleError::Conflict(conflict)) => {
             return SenderRoleOutcome::Refused {
                 reason: "conflicting sender roles",
                 groups: conflict.groups,
                 risk_profiles: conflict.risk_profiles,
+            };
+        }
+        Err(zeroclaw_config::schema::SenderRoleError::BudgetWithoutRole { groups, .. }) => {
+            return SenderRoleOutcome::Refused {
+                reason: "sender role budget names no role",
+                groups,
+                risk_profiles: Vec::new(),
             };
         }
     };
@@ -39663,6 +39670,7 @@ BTC is currently around $65,000 based on latest tool output."#
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
             risk_profile: None,
+            runtime_profile: None,
         }
     }
 
@@ -40707,6 +40715,7 @@ BTC is currently around $65,000 based on latest tool output."#
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
             risk_profile: None,
+            runtime_profile: None,
         }
     }
 

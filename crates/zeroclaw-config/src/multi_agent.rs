@@ -198,6 +198,29 @@ pub struct PeerGroupConfig {
     /// rather than guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_profile: Option<String>,
+    /// Sender-role action budget: the `[runtime_profiles.<alias>]` whose
+    /// `max_actions_per_hour` caps the actions each sender in this group's
+    /// role may take per hour on the agents the role applies to. Each sender
+    /// has their own budget, charged on top of the agent's own budget, so an
+    /// action runs only when both allow it. Requires `risk_profile`, which
+    /// may name the agent's own risk profile when the group only needs a
+    /// budget. Without one, config validation rejects the group, and a
+    /// sender it would place is refused rather than run without the budget.
+    /// `None` (default) adds no budget.
+    ///
+    /// The named profile may differ from each agent's own runtime profile
+    /// (the built-in defaults for an agent that names none) only in
+    /// `max_actions_per_hour`. Config validation rejects any other
+    /// difference, because those settings are fixed when the agent is built
+    /// and would otherwise be ignored silently. A cap above an agent's own is
+    /// accepted: the agent's own limit still applies to every action, and
+    /// the budget adds a per-sender limit beside it.
+    ///
+    /// Role groups of the same rank that match a sender must agree on this
+    /// field as well as on `risk_profile`: when one names a different budget,
+    /// or names one while the other names none, the sender is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_profile: Option<String>,
 }
 
 /// Inbound A2A discovery server configuration.
