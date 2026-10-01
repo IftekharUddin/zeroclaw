@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Link, Navigate, useParams } from 'react-router-dom';
+import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -20,6 +20,7 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import WorkspaceAttention from '@/components/layout/WorkspaceAttention';
 import SessionPicker from '@/components/SessionPicker';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
@@ -75,10 +76,11 @@ function ContextBar({ contextMaxTokens, contextInputTokens }: {
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
+  const [params] = useSearchParams();
   if (!alias) {
     return <Navigate to="/agents" replace />;
   }
-  return <ChatWorkspace initialAlias={alias} />;
+  return <ChatWorkspace initialAlias={alias} initialSessionId={params.get('session') ?? undefined} />;
 }
 
 /** Status snapshot a chat pane pushes up to the workspace tab bar. */
@@ -724,7 +726,10 @@ export function AgentChatInner({
 
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
       {pendingApproval && (
-        <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        <>
+          <WorkspaceAttention to={`/agent/${encodeURIComponent(agentAlias)}?session=${encodeURIComponent(sessionId)}`} label={agentAlias} />
+          <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        </>
       )}
 
       {/* Input area */}

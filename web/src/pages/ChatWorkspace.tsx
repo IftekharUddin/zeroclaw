@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
+import { useWorkspaceVisible } from '@/components/layout/WorkspaceOutlet';
 import { basePath } from '@/lib/basePath';
 import {
   applySessionChange,
   loadPersisted,
   makeTab,
+  matchesChatRequest,
   reservationsByKey,
   STORAGE_KEY,
   tabForOpenRequest,
@@ -30,6 +32,7 @@ export interface ChatWorkspaceProps {
    * whenever it changes (deep links / "Open chat"), without remounting the
    * workspace. */
   initialAlias: string;
+  initialSessionId?: string;
 }
 
 /**
@@ -41,16 +44,17 @@ export interface ChatWorkspaceProps {
  * so background chats stay connected and keep streaming. A pane only unmounts —
  * and its socket only closes — when its tab is explicitly closed.
  */
-export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
+export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWorkspaceProps) {
+  const visible = useWorkspaceVisible();
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
   const [tabs, setTabs] = useState<ChatTab[]>(() => {
     const stored = persisted.current.tabs ?? [];
     // The route's agent is always open, but only add it when it is not already
     // there — a deep link should land on the existing pane, not fork a new one.
-    return stored.some((tb) => tb.alias === initialAlias)
+    return stored.some((tb) => matchesChatRequest(tb, initialAlias, initialSessionId))
       ? stored
-      : [...stored, makeTab(initialAlias)];
+      : [...stored, makeTab(initialAlias, initialSessionId)];
   });
   // Resolved up front rather than in an effect: an empty first commit would
   // activate tabs[0] and replaceState the URL to the wrong agent before the
@@ -59,8 +63,8 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   const [activeKey, setActiveKey] = useState<string>(() => {
     const preferred = persisted.current.activeKey;
     const match =
-      tabs.find((tb) => tb.key === preferred && tb.alias === initialAlias) ??
-      tabs.find((tb) => tb.alias === initialAlias);
+      tabs.find((tb) => tb.key === preferred && matchesChatRequest(tb, initialAlias, initialSessionId)) ??
+      tabs.find((tb) => matchesChatRequest(tb, initialAlias, initialSessionId));
     return match?.key ?? tabs[0]?.key ?? '';
   });
   const [layout, setLayout] = useState<WorkspaceLayout>(persisted.current.layout ?? 'tabs');
@@ -103,11 +107,12 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
 
   // Keys of the panes currently visible (so background panes can be `hidden`).
   const visibleKeys = useMemo<Set<string>>(() => {
+    if (!visible) return new Set();
     if (effectiveLayout === 'split') {
       return new Set([resolvedSplit[0], resolvedSplit[1]].filter(Boolean) as string[]);
     }
     return new Set(activeTab ? [activeTab.key] : []);
-  }, [effectiveLayout, resolvedSplit, activeTab]);
+  }, [effectiveLayout, resolvedSplit, activeTab, visible]);
 
   // Recompute the rendered indicator map from the status ref. An alias that is
   // currently visible is never shown as unread.
@@ -176,18 +181,19 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     // above resolved it. Bailing keeps this idempotent under StrictMode's
     // double-invoked effects, which would otherwise re-activate the agent's
     // first pane and undo the restored selection.
+    if (!visible) return;
     const current = tabsRef.current.find((tb) => tb.key === activeKeyRef.current);
-    if (current?.alias === initialAlias) return;
+    if (current && matchesChatRequest(current, initialAlias, initialSessionId)) return;
 
-    const existing = tabsRef.current.find((tb) => tb.alias === initialAlias);
+    const existing = tabsRef.current.find((tb) => matchesChatRequest(tb, initialAlias, initialSessionId));
     if (existing) {
       setActiveKey(existing.key);
       return;
     }
-    const tab = makeTab(initialAlias);
-    setTabs((prev) => (prev.some((tb) => tb.alias === initialAlias) ? prev : [...prev, tab]));
+    const tab = makeTab(initialAlias, initialSessionId);
+    setTabs((prev) => (prev.some((tb) => matchesChatRequest(tb, initialAlias, initialSessionId)) ? prev : [...prev, tab]));
     setActiveKey(tab.key);
-  }, [initialAlias]);
+  }, [initialAlias, initialSessionId, visible]);
 
   // Persist workspace shape on any structural change.
   useEffect(() => {
@@ -242,11 +248,12 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     // reload/deep-link (Router's basename no longer matches). basePath is
     // already normalized to "" (root) or a no-trailing-slash prefix, so plain
     // concatenation can't produce a double slash.
-    const target = `${basePath}/agent/${activeTab?.alias ?? initialAlias}`;
-    if (window.location.pathname !== target) {
+    if (!visible) return;
+    const target = `${basePath}/agent/${encodeURIComponent(activeTab?.alias ?? initialAlias)}?session=${encodeURIComponent(activeTab?.sessionId ?? '')}`;
+    if (`${window.location.pathname}${window.location.search}` !== target) {
       try { window.history.replaceState(window.history.state, '', target); } catch { /* noop */ }
     }
-  }, [activeTab, initialAlias]);
+  }, [activeTab, initialAlias, visible]);
 
   // ── Tab bar handlers ──────────────────────────────────────────────────
   const selectTab = useCallback((key: string) => {

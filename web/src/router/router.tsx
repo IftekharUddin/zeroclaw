@@ -7,9 +7,12 @@ import {
   AgentWorkspaceExplorer,
   AgentsList,
   Canvas,
+  Code,
   Config,
   Cron,
   Dashboard,
+  Home,
+  Sessions,
   Doctor,
   Integrations,
   Logs,
@@ -39,7 +42,10 @@ export const Router = () => (
   <Suspense fallback={<RouteFallback />}>
     <Routes>
       <Route element={<Layout />}>
-        <Route path="/" element={<Dashboard />} />
+        <Route path="/" element={<Home />} />
+        <Route path="/system" element={<Dashboard />} />
+        <Route path="/sessions" element={<Sessions />} />
+        <Route path="/code" element={<Code />} />
         <Route path="/agent" element={<Navigate to="/agents" replace />} />
         <Route path="/agents" element={<AgentsList />} />
         <Route path="/agent/:alias" element={<AgentChat />} />

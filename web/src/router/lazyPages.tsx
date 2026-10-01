@@ -22,3 +22,7 @@ export const SopEditor = lazy(() =>
 );
 export const Runs = lazy(() => import('../pages/Runs'));
 export const RunDetail = lazy(() => import('../pages/RunDetail'));
+
+export const Home = lazy(() => import('../pages/Home'));
+export const Sessions = lazy(() => import('../pages/Sessions'));
+export const Code = lazy(() => import('../pages/Code'));

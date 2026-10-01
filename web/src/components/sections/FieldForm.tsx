@@ -26,7 +26,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import {
   ExternalLink,
   Eye,
@@ -972,7 +972,23 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const [schema, setSchema] = useState<Record<string, unknown> | undefined>(
       undefined,
     );
+    const location = useLocation();
+    const fieldTarget = new URLSearchParams(location.search).get('field');
     const [filter, setFilter] = useState("");
+    useEffect(() => { setFilter(''); }, [fieldTarget]);
+    useEffect(() => {
+      if (loading || !fieldTarget || !entries.some((entry) => entry.path === fieldTarget)) return;
+      const frame = requestAnimationFrame(() => {
+        const input = document.getElementById(fieldTarget)
+          ?? [...document.querySelectorAll<HTMLElement>('[data-config-field]')].find((node) => node.dataset.configField === fieldTarget)
+          ?? [...document.querySelectorAll<HTMLElement>('[data-config-prefix]')].find((node) => fieldTarget.startsWith(`${node.dataset.configPrefix}.`));
+        const row = input?.closest('[data-config-field]') ?? input;
+        row?.scrollIntoView({ block: 'center', behavior: 'instant' });
+        const focus = input?.matches('input, select, textarea, button') ? input : input?.querySelector<HTMLElement>('input, select, textarea, button') ?? input;
+        focus?.focus({ preventScroll: true });
+      });
+      return () => cancelAnimationFrame(frame);
+    }, [fieldTarget, entries, loading]);
 
     // When this form edits a channel block (`channels.<type>.<alias>`), its
     // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
@@ -1424,6 +1440,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               <span />
             )}
             {enabledEntry && (
+              <div data-config-field={enabledEntry.path} tabIndex={-1}>
               <EntityEnabledToggle
                 prefix={prefix}
                 enabled={entryValue(enabledEntry) === "true"}
@@ -1437,6 +1454,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                   );
                 }}
               />
+              </div>
             )}
           </div>
         )}
@@ -1537,6 +1555,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           return (
           <div
             key={g.parent}
+            data-config-prefix={g.parent}
+            tabIndex={-1}
             className="surface-panel p-4"
             style={{ borderColor: "var(--pc-border)" }}
           >
@@ -1915,7 +1935,7 @@ function FieldRow({
   }
 
   return (
-    <div className="px-4 py-3">
+    <div data-config-field={entry.path} className="px-4 py-3 focus-within:bg-pc-accent/5">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <label

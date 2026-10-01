@@ -1,48 +1,13 @@
 import { useState, useRef, useEffect } from 'react';
-import { useLocation } from 'react-router-dom';
-import { LogOut, Settings, ChevronDown, Menu, Globe, Search } from 'lucide-react';
+import { Link, useLocation } from 'react-router-dom';
+import { LogOut, Palette, Settings, ChevronDown, Menu, Globe, Search } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 import { SettingsModal } from '@/components/SettingsModal';
 import { Button } from '@/components/ui';
 
-// Exact-path titles. The dashboard ('/') must stay exact so it doesn't
-// swallow every other route as a prefix.
-const exactRouteTitles: Record<string, string> = {
-  '/': 'nav.dashboard',
-};
-
-// Section titles keyed by the first path segment. Resolving by the matched
-// section (not the literal pathname) means nested routes like /config/agents,
-// /agent/:alias, or /agents all surface a correct <h1> instead of an empty one.
-const sectionTitles: Record<string, string> = {
-  agent: 'nav.agent',
-  agents: 'nav.agents',
-  tools: 'nav.tools',
-  skills: 'nav.skills',
-  cron: 'nav.cron',
-  integrations: 'nav.integrations',
-  config: 'nav.config',
-  setup: 'nav.config',
-  memory: 'nav.memory',
-  logs: 'nav.logs',
-  doctor: 'nav.doctor',
-  pairing: 'nav.pairing',
-  canvas: 'nav.canvas',
-  'acp-console': 'nav.acp',
-  quickstart: 'nav.quickstart',
-};
-
-// Derive the i18n title key from the matched route/section so every page —
-// including nested config routes — renders a non-empty heading. Unknown routes
-// fall back to an empty title rather than mislabeling them. With the rail now
-// icon-only, this <h1> is the primary on-screen name for the current section.
-function titleKeyFor(pathname: string): string | undefined {
-  if (exactRouteTitles[pathname]) return exactRouteTitles[pathname];
-  const section = pathname.split('/').filter(Boolean)[0];
-  return section ? sectionTitles[section] : undefined;
-}
+import { featureSettingsPath, routeTitleKey } from '@/lib/navigation';
 
 interface HeaderProps {
   onMenuToggle: () => void;
@@ -60,7 +25,8 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
   // Fall back to a plain title for unknown routes rather than mislabeling
   // them as "Dashboard" — e.g. early /quickstart hits before the entry was
   // mapped here showed "Dashboard" for the first-run flow.
-  const titleKey = titleKeyFor(location.pathname);
+  const titleKey = routeTitleKey(location.pathname);
+  const settingsPath = featureSettingsPath(location.pathname);
   const pageTitle = titleKey ? t(titleKey) : '';
 
   const handleLogout = () => {
@@ -82,7 +48,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
 
   return (
     <>
-      <header className="h-14 flex items-center justify-between px-6 border-b animate-fade-in relative" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}>
+      <header className="h-14 flex items-center justify-between px-3 sm:px-6 border-b animate-fade-in relative" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}>
         <div className="flex items-center gap-3 min-w-0">
           {/* Hamburger — opens the mobile drawer; hidden on desktop where the
               slim rail is always present. */}
@@ -115,7 +81,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             aria-label={t('nav.cmdk.placeholder')}
           >
             <Search className="h-[20px] w-[20px] shrink-0" aria-hidden="true" />
-            <span className="hidden md:inline w-32 text-left">{t('nav.cmdk.placeholder')}</span>
+            <span className="hidden md:inline w-40 truncate text-left">{t('nav.search_short')}</span>
             <kbd className="ml-1 flex items-center gap-0.5 rounded-[var(--radius-sm)] border border-pc-border bg-pc-elevated px-1.5 py-0.5 text-[11px] font-mono text-pc-text-faint">
               <span className="text-[13px] leading-none">⌘</span>K
             </kbd>
@@ -131,14 +97,19 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             <Search className="h-[20px] w-[20px] shrink-0" />
           </Button>
 
-          {/* Settings */}
+          {settingsPath && (
+            <Link to={settingsPath} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-pc-elevated focus-visible:ring-2 focus-visible:ring-pc-accent" aria-label={t('nav.feature_settings')} title={t('nav.feature_settings')}>
+              <Settings className="h-5 w-5" />
+            </Link>
+          )}
+          {/* Appearance */}
           <Button
             variant="ghost"
             onClick={() => setSettingsOpen(true)}
             className="h-9 w-9 border-transparent px-0"
-            aria-label={t('settings.title')}
+            aria-label={t('nav.appearance')}
           >
-            <Settings className="h-[20px] w-[20px] shrink-0" />
+            <Palette className="h-[20px] w-[20px] shrink-0" />
           </Button>
 
           {/* Language switcher dropdown */}
@@ -148,12 +119,12 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
               onClick={() => setLangOpen(!langOpen)}
               aria-expanded={langOpen}
               aria-label={t('settings.language')}
-              className="h-9 px-3 text-xs font-semibold gap-1.5"
+              className="h-9 w-9 sm:w-auto px-0 sm:px-3 text-xs font-semibold gap-1.5"
               style={{ background: 'var(--pc-bg-elevated)' }}
             >
               <Globe className="h-[20px] w-[20px] shrink-0" />
-              {locale.toUpperCase()}
-              <ChevronDown className="h-3 w-3 shrink-0" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
+              <span className="hidden sm:inline">{locale.toUpperCase()}</span>
+              <ChevronDown className="hidden sm:block h-3 w-3 shrink-0" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
             </Button>
 
             {langOpen && (
@@ -207,7 +178,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
           <Button
             variant="ghost"
             onClick={handleLogout}
-            className="h-9 px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
+            className="h-9 w-9 sm:w-auto px-0 sm:px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
             aria-label={t('auth.logout')}
           >
             <LogOut className="h-[20px] w-[20px] shrink-0" />

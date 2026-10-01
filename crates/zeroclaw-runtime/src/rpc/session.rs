@@ -713,6 +713,12 @@ impl SessionStore {
         sessions.get(session_id).map(|s| s.owner_tui_id.clone())
     }
 
+    /// Live activity includes admitted turns and queued work. Used by both
+    /// session recovery and activity listings; persistence is not a live lock.
+    pub async fn has_running_work(&self, id: &str) -> bool {
+        self.inflight_turn_generation(id).is_some() || self.session_queue.queue_depth(id).await > 0
+    }
+
     pub async fn list_ids(&self) -> Vec<String> {
         self.sessions.lock().await.keys().cloned().collect()
     }

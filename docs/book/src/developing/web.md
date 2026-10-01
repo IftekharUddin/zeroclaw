@@ -20,6 +20,67 @@ cargo web install       # npm install in web/
 
 `cargo web` is an alias for `cargo run -p xtask --bin web --` (defined in the cargo config). Every subcommand auto-runs `npm install` if `web/node_modules/` is missing.
 
+## Workspace navigation
+
+The home page (`/`) shows recent sessions, current web/code tasks and workflow
+runs, and actions supported by the connected daemon. Availability comes from
+`GET /api/workspace`, which resolves configured agents with the setup readiness
+checks and probes the local RPC listener. An unavailable service does not hide
+history from other services. Operational metrics and channel, memory, cost, and
+health tabs live at `/system`; existing `/?tab=...` bookmarks still work.
+
+![Home with recent sessions and running work](assets/workspace-home.png)
+
+The daily navigation rail links Home, Sessions, Agents, Code, Workflows, and
+Runs. All features remain in the expanded menu and command palette. Use
+**Cmd+K / Ctrl+K** to search features, session names, agent aliases, and settings.
+Setting results open the owning form and tab and focus the field. Search uses
+schema metadata and paths, never setting values or secrets. The header's
+settings button opens the configuration for the current feature.
+
+Session history opens a transcript first. Idle gateway sessions offer a resume
+link when their agent is dispatchable. Chat and Code stay mounted while moving
+between pages, so navigating to settings does not disconnect active work.
+Pending approvals appear above the current page with a link back to their task.
+Logging out, closing the window, or refreshing still closes those connections;
+Code asks the browser to confirm leaving during active work.
+
+The Code workspace (`/code`) uses the daemon's existing zerocode RPC dispatcher
+through the authenticated `/ws/code` bridge. It supports session history,
+streaming output, tool approvals, choice questions, cancellation, and a read-only
+workspace file preview. Agents edit files through their normal runtime tools
+and permission checks. Opening the page alone does not start a model call.
+**Cmd+Enter / Ctrl+Enter** sends the composer. Tasks resumed from another client
+are reconciled against runtime state until they finish.
+
+![Code workspace with a tool approval and file preview](assets/workspace-code.png)
+
+The Tauri desktop wrapper loads this same web application. These changes add no
+native commands, filesystem permissions, or separate desktop configuration.
+Browser checks do not substitute for a packaged desktop smoke test when
+changing the Tauri wrapper itself.
+
+### Browser verification
+
+`web/scripts/workspace-smoke.cjs` exercises the real web renderer with synthetic
+HTTP and RPC fixtures. It covers transcript navigation, keyboard settings search
+and focus, approvals across page changes, stale turn events, resumed task
+recovery, unavailable capabilities, mobile layout, and light mode. It writes
+screenshots to `/tmp/zeroclaw-workspace-evidence` by default.
+
+Start Vite on port 5178, then run the script with an existing Playwright module
+and Chrome installation. `PLAYWRIGHT_MODULE` can be an absolute path to that
+module; when omitted, Node resolves `playwright` normally. `WEB_SMOKE_URL` and
+`WEB_SMOKE_OUTPUT` override the server URL and screenshot directory.
+
+```sh
+node web/scripts/workspace-smoke.cjs
+```
+
+These fixtures verify browser behavior without model calls. The gateway's
+`code::tests` separately exercise real authentication, HTTP/WebSocket upgrade,
+local IPC, the runtime dispatcher, and session history in an isolated install.
+
 ## What gets generated
 
 | Path                            | Generator                | Tracked?   |

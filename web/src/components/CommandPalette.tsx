@@ -1,55 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import {
-  Activity,
-  Bot,
-  Clock,
-  CornerDownLeft,
-  FolderTree,
-  LayoutDashboard,
-  MessageSquare,
-  Monitor,
-  Puzzle,
-  Search,
-  Settings,
-  SlidersHorizontal,
-  Sparkles,
-  Stethoscope,
-  Terminal,
-  Wrench,
-} from 'lucide-react';
+import { CornerDownLeft, FolderTree, History, Search, SlidersHorizontal, type LucideIcon } from 'lucide-react';
+import { destinations } from '@/lib/navigation';
+import { useCodeSessions } from '@/hooks/useCodeSessions';
+import { getSessions, getWorkspaceAvailability } from '@/lib/api';
+import { sessionTarget } from '@/lib/sessionNavigation';
+import type { Session } from '@/types/api';
 import { t } from '@/lib/i18n';
 import { loadConfigSearchItems, type ConfigSearchItem } from '@/lib/configSearch';
 
-// Navigation destinations mirror the Sidebar's grouped nav. They're
-// re-declared locally (rather than imported from Sidebar) to keep the palette
-// self-contained and avoid coupling the two files — the destination list is a
-// flat projection of the same routes/labels the sidebar renders.
-interface Destination {
-  to: string;
-  icon: typeof LayoutDashboard;
-  labelKey: string;
-  groupKey: string;
-}
-
-const DESTINATIONS: Destination[] = [
-  { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard', groupKey: 'nav.group.home' },
-  { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents', groupKey: 'nav.group.chat' },
-  { to: '/config', icon: Settings, labelKey: 'nav.config', groupKey: 'nav.group.configure' },
-  { to: '/config/agents', icon: Bot, labelKey: 'nav.agent', groupKey: 'nav.group.configure' },
-  { to: '/tools', icon: Wrench, labelKey: 'nav.tools', groupKey: 'nav.group.configure' },
-  { to: '/skills', icon: Sparkles, labelKey: 'nav.skills', groupKey: 'nav.group.configure' },
-  { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations', groupKey: 'nav.group.configure' },
-  { to: '/cron', icon: Clock, labelKey: 'nav.cron', groupKey: 'nav.group.configure' },
-  { to: '/logs', icon: Activity, labelKey: 'nav.logs', groupKey: 'nav.group.operations' },
-  { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor', groupKey: 'nav.group.operations' },
-  { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas', groupKey: 'nav.group.operations' },
-  { to: '/acp-console', icon: Terminal, labelKey: 'nav.acp', groupKey: 'nav.group.operations' },
-];
-
-// The three result buckets, rendered in this order with their own headers.
-// "page" = static nav destinations; "section"/"entry" come from configSearch.
-type ResultKind = 'page' | 'section' | 'entry';
+// Navigation, session history, and schema-derived settings share one search.
+type ResultKind = 'page' | 'session' | 'section' | 'entry' | 'field';
 
 // A unified, keyboard-navigable result row. Nav destinations and config items
 // are normalized into this single shape so the filter / selection / render
@@ -64,7 +25,7 @@ interface PaletteItem {
   sublabel: string;
   /** Extra match text (the url/path) — searched but not displayed. */
   searchExtra: string;
-  icon: typeof LayoutDashboard;
+  icon: LucideIcon;
 }
 
 // Cap on rendered rows so a large config tree (100s of entities) stays snappy.
@@ -72,19 +33,23 @@ interface PaletteItem {
 const MAX_RESULTS = 50;
 
 // Section headers + the bucket order they render in.
-const KIND_ORDER: ResultKind[] = ['page', 'section', 'entry'];
+const KIND_ORDER: ResultKind[] = ['page', 'session', 'section', 'entry', 'field'];
 // Resolved at render time so the locale catalog is consulted on each render.
 function kindHeader(kind: ResultKind): string {
   switch (kind) {
     case 'page':
       return t('nav.cmdk.header.pages');
+    case 'session': return t('home.sessions');
+    case 'field': return t('nav.cmdk.header.fields');
     case 'section':
       return t('nav.cmdk.header.sections');
     case 'entry':
       return t('nav.cmdk.header.entries');
   }
 }
-const KIND_ICON: Record<Exclude<ResultKind, 'page'>, typeof LayoutDashboard> = {
+const KIND_ICON: Record<Exclude<ResultKind, 'page'>, LucideIcon> = {
+  session: History,
+  field: SlidersHorizontal,
   section: FolderTree,
   entry: SlidersHorizontal,
 };
@@ -92,13 +57,13 @@ const KIND_ICON: Record<Exclude<ResultKind, 'page'>, typeof LayoutDashboard> = {
 // Map a configSearch item into a PaletteItem. Config sections and entries get
 // distinct icons + buckets; the section/owning-section label is the sublabel.
 function toPaletteItem(c: ConfigSearchItem): PaletteItem {
-  const kind: ResultKind = c.group === 'Config section' ? 'section' : 'entry';
+  const kind: ResultKind = c.group === 'Config section' ? 'section' : c.group === 'Config field' ? 'field' : 'entry';
   return {
     kind,
     to: c.url,
     label: c.label,
     sublabel: c.sublabel,
-    searchExtra: c.url,
+    searchExtra: `${c.path ?? ''} ${c.url}`,
     icon: KIND_ICON[kind],
   };
 }
@@ -114,6 +79,8 @@ function matchScore(item: PaletteItem, q: string): number | null {
   if (label.includes(q)) return 2;
   if (sub.includes(q)) return 1;
   if (extra.includes(q)) return 0;
+  const words = q.split(/\s+/);
+  if (words.every((word) => `${label} ${sub} ${extra}`.replace(/[_./]/g, ' ').includes(word))) return 0;
   return null;
 }
 
@@ -138,9 +105,12 @@ interface CommandPaletteProps {
 export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [codeEnabled, setCodeEnabled] = useState(false);
+  const code = useCodeSessions(open && codeEnabled);
   const [selected, setSelected] = useState(0);
-  // Config search items, loaded lazily on open (cached for the session by
-  // configSearch). `loadingConfig` drives the subtle "loading settings…" hint;
+  // Config search items refresh on open. `loadingConfig` drives the subtle
+  // "loading settings…" hint;
   // nav destinations are usable the whole time regardless.
   const [configItems, setConfigItems] = useState<ConfigSearchItem[]>([]);
   const [loadingConfig, setLoadingConfig] = useState(false);
@@ -156,6 +126,10 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
     if (!open) return;
     let cancelled = false;
     setLoadingConfig(true);
+    void getWorkspaceAvailability().then((value) => { if (!cancelled) setCodeEnabled(value.code); }).catch(() => { if (!cancelled) setCodeEnabled(false); });
+    void getSessions().then((items) => {
+      if (!cancelled) setSessions(items.sort((a, b) => b.last_activity.localeCompare(a.last_activity)));
+    }).catch(() => { if (!cancelled) setSessions([]); });
     void loadConfigSearchItems()
       .then((items) => {
         if (!cancelled) setConfigItems(items);
@@ -171,7 +145,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
   // All searchable items in one flat list: static pages first, then config
   // sections, then config entries (toPaletteItem assigns the bucket/icon).
   const allItems = useMemo<PaletteItem[]>(() => {
-    const pages: PaletteItem[] = DESTINATIONS.map((d) => ({
+    const pages: PaletteItem[] = destinations.map((d) => ({
       kind: 'page',
       to: d.to,
       label: t(d.labelKey),
@@ -179,8 +153,13 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
       searchExtra: d.to,
       icon: d.icon,
     }));
-    return [...pages, ...configItems.map(toPaletteItem)];
-  }, [configItems]);
+    const history: PaletteItem[] = [...sessions, ...code.sessions].map((session) => ({
+      kind: 'session', to: sessionTarget(session), label: session.name || ('surface' in session ? `${t('nav.code')} · ${session.agent_alias}` : session.session_id),
+      sublabel: session.agent_alias ?? session.channel_id ?? t('home.sessions'),
+      searchExtra: `${session.session_key} ${session.channel_id ?? ''}`, icon: History,
+    }));
+    return [...pages, ...history, ...configItems.map(toPaletteItem)];
+  }, [configItems, sessions, code.sessions]);
 
   // Filter + sort + bucket + cap. The flat `results` list (header rows
   // interleaved) is what we render; `items` (no headers) is the keyboard-
