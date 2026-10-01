@@ -1669,6 +1669,111 @@ mod tests {
         }
     }
 
+    /// A value for `field` that differs from its current one, derived from
+    /// its kind, or `None` where `set_prop` takes no plain value for it.
+    fn changed_value(field: &zeroclaw_config::traits::PropFieldInfo) -> Option<String> {
+        use zeroclaw_config::traits::{PropKind, UNSET_DISPLAY};
+        let current = field.display_value.as_str();
+        let unset = current == UNSET_DISPLAY;
+        match field.kind {
+            PropKind::Bool => Some((current != "true").to_string()),
+            PropKind::Integer if unset => Some("1".to_owned()),
+            PropKind::Integer => Some(current.parse::<i64>().ok()?.checked_add(1)?.to_string()),
+            PropKind::Float if unset => Some("1.0".to_owned()),
+            PropKind::Float => Some((current.parse::<f64>().ok()? + 1.0).to_string()),
+            PropKind::String | PropKind::AliasRef if unset => Some("drift-guard".to_owned()),
+            PropKind::String | PropKind::AliasRef => Some(format!("{current}-drift-guard")),
+            PropKind::Enum => (field.enum_variants?)()
+                .into_iter()
+                .find(|variant| variant != current),
+            PropKind::StringArray => {
+                let mut items: Vec<String> = if unset {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(current).ok()?
+                };
+                items.push("drift-guard".to_owned());
+                serde_json::to_string(&items).ok()
+            }
+            PropKind::Object | PropKind::ObjectArray => None,
+        }
+    }
+
+    /// The drift guard for `is_auth_input_path`: a property whose write
+    /// changes the authorization inputs but which the predicate does not
+    /// name would let an edit bypass the running daemon's policy. Every
+    /// property the configuration exposes, with one entry in each
+    /// authorization section so their fields are exposed too, is changed on
+    /// its own and the inputs compared before and after.
+    #[test]
+    fn is_auth_input_path_names_every_property_that_changes_the_authorization_inputs() {
+        let mut config = base_config();
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["operator".into()],
+            },
+        );
+        config
+            .permission_profiles
+            .insert("operator".into(), PermissionProfileConfig::default());
+        config.oidc.insert("corp".into(), OidcConfig::default());
+        let inputs = auth_inputs(&config).expect("the fixture encodes");
+        let serialized = |config: &Config| toml::to_string(config).expect("the config encodes");
+        let unedited = serialized(&config);
+
+        let mut exercised: Vec<String> = Vec::new();
+        for field in config.prop_fields() {
+            let Some(value) = changed_value(&field) else {
+                continue;
+            };
+            let mut staged = config.clone();
+            if staged.set_prop(&field.name, &value).is_err() {
+                continue;
+            }
+            // `get_prop` masks a secret whatever its value, so a write to one
+            // is seen in the serialized configuration instead.
+            let took_effect = staged.get_prop(&field.name).ok()
+                != config.get_prop(&field.name).ok()
+                || (field.is_secret && serialized(&staged) != unedited);
+            if !took_effect {
+                continue;
+            }
+            let changed = auth_inputs(&staged).expect("the edited config encodes") != inputs;
+            if changed {
+                assert!(
+                    is_auth_input_path(&field.name),
+                    "a write to {} changes the authorization inputs, but is_auth_input_path does not name it",
+                    field.name
+                );
+            } else {
+                // No property under the authorization sections takes a write
+                // that serialization does not show, so none is exempt here.
+                assert!(
+                    !is_auth_input_path(&field.name),
+                    "is_auth_input_path names {}, but a write to it leaves the authorization inputs unchanged",
+                    field.name
+                );
+            }
+            exercised.push(field.name);
+        }
+
+        for section in ["users.", "permission_profiles.", "oidc."] {
+            assert!(
+                exercised.iter().any(|name| name.starts_with(section)),
+                "no property under {section} was exercised: {exercised:?}"
+            );
+        }
+        assert!(
+            exercised
+                .iter()
+                .any(|name| name == "security.trust_daemon_uid"),
+            "security.trust_daemon_uid was not exercised: {exercised:?}"
+        );
+    }
+
     #[test]
     fn publish_accepted_replaces_a_deny_all_state_with_the_repaired_policy() {
         let mut dangling = base_config();

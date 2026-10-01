@@ -10,9 +10,10 @@
 //! The error variants separate the cases a caller handles differently:
 //! nothing listening, a handshake that failed before any request was sent, a
 //! daemon that is not this configuration's, a daemon of another release, a
-//! daemon that refused this caller, a daemon that refused the request, and a
-//! request that was written but never answered, whose outcome is therefore
-//! unknown.
+//! daemon that refused this caller at the handshake and so bound no
+//! principal, a daemon that bound a principal and then refused it the
+//! request, a daemon that rejected the request itself, and a request that
+//! was written but never answered, whose outcome is therefore unknown.
 //!
 //! On a Unix socket the kernel reports the account at the other end and,
 //! where it records one, the process, and the client checks both before it
@@ -60,10 +61,14 @@ pub(crate) enum DaemonCallError {
     /// from this CLI's, so the request was not sent. `daemon` is its version.
     #[cfg(unix)]
     VersionMismatch { daemon: String },
-    /// The daemon refused this caller: AUTH_REQUIRED or FORBIDDEN, from
-    /// `initialize` or from the request.
+    /// `initialize` answered AUTH_REQUIRED or FORBIDDEN: the daemon bound no
+    /// principal to this caller, so the request was not sent.
     #[cfg(unix)]
-    Refused { code: i64, message: String },
+    HandshakeRefused { code: i64, message: String },
+    /// `initialize` bound a principal to this caller, and the request
+    /// answered AUTH_REQUIRED or FORBIDDEN: that principal may not make it.
+    #[cfg(unix)]
+    RequestRefused { code: i64, message: String },
     /// The daemon accepted the caller but rejected the request (any other
     /// JSON-RPC error, e.g. INVALID_PARAMS, INTERNAL_ERROR).
     #[cfg(unix)]
@@ -100,9 +105,17 @@ impl fmt::Display for DaemonCallError {
                 "the running daemon is version {daemon} but this CLI is {CLI_VERSION}"
             ),
             #[cfg(unix)]
-            Self::Refused { code, message } => {
-                write!(f, "the daemon refused this caller ({code}): {message}")
+            Self::HandshakeRefused { code, message } => {
+                write!(
+                    f,
+                    "the daemon refused this caller at initialize ({code}): {message}"
+                )
             }
+            #[cfg(unix)]
+            Self::RequestRefused { code, message } => write!(
+                f,
+                "the daemon bound this caller to a principal and refused it the request ({code}): {message}"
+            ),
             #[cfg(unix)]
             Self::Rejected { code, message } => {
                 write!(f, "the daemon rejected the request ({code}): {message}")
@@ -118,15 +131,16 @@ impl fmt::Display for DaemonCallError {
 impl std::error::Error for DaemonCallError {}
 
 /// Refuse the call without opening the endpoint: this client does not verify
-/// that a named pipe's server is the daemon `expected_pid` names, so it sends
-/// nothing over one. It takes the Unix client's arguments so its callers are
-/// the same on every platform, and the future it returns is ready at once.
+/// that a named pipe's server is the daemon the expected pid names, so it
+/// sends nothing over one. It takes the Unix client's arguments, unused here,
+/// so its callers are the same on every platform, and the future it returns
+/// is ready at once.
 #[cfg(not(unix))]
 pub(crate) fn call(
-    config: &crate::config::Config,
-    expected_pid: u32,
-    method: &str,
-    params: serde_json::Value,
+    _config: &crate::config::Config,
+    _expected_pid: u32,
+    _method: &str,
+    _params: serde_json::Value,
 ) -> impl std::future::Future<Output = Result<serde_json::Value, DaemonCallError>> {
     std::future::ready(Err(DaemonCallError::UnverifiableEndpoint))
 }
@@ -291,7 +305,10 @@ mod unix {
         .map_err(handshake_failed)?;
         let accepted = answer.map_err(|error| {
             if is_refusal(&error) {
-                refused(error)
+                DaemonCallError::HandshakeRefused {
+                    code: i64::from(error.code),
+                    message: error.message,
+                }
             } else {
                 handshake_failed(format!(
                     "initialize failed ({}): {}",
@@ -332,9 +349,14 @@ mod unix {
             detail: format!("no answer within {}s", REQUEST_TIMEOUT.as_secs()),
         })?
         .map_err(|detail| DaemonCallError::NoAnswer { detail })?;
+        // `initialize` bound a principal, so a refusal here is the daemon's
+        // verdict on what that principal may do, not on who the caller is.
         answer.map_err(|error| {
             if is_refusal(&error) {
-                refused(error)
+                DaemonCallError::RequestRefused {
+                    code: i64::from(error.code),
+                    message: error.message,
+                }
             } else {
                 DaemonCallError::Rejected {
                     code: i64::from(error.code),
@@ -407,16 +429,10 @@ mod unix {
         }
     }
 
-    /// AUTH_REQUIRED and FORBIDDEN concern the caller rather than the request.
+    /// AUTH_REQUIRED and FORBIDDEN concern the caller and its principal
+    /// rather than the request's content.
     fn is_refusal(error: &JsonRpcError) -> bool {
         matches!(error.code, AUTH_REQUIRED | FORBIDDEN)
-    }
-
-    fn refused(error: JsonRpcError) -> DaemonCallError {
-        DaemonCallError::Refused {
-            code: i64::from(error.code),
-            message: error.message,
-        }
     }
 
     fn handshake_failed(detail: String) -> DaemonCallError {
@@ -617,16 +633,16 @@ mod unix {
         /// With daemon-uid trust off and no roster, the endpoint's peer
         /// credential identifies nobody, so the daemon refuses the handshake.
         #[tokio::test]
-        async fn call_reports_a_refused_caller() {
+        async fn call_reports_a_caller_refused_at_the_handshake() {
             let (_dir, mut config) = scratch_config();
             config.security.trust_daemon_uid = false;
             let _daemon = serve(&config).await;
 
             match call(&config, std::process::id(), "config/get", json!({})).await {
-                Err(DaemonCallError::Refused { code, .. }) => {
+                Err(DaemonCallError::HandshakeRefused { code, .. }) => {
                     assert_eq!(code, i64::from(AUTH_REQUIRED));
                 }
-                other => panic!("expected Refused, got {other:?}"),
+                other => panic!("expected HandshakeRefused, got {other:?}"),
             }
         }
 
@@ -992,6 +1008,80 @@ mod unix {
                     assert!(detail.contains("protocol 2 only"), "{detail}");
                 }
                 other => panic!("expected Handshake, got {other:?}"),
+            }
+        }
+
+        /// A refusal at `initialize` binds no principal, so the request is
+        /// never sent, whichever refusal code the daemon answers.
+        #[tokio::test]
+        async fn exchange_reports_a_refusal_at_initialize_as_a_refused_handshake() {
+            for refusal in [AUTH_REQUIRED, FORBIDDEN] {
+                let (client, daemon_end) = tokio::io::duplex(64 * 1024);
+                let daemon = async move {
+                    let mut daemon_end = BufReader::new(daemon_end);
+                    read_frame(&mut daemon_end).await;
+                    write_frames(
+                        &mut daemon_end,
+                        &[json!({
+                            "jsonrpc": "2.0",
+                            "id": INITIALIZE_ID,
+                            "error": { "code": refusal, "message": "no principal for this uid" },
+                        })],
+                    )
+                    .await;
+                    let mut rest = String::new();
+                    daemon_end
+                        .read_line(&mut rest)
+                        .await
+                        .expect("the client hangs up cleanly");
+                    rest
+                };
+
+                let (result, rest) =
+                    tokio::join!(exchange_with_recorded(client, "config/set"), daemon);
+                match result {
+                    Err(DaemonCallError::HandshakeRefused { code, message }) => {
+                        assert_eq!(code, i64::from(refusal));
+                        assert_eq!(message, "no principal for this uid");
+                    }
+                    other => panic!("expected HandshakeRefused for {refusal}, got {other:?}"),
+                }
+                assert!(rest.is_empty(), "the request must not be sent: {rest}");
+            }
+        }
+
+        /// A refusal of the request after `initialize` bound a principal is
+        /// told apart from a refusal at the handshake: it is the daemon's
+        /// verdict on what that principal may do.
+        #[tokio::test]
+        async fn exchange_reports_a_refusal_after_the_handshake_as_a_refused_request() {
+            for refusal in [AUTH_REQUIRED, FORBIDDEN] {
+                let (client, daemon_end) = tokio::io::duplex(64 * 1024);
+                let daemon = async move {
+                    let mut daemon_end = BufReader::new(daemon_end);
+                    read_frame(&mut daemon_end).await;
+                    write_frames(&mut daemon_end, &[initialize_answer(CLI_VERSION)]).await;
+                    let request = read_frame(&mut daemon_end).await;
+                    write_frames(
+                        &mut daemon_end,
+                        &[json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "error": { "code": refusal, "message": "Principal is not granted config:update" },
+                        })],
+                    )
+                    .await;
+                };
+
+                let (result, ()) =
+                    tokio::join!(exchange_with_recorded(client, "config/set"), daemon);
+                match result {
+                    Err(DaemonCallError::RequestRefused { code, message }) => {
+                        assert_eq!(code, i64::from(refusal));
+                        assert_eq!(message, "Principal is not granted config:update");
+                    }
+                    other => panic!("expected RequestRefused for {refusal}, got {other:?}"),
+                }
             }
         }
 

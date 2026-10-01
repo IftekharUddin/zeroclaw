@@ -8,9 +8,14 @@
 //! the previous policy while the CLI reports success.
 //!
 //! A daemon for this configuration is running when the heartbeat beside
-//! config.toml is recent and names a process that is alive. While none runs,
-//! every edit keeps the direct save and today's output, and no endpoint is
-//! contacted, whatever `ZEROCLAW_SOCKET` names.
+//! config.toml is recent and names a process that is alive. When no
+//! heartbeat shows one, the CLI probes the configuration's ownership lock
+//! once, which every daemon takes before it loads its configuration: while
+//! another process holds it, the edit is saved and reported as pending,
+//! since that process may be a daemon that is still starting. While no
+//! daemon runs and the lock shows none, every edit keeps the direct save and
+//! today's output, and no endpoint is contacted, whatever `ZEROCLAW_SOCKET`
+//! names.
 //!
 //! While one runs, an edit that writes the authorization inputs, or changes
 //! them, goes to the daemon (`config/set` or `config/set-many`), which
@@ -18,12 +23,16 @@
 //! re-asserts the value already in the file goes to the daemon too: the file
 //! is not what the daemon enforces. When the daemon cannot be reached, is not
 //! the process the heartbeat names, runs another release or refuses this
-//! caller, or when the CLI does not verify which process serves its endpoint
-//! on this platform, the CLI saves the edit locally and reports it as pending
-//! until the daemon reloads. When the daemon rejects the edit, or is asked and
-//! never answers, the command fails and saves nothing: saving locally would
-//! either install a policy the daemon refused or race an edit it may already
-//! have applied.
+//! caller at the handshake, binding no principal, or when the CLI does not
+//! verify which process serves its endpoint on this platform, the CLI saves
+//! the edit locally and reports it as pending until the daemon reloads. A
+//! refusal at the handshake is how a daemon enforcing a deny-all policy
+//! answers, and how one answers a caller its roster does not map, so the
+//! local save is what lets an operator repair a lockout. When the daemon
+//! binds a principal and then refuses it the edit, rejects the edit, or is
+//! asked and never answers, the command fails and saves nothing: saving
+//! locally would hand the file an edit the daemon refused, install a policy
+//! it rejected, or race an edit it may already have applied.
 //!
 //! A write the daemon's config methods do not take, and `config init`, which
 //! has no daemon path for an authorization entry, are saved locally and
@@ -36,10 +45,12 @@
 
 use std::cell::OnceCell;
 use std::fmt;
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::Duration;
 
 use serde_json::Value;
+use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
 use zeroclaw_runtime::rpc::auth::{auth_inputs, is_auth_input_path, validate_accepted_auth_config};
 use zeroclaw_runtime::rpc::types::{ConfigSetManyParams, ConfigSetParams};
 
@@ -110,7 +121,9 @@ impl AuthSnapshot {
 /// Why an authorization edit was saved without reaching the running daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingReason {
-    /// The daemon refused this caller.
+    /// The daemon refused this caller at the handshake, binding no principal
+    /// to it: a caller its roster does not map, or any caller while it
+    /// enforces a deny-all policy.
     #[cfg(unix)]
     Refused,
     /// The daemon runs another release than this CLI.
@@ -130,6 +143,12 @@ pub(crate) enum PendingReason {
     /// so the edit was not sent.
     #[cfg(not(unix))]
     UnverifiedEndpoint,
+    /// No heartbeat confirms a daemon, but another process holds this
+    /// configuration's ownership lock, which a daemon takes before it loads
+    /// its configuration: it may be a daemon that is still starting. Without
+    /// a heartbeat there is no pid to check an endpoint against, so the edit
+    /// was not sent.
+    OwnerUnconfirmed,
     /// The command has no daemon path for this write and wrote config.toml
     /// itself.
     OfflineCommand,
@@ -155,6 +174,7 @@ impl PendingReason {
             Self::OtherDaemon => "other_daemon",
             #[cfg(not(unix))]
             Self::UnverifiedEndpoint => "unverified_endpoint",
+            Self::OwnerUnconfirmed => "owner_unconfirmed",
             Self::OfflineCommand => "offline_command",
             Self::NotReplayable => "not_replayable",
         }
@@ -173,14 +193,16 @@ pub(crate) enum Publication {
     /// The daemon validated, saved, swapped and published the edit. The
     /// caller must NOT save locally.
     Applied,
-    /// A daemon runs but did not take the edit: it could not be asked, is not
-    /// this configuration's, refused the caller, or was never asked because
-    /// the write has no daemon path or the CLI does not verify its endpoint
-    /// on this platform. Save locally and report pending reload.
+    /// A daemon runs, or may be starting, but did not take the edit: it could
+    /// not be asked, is not this configuration's, refused the caller at the
+    /// handshake, or was never asked because the write has no daemon path, no
+    /// heartbeat confirms it, or the CLI does not verify its endpoint on this
+    /// platform. Save locally and report pending reload.
     ///
     /// `detail` is the evidence behind `reason`: the daemon's refusal, the
     /// handshake failure, the identity mismatch or the connect error. For
-    /// `VersionMismatch` it is the daemon's version; for `OfflineCommand`,
+    /// `VersionMismatch` it is the daemon's version; for `OwnerUnconfirmed`,
+    /// the ownership lock another process holds; for `OfflineCommand`,
     /// `NotReplayable` and `UnverifiedEndpoint` it is empty.
     Pending {
         reason: PendingReason,
@@ -261,6 +283,11 @@ impl Publication {
                         "cli-config-auth-reason-unverified",
                         "the CLI does not verify which process serves the daemon's named pipe, so it did not send the edit",
                     ),
+                    PendingReason::OwnerUnconfirmed => crate::ta(
+                        "cli-config-auth-reason-owner-unconfirmed",
+                        &[("detail", detail)],
+                        "another ZeroClaw process holds this configuration ({$detail}) but no daemon heartbeat confirms it; a daemon that is still starting may not see this edit until its next reload",
+                    ),
                     PendingReason::OfflineCommand => crate::t(
                         "cli-config-auth-reason-offline",
                         "this command writes config.toml directly",
@@ -294,6 +321,13 @@ pub(crate) enum CommitFailure {
         code: i64,
         suggest_patch: bool,
     },
+    /// The daemon bound this caller to a principal at the handshake, then
+    /// refused that principal the edit (AUTH_REQUIRED or FORBIDDEN); nothing
+    /// was saved. A local save would put an edit the daemon refused this
+    /// caller into the file its next reload installs. `message` is the
+    /// daemon's reason.
+    #[cfg(unix)]
+    Forbidden { message: String },
     /// A daemon runs but the edit is to be saved locally, whether the daemon
     /// did not take it or was never offered it, and saving it would turn a
     /// policy that compiles into one that does not, which the daemon would
@@ -304,6 +338,12 @@ pub(crate) enum CommitFailure {
     /// or may not have been applied. `path` is a property to check.
     #[cfg(unix)]
     Unknown { path: String },
+    /// A `config patch` batch the running daemon would have committed
+    /// carries a `test` op on the authorization input `path`. The op was
+    /// checked against the CLI's copy of config.toml, while the batch's
+    /// writes would land on the daemon's live configuration, so the daemon
+    /// was not contacted and nothing was saved.
+    UncheckableTest { path: String },
 }
 
 impl fmt::Display for CommitFailure {
@@ -322,6 +362,16 @@ impl fmt::Display for CommitFailure {
                 ),
                 *suggest_patch,
             ),
+            // A principal the daemon refused an edit is not helped by
+            // setting fields together, so there is no patch hint.
+            #[cfg(unix)]
+            Self::Forbidden { message } => {
+                return f.write_str(&crate::ta(
+                    "cli-config-auth-forbidden",
+                    &[("reason", message)],
+                    "The running daemon identified you and refused this edit; nothing was saved: {$reason}",
+                ));
+            }
             Self::PolicyWouldNotCompile {
                 error,
                 suggest_patch,
@@ -339,6 +389,13 @@ impl fmt::Display for CommitFailure {
                     "cli-config-auth-unknown",
                     &[("path", path)],
                     "The running daemon did not answer; the edit may or may not have been applied.",
+                ));
+            }
+            Self::UncheckableTest { path } => {
+                return f.write_str(&crate::ta(
+                    "cli-config-auth-patch-test-op",
+                    &[("path", path)],
+                    "A `test` op on `{$path}` cannot be checked against the running daemon's live configuration, so the patch was not applied; remove the `test` op, or check the value with `zeroclaw config get` first",
                 ));
             }
         };
@@ -362,12 +419,15 @@ impl std::error::Error for CommitFailure {}
 /// Commit one staged `config set` edit through the daemon when it writes or
 /// changes the authorization inputs. `staged` is the CLI's config with the
 /// edit already applied in memory; `value` is the raw string the CLI staged.
+/// `holds_config_ownership` is set when the command itself holds the
+/// configuration's ownership lock, as an offline agent mutation does.
 pub(crate) async fn commit_set(
     before: &AuthSnapshot,
     staged: &Config,
     path: &str,
     value: &str,
     comment: Option<&str>,
+    holds_config_ownership: bool,
 ) -> anyhow::Result<Publication> {
     if !(before.changed_by(staged)? || is_auth_input_path(path)) {
         return Ok(Publication::NotAuthorizationEdit);
@@ -383,15 +443,32 @@ pub(crate) async fn commit_set(
             .filter(|comment| !comment.is_empty())
             .map(str::to_owned),
     })?;
-    commit(before, staged, "config/set", params, path, true).await
+    commit(
+        before,
+        staged,
+        "config/set",
+        params,
+        path,
+        true,
+        holds_config_ownership,
+        None,
+    )
+    .await
 }
 
 /// Same for a `config patch` batch, through `config/set-many` with
-/// `{"sets":[{"prop","value"}...]}` (values are JSON strings).
+/// `{"sets":[{"prop","value"}...]}` (values are JSON strings). `tested` are
+/// the properties the patch's `test` ops checked on `staged`: a running
+/// daemon that would take the batch applies its writes to its live
+/// configuration instead, so a `test` op on an authorization input then
+/// fails the batch with `CommitFailure::UncheckableTest` before the daemon is
+/// contacted.
 pub(crate) async fn commit_set_many(
     before: &AuthSnapshot,
     staged: &Config,
     sets: &[(String, String)],
+    tested: &[String],
+    holds_config_ownership: bool,
 ) -> anyhow::Result<Publication> {
     if !(before.changed_by(staged)? || sets.iter().any(|(prop, _)| is_auth_input_path(prop))) {
         return Ok(Publication::NotAuthorizationEdit);
@@ -406,6 +483,10 @@ pub(crate) async fn commit_set_many(
             })
             .collect(),
     })?;
+    let uncheckable_test = tested
+        .iter()
+        .map(String::as_str)
+        .find(|path| is_auth_input_path(path));
     commit(
         before,
         staged,
@@ -413,6 +494,8 @@ pub(crate) async fn commit_set_many(
         params,
         batch_check_path(sets),
         false,
+        holds_config_ownership,
+        uncheckable_test,
     )
     .await
 }
@@ -435,27 +518,82 @@ fn batch_check_path(sets: &[(String, String)]) -> &str {
 ///
 /// `NotAuthorizationEdit` when the write neither changes the authorization
 /// inputs nor writes one of them; `NoDaemon` when no daemon for this
-/// configuration is running; else `Pending { reason }`. While a daemon runs,
-/// a write that turns a policy that compiles into one that does not fails
-/// with `CommitFailure::PolicyWouldNotCompile`, and the caller saves nothing.
+/// configuration is running and its ownership lock shows none either;
+/// `Pending { reason: OwnerUnconfirmed }` when no heartbeat confirms a daemon
+/// but another process holds that lock; else `Pending { reason }`. While a
+/// daemon runs or may be starting, a write that turns a policy that compiles
+/// into one that does not fails with `CommitFailure::PolicyWouldNotCompile`,
+/// and the caller saves nothing. `holds_config_ownership` as for
+/// `commit_set`.
 pub(crate) fn classify_local_save(
     before: &AuthSnapshot,
     staged: &Config,
     touched: &[String],
     reason: PendingReason,
     suggest_patch: bool,
+    holds_config_ownership: bool,
 ) -> anyhow::Result<Publication> {
     if !(before.changed_by(staged)? || touched.iter().any(|path| is_auth_input_path(path))) {
         return Ok(Publication::NotAuthorizationEdit);
     }
-    if running_daemon(staged).is_none() {
-        return Ok(Publication::NoDaemon);
-    }
+    let (reason, detail) = match daemon_presence(staged, holds_config_ownership) {
+        DaemonPresence::Running(_) => (reason, String::new()),
+        DaemonPresence::OwnerUnconfirmed { lock } => {
+            (PendingReason::OwnerUnconfirmed, lock.display().to_string())
+        }
+        DaemonPresence::Absent => return Ok(Publication::NoDaemon),
+    };
     before.refuse_breaking(staged, suggest_patch)?;
-    Ok(Publication::Pending {
-        reason,
-        detail: String::new(),
-    })
+    Ok(Publication::Pending { reason, detail })
+}
+
+/// What the CLI can tell, without contacting anything, about the daemon
+/// serving a configuration.
+#[derive(Debug)]
+enum DaemonPresence {
+    /// The heartbeat is recent and names this live process.
+    Running(u32),
+    /// No heartbeat confirms a daemon, and the ownership lock shows none: it
+    /// was free, this command holds it, or it cannot be taken at all.
+    Absent,
+    /// No heartbeat confirms a daemon, but another process holds the
+    /// ownership lock at `lock`.
+    OwnerUnconfirmed { lock: PathBuf },
+}
+
+/// Look for the daemon serving `config`: the heartbeat first, and only when
+/// it shows none, the configuration's ownership lock. A command looks once,
+/// so the lock is probed at most once per command.
+///
+/// Every daemon takes the ownership lock before it loads its configuration
+/// and holds it for as long as it runs, so a lock another process holds while
+/// no heartbeat shows a daemon may be a daemon that is still starting. The
+/// probe holds the lock only for the instant of the check. A daemon starting
+/// at that same instant fails its own acquire, as it does against any
+/// offline CLI mutation that holds the lock.
+///
+/// `holds_config_ownership` is set when this command already holds the lock
+/// itself. No daemon can run meanwhile, and a second acquire in this process
+/// would conflict with the command's own guard, so the lock is not probed.
+fn daemon_presence(config: &Config, holds_config_ownership: bool) -> DaemonPresence {
+    if let Some(pid) = running_daemon(config) {
+        return DaemonPresence::Running(pid);
+    }
+    if holds_config_ownership {
+        return DaemonPresence::Absent;
+    }
+    match ConfigOwnershipGuard::acquire(&config.data_dir) {
+        Ok(guard) => {
+            drop(guard);
+            DaemonPresence::Absent
+        }
+        Err(ConfigOwnershipError::AlreadyOwned { path }) => {
+            DaemonPresence::OwnerUnconfirmed { lock: path }
+        }
+        // A daemon takes the same lock before it loads its configuration, so
+        // one that cannot be taken here could not be taken by a daemon either.
+        Err(ConfigOwnershipError::Unavailable(_)) => DaemonPresence::Absent,
+    }
 }
 
 /// The pid of the daemon serving `config`'s directory, when one is running:
@@ -499,57 +637,56 @@ fn process_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
-/// Send an edit to the daemon serving `config`, or `None`, contacting
-/// nothing, when no daemon for this configuration is running.
+/// Send an edit to the daemon the command found running as `pid`.
 ///
 /// A running daemon whose endpoint accepts no connection is usually between
 /// generations: a reload rebinds its endpoint within moments, so it is asked
-/// again briefly before it counts as unreachable. Each attempt reads the
+/// again briefly before it counts as unreachable. Each retry reads the
 /// heartbeat afresh and asks the daemon it names then, so a successor is
 /// asked under its own pid. A heartbeat that stops naming a running daemon
 /// does not end the wait: the daemon seen running may be restarting, and its
 /// successor may load the file before this edit reaches it. A wait that ends
 /// without an answer returns the last connect failure, so the edit is
-/// reported pending rather than saved as if no daemon ran.
+/// reported pending rather than saved as if no daemon ran. The wait reads
+/// only the heartbeat: the ownership lock was probed, if at all, when the
+/// command first looked for the daemon.
 #[cfg(unix)]
 async fn send(
     config: &Config,
+    mut pid: u32,
     method: &str,
     params: Value,
-) -> Option<Result<Value, DaemonCallError>> {
+) -> Result<Value, DaemonCallError> {
     let deadline = tokio::time::Instant::now() + RECONNECT_WINDOW;
-    // Why the last attempt that found a daemon running reached nothing there.
-    let mut unreachable = None;
     loop {
-        match running_daemon(config) {
-            Some(pid) => match daemon_rpc::call(config, pid, method, params.clone()).await {
-                Err(error) if nothing_listening(&error) => unreachable = Some(error),
-                outcome => return Some(outcome),
-            },
-            // No daemon ran when the command first looked, and none was
-            // contacted.
-            None if unreachable.is_none() => return None,
-            None => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return unreachable.map(Err);
-        }
-        tokio::time::sleep(RECONNECT_INTERVAL).await;
+        // Why this attempt reached nothing at the daemon's endpoint.
+        let unreachable = match daemon_rpc::call(config, pid, method, params.clone()).await {
+            Err(error) if nothing_listening(&error) => error,
+            outcome => return outcome,
+        };
+        pid = loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(unreachable);
+            }
+            tokio::time::sleep(RECONNECT_INTERVAL).await;
+            if let Some(next) = running_daemon(config) {
+                break next;
+            }
+        };
     }
 }
 
-/// Send an edit to the daemon serving `config`, or `None`, contacting
-/// nothing, when no daemon for this configuration is running. The daemon
-/// client opens nothing on this platform, so there is no endpoint to wait
-/// for.
+/// Send an edit to the daemon the command found running as `pid`. The
+/// daemon client opens nothing on this platform, so there is no endpoint to
+/// wait for.
 #[cfg(not(unix))]
 async fn send(
     config: &Config,
+    pid: u32,
     method: &str,
     params: Value,
-) -> Option<Result<Value, DaemonCallError>> {
-    let pid = running_daemon(config)?;
-    Some(daemon_rpc::call(config, pid, method, params).await)
+) -> Result<Value, DaemonCallError> {
+    daemon_rpc::call(config, pid, method, params).await
 }
 
 /// Whether a call failed because nothing listens at the endpoint: no socket
@@ -569,7 +706,9 @@ fn nothing_listening(error: &DaemonCallError) -> bool {
 
 /// Send an authorization edit to the daemon and classify the outcome.
 /// `config` is the CLI's config with the edit staged; `check_path` is the
-/// property a caller should inspect when the outcome is unknown.
+/// property a caller should inspect when the outcome is unknown;
+/// `uncheckable_test` is the authorization input a batch's `test` op checked
+/// on `config`, if any.
 async fn commit(
     before: &AuthSnapshot,
     config: &Config,
@@ -577,11 +716,36 @@ async fn commit(
     params: Value,
     check_path: &str,
     suggest_patch: bool,
+    holds_config_ownership: bool,
+    uncheckable_test: Option<&str>,
 ) -> anyhow::Result<Publication> {
-    let Some(outcome) = send(config, method, params).await else {
-        return Ok(Publication::NoDaemon);
+    let pid = match daemon_presence(config, holds_config_ownership) {
+        DaemonPresence::Running(pid) => pid,
+        DaemonPresence::Absent => return Ok(Publication::NoDaemon),
+        // Without a heartbeat there is no pid to check the process at the
+        // endpoint against, so nothing is sent, and the edit is saved like
+        // any other a daemon did not take.
+        DaemonPresence::OwnerUnconfirmed { lock } => {
+            before.refuse_breaking(config, suggest_patch)?;
+            return Ok(Publication::Pending {
+                reason: PendingReason::OwnerUnconfirmed,
+                detail: lock.display().to_string(),
+            });
+        }
     };
-    let (reason, detail) = match outcome {
+    // The daemon would apply the batch to its live configuration, not to the
+    // copy its `test` ops were checked against. Only the Unix client sends a
+    // running daemon anything; elsewhere the batch is saved to that copy, so
+    // its `test` ops hold as checked.
+    if cfg!(unix)
+        && let Some(path) = uncheckable_test
+    {
+        return Err(CommitFailure::UncheckableTest {
+            path: path.to_owned(),
+        }
+        .into());
+    }
+    let (reason, detail) = match send(config, pid, method, params).await {
         Ok(_) => return Ok(Publication::Applied),
         #[cfg(not(unix))]
         Err(DaemonCallError::UnverifiableEndpoint) => {
@@ -600,8 +764,14 @@ async fn commit(
         }
         #[cfg(unix)]
         Err(DaemonCallError::Handshake { detail }) => (PendingReason::Handshake, detail),
+        // No principal was bound, which is how a daemon enforcing deny-all
+        // answers every caller: the local save is what repairs a lockout.
         #[cfg(unix)]
-        Err(DaemonCallError::Refused { message, .. }) => (PendingReason::Refused, message),
+        Err(DaemonCallError::HandshakeRefused { message, .. }) => (PendingReason::Refused, message),
+        #[cfg(unix)]
+        Err(DaemonCallError::RequestRefused { message, .. }) => {
+            return Err(CommitFailure::Forbidden { message }.into());
+        }
         #[cfg(unix)]
         Err(DaemonCallError::Rejected { code, message }) => {
             return Err(CommitFailure::Rejected {
@@ -788,6 +958,7 @@ mod tests {
             (PendingReason::OtherDaemon, "other_daemon"),
             #[cfg(not(unix))]
             (PendingReason::UnverifiedEndpoint, "unverified_endpoint"),
+            (PendingReason::OwnerUnconfirmed, "owner_unconfirmed"),
             (PendingReason::OfflineCommand, "offline_command"),
             (PendingReason::NotReplayable, "not_replayable"),
         ] {
@@ -843,6 +1014,17 @@ mod tests {
                 assert!(!notice.contains("{cli-"), "{notice}");
             }
         }
+        let unconfirmed = Publication::Pending {
+            reason: PendingReason::OwnerUnconfirmed,
+            detail: "/data/config-lifecycle.lock".into(),
+        }
+        .notice()
+        .expect("pending has a notice");
+        assert!(
+            unconfirmed.contains("/data/config-lifecycle.lock"),
+            "the notice names the lock another process holds: {unconfirmed}"
+        );
+        assert!(!unconfirmed.contains("{cli-"), "{unconfirmed}");
         let mut local_notices = BTreeSet::new();
         for reason in [
             #[cfg(not(unix))]
@@ -896,7 +1078,29 @@ mod tests {
             .to_string();
             assert!(unknown.contains("users.alice.uid"), "{unknown}");
             assert!(!unknown.contains("{cli-"), "{unknown}");
+
+            let forbidden = CommitFailure::Forbidden {
+                message: "Principal is not granted config:update".into(),
+            }
+            .to_string();
+            assert!(
+                forbidden.contains("Principal is not granted config:update")
+                    && forbidden.contains("nothing was saved"),
+                "{forbidden}"
+            );
+            assert!(!forbidden.contains("{cli-"), "{forbidden}");
         }
+
+        let uncheckable = CommitFailure::UncheckableTest {
+            path: "users.alice.uid".into(),
+        }
+        .to_string();
+        assert!(
+            uncheckable.contains("`users.alice.uid`")
+                && uncheckable.contains("zeroclaw config get"),
+            "the failure names the property and how to check it: {uncheckable}"
+        );
+        assert!(!uncheckable.contains("{cli-"), "{uncheckable}");
 
         let uncompilable = |suggest_patch| {
             CommitFailure::PolicyWouldNotCompile {
@@ -1016,6 +1220,7 @@ mod tests {
             &touched,
             PendingReason::OfflineCommand,
             true,
+            false,
         )
         .expect("no daemon, no compile check");
         assert!(
@@ -1034,6 +1239,7 @@ mod tests {
             &touched,
             PendingReason::NotReplayable,
             true,
+            false,
         )
         .expect("a stale heartbeat is no daemon");
         assert!(
@@ -1048,6 +1254,7 @@ mod tests {
             &unrelated,
             PendingReason::OfflineCommand,
             true,
+            false,
         )
         .expect("classifies");
         assert!(
@@ -1072,6 +1279,7 @@ mod tests {
                 &touched,
                 PendingReason::OfflineCommand,
                 suggest_patch,
+                false,
             )
             .expect_err("a policy that stops compiling is refused");
             assert_would_not_compile(&failure, suggest_patch);
@@ -1084,6 +1292,7 @@ mod tests {
                 &["security.trust_daemon_uid".to_owned()],
                 reason,
                 true,
+                false,
             )
             .expect("a policy that still compiles is saved");
             assert!(
@@ -1113,6 +1322,7 @@ mod tests {
             &["security.trust_daemon_uid".to_owned()],
             PendingReason::NotReplayable,
             true,
+            false,
         )
         .expect("a policy that did not compile before may still not");
         assert!(
@@ -1141,6 +1351,7 @@ mod tests {
             &["users.me.permission_profiles".to_owned()],
             PendingReason::NotReplayable,
             true,
+            false,
         )
         .expect("classifies");
         assert!(
@@ -1163,14 +1374,14 @@ mod tests {
         let mut unrelated = config.clone();
         unrelated.gateway.host = "0.0.0.0".into();
         let unrelated_sets = [("gateway.host".to_owned(), "0.0.0.0".to_owned())];
-        let publication = commit_set(&before, &unrelated, "gateway.host", "0.0.0.0", None)
+        let publication = commit_set(&before, &unrelated, "gateway.host", "0.0.0.0", None, false)
             .await
             .expect("classifies");
         assert!(
             matches!(publication, Publication::NotAuthorizationEdit),
             "{publication:?}"
         );
-        let publication = commit_set_many(&before, &unrelated, &unrelated_sets)
+        let publication = commit_set_many(&before, &unrelated, &unrelated_sets, &[], false)
             .await
             .expect("classifies");
         assert!(
@@ -1181,14 +1392,21 @@ mod tests {
         let staged = with_trust_flipped(&config);
         let value = staged.security.trust_daemon_uid.to_string();
         let sets = [("security.trust_daemon_uid".to_owned(), value.clone())];
-        let publication = commit_set(&before, &staged, "security.trust_daemon_uid", &value, None)
-            .await
-            .expect("classifies");
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
         assert!(
             matches!(publication, Publication::NoDaemon),
             "no heartbeat: {publication:?}"
         );
-        let publication = commit_set_many(&before, &staged, &sets)
+        let publication = commit_set_many(&before, &staged, &sets, &[], false)
             .await
             .expect("classifies");
         assert!(
@@ -1199,9 +1417,16 @@ mod tests {
         // Re-asserting the value already on disk still looks for the daemon,
         // which finds none here.
         let value = config.security.trust_daemon_uid.to_string();
-        let publication = commit_set(&before, &config, "security.trust_daemon_uid", &value, None)
-            .await
-            .expect("classifies");
+        let publication = commit_set(
+            &before,
+            &config,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
         assert!(
             matches!(publication, Publication::NoDaemon),
             "an authorization path is committed even when nothing changed: {publication:?}"
@@ -1213,6 +1438,8 @@ mod tests {
                 ("gateway.host".to_owned(), config.gateway.host.clone()),
                 ("security.trust_daemon_uid".to_owned(), value),
             ],
+            &[],
+            false,
         )
         .await
         .expect("classifies");
@@ -1229,6 +1456,7 @@ mod tests {
             "users.bob.uid",
             "4242",
             None,
+            false,
         )
         .await
         .expect("classifies");
@@ -1243,12 +1471,282 @@ mod tests {
             chrono::Utc::now() - chrono::TimeDelta::seconds(60),
             std::process::id(),
         );
-        let publication = commit_set(&before, &staged, "security.trust_daemon_uid", "true", None)
-            .await
-            .expect("classifies");
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            "true",
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
         assert!(
             matches!(publication, Publication::NoDaemon),
             "a stale heartbeat: {publication:?}"
+        );
+    }
+
+    /// Listen where `config`'s daemon endpoint is, so a test can tell whether
+    /// anything connected to it.
+    #[cfg(unix)]
+    fn listen_at_the_endpoint(config: &Config) -> std::os::unix::net::UnixListener {
+        let endpoint = zeroclaw_runtime::rpc::local::socket_path(config);
+        let listener = std::os::unix::net::UnixListener::bind(&endpoint)
+            .unwrap_or_else(|error| panic!("bind {}: {error}", endpoint.display()));
+        listener
+            .set_nonblocking(true)
+            .expect("the listener can be made nonblocking");
+        listener
+    }
+
+    /// A connection the CLI made would wait in the accept queue.
+    #[cfg(unix)]
+    fn assert_nothing_connected(listener: &std::os::unix::net::UnixListener) {
+        match listener.accept() {
+            Err(error) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "accept must find the queue empty, not fail: {error}"
+            ),
+            Ok((_, peer)) => panic!("something connected to the endpoint: {peer:?}"),
+        }
+    }
+
+    /// With no heartbeat, the ownership lock is probed and released: a free
+    /// lock is no daemon, and it is free again afterwards.
+    #[tokio::test]
+    async fn a_free_ownership_lock_without_a_heartbeat_is_no_daemon() {
+        let (_dir, config) = scratch_config();
+        let before = AuthSnapshot::capture(&config).expect("encodes");
+        let staged = with_trust_flipped(&config);
+        let value = staged.security.trust_daemon_uid.to_string();
+
+        let publication = classify_local_save(
+            &before,
+            &staged,
+            &["security.trust_daemon_uid".to_owned()],
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NoDaemon),
+            "{publication:?}"
+        );
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NoDaemon),
+            "{publication:?}"
+        );
+        ConfigOwnershipGuard::acquire(&config.data_dir)
+            .expect("the probe holds the lock only for the instant of the check");
+    }
+
+    /// Another process holding the ownership lock while no heartbeat shows a
+    /// daemon may be a daemon that is still starting: the edit is saved and
+    /// pending, nothing is contacted, and the compile guard still applies.
+    /// The lock this test holds is a separate open of the lock file, which
+    /// conflicts with the probe the way another process's would.
+    #[tokio::test]
+    async fn a_lock_another_process_holds_without_a_heartbeat_leaves_the_edit_pending() {
+        let (_dir, config) = scratch_config();
+        let before = AuthSnapshot::capture(&config).expect("encodes");
+        let owner =
+            ConfigOwnershipGuard::acquire(&config.data_dir).expect("the test takes the lock");
+        #[cfg(unix)]
+        let listener = listen_at_the_endpoint(&config);
+        let staged = with_trust_flipped(&config);
+        let value = staged.security.trust_daemon_uid.to_string();
+        let lock = config
+            .data_dir
+            .join("config-lifecycle.lock")
+            .display()
+            .to_string();
+        let unconfirmed = |publication: &Publication| {
+            matches!(
+                publication,
+                Publication::Pending {
+                    reason: PendingReason::OwnerUnconfirmed,
+                    detail,
+                } if *detail == lock
+            )
+        };
+
+        let publication = classify_local_save(
+            &before,
+            &staged,
+            &["security.trust_daemon_uid".to_owned()],
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect("classifies");
+        assert!(unconfirmed(&publication), "{publication:?}");
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
+        assert!(unconfirmed(&publication), "{publication:?}");
+        // The batch is saved to the copy its `test` op was checked against,
+        // so the op keeps its meaning.
+        let publication = commit_set_many(
+            &before,
+            &staged,
+            &[("security.trust_daemon_uid".to_owned(), value)],
+            &["users.me.permission_profiles".to_owned()],
+            false,
+        )
+        .await
+        .expect("classifies");
+        assert!(unconfirmed(&publication), "{publication:?}");
+
+        let broken = with_profileless_user(&config);
+        let failure = classify_local_save(
+            &before,
+            &broken,
+            &["users.bob.uid".to_owned()],
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect_err("a policy that stops compiling is refused");
+        assert_would_not_compile(&failure, true);
+        let failure = commit_set(&before, &broken, "users.bob.uid", "4242", None, false)
+            .await
+            .expect_err("a policy that stops compiling is refused");
+        assert_would_not_compile(&failure, true);
+
+        #[cfg(unix)]
+        assert_nothing_connected(&listener);
+        drop(owner);
+    }
+
+    /// A command that holds the ownership lock itself, as an offline agent
+    /// mutation does, knows no daemon runs, and does not probe the lock: a
+    /// second acquire in its own process would conflict with its own guard.
+    #[tokio::test]
+    async fn a_command_that_holds_the_ownership_lock_finds_no_daemon() {
+        let (_dir, config) = scratch_config();
+        let before = AuthSnapshot::capture(&config).expect("encodes");
+        let held = ConfigOwnershipGuard::acquire(&config.data_dir).expect("the command's lock");
+        let staged = with_trust_flipped(&config);
+        let value = staged.security.trust_daemon_uid.to_string();
+
+        let publication = classify_local_save(
+            &before,
+            &staged,
+            &["security.trust_daemon_uid".to_owned()],
+            PendingReason::OfflineCommand,
+            true,
+            true,
+        )
+        .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NoDaemon),
+            "{publication:?}"
+        );
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            true,
+        )
+        .await
+        .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NoDaemon),
+            "{publication:?}"
+        );
+        let publication = commit_set_many(
+            &before,
+            &staged,
+            &[("security.trust_daemon_uid".to_owned(), value)],
+            &["users.me.permission_profiles".to_owned()],
+            true,
+        )
+        .await
+        .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NoDaemon),
+            "{publication:?}"
+        );
+        drop(held);
+    }
+
+    /// A batch a running daemon would commit applies its writes to the
+    /// daemon's live configuration, so a `test` op the CLI checked on its own
+    /// copy of an authorization input fails the batch before the daemon is
+    /// contacted. A `test` op elsewhere does not stop the batch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_batch_testing_an_authorization_input_is_not_sent_to_a_running_daemon() {
+        let (_dir, config) = scratch_config();
+        let before = AuthSnapshot::capture(&config).expect("encodes");
+        record_running_daemon(&config);
+        let listener = listen_at_the_endpoint(&config);
+        let staged = with_trust_flipped(&config);
+        let sets = [(
+            "security.trust_daemon_uid".to_owned(),
+            staged.security.trust_daemon_uid.to_string(),
+        )];
+
+        let failure = commit_set_many(
+            &before,
+            &staged,
+            &sets,
+            &[
+                "gateway.host".to_owned(),
+                "users.me.permission_profiles".to_owned(),
+            ],
+            false,
+        )
+        .await
+        .expect_err("the batch is refused");
+        match failure.downcast_ref::<CommitFailure>() {
+            Some(CommitFailure::UncheckableTest { path }) => {
+                assert_eq!(path, "users.me.permission_profiles");
+            }
+            other => panic!("expected UncheckableTest, got {other:?}"),
+        }
+        assert_nothing_connected(&listener);
+
+        // An endpoint that fails at once shows the batch was offered to the
+        // daemon when its only `test` op is outside the authorization inputs.
+        let unconnectable = with_unconnectable_endpoint(&config);
+        record_running_daemon(&unconnectable);
+        let staged = with_trust_flipped(&unconnectable);
+        let publication =
+            commit_set_many(&before, &staged, &sets, &["gateway.host".to_owned()], false)
+                .await
+                .expect("classifies");
+        assert!(
+            matches!(
+                publication,
+                Publication::Pending {
+                    reason: PendingReason::Unreachable,
+                    ..
+                }
+            ),
+            "{publication:?}"
         );
     }
 
@@ -1265,9 +1763,16 @@ mod tests {
 
         let staged = with_trust_flipped(&config);
         let value = staged.security.trust_daemon_uid.to_string();
-        let publication = commit_set(&before, &staged, "security.trust_daemon_uid", &value, None)
-            .await
-            .expect("classifies");
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
         match publication {
             Publication::Pending {
                 reason: PendingReason::Unreachable,
@@ -1277,7 +1782,7 @@ mod tests {
         }
 
         let staged = with_profileless_user(&config);
-        let failure = commit_set(&before, &staged, "users.bob.uid", "4242", None)
+        let failure = commit_set(&before, &staged, "users.bob.uid", "4242", None, false)
             .await
             .expect_err("a policy that stops compiling is refused");
         assert_would_not_compile(&failure, true);
@@ -1307,9 +1812,16 @@ mod tests {
 
         let staged = with_trust_flipped(&config);
         let value = staged.security.trust_daemon_uid.to_string();
-        let publication = commit_set(&before, &staged, "security.trust_daemon_uid", &value, None)
-            .await
-            .expect("classifies");
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
         stop.await.expect("the heartbeat was removed");
         assert!(
             matches!(
@@ -1337,9 +1849,16 @@ mod tests {
 
         let staged = with_trust_flipped(&broken);
         let value = staged.security.trust_daemon_uid.to_string();
-        let publication = commit_set(&before, &staged, "security.trust_daemon_uid", &value, None)
-            .await
-            .expect("an edit to a policy that did not compile is saved");
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("an edit to a policy that did not compile is saved");
         assert!(
             matches!(
                 publication,
@@ -1364,9 +1883,16 @@ mod tests {
 
         let staged = with_trust_flipped(&config);
         let value = staged.security.trust_daemon_uid.to_string();
-        let publication = commit_set(&before, &staged, "security.trust_daemon_uid", &value, None)
-            .await
-            .expect("classifies");
+        let publication = commit_set(
+            &before,
+            &staged,
+            "security.trust_daemon_uid",
+            &value,
+            None,
+            false,
+        )
+        .await
+        .expect("classifies");
         assert!(
             matches!(
                 publication,
@@ -1378,12 +1904,35 @@ mod tests {
             "{publication:?}"
         );
 
+        // The batch is saved to the copy its `test` op was checked against,
+        // so the op keeps its meaning.
+        let publication = commit_set_many(
+            &before,
+            &staged,
+            &[("security.trust_daemon_uid".to_owned(), value)],
+            &["users.me.permission_profiles".to_owned()],
+            false,
+        )
+        .await
+        .expect("classifies");
+        assert!(
+            matches!(
+                publication,
+                Publication::Pending {
+                    reason: PendingReason::UnverifiedEndpoint,
+                    ..
+                }
+            ),
+            "{publication:?}"
+        );
+
         let failure = commit_set(
             &before,
             &with_profileless_user(&config),
             "users.bob.uid",
             "4242",
             None,
+            false,
         )
         .await
         .expect_err("a policy that stops compiling is refused");

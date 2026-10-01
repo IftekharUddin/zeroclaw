@@ -6,20 +6,24 @@
 //! RPC config methods, even when it re-asserts the value already in the
 //! file: the daemon validates it, saves `config.toml` itself, and publishes
 //! the new policy, which established connections pick up at their next
-//! operation. When the daemon refuses the caller, is not the one serving the
-//! CLI's config dir, or cannot take the write, the CLI saves the file
-//! directly and reports the edit as pending a reload, unless the policy it
-//! would leave there stops compiling; when the daemon rejects the edit as
-//! invalid, nothing is saved. Edits outside those sections, and every edit
-//! made while no daemon serves the CLI's config dir, keep the direct save and
-//! today's output, and contact no daemon.
+//! operation. When the daemon refuses the caller at the handshake, binding no
+//! principal, is not the one serving the CLI's config dir, or cannot take the
+//! write, or when no heartbeat confirms a daemon but another process holds
+//! the config dir's ownership lock, the CLI saves the file directly and
+//! reports the edit as pending a reload, unless the policy it would leave
+//! there stops compiling. When the daemon binds a principal and refuses it
+//! the edit, or rejects the edit as invalid, nothing is saved. Edits outside
+//! those sections, and every edit made while no daemon serves the CLI's
+//! config dir, keep the direct save and today's output, and contact no
+//! daemon.
 //!
 //! Every test drives real processes: a `zeroclaw daemon` on a private config
 //! dir and port, the CLI in a separate process, and a raw JSON-RPC client on
 //! the daemon's local socket. The fixture maps this process's uid to
-//! `[users.me]` and sets `security.trust_daemon_uid = false`. With the default
-//! `true`, the daemon's own uid is the shared operator whatever the roster
-//! says, so a narrowed profile could never be observed.
+//! `[users.me]` (or, to have the daemon refuse this process at the
+//! handshake, another uid) and sets `security.trust_daemon_uid = false`. With
+//! the default `true`, the daemon's own uid is the shared operator whatever
+//! the roster says, so a narrowed profile could never be observed.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -30,8 +34,9 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use zeroclaw_api::jsonrpc::error_codes::FORBIDDEN;
+use zeroclaw_api::jsonrpc::error_codes::{AUTH_REQUIRED, FORBIDDEN};
 use zeroclaw_api::principal::PrincipalId;
+use zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard;
 use zeroclaw_runtime::rpc::dispatch::RPC_PROTOCOL_VERSION;
 
 /// Bound on daemon startup, until both `/health` and the local socket serve.
@@ -42,24 +47,38 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on each read and write on a probe connection.
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A private config dir whose roster maps this process's uid to `users.me`.
+/// A private config dir whose roster maps a uid, usually this process's, to
+/// `users.me`.
 struct Fixture {
     dir: tempfile::TempDir,
+    /// The uid `users.me` maps.
     uid: u32,
     port: u16,
 }
 
 impl Fixture {
-    /// `users.me` holds the `me_profile` permission profile: `admin` may do
-    /// anything, `reader` may read config but not write it.
+    /// `users.me` maps this process's uid and holds the `me_profile`
+    /// permission profile: `admin` may do anything, `reader` may read config
+    /// but not write it, and a profile the file does not define leaves a
+    /// policy that does not compile.
     fn new(me_profile: &str) -> Self {
+        Self::with_roster_uid(me_profile, peer_uid())
+    }
+
+    /// `users.me` maps a uid other than this process's, so the daemon binds
+    /// no principal to this process and refuses it at `initialize`.
+    fn unmapped(me_profile: &str) -> Self {
+        let uid = if peer_uid() == 4242 { 4243 } else { 4242 };
+        Self::with_roster_uid(me_profile, uid)
+    }
+
+    fn with_roster_uid(me_profile: &str, uid: u32) -> Self {
         // A short root keeps `<dir>/data/daemon.sock` inside the 104-byte
         // `sun_path` limit on macOS whatever `TMPDIR` is.
         let dir = tempfile::Builder::new()
             .prefix("zc")
             .tempdir_in("/tmp")
             .expect("create a temp config dir under /tmp");
-        let uid = peer_uid();
         let port = free_port();
         let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
         std::fs::write(
@@ -95,10 +114,15 @@ permission_profiles = ["{me_profile}"]
         self.dir.path()
     }
 
-    /// The daemon's local RPC socket: `data_dir` defaults to
-    /// `<config_dir>/data`.
+    /// `data_dir`, which defaults to `<config_dir>/data`: the daemon's local
+    /// RPC socket and the config dir's ownership lock live there.
+    fn data_dir(&self) -> PathBuf {
+        self.path().join("data")
+    }
+
+    /// The daemon's local RPC socket.
     fn socket(&self) -> PathBuf {
-        self.path().join("data").join("daemon.sock")
+        self.data_dir().join("daemon.sock")
     }
 
     fn config_text(&self) -> String {
@@ -176,8 +200,22 @@ struct Daemon {
     log: PathBuf,
 }
 
+/// What the daemon's `initialize` answers this process once it serves.
+#[derive(Clone, Copy)]
+enum Handshake {
+    /// It binds the roster principal `users.me`.
+    BindsMe,
+    /// It binds no principal and refuses this process with this code.
+    Refuses(i32),
+}
+
 impl Daemon {
+    /// A daemon whose `initialize` binds this process to `users.me`.
     fn start(fixture: &Fixture) -> Self {
+        Self::start_expecting(fixture, Handshake::BindsMe)
+    }
+
+    fn start_expecting(fixture: &Fixture, handshake: Handshake) -> Self {
         // A file rather than a pipe: nothing drains a pipe while the test
         // runs, and a full one would stall the daemon mid-test.
         let log = fixture.path().join("daemon.log");
@@ -202,14 +240,13 @@ impl Daemon {
             socket: fixture.socket(),
             log,
         };
-        daemon.wait_until_serving(fixture);
+        daemon.wait_until_serving(fixture, handshake);
         daemon
     }
 
     /// Wait until the gateway answers `/health`, the heartbeat names this
-    /// daemon, and the local socket binds the fixture's roster principal at
-    /// `initialize`.
-    fn wait_until_serving(&mut self, fixture: &Fixture) {
+    /// daemon, and the local socket answers `initialize` as `expected` says.
+    fn wait_until_serving(&mut self, fixture: &Fixture, expected: Handshake) {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll the daemon") {
@@ -223,7 +260,10 @@ impl Daemon {
                 && let Ok(mut probe) = RpcProbe::connect(&self.socket)
             {
                 let handshake = probe.initialize();
-                self.assert_bound_to_me(handshake);
+                match expected {
+                    Handshake::BindsMe => self.assert_bound_to_me(handshake),
+                    Handshake::Refuses(code) => self.assert_refused(handshake, code),
+                }
                 return;
             }
             assert!(
@@ -260,6 +300,23 @@ impl Daemon {
             "initialize must bind the roster principal users.me: {result}\n{}",
             self.output()
         );
+    }
+
+    /// A daemon that maps no principal to this process, or enforces a
+    /// deny-all policy, refuses it at `initialize` with `code`.
+    fn assert_refused(&self, handshake: Result<Value, Value>, code: i32) {
+        match handshake {
+            Err(error) => assert_eq!(
+                error.get("code").and_then(Value::as_i64),
+                Some(i64::from(code)),
+                "initialize must refuse this process with {code}: {error}\n{}",
+                self.output()
+            ),
+            Ok(result) => panic!(
+                "initialize must refuse this process with {code}, but it bound {result}\n{}",
+                self.output()
+            ),
+        }
     }
 
     /// Everything the daemon printed so far, for failure messages.
@@ -599,10 +656,11 @@ fn config_set_comment_on_an_applied_edit_is_written_by_the_daemon() {
     );
 }
 
-/// The security regression: a caller the daemon refuses must not move the
-/// running policy, even though its edit reaches the file.
+/// The security regression: a principal the daemon identified and refused an
+/// edit must move neither the running policy nor the file the daemon's next
+/// reload would install.
 #[test]
-fn config_set_is_pending_when_the_daemon_refuses_the_caller() {
+fn config_set_refused_to_the_bound_principal_saves_nothing() {
     let fixture = Fixture::new("reader");
     let daemon = Daemon::start(&fixture);
     let mut established = daemon.probe();
@@ -610,34 +668,34 @@ fn config_set_is_pending_when_the_daemon_refuses_the_caller() {
         established.config_set("gateway.host", "127.0.0.9"),
         "a reader before the edit",
     );
+    let before = fixture.config_text();
 
-    // The reader tries to grant itself admin. The daemon refuses the caller,
-    // so the CLI saves the file directly and reports a pending reload.
+    // The reader tries to grant itself admin. The daemon binds users.me at
+    // initialize and then refuses it the edit, so the command fails.
     let output = config_set_json(&fixture, "permission_profiles.reader.admin", "true");
     assert!(
-        output.status.success(),
-        "a refused commit falls back to the direct save\n{}",
+        !output.status.success(),
+        "an edit the daemon refused the bound principal must fail\n{}",
         describe(&output)
     );
-    let envelope = stdout_json(&output);
-    assert_eq!(
-        envelope["path"], "permission_profiles.reader.admin",
-        "{envelope}"
+    assert!(
+        output.stdout.is_empty(),
+        "a refused edit prints no envelope\n{}",
+        describe(&output)
     );
-    assert_eq!(envelope["daemon"]["applied"], false, "{envelope}");
-    assert_eq!(envelope["daemon"]["pending_reload"], true, "{envelope}");
-    assert_eq!(envelope["daemon"]["reason"], "refused", "{envelope}");
-    assert_clean_stderr(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("identified you and refused this edit") && stderr.contains("not granted"),
+        "stderr must carry the refusal and the daemon's reason\n{}",
+        describe(&output)
+    );
     assert_eq!(
-        toml_at(&fixture.config_toml(), "permission_profiles.reader.admin")
-            .and_then(toml::Value::as_bool),
-        Some(true),
-        "the CLI must have saved config.toml directly:\n{}",
-        fixture.config_text()
+        fixture.config_text(),
+        before,
+        "a refused edit must leave config.toml byte-identical"
     );
 
-    // Without an envelope, the same outcome is a notice on stderr. The value
-    // is already in the file, and the edit still goes to the daemon first.
+    // Without an envelope, the outcome is the same.
     let human = run_cli(
         &fixture,
         &[
@@ -650,16 +708,19 @@ fn config_set_is_pending_when_the_daemon_refuses_the_caller() {
         None,
     );
     assert!(
-        human.status.success(),
-        "a refused commit falls back to the direct save\n{}",
+        !human.status.success(),
+        "an edit the daemon refused the bound principal must fail\n{}",
         describe(&human)
     );
-    let notice = String::from_utf8_lossy(&human.stderr);
     assert!(
-        notice.contains("still enforces the previous authorization policy")
-            && notice.contains("refused this caller"),
-        "a pending edit prints its notice on stderr in human mode\n{}",
+        String::from_utf8_lossy(&human.stderr).contains("identified you and refused this edit"),
+        "stderr must carry the refusal in human mode\n{}",
         describe(&human)
+    );
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "a refused edit must leave config.toml byte-identical"
     );
 
     // The daemon's policy did not move: the refused caller gained nothing on
@@ -679,6 +740,99 @@ fn config_set_is_pending_when_the_daemon_refuses_the_caller() {
     assert_forbidden(
         fresh.config_set("gateway.host", "127.0.0.9"),
         "a new connection after the refused edit",
+    );
+}
+
+/// A daemon whose roster does not map this process binds it no principal and
+/// refuses it at the handshake. That refusal is no verdict on the edit, so
+/// the CLI saves the file directly and reports the edit as pending a reload.
+/// This process is no principal of the daemon, so no probe can read its live
+/// policy.
+#[test]
+fn config_set_refused_at_the_handshake_is_saved_and_pending() {
+    let fixture = Fixture::unmapped("reader");
+    let _daemon = Daemon::start_expecting(&fixture, Handshake::Refuses(AUTH_REQUIRED));
+
+    let output = config_set_json(&fixture, "users.me.permission_profiles", "admin");
+    assert!(
+        output.status.success(),
+        "an edit refused at the handshake falls back to the direct save\n{}",
+        describe(&output)
+    );
+    let envelope = stdout_json(&output);
+    assert_eq!(
+        envelope["path"], "users.me.permission_profiles",
+        "{envelope}"
+    );
+    assert_eq!(envelope["daemon"]["applied"], false, "{envelope}");
+    assert_eq!(envelope["daemon"]["pending_reload"], true, "{envelope}");
+    assert_eq!(envelope["daemon"]["reason"], "refused", "{envelope}");
+    assert_clean_stderr(&output);
+    assert_eq!(
+        toml_at(&fixture.config_toml(), "users.me.permission_profiles"),
+        Some(&string_array(&["admin"])),
+        "the CLI must have saved config.toml directly:\n{}",
+        fixture.config_text()
+    );
+
+    // Without an envelope, the same outcome is a notice on stderr.
+    let human = run_cli(
+        &fixture,
+        &[
+            "config",
+            "set",
+            "--no-interactive",
+            "users.me.permission_profiles",
+            "reader",
+        ],
+        None,
+    );
+    assert!(
+        human.status.success(),
+        "an edit refused at the handshake falls back to the direct save\n{}",
+        describe(&human)
+    );
+    let notice = String::from_utf8_lossy(&human.stderr);
+    assert!(
+        notice.contains("still enforces the previous authorization policy")
+            && notice.contains("refused this caller"),
+        "a pending edit prints its notice on stderr in human mode\n{}",
+        describe(&human)
+    );
+    assert_eq!(
+        toml_at(&fixture.config_toml(), "users.me.permission_profiles"),
+        Some(&string_array(&["reader"])),
+        "the CLI must have saved config.toml directly:\n{}",
+        fixture.config_text()
+    );
+}
+
+/// A daemon whose authorization sections do not compile enforces deny-all
+/// and refuses every caller at the handshake, so the file is the only way to
+/// repair it: the CLI saves the edit and reports it as pending. The policy
+/// did not compile before the edit, so the compile guard lets it through.
+#[test]
+fn config_set_repairs_a_deny_all_daemon_through_the_file() {
+    // `users.me` names a permission profile the file does not define.
+    let fixture = Fixture::new("missing");
+    let _daemon = Daemon::start_expecting(&fixture, Handshake::Refuses(FORBIDDEN));
+
+    let output = config_set_json(&fixture, "users.me.permission_profiles", "admin");
+    assert!(
+        output.status.success(),
+        "a repair of a deny-all daemon falls back to the direct save\n{}",
+        describe(&output)
+    );
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["daemon"]["applied"], false, "{envelope}");
+    assert_eq!(envelope["daemon"]["pending_reload"], true, "{envelope}");
+    assert_eq!(envelope["daemon"]["reason"], "refused", "{envelope}");
+    assert_clean_stderr(&output);
+    assert_eq!(
+        toml_at(&fixture.config_toml(), "users.me.permission_profiles"),
+        Some(&string_array(&["admin"])),
+        "the CLI must have saved the repair:\n{}",
+        fixture.config_text()
     );
 }
 
@@ -1089,13 +1243,13 @@ fn config_set_reasserting_a_hand_edit_reaches_the_daemon() {
 /// next reload.
 #[test]
 fn config_set_leaves_no_uncompilable_policy_pending() {
-    let fixture = Fixture::new("reader");
-    let _daemon = Daemon::start(&fixture);
+    let fixture = Fixture::unmapped("admin");
+    let _daemon = Daemon::start_expecting(&fixture, Handshake::Refuses(AUTH_REQUIRED));
     let before = fixture.config_text();
 
-    // The daemon refuses a reader's config write, which would fall back to
-    // the direct save; a roster entry with no permission profile does not
-    // compile.
+    // The daemon refuses this process at the handshake, which would fall
+    // back to the direct save; a roster entry with no permission profile
+    // does not compile.
     let uid = fixture.other_uid().to_string();
     let output = config_set_json(&fixture, "users.bob.uid", &uid);
     assert!(
@@ -1344,4 +1498,155 @@ fn config_patch_rejected_by_the_daemon_fails_with_a_json_error() {
     if let Ok(live) = probe.config_get("users.bob.uid") {
         panic!("the daemon's live config must not gain users.bob: {live}");
     }
+}
+
+/// With no heartbeat naming a daemon, another process holding the config
+/// dir's ownership lock may be a daemon that is still starting, which takes
+/// that lock before it loads its configuration. The CLI then saves the edit
+/// and reports it as pending rather than as if no daemon ran.
+#[test]
+fn config_set_reports_pending_while_another_process_owns_the_configuration() {
+    let fixture = Fixture::new("admin");
+    assert!(
+        !fixture
+            .path()
+            .join("state")
+            .join("daemon_state.json")
+            .exists(),
+        "no heartbeat may name a daemon for this fixture"
+    );
+    let owner = ConfigOwnershipGuard::acquire(&fixture.data_dir())
+        .unwrap_or_else(|error| panic!("take the config dir's ownership lock: {error}"));
+
+    let output = config_set_json(&fixture, "users.me.permission_profiles", "reader");
+    assert!(
+        output.status.success(),
+        "an edit while another process owns the config dir falls back to the direct save\n{}",
+        describe(&output)
+    );
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["daemon"]["applied"], false, "{envelope}");
+    assert_eq!(envelope["daemon"]["pending_reload"], true, "{envelope}");
+    assert_eq!(
+        envelope["daemon"]["reason"], "owner_unconfirmed",
+        "{envelope}"
+    );
+    assert_clean_stderr(&output);
+    assert_eq!(
+        toml_at(&fixture.config_toml(), "users.me.permission_profiles"),
+        Some(&string_array(&["reader"])),
+        "the CLI must have saved config.toml directly:\n{}",
+        fixture.config_text()
+    );
+    drop(owner);
+}
+
+/// A patch that tests an authorization input and replaces another, which a
+/// daemon running as the admin `users.me` would otherwise take.
+fn patch_testing_an_authorization_input() -> Value {
+    json!([
+        {"op": "test", "path": "/permission_profiles/admin/admin", "value": true},
+        {"op": "replace", "path": "/users/me/permission_profiles", "value": ["reader"]}
+    ])
+}
+
+/// A patch the running daemon would commit applies its writes to the
+/// daemon's live configuration, while the CLI checked its `test` ops against
+/// its own copy of config.toml. A `test` op on an authorization input then
+/// fails the whole patch before the daemon is contacted, and nothing is
+/// saved.
+#[test]
+fn config_patch_testing_an_authorization_input_fails_while_a_daemon_runs() {
+    let fixture = Fixture::new("admin");
+    let daemon = Daemon::start(&fixture);
+    let before = fixture.config_text();
+
+    let output = config_patch_json(&fixture, &patch_testing_an_authorization_input());
+    assert!(
+        !output.status.success(),
+        "a patch whose `test` op cannot be checked where it applies must fail\n{}",
+        describe(&output)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a failed patch prints no envelope\n{}",
+        describe(&output)
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+        panic!("stderr is not a JSON error: {error}\n{}", describe(&output))
+    });
+    assert_eq!(error["code"], "op_not_supported", "{error}");
+    assert_eq!(error["path"], "permission_profiles.admin.admin", "{error}");
+    assert!(
+        error["message"].as_str().is_some_and(|message| {
+            message.contains("cannot be checked against the running daemon's live configuration")
+        }),
+        "the error must say why the `test` op was refused: {error}"
+    );
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "a refused patch must leave config.toml untouched"
+    );
+
+    let mut probe = daemon.probe();
+    let live = live_profiles_of_me(&mut probe);
+    assert!(
+        live.contains("admin") && !live.contains("reader"),
+        "the daemon's live roster must be unchanged: {live}"
+    );
+}
+
+/// With no daemon running, the patch is saved to the copy of config.toml its
+/// `test` ops were checked against, so they keep their meaning: one that
+/// holds lets the patch through, one that fails stops it.
+#[test]
+fn config_patch_testing_an_authorization_input_is_unchanged_without_a_daemon() {
+    let fixture = Fixture::new("admin");
+    assert!(
+        !fixture.socket().exists(),
+        "no daemon may serve this fixture"
+    );
+
+    let output = config_patch_json(&fixture, &patch_testing_an_authorization_input());
+    assert!(
+        output.status.success(),
+        "with no daemon a `test` op that holds lets the patch through\n{}",
+        describe(&output)
+    );
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["saved"], true, "{envelope}");
+    assert_eq!(envelope["results"][0]["op"], "test", "{envelope}");
+    assert!(
+        envelope.get("daemon").is_none(),
+        "with no daemon the envelope is today's: {envelope}"
+    );
+    assert_clean_stderr(&output);
+    assert_eq!(
+        toml_at(&fixture.config_toml(), "users.me.permission_profiles"),
+        Some(&string_array(&["reader"])),
+        "the CLI must have saved config.toml directly:\n{}",
+        fixture.config_text()
+    );
+
+    let before = fixture.config_text();
+    let failing = json!([
+        {"op": "test", "path": "/permission_profiles/admin/admin", "value": false},
+        {"op": "replace", "path": "/users/me/permission_profiles", "value": ["admin"]}
+    ]);
+    let output = config_patch_json(&fixture, &failing);
+    assert!(
+        !output.status.success(),
+        "a `test` op that fails stops the patch\n{}",
+        describe(&output)
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+        panic!("stderr is not a JSON error: {error}\n{}", describe(&output))
+    });
+    assert_eq!(error["code"], "validation_failed", "{error}");
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "a patch whose `test` op fails must leave config.toml untouched"
+    );
 }

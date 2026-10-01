@@ -848,10 +848,13 @@ fn patch_batch_is_delegatable(entries: usize, replayable: bool) -> bool {
 }
 
 /// The API error for an authorization edit that failed a `config patch`, in
-/// the daemon or before a local save: a rejection as invalid params, or a
-/// policy that would not compile, is a validation verdict; any other
-/// rejection, and an edit whose outcome is unknown (which names the property
-/// to check), is internal.
+/// the daemon or before a local save: a rejection as invalid params, a
+/// refusal of the principal the daemon bound, or a policy that would not
+/// compile, is a validation verdict (no code names a permission denial, and
+/// a refusal is a verdict on this edit, not a server fault); a `test` op the
+/// running daemon's live configuration could not be checked against is an
+/// unsupported op on its path; any other rejection, and an edit whose outcome
+/// is unknown (which names the property to check), is internal.
 #[cfg(feature = "agent-runtime")]
 fn daemon_commit_api_error(err: &anyhow::Error) -> ConfigApiError {
     use config_publication::CommitFailure;
@@ -864,8 +867,15 @@ fn daemon_commit_api_error(err: &anyhow::Error) -> ConfigApiError {
         Some(CommitFailure::Rejected { code, .. }) if *code == i64::from(INVALID_PARAMS) => {
             ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
         }
+        #[cfg(unix)]
+        Some(CommitFailure::Forbidden { .. }) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
         Some(CommitFailure::PolicyWouldNotCompile { .. }) => {
             ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
+        Some(CommitFailure::UncheckableTest { path }) => {
+            ConfigApiError::new(ConfigApiCode::OpNotSupported, message).with_path(path)
         }
         #[cfg(unix)]
         Some(CommitFailure::Unknown { path }) => {
@@ -9637,7 +9647,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 };
 
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership =
+                let offline_ownership =
                     if zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).is_some() {
                         match crate::alias_cli::route_agent_mutation(
                             &mut config,
@@ -9685,6 +9695,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
                 config.set_prop_persistent(&path, &selected_value)?;
+                // An offline agent route already holds the configuration's
+                // ownership lock, which no daemon can hold meanwhile.
+                let holds_config_ownership = offline_ownership.is_some();
                 let publication = if daemon_replays_write(&config, &path, &selected_value) {
                     let publication = Box::pin(config_publication::commit_set(
                         &before,
@@ -9692,6 +9705,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         &path,
                         &selected_value,
                         comment.as_deref(),
+                        holds_config_ownership,
                     ))
                     .await?;
                     // A daemon that applied the edit has already saved
@@ -9709,6 +9723,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         std::slice::from_ref(&path),
                         config_publication::PendingReason::NotReplayable,
                         true,
+                        holds_config_ownership,
                     )?;
                     Box::pin(config.save_dirty()).await?;
                     publication
@@ -9742,7 +9757,7 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
             ConfigCommands::Init { section, json } => {
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership = if let Some(("agents", alias)) = section
+                let offline_ownership = if let Some(("agents", alias)) = section
                     .as_deref()
                     .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
                 {
@@ -9818,13 +9833,15 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // OIDC entry: one it creates waits for the running daemon's
                 // next reload. It is classified before the save, so while a
                 // daemon runs an entry that breaks a policy that compiles
-                // saves nothing.
+                // saves nothing. An offline agent route already holds the
+                // configuration's ownership lock.
                 let publication = config_publication::classify_local_save(
                     &before,
                     &config,
                     &initialized,
                     config_publication::PendingReason::OfflineCommand,
                     true,
+                    offline_ownership.is_some(),
                 )?;
                 if !initialized.is_empty() {
                     Box::pin(config.save_dirty()).await?;
@@ -10007,7 +10024,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
 
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership = if ops.iter().any(|op| {
+                let offline_ownership = if ops.iter().any(|op| {
                     let op_name = op.get("op").and_then(|value| value.as_str());
                     let path = op.get("path").and_then(|value| value.as_str()).map(|path| {
                         path.strip_prefix('/')
@@ -10047,6 +10064,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // saved here instead.
                 let mut sets: Vec<(String, String)> = Vec::with_capacity(ops.len());
                 let mut replayable = true;
+                // The properties the patch's `test` ops checked, on this copy
+                // of config.toml. A daemon that commits the batch applies its
+                // writes to its live configuration instead.
+                let mut tested: Vec<String> = Vec::new();
 
                 for (idx, op) in ops.iter().enumerate() {
                     let object = match op.as_object() {
@@ -10281,6 +10302,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 );
                                 config_patch_fail_json_or_human(json, err, human)?;
                             }
+                            tested.push(path.clone());
                             serde_json::json!({
                                 "op": "test",
                                 "path": path,
@@ -10319,15 +10341,24 @@ Add pricing to the active provider profile or supply a catalog entry."
                     );
                     config_patch_fail_json_or_human(json, api_err, human)?;
                 }
+                // An offline agent route already holds the configuration's
+                // ownership lock, which no daemon can hold meanwhile.
+                let holds_config_ownership = offline_ownership.is_some();
                 let publication = if patch_batch_is_delegatable(sets.len(), replayable) {
                     let publication = match Box::pin(config_publication::commit_set_many(
-                        &before, &config, &sets,
+                        &before,
+                        &config,
+                        &sets,
+                        &tested,
+                        holds_config_ownership,
                     ))
                     .await
                     {
                         Ok(publication) => publication,
-                        // The daemon's verdict fails the whole patch, in
-                        // the same envelope its other failures use.
+                        // The daemon's verdict, or a `test` op that cannot be
+                        // checked where the daemon would apply the batch,
+                        // fails the whole patch, in the same envelope its
+                        // other failures use.
                         Err(err) => config_patch_fail_json_or_human(
                             json,
                             daemon_commit_api_error(&err),
@@ -10351,6 +10382,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         &touched,
                         config_publication::PendingReason::NotReplayable,
                         false,
+                        holds_config_ownership,
                     ) {
                         Ok(publication) => publication,
                         Err(err) => config_patch_fail_json_or_human(
@@ -16820,7 +16852,37 @@ mod tests {
                 Some("users.bob.uid"),
                 "an unknown outcome names the property to check"
             );
+
+            let forbidden: anyhow::Error = config_publication::CommitFailure::Forbidden {
+                message: "Principal is not granted config:update".into(),
+            }
+            .into();
+            let forbidden = daemon_commit_api_error(&forbidden);
+            assert_eq!(
+                forbidden.code,
+                ConfigApiCode::ValidationFailed,
+                "a refusal of the bound principal is a verdict on the edit, not a server fault"
+            );
+            assert!(
+                forbidden
+                    .message
+                    .contains("Principal is not granted config:update"),
+                "{}",
+                forbidden.message
+            );
         }
+
+        let uncheckable: anyhow::Error = config_publication::CommitFailure::UncheckableTest {
+            path: "users.bob.permission_profiles".into(),
+        }
+        .into();
+        let uncheckable = daemon_commit_api_error(&uncheckable);
+        assert_eq!(uncheckable.code, ConfigApiCode::OpNotSupported);
+        assert_eq!(
+            uncheckable.path.as_deref(),
+            Some("users.bob.permission_profiles"),
+            "the error names the `test` op's property"
+        );
 
         let uncompilable: anyhow::Error =
             config_publication::CommitFailure::PolicyWouldNotCompile {

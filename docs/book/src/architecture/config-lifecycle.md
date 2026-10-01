@@ -20,7 +20,7 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | Generated reference | `cargo mdbook refs` / `markdown-schema` | `docs/book/src/reference/config.md` at build time | Documentation only |
 | Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, deprecated `ZEROCLAW_WORKSPACE` | Environment only | Before `Config` exists |
 | Schema-mirror overrides | `ZEROCLAW_<lowercase_path>` with `__` for dots | In-memory only | Each `Config::load_or_init()` |
-| CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load or reload unless the current command uses the new in-memory value. An authorization edit (`[users]`, `[permission_profiles]`, `[oidc]`, `security.trust_daemon_uid`) made while this configuration's daemon runs is applied by the daemon, reported pending reload, or fails without saving when the daemon rejects or does not answer the edit, or when the edit would break a compiling policy |
+| CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load or reload unless the current command uses the new in-memory value. A running daemon may commit authorization edits at save time; see [Saved vs applied](#saved-vs-applied) |
 | RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | RPC context updates immediately; daemon-owned subsystems need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | `save_dirty()` to `config.toml` | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
 | Gateway config writes | Config API handlers and `persist_and_swap()` | `save_dirty()` to `config.toml` | Gateway-visible state updates immediately and the authorization policy is published at save time (under the daemon, the one RPC also enforces); daemon subsystems apply after reload |
@@ -112,41 +112,12 @@ editor reflect the write immediately, while the reload banner tells the operator
 that channels, providers, scheduler, or other daemon-owned components may still
 be running from the previous subsystem instance.
 
-Authorization sections are an exception to reload-bound CLI writes. The CLI
-treats this configuration's daemon as running only while the heartbeat file
-beside `config.toml` (`state/daemon_state.json`) is recent and, on Unix,
-names a live process; a daemon still starting, before its first heartbeat,
-counts as not running, so an edit made then may wait for its next reload or
-restart. With no such daemon, authorization writes behave as before and no
-endpoint is contacted for them, not even one an exported `ZEROCLAW_SOCKET`
-names. With the daemon running, `zeroclaw config set` or `config patch` hands
-an edit that writes or changes those sections to the daemon's RPC config path
-(`config/set`, or `config/set-many` for a patch) once the CLI has checked
-that the endpoint is that daemon's: on Unix, the socket's peer must be this
-account or root, and its process the one the heartbeat names. The daemon
-validates, saves, swaps the shared live configuration, and publishes the
-policy before the CLI reports the edit applied. It commits a patch that also
-writes other paths as one batch, so those paths take the RPC apply boundary
-too; the patch's `test` ops are checked against the CLI's on-disk copy, not
-the daemon's live configuration. An edit the daemon rejects, or a request it
-does not answer, fails the command and the CLI saves nothing.
-
-With the daemon running, the CLI instead saves the edit itself and reports it
-pending reload when the daemon refuses the caller, runs another release,
-fails the handshake, cannot be reached, or fails that identity check; when
-the endpoint is a named pipe (the CLI does not verify a named pipe's server,
-so on Windows it never sends an authorization edit over one); when the
-daemon's config methods do not take the write (clearing or masking a secret,
-a patch that creates a keyed-list row, a patch of more than 256 writes); and
-for `config init`, which never commits an authorization entry through the
-daemon. Before that save, the CLI refuses, saving nothing, only an edit that
-would turn a policy that compiles into one that does not, so with
-`config set` and `config init` a file whose policy already does not compile
-can still be repaired one field at a time; `config patch` validates the
-whole resulting configuration first, as it always has. So while a daemon
-runs, `config init users.<name>` and `config init oidc.<alias>` fail, since
-their entries cannot compile until filled in, and
-`config init permission_profiles.<name>` is saved and reported pending.
+Authorization sections (`[users]`, `[permission_profiles]`, `[oidc]`,
+`security.trust_daemon_uid`) are the exception: this configuration's running
+daemon commits a `zeroclaw config set` or `config patch` edit to them and
+publishes it at save time; when it does not, the CLI saves the file and
+reports the edit pending reload, or fails without saving. See
+[When authorization edits take effect](../security/authentication.md#when-authorization-edits-take-effect).
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
