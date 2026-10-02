@@ -1,24 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
-import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
+import { Link, useNavigate } from 'react-router-dom';
+import { Badge, Card, HelpTip } from '@/components/ui';
+import SopSourceEditor from '@/components/SopSourceEditor';
+import Code from '@/pages/Code';
+import { useWorkspaceVisible } from '@/components/layout/WorkspaceOutlet';
 import SopCanvas from './SopCanvas';
 import MarkdownEditor from '@/components/MarkdownEditor';
 import ToolPicker from '@/components/ToolPicker';
 import { PlannedCallsEditor } from '@/components/SopCalls';
-import SopStepList from '@/components/SopStepList';
 import { t } from '@/lib/i18n';
 import { loadAgentPickerSummaries } from '@/lib/agents';
 import {
-  listSops,
   listRuns,
-  getSopGraph,
   getRunOverlay,
   getSop,
   runSop,
   createSop,
   saveSop,
-  deleteSop,
   wireDraft,
   graphDraft,
   triggerSources,
@@ -30,7 +29,6 @@ import {
   sopExecutionModes,
   sopStepKinds,
   type WireRole,
-  type SopSummary,
   type SopGraph,
   type RunOverlay,
   type Sop,
@@ -101,39 +99,28 @@ function writeStepBinding(sop: Sop, toStep: number, toPin: string, value: string
   };
 }
 
-function loadStoredDraft(): Sop | null {
+function draftStorageKey(name: string | null) { return `${DRAFT_STORAGE_KEY}:${name ?? '@new'}`; }
+function loadStoredDraft(name: string | null): Sop | null {
   try {
-    const raw = sessionStorage.getItem(DRAFT_STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as Sop) : null;
-  } catch {
-    return null;
-  }
+    const raw = sessionStorage.getItem(draftStorageKey(name));
+    if (raw) return JSON.parse(raw) as Sop;
+    // Recover drafts made before drafts were scoped to each carousel item.
+    if (sessionStorage.getItem(DRAFT_EDITING_NAME_KEY) === name) {
+      const legacy = sessionStorage.getItem(DRAFT_STORAGE_KEY);
+      if (legacy) return JSON.parse(legacy) as Sop;
+    }
+  } catch { /* Optional recovery; the gateway remains the saved owner. */ }
+  return null;
 }
-
-function storeDraft(draft: Sop | null): void {
+function storeDraft(name: string | null, draft: Sop | null): void {
   try {
-    if (draft) sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
-    else sessionStorage.removeItem(DRAFT_STORAGE_KEY);
-  } catch {
-    // Storage is best-effort; a failure only loses cross-navigation recovery.
-  }
-}
-
-function loadStoredEditingName(): string | null {
-  try {
-    return sessionStorage.getItem(DRAFT_EDITING_NAME_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function storeEditingName(name: string | null): void {
-  try {
-    if (name !== null) sessionStorage.setItem(DRAFT_EDITING_NAME_KEY, name);
-    else sessionStorage.removeItem(DRAFT_EDITING_NAME_KEY);
-  } catch {
-    // Best-effort; a failure only degrades a post-reload rename into a fork.
-  }
+    if (draft) sessionStorage.setItem(draftStorageKey(name), JSON.stringify(draft));
+    else sessionStorage.removeItem(draftStorageKey(name));
+    if (sessionStorage.getItem(DRAFT_EDITING_NAME_KEY) === name) {
+      sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+      sessionStorage.removeItem(DRAFT_EDITING_NAME_KEY);
+    }
+  } catch { /* Optional draft recovery. */ }
 }
 
 function blankSop(name: string): Sop {
@@ -1334,7 +1321,7 @@ function StepInspector({
   );
 }
 
-const noop = () => {};
+
 
 /// Build a Manual-run payload skeleton from a SOP's step-1 input JSON Schema.
 /// Registry-driven: keys and placeholder value shapes come from the SOP's own
@@ -1442,211 +1429,17 @@ function ManualRunPanel({ name, sop }: { name: string; sop: Sop | null }) {
   );
 }
 
-// ── /sops ── read-only collection navigator. No selection, graph, overlay, or
-// mutation lives here; rows link to the addressable member view. Create is an
-// addressable action (/sops/new), not inline state.
-export function SopsList() {
-  const [sops, setSops] = useState<SopSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+// The focused editor owns one SOP draft; the workspace preserves it while
+// another SOP is selected. Fields, canvas, and applied source edit this draft.
+export function SopEditor({ editing, onSaved }: {
+  editing: string | null; onSaved: (name: string) => void;
+}) {
+  const editingRoute = editing;
+  const visible = useWorkspaceVisible();
+  const [assistantBusy, setAssistantBusy] = useState(false);
 
-  useEffect(() => {
-    let active = true;
-    listSops()
-      .then((list) => {
-        if (active) setSops(list);
-      })
-      .catch((e: unknown) => {
-        if (active) setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  return (
-    <div className="p-6 space-y-6 animate-fade-in">
-      <PageHeader
-        title={t('sops.title')}
-        description={t('sops.subtitle')}
-        actions={
-          <Link
-            to="/sops/new"
-            className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm text-[#0b1220] hover:bg-pc-accent-light"
-          >
-            <Plus className="h-4 w-4" aria-hidden /> {t('sops.new')}
-          </Link>
-        }
-      />
-      {error ? (
-        <Card>
-          <div className="text-status-error">{error}</div>
-        </Card>
-      ) : loading ? (
-        <Card>
-          <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
-        </Card>
-      ) : sops.length === 0 ? (
-        <Card>
-          <div className="text-pc-text-muted">{t('sops.empty')}</div>
-        </Card>
-      ) : (
-        <Card className="p-2">
-          <ul className="space-y-1">
-            {sops.map((s) => (
-              <li key={s.name}>
-                <Link
-                  to={`/sops/${encodeURIComponent(s.name)}`}
-                  className="block rounded px-3 py-2 text-sm text-pc-text hover:bg-pc-elevated"
-                >
-                  <div className="font-medium">{s.name}</div>
-                  {s.description ? (
-                    <div className="truncate text-xs text-pc-text-muted">{s.description}</div>
-                  ) : null}
-                </Link>
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-    </div>
-  );
-}
-
-// ── /sops/:name ── read-only member representation. Renders the SOP graph via
-// the same graph/get RPC the editor loads from, with no run-overlay tint: run
-// progress belongs to /runs, not the SOP resource. Edit and Delete are
-// addressable member actions, never inline editing.
-export function SopView() {
-  const { name = '' } = useParams();
-  const navigate = useNavigate();
-  const [graph, setGraph] = useState<SopGraph | null>(null);
-  const [viewSop, setViewSop] = useState<Sop | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
-
-  useEffect(() => {
-    if (!name) return;
-    let active = true;
-    setLoading(true);
-    Promise.all([getSopGraph(name), getSop(name)])
-      .then(([g, full]) => {
-        if (!active) return;
-        setGraph(g);
-        setViewSop(full);
-      })
-      .catch((e: unknown) => {
-        if (!active) return;
-        setError(e instanceof Error ? e.message : String(e));
-        setGraph(null);
-        setViewSop(null);
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [name]);
-
-  const onDelete = useCallback(() => {
-    deleteSop(name)
-      .then(() => navigate('/sops'))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, [name, navigate]);
-
-  return (
-    <div className="p-6 space-y-6 animate-fade-in">
-      <PageHeader
-        title={name}
-        description={viewSop?.description || t('sops.subtitle')}
-        actions={
-          <Link to="/sops" className="text-sm text-pc-accent hover:underline">
-            {t('sops.back_to_list')}
-          </Link>
-        }
-      />
-      {error ? (
-        <Card>
-          <div className="text-status-error">{error}</div>
-        </Card>
-      ) : null}
-      <ManualRunPanel name={name} sop={viewSop} />
-      <div>
-        <div className="mb-3 flex flex-wrap items-center gap-2">
-          {graph ? (
-            <Badge tone="neutral">
-              {graph.nodes.length} {t('sops.steps')}
-            </Badge>
-          ) : null}
-          <div className="ml-auto flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() => setLayer((l) => (l === 'visual' ? 'fields' : 'visual'))}
-              disabled={!graph}
-              className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
-            >
-              {layer === 'visual' ? t('sops.layer_fields') : t('sops.layer_visual')}
-            </button>
-            <Link
-              to={`/sops/${encodeURIComponent(name)}/edit`}
-              className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated"
-            >
-              {t('sops.edit')}
-            </Link>
-            <button
-              type="button"
-              onClick={onDelete}
-              className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-status-error hover:bg-pc-elevated"
-            >
-              <Trash2 className="h-4 w-4" aria-hidden /> {t('sops.delete')}
-            </button>
-          </div>
-        </div>
-        {loading ? (
-          <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
-        ) : graph ? (
-          <>
-            {layer === 'visual' && viewSop ? (
-              <SopCanvas
-                draft={viewSop}
-                graph={graph}
-                selectedStep={null}
-                readOnly
-                onSelectStep={noop}
-                onSelectTrigger={noop}
-                onAddStep={noop}
-                onConnect={noop}
-                onDisconnect={noop}
-                onConnectData={noop}
-                onDisconnectData={noop}
-              />
-            ) : (
-              <SopStepList graph={graph} />
-            )}
-            <DiagnosticsPanel graph={graph} />
-          </>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-// ── /sops/new and /sops/:name/edit ── the authoring surface. The draft is the
-// single source of edit state; graph projection comes from graphDraft/wireDraft
-// (never re-derived client-side). Captured-calls overlay is loaded from the
-// SOP's latest run to feed the pin-from-run flow in the step inspector.
-export function SopEditor() {
-  const { name: routeName } = useParams();
-  const editingRoute = routeName ?? null;
-  const navigate = useNavigate();
-
-  const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
-  const [editingName, setEditingName] = useState<string | null>(loadStoredEditingName);
+  const [draft, setDraft] = useState<Sop | null>(() => loadStoredDraft(editingRoute));
+  const [editingName, setEditingName] = useState<string | null>(editingRoute);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
   // Undo stack of pre-mutation draft snapshots. Every canvas edit (wire
   // connect/disconnect, data binding, node move) snapshots the draft here
@@ -1659,6 +1452,12 @@ export function SopEditor() {
   const [selectedTrigger, setSelectedTrigger] = useState<number | null>(null);
   const [triggerRegistry, setTriggerRegistry] = useState<TriggerSourceRegistry | null>(null);
   const [agentAliases, setAgentAliases] = useState<string[]>([]);
+  const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
+  const [sideTab, setSideTab] = useState<'source' | 'assistant'>('source');
+  const [assistantOpened, setAssistantOpened] = useState(false);
+  const [sourceDirty, setSourceDirty] = useState(false);
+  const [baseline, setBaseline] = useState<string | null>(null);
+  const dirty = draft !== null && JSON.stringify(draft) !== baseline;
   const [latestOverlay, setLatestOverlay] = useState<RunOverlay | null>(null);
 
   // Load the draft the route addresses: an existing SOP by name for edit, or a
@@ -1667,16 +1466,19 @@ export function SopEditor() {
   useEffect(() => {
     let active = true;
     if (editingRoute === null) {
-      setDraft((cur) => (cur && editingName === null ? cur : blankSop('')));
+      const blank = blankSop('');
+      setDraft((cur) => cur ?? blank);
+      setBaseline(JSON.stringify(blank));
       setEditingName(null);
       return;
     }
-    if (draft && editingName === editingRoute) return;
+
     getSop(editingRoute)
       .then((full) => {
         if (!active) return;
         setEditingName(full.name);
-        setDraft(full);
+        setBaseline(JSON.stringify(full));
+        setDraft((current) => current ?? full);
       })
       .catch((e: unknown) => {
         if (active) setSaveError(e instanceof Error ? e.message : String(e));
@@ -1688,19 +1490,15 @@ export function SopEditor() {
   }, [editingRoute]);
 
   useEffect(() => {
-    storeDraft(draft);
-    if (!draft) return;
+    if (baseline !== null) storeDraft(editingRoute, dirty ? draft : null);
+    if (!dirty && !sourceDirty) return;
     const warn = (e: BeforeUnloadEvent) => {
       e.preventDefault();
       e.returnValue = '';
     };
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
-  }, [draft]);
-
-  useEffect(() => {
-    storeEditingName(draft ? editingName : null);
-  }, [draft, editingName]);
+  }, [draft, dirty, sourceDirty, baseline, editingRoute]);
 
   useEffect(() => {
     let active = true;
@@ -1772,7 +1570,7 @@ export function SopEditor() {
   // Ctrl+Z / Cmd+Z undoes the last canvas edit while an editor is open, unless
   // the user is typing in an input where the browser's native undo should win.
   useEffect(() => {
-    if (!draft) return;
+    if (!draft || !visible) return;
     const onKey = (e: KeyboardEvent) => {
       if (!(e.key === 'z' || e.key === 'Z') || !(e.ctrlKey || e.metaKey) || e.shiftKey) return;
       const target = e.target as HTMLElement | null;
@@ -1783,7 +1581,7 @@ export function SopEditor() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [draft, undo]);
+  }, [draft, undo, visible]);
 
   const onConnect = useCallback(
     (from: number, to: number, kind: WireRole, portIndex?: number) => {
@@ -1891,19 +1689,18 @@ export function SopEditor() {
     setDraft((d) => (d ? updater(d) : d));
   }, []);
 
-  const close = useCallback(
-    (toName?: string) => {
-      undoStackRef.current = [];
-      setUndoDepth(0);
-      setDraft(null);
-      setEditingName(null);
-      navigate(toName ? `/sops/${encodeURIComponent(toName)}` : '/sops');
-    },
-    [navigate],
-  );
+  const close = useCallback(() => {
+    undoStackRef.current = [];
+    setUndoDepth(0);
+    setSaveError(null);
+    storeDraft(editingRoute, null);
+    if (editingRoute) void getSop(editingRoute).then((full) => { setDraft(full); setBaseline(JSON.stringify(full)); }).catch((e: Error) => setSaveError(e.message));
+    else { const blank = blankSop(''); setDraft(blank); setBaseline(JSON.stringify(blank)); }
+  }, [editingRoute]);
 
   const onSaveDraft = useCallback(() => {
-    if (!draft) return;
+    if (!draft || assistantBusy) return;
+    if (sourceDirty) { setSaveError(t("workspace.apply_source_first")); return; }
     setSaving(true);
     setSaveError(null);
     // Name authority, three cases:
@@ -1916,16 +1713,21 @@ export function SopEditor() {
     const isNew = editingName === null;
     if (!isNew && draft.name !== editingName) {
       setSaving(false);
-      setSaveError(`rename not supported: '${editingName}' cannot be saved as '${draft.name}'`);
+      setSaveError(t('workspace.rename_unsupported'));
       return;
     }
     const write = isNew ? createSop(draft) : saveSop(draft);
     const savedName = draft.name;
     write
-      .then(() => close(savedName))
+      .then(() => {
+        storeDraft(editingRoute, null);
+        setBaseline(JSON.stringify(draft));
+        setEditingName(savedName);
+        onSaved(savedName);
+      })
       .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)))
       .finally(() => setSaving(false));
-  }, [draft, editingName, close]);
+  }, [draft, editingName, editingRoute, onSaved, sourceDirty, assistantBusy]);
 
   const editorHandlers = draft
     ? {
@@ -1974,16 +1776,27 @@ export function SopEditor() {
     return (
       <div className="p-6">
         <Card>
-          <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
+          {saveError ? <p role="alert" className="text-sm text-status-error">{saveError}</p> : <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />}
         </Card>
       </div>
     );
   }
 
   return (
-    <div className="p-6 space-y-6 animate-fade-in">
-      <PageHeader title={t('sops.editor_title')} description={t('sops.subtitle')} />
-      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[20rem_minmax(0,1fr)]">
+    <div className="min-w-0 flex-1 space-y-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="mr-auto truncate text-lg font-medium">{draft.name || t('sops.new')}</h1>
+        <div role="tablist" aria-label={t('workspace.sop_editor')} className="flex gap-1 rounded-lg bg-pc-elevated p-1">
+          {(['visual', 'fields'] as const).map((value) => <button key={value} type="button" role="tab" aria-selected={layer === value} onClick={() => setLayer(value)} className={`rounded-md px-3 py-1 text-xs ${layer === value ? 'bg-pc-surface text-pc-text' : 'text-pc-text-muted'}`}>{t(`workspace.${value}`)}</button>)}
+        </div>
+        <button type="button" disabled={saving || sourceDirty} onClick={close} className="px-2 py-2 text-xs text-pc-text-muted disabled:opacity-40">{t('workspace.reset_source')}</button>
+        <button type="button" disabled={saving || sourceDirty || !dirty || assistantBusy} onClick={onSaveDraft} className="btn-primary flex items-center gap-2 px-3 py-2 text-xs disabled:opacity-40"><Save className="h-3.5 w-3.5" />{t(saving ? 'common.loading' : 'sops.save')}</button>
+      </div>
+      {saveError && <p role="alert" className="text-sm text-status-error">{saveError}</p>}
+      {sourceDirty && <p role="status" className="text-xs text-pc-text-muted">{t('workspace.apply_source_first')}</p>}
+      <div className="grid min-w-0 items-start gap-4 min-[900px]:grid-cols-[minmax(0,1fr)_minmax(18rem,0.65fr)]">
+        <div inert={sourceDirty || saving} className={`min-w-0 space-y-3 ${sourceDirty ? "opacity-50" : ""}`}>
+          {layer === 'fields' ? (
         <DraftSidebar
           draft={draft}
           saving={saving}
@@ -2001,18 +1814,9 @@ export function SopEditor() {
           onRemoveStep={editorHandlers.onRemoveStep}
           onMoveStep={editorHandlers.onMoveStep}
           onSave={onSaveDraft}
-          onCancel={() => close(editingName ?? undefined)}
+          onCancel={close}
         />
-        <div className="min-w-0 space-y-4">
-          <StepInspector
-            draft={draft}
-            selectedStep={selectedStep}
-            runCallsByStep={runCallsByStep}
-            agentAliases={agentAliases}
-            onStep={editorHandlers.onStep}
-            onRemoveStep={editorHandlers.onRemoveStep}
-            onMoveStep={editorHandlers.onMoveStep}
-          />
+          ) : <>
           {draftGraph ? (
             <SopCanvas
               draft={draft}
@@ -2034,7 +1838,34 @@ export function SopEditor() {
               canUndo={undoDepth > 0}
             />
           ) : null}
+            {draftGraph && <DiagnosticsPanel graph={draftGraph} />}
+            <details className="rounded-xl border border-pc-border p-3">
+              <summary className="cursor-pointer text-xs text-pc-text-muted">{t('workspace.step_details')}</summary>
+          <StepInspector
+            draft={draft}
+            selectedStep={selectedStep}
+            runCallsByStep={runCallsByStep}
+            agentAliases={agentAliases}
+            onStep={editorHandlers.onStep}
+            onRemoveStep={editorHandlers.onRemoveStep}
+            onMoveStep={editorHandlers.onMoveStep}
+          />
+            </details>
+          </>}
+          {editingName && <details className="rounded-xl border border-pc-border p-3">
+            <summary className="cursor-pointer text-xs text-pc-text-muted">{t('workspace.run_sop')}</summary>
+            <ManualRunPanel name={editingName} sop={draft} />
+          </details>}
         </div>
+        <aside aria-label={t('workspace.sop_code')} className="flex h-[36rem] min-w-0 flex-col overflow-hidden rounded-xl border border-pc-border bg-pc-surface min-[900px]:sticky min-[900px]:top-0">
+          <div role="tablist" aria-label={t('workspace.sop_code')} className="flex border-b border-pc-border px-2">
+            {(['source', 'assistant'] as const).map((value) => <button key={value} type="button" role="tab" aria-selected={sideTab === value} className={`px-3 py-3 text-xs ${sideTab === value ? 'text-pc-text border-b border-pc-accent' : 'text-pc-text-muted'}`} onClick={() => { setSideTab(value); if (value === 'assistant') setAssistantOpened(true); }}>{t(`workspace.${value}`)}</button>)}
+          </div>
+          <div hidden={sideTab !== 'source'} className="min-h-0 flex-1"><div className="flex h-full flex-col">
+            <SopSourceEditor draft={draft} storageKey={`${draftStorageKey(editingRoute)}:source`} onDirty={setSourceDirty} onApply={(next) => { pushUndo(draft); setDraft({ ...next, steps: next.steps.map((step) => ({ ...blankStep(step.number), ...step })) }); }} />
+          </div></div>
+          <div hidden={sideTab !== 'assistant'} className="min-h-0 flex-1">{assistantOpened && <Code embedded contextText={JSON.stringify(draft, null, 2)} onBusyChange={setAssistantBusy} onAttentionOpen={() => setSideTab('assistant')} attentionTarget={editingRoute ? `/sops/${encodeURIComponent(editingRoute)}` : "/sops/new"} />}</div>
+        </aside>
       </div>
     </div>
   );

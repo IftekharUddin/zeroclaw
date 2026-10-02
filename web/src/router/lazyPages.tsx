@@ -15,11 +15,7 @@ export const Canvas = lazy(() => import('../pages/Canvas'));
 export const AcpConsole = lazy(() => import('../pages/AcpConsole'));
 export const Quickstart = lazy(() => import('../pages/quickstart/Quickstart'));
 export const Skills = lazy(() => import('../pages/Skills'));
-export const SopsList = lazy(() => import('../pages/Sops').then((m) => ({ default: m.SopsList })));
-export const SopView = lazy(() => import('../pages/Sops').then((m) => ({ default: m.SopView })));
-export const SopEditor = lazy(() =>
-  import('../pages/Sops').then((m) => ({ default: m.SopEditor })),
-);
+export const SopWorkspace = lazy(() => import('../pages/SopWorkspace'));
 export const Runs = lazy(() => import('../pages/Runs'));
 export const RunDetail = lazy(() => import('../pages/RunDetail'));
 

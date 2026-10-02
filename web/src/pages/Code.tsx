@@ -1,8 +1,15 @@
-import { useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Link,
+  useSearchParams,
+  type SetURLSearchParams,
+  createSearchParams,
+} from "react-router-dom";
 import {
   ArrowUp,
-  Code2,
+  PanelLeft,
+  Plus,
+  Search,
   FileText,
   Folder,
   RefreshCw,
@@ -22,6 +29,13 @@ import {
   readAgentWorkspaceFile,
   type BrowseEntry,
 } from "@/lib/api";
+import { useDraft } from "@/hooks/useDraft";
+import {
+  loadCodeSelection,
+  resumeCodeSession,
+  saveCodeSelection,
+} from "@/lib/codeSelection";
+import { useWorkspaceSettings } from "@/components/WorkspaceSettings";
 import { t } from "@/lib/i18n";
 import { useWorkspaceVisible } from "@/components/layout/WorkspaceOutlet";
 import WorkspaceAttention from "@/components/layout/WorkspaceAttention";
@@ -55,21 +69,61 @@ interface Update {
   timeout_secs?: number;
 }
 
-export default function Code() {
+export default function Code({
+  embedded = false,
+  contextText,
+  onBusyChange,
+  attentionTarget,
+  onAttentionOpen,
+}: {
+  embedded?: boolean;
+  contextText?: string;
+  attentionTarget?: string;
+  onAttentionOpen?: () => void;
+  onBusyChange?: (busy: boolean) => void;
+}) {
   const visible = useWorkspaceVisible();
+  const openSettings = useWorkspaceSettings();
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
-  const [params, setParams] = useSearchParams();
+  const [routeParams, setRouteParams] = useSearchParams();
+  const [localParams, setLocalParams] = useState(
+    () => new URLSearchParams({ new: "1" }),
+  );
+  const params = embedded ? localParams : routeParams;
+  const setParams: SetURLSearchParams = useCallback(
+    (next, options) => {
+      if (embedded)
+        setLocalParams((current) =>
+          createSearchParams(typeof next === "function" ? next(current) : next),
+        );
+      else setRouteParams(next, options);
+    },
+    [embedded, setRouteParams],
+  );
   const [agents, setAgents] = useState<string[] | null>(null);
   const [available, setAvailable] = useState<boolean | null>(null);
-  const [alias, setAlias] = useState(params.get("agent") ?? "");
+  const [alias, setAlias] = useState(
+    params.get("agent") ?? (!embedded ? loadCodeSelection()?.agent : "") ?? "",
+  );
   const [session, setSession] = useState<CodeSession | null>(null);
   const [history, setHistory] = useState<
     (Session & { interaction_surface?: string })[]
   >([]);
   const [messages, setMessages] = useState<CodeMessage[]>([]);
   const [stream, setStream] = useState("");
-  const [prompt, setPrompt] = useState("");
+  const draftKey = `code.${attentionTarget ?? "workspace"}.${alias}.${session?.session_id ?? "new"}`;
+  const { draft, saveDraft, clearDraft } = useDraft(draftKey);
+  const [prompt, setPromptValue] = useState(draft);
+  const setPrompt = (value: string) => {
+    setPromptValue(value);
+    saveDraft(value);
+  };
+  useEffect(() => {
+    setPromptValue(draft);
+  }, [draftKey, draft]);
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [observing, setObserving] = useState(false);
@@ -224,6 +278,10 @@ export default function Code() {
     };
   }, [alias, available, connection]);
 
+  useEffect(() => {
+    onBusyChange?.(busy);
+  }, [busy, onBusyChange]);
+
   const requestedAgent = params.get("agent");
   useEffect(() => {
     if (
@@ -268,6 +326,7 @@ export default function Code() {
     if (client !== clientRef.current) throw new Error(t("code.disconnected"));
     sessionRef.current = next;
     setSession(next);
+    if (!embedded) saveCodeSelection(next.agent_alias, next.session_id);
     if (visibleRef.current)
       setParams({ agent: alias, session: next.session_id }, { replace: true });
     if (id) {
@@ -333,10 +392,40 @@ export default function Code() {
 
   const requestedSession = params.get("session");
   useEffect(() => {
+    if (!visible || !ready || requestedSession || params.has("new")) return;
+    if (sessionRef.current) {
+      setParams(
+        {
+          agent: sessionRef.current.agent_alias,
+          session: sessionRef.current.session_id,
+        },
+        { replace: true },
+      );
+      return;
+    }
+    const last = resumeCodeSession(history, agents ?? []);
+    if (last?.agent_alias)
+      setParams(
+        { agent: last.agent_alias, session: last.session_id },
+        { replace: true },
+      );
+    else if (alias) setParams({ agent: alias, new: "1" }, { replace: true });
+  }, [
+    visible,
+    ready,
+    requestedSession,
+    params,
+    history,
+    agents,
+    alias,
+    setParams,
+  ]);
+  useEffect(() => {
     if (
       !visible ||
       !ready ||
       !requestedSession ||
+      !clientRef.current?.connected ||
       sessionRef.current?.session_id === requestedSession
     )
       return;
@@ -358,7 +447,7 @@ export default function Code() {
     });
     // The URL is a selection request, not a second owner of session state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, requestedSession, visible]);
+  }, [ready, requestedSession, visible, alias]);
 
   const send = async () => {
     if (!prompt.trim() || !ready || busy) return;
@@ -373,6 +462,7 @@ export default function Code() {
       const current = sessionRef.current ?? (await openSession());
       setMessages((messages) => [...messages, { role: "user", content: text }]);
       setPrompt("");
+      clearDraft();
       // The RPC terminal notification is authoritative. The request response
       // may arrive later and must not release the next turn prematurely.
       await client?.request(
@@ -411,235 +501,344 @@ export default function Code() {
   };
 
   return (
-    <div className="flex min-h-full flex-col p-4 sm:p-6 gap-4">
-      {!visible && (approval || question) && (
-        <WorkspaceAttention
-          to={`/code?${new URLSearchParams({ agent: alias, ...(session ? { session: session.session_id } : {}) })}`}
-          label={t("nav.code")}
-        />
-      )}
-      <div className="flex flex-wrap items-center gap-3">
-        <Code2 className="h-5 w-5 text-pc-accent" />
-        <h2 className="text-lg font-semibold">{t("nav.code")}</h2>
-        <select
-          aria-label={t("code.agent")}
-          value={alias}
-          disabled={busy || !agents?.length}
-          onChange={(event) => {
-            setParams({ agent: event.target.value }, { replace: true });
-            setAlias(event.target.value);
-          }}
-          className="input-electric p-2 text-sm max-w-48"
-        >
-          {(agents ?? []).map((agent) => (
-            <option key={agent}>{agent}</option>
-          ))}
-        </select>
-        <select
-          aria-label={t("code.history")}
-          value={session?.session_id ?? ""}
-          disabled={!ready || busy}
-          onChange={(event) => {
-            const id = event.target.value;
-            if (!id) {
-              setParams({ agent: alias }, { replace: true });
-              sessionRef.current = null;
-              setSession(null);
-              setMessages([]);
-              setStream("");
-              return;
-            }
-            setBusy(true);
-            void openSession(id).catch((error: Error) => {
-              setError(error.message);
-              setBusy(false);
-            });
-          }}
-          className="input-electric p-2 text-sm max-w-60"
-        >
-          <option value="">{t("code.new_session")}</option>
-          {history
-            .filter(
-              (item) =>
-                item.agent_alias === alias &&
-                item.interaction_surface === "zerocode_code",
-            )
-            .map((item) => (
-              <option key={item.session_id} value={item.session_id}>
-                {new Date(item.last_activity).toLocaleString()} ·{" "}
-                {item.session_id.slice(0, 8)}
-              </option>
-            ))}
-        </select>
-        <span role="status" className="text-xs text-pc-text-muted">
-          {t(
-            available === false
-              ? "code.offline"
-              : busy
-                ? "code.working"
-                : ready
-                  ? "code.ready"
-                  : "code.connecting",
-          )}
-        </span>
-        <Link
-          to={`/config/agents/${encodeURIComponent(alias)}`}
-          className="ml-auto flex items-center gap-2 text-sm text-pc-text-muted"
-        >
-          <Settings className="h-4 w-4" />
-          {t("nav.feature_settings")}
-        </Link>
-      </div>
-      {available === false && (
-        <div className="rounded-lg border border-pc-border p-4 text-sm">
-          {t("code.unavailable")}{" "}
-          <Link to="/config/gateway" className="text-pc-accent">
-            {t("nav.feature_settings")}
-          </Link>
-        </div>
-      )}
-      {error && (
-        <div
-          role="alert"
-          className="flex flex-wrap items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/5 p-3 text-sm text-status-error"
-        >
-          {error}
+    <div className="relative flex h-full min-h-0">
+      {!embedded && (
+        <>
           <button
             type="button"
-            disabled={busy}
-            onClick={() => setConnection((value) => value + 1)}
-            className="underline"
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            aria-label={t("code.history")}
+            aria-expanded={sidebarOpen}
+            className="absolute top-3 left-3 z-20 rounded-lg border border-pc-border bg-pc-surface p-2 md:hidden"
           >
-            {t("code.reconnect")}
+            <PanelLeft className="h-4 w-4" />
           </button>
-        </div>
-      )}
-      <div className="grid flex-1 min-h-0 gap-4 xl:grid-cols-[minmax(20rem,0.9fr)_minmax(0,1.1fr)]">
-        <section
-          className="flex flex-col min-h-[28rem] rounded-xl border border-pc-border bg-pc-surface overflow-hidden"
-          aria-label={t("code.conversation")}
-        >
-          <div className="flex-1 max-h-[60vh] overflow-y-auto p-4 space-y-4">
-            {messages.length === 0 && (
-              <div className="py-8">
-                <h3 className="font-medium">{t("code.start_title")}</h3>
-                <p className="mt-2 text-sm text-pc-text-muted">
-                  {t("code.start_hint")}
-                </p>
-              </div>
-            )}
-            {messages.map((message, index) =>
-              message.role === "tool" ||
-              message.kind === "tool_call" ||
-              message.kind === "tool_result" ? (
-                <details
-                  key={index}
-                  className="rounded-md bg-pc-elevated p-2 text-xs"
-                >
-                  <summary className="cursor-pointer font-mono">
-                    {message.tool_name || t("acp.tool_call")}
-                  </summary>
-                  <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words">
-                    {message.content}
-                  </pre>
-                </details>
-              ) : (
-                <div
-                  key={index}
-                  className={
-                    message.role === "user"
-                      ? "rounded-lg bg-pc-elevated p-3 text-sm whitespace-pre-wrap"
-                      : "chat-markdown text-sm break-words"
-                  }
-                >
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {message.content}
-                  </ReactMarkdown>
-                </div>
-              ),
-            )}
-            {stream && (
-              <div className="chat-markdown text-sm break-words">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {stream}
-                </ReactMarkdown>
-              </div>
-            )}
-            <div ref={endRef} />
-          </div>
-          {approval && (
-            <ApprovalBanner
-              pending={approval}
-              onRespond={(decision) => void respondApproval(decision)}
+          {sidebarOpen && (
+            <button
+              type="button"
+              className="absolute inset-0 z-20 bg-black/40 md:hidden"
+              aria-label={t("common.close")}
+              onClick={() => setSidebarOpen(false)}
             />
           )}
-          {question && (
-            <CodeQuestion
-              key={question.id}
-              request={question}
-              onRespond={(result) => {
-                clientRef.current?.respond(question.id, result);
-                setQuestion(null);
-              }}
-            />
-          )}
-          <form
-            className="border-t border-pc-border p-3"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void send();
-            }}
+          <aside
+            aria-label={t("code.history")}
+            className={`${sidebarOpen ? "absolute inset-y-0 left-0 z-30 flex" : "hidden"} w-60 shrink-0 flex-col border-r border-pc-border bg-pc-surface md:static md:flex`}
           >
-            <textarea
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              rows={3}
-              aria-label={t("code.prompt")}
-              placeholder={t("code.prompt")}
-              disabled={!ready}
-              className="input-electric w-full resize-y p-3 text-sm"
-              onKeyDown={(event) => {
-                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                  event.preventDefault();
-                  void send();
-                }
-              }}
-            />
-            <div className="mt-2 flex items-center justify-between gap-2">
-              <p className="text-xs text-pc-text-muted">
-                {t("code.send_hint")}
-              </p>
-              {busy ? (
-                <button
-                  type="button"
-                  className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
-                  onClick={() => {
-                    if (session)
-                      void clientRef.current
-                        ?.request("session/cancel", {
-                          session_id: session.session_id,
-                        })
-                        .catch((error: Error) => setError(error.message));
-                  }}
-                >
-                  <Square className="h-4 w-4" />
-                  {t("acp.cancel")}
-                </button>
-              ) : (
-                <button
-                  disabled={!ready || !prompt.trim()}
-                  className="btn-primary flex items-center gap-2 px-3 py-2 text-sm disabled:opacity-40"
-                >
-                  <Send className="h-4 w-4" />
-                  {t("agent.send")}
-                </button>
+            <div className="flex items-center justify-between px-4 py-4">
+              <h2 className="text-xs font-medium text-pc-text-muted">
+                {t("code.history")}
+              </h2>
+              <button
+                type="button"
+                disabled={!ready || busy}
+                onClick={() => {
+                  setParams({ agent: alias, new: "1" }, { replace: true });
+                  sessionRef.current = null;
+                  setSession(null);
+                  setMessages([]);
+                  setStream("");
+                  setSidebarOpen(false);
+                }}
+                aria-label={t("code.new_session")}
+                className="rounded p-1 text-pc-text-muted hover:text-pc-text disabled:opacity-40"
+              >
+                <Plus className="h-4 w-4" />
+              </button>
+            </div>
+            <label className="mx-3 mb-3 flex items-center gap-2 rounded-lg bg-pc-elevated px-3 py-2">
+              <Search className="h-3.5 w-3.5 text-pc-text-muted" />
+              <input
+                aria-label={t("home.search_sessions")}
+                placeholder={t("home.search_sessions")}
+                value={sessionQuery}
+                onChange={(e) => setSessionQuery(e.target.value)}
+                className="min-w-0 w-full bg-transparent text-xs outline-none"
+              />
+            </label>
+            <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+              {history
+                .filter(
+                  (item) =>
+                    item.interaction_surface === "zerocode_code" &&
+                    `${item.name} ${item.agent_alias} ${item.session_id}`
+                      .toLowerCase()
+                      .includes(sessionQuery.toLowerCase()),
+                )
+                .sort((a, b) => b.last_activity.localeCompare(a.last_activity))
+                .map((item) => (
+                  <button
+                    key={item.session_id}
+                    type="button"
+                    aria-current={
+                      session?.session_id === item.session_id
+                        ? "page"
+                        : undefined
+                    }
+                    disabled={busy || !ready}
+                    onClick={() => {
+                      setParams(
+                        {
+                          agent: item.agent_alias ?? alias,
+                          session: item.session_id,
+                        },
+                        { replace: true },
+                      );
+                      setSidebarOpen(false);
+                    }}
+                    className={`mb-1 w-full rounded-lg px-3 py-3 text-left text-sm disabled:opacity-50 ${session?.session_id === item.session_id ? "bg-pc-elevated text-pc-text" : "text-pc-text-secondary hover:bg-pc-elevated/60"}`}
+                  >
+                    <span className="block truncate">
+                      {item.name ||
+                        `${item.agent_alias} · ${item.session_id.slice(0, 8)}`}
+                    </span>
+                    <span className="mt-1 block text-xs text-pc-text-faint">
+                      {new Date(item.last_activity).toLocaleDateString()}
+                    </span>
+                  </button>
+                ))}
+              {!history.some(
+                (item) => item.interaction_surface === "zerocode_code",
+              ) && (
+                <p className="p-3 text-xs text-pc-text-muted">
+                  {t("workspace.no_code_sessions")}
+                </p>
               )}
             </div>
-          </form>
-        </section>
-        {alias && available && (
-          <CodeFiles key={alias} alias={alias} refresh={refresh} />
+            {busy && (
+              <p className="p-3 text-xs text-pc-text-muted">
+                {t("code.finish_before_switch")}
+              </p>
+            )}
+          </aside>
+        </>
+      )}
+      <div className="flex min-w-0 flex-1 flex-col gap-3 overflow-y-auto p-3 sm:p-5">
+        {(!visible || embedded) && (approval || question) && (
+          <WorkspaceAttention
+            to={
+              attentionTarget ??
+              `/code?${new URLSearchParams({ agent: alias, ...(session ? { session: session.session_id } : {}) })}`
+            }
+            label={t("nav.code")}
+            onOpen={onAttentionOpen}
+          />
         )}
+        <div className={`flex flex-wrap items-center gap-3 ${embedded ? "" : "pl-10 md:pl-0"}`}>
+          <select
+            aria-label={t("code.agent")}
+            value={alias}
+            disabled={busy || !agents?.length}
+            onChange={(event) => {
+              setParams(
+                { agent: event.target.value, new: "1" },
+                { replace: true },
+              );
+              setAlias(event.target.value);
+            }}
+            className="input-electric p-2 text-sm max-w-48"
+          >
+            {(agents ?? []).map((agent) => (
+              <option key={agent}>{agent}</option>
+            ))}
+          </select>
+          <span role="status" className="text-xs text-pc-text-muted">
+            {t(
+              available === false
+                ? "code.offline"
+                : busy
+                  ? "code.working"
+                  : ready
+                    ? "code.ready"
+                    : "code.connecting",
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={() =>
+              openSettings(`/config/agents/${encodeURIComponent(alias)}`)
+            }
+            aria-label={`${t("workspace.settings")}: ${alias}`}
+            className="ml-auto rounded-lg p-2 text-pc-text-muted hover:bg-pc-elevated"
+          >
+            <Settings className="h-4 w-4" />
+          </button>
+        </div>
+        {available === false && (
+          <div className="rounded-lg border border-pc-border p-4 text-sm">
+            {t("code.unavailable")}{" "}
+            <Link to="/config/gateway" className="text-pc-accent">
+              {t("nav.feature_settings")}
+            </Link>
+          </div>
+        )}
+        {error && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/5 p-3 text-sm text-status-error"
+          >
+            {error}
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => setConnection((value) => value + 1)}
+              className="underline"
+            >
+              {t("code.reconnect")}
+            </button>
+          </div>
+        )}
+        <div className="flex flex-1 min-h-0 flex-col gap-3">
+          <section
+            className="flex flex-1 flex-col min-h-[20rem] overflow-hidden"
+            aria-label={t("code.conversation")}
+          >
+            <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
+              {messages.length === 0 && (
+                <div className="py-8">
+                  <h3 className="font-medium">{t("code.start_title")}</h3>
+                  <p className="mt-2 text-sm text-pc-text-muted">
+                    {t("code.start_hint")}
+                  </p>
+                </div>
+              )}
+              {messages.map((message, index) =>
+                message.role === "tool" ||
+                message.kind === "tool_call" ||
+                message.kind === "tool_result" ? (
+                  <details
+                    key={index}
+                    className="rounded-md bg-pc-elevated p-2 text-xs"
+                  >
+                    <summary className="cursor-pointer font-mono">
+                      {message.tool_name || t("acp.tool_call")}
+                    </summary>
+                    <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words">
+                      {message.content}
+                    </pre>
+                  </details>
+                ) : (
+                  <div
+                    key={index}
+                    className={
+                      message.role === "user"
+                        ? "rounded-lg bg-pc-elevated p-3 text-sm whitespace-pre-wrap"
+                        : "chat-markdown text-sm break-words"
+                    }
+                  >
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {message.content}
+                    </ReactMarkdown>
+                  </div>
+                ),
+              )}
+              {stream && (
+                <div className="chat-markdown text-sm break-words">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {stream}
+                  </ReactMarkdown>
+                </div>
+              )}
+              <div ref={endRef} />
+            </div>
+            {approval && (
+              <ApprovalBanner
+                pending={approval}
+                onRespond={(decision) => void respondApproval(decision)}
+              />
+            )}
+            {question && (
+              <CodeQuestion
+                key={question.id}
+                request={question}
+                onRespond={(result) => {
+                  clientRef.current?.respond(question.id, result);
+                  setQuestion(null);
+                }}
+              />
+            )}
+            <form
+              className="border-t border-pc-border p-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void send();
+              }}
+            >
+              {contextText && (
+                <button
+                  type="button"
+                  className="mb-2 text-xs text-pc-accent"
+                  onClick={() =>
+                    setPrompt(
+                      `${prompt}\n\n${t("workspace.sop_definition")}:\n\`\`\`json\n${contextText}\n\`\`\``.trim(),
+                    )
+                  }
+                >
+                  {t("workspace.insert_sop")}
+                </button>
+              )}
+              <textarea
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                rows={3}
+                aria-label={t("code.prompt")}
+                placeholder={t("code.prompt")}
+                disabled={!ready}
+                className="input-electric w-full resize-y p-3 text-sm"
+                onKeyDown={(event) => {
+                  if (
+                    (event.metaKey || event.ctrlKey) &&
+                    event.key === "Enter"
+                  ) {
+                    event.preventDefault();
+                    void send();
+                  }
+                }}
+              />
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <p className="text-xs text-pc-text-muted">
+                  {t("code.send_hint")}
+                </p>
+                {busy ? (
+                  <button
+                    type="button"
+                    className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
+                    onClick={() => {
+                      if (session)
+                        void clientRef.current
+                          ?.request("session/cancel", {
+                            session_id: session.session_id,
+                          })
+                          .catch((error: Error) => setError(error.message));
+                    }}
+                  >
+                    <Square className="h-4 w-4" />
+                    {t("acp.cancel")}
+                  </button>
+                ) : (
+                  <button
+                    disabled={!ready || !prompt.trim()}
+                    className="btn-primary flex items-center gap-2 px-3 py-2 text-sm disabled:opacity-40"
+                  >
+                    <Send className="h-4 w-4" />
+                    {t("agent.send")}
+                  </button>
+                )}
+              </div>
+            </form>
+          </section>
+          {!embedded && alias && available && (
+            <details
+              className="shrink-0 rounded-xl border border-pc-border"
+              open
+            >
+              <summary className="cursor-pointer px-4 py-2 text-xs text-pc-text-muted">
+                {t("code.files")}
+              </summary>
+              <CodeFiles key={alias} alias={alias} refresh={refresh} />
+            </details>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -693,7 +892,6 @@ function CodeFiles({ alias, refresh }: { alias: string; refresh: number }) {
       aria-label={t("code.files")}
     >
       <div className="flex items-center gap-2 border-b border-pc-border p-3">
-        <h3 className="text-sm font-medium">{t("code.files")}</h3>
         <span className="ml-auto text-xs text-pc-text-muted">
           {t("code.read_only")}
         </span>
@@ -711,10 +909,10 @@ function CodeFiles({ alias, refresh }: { alias: string; refresh: number }) {
           {error}
         </p>
       )}
-      <div className="grid sm:grid-cols-[10rem_minmax(0,1fr)] min-h-[28rem]">
+      <div className="grid sm:grid-cols-[10rem_minmax(0,1fr)] min-h-[10rem]">
         <nav
           aria-label={t("code.files")}
-          className="border-b sm:border-b-0 sm:border-r border-pc-border p-2 max-h-[60vh] overflow-auto"
+          className="border-b sm:border-b-0 sm:border-r border-pc-border p-2 max-h-60 overflow-auto"
         >
           {path && (
             <button
@@ -762,7 +960,7 @@ function CodeFiles({ alias, refresh }: { alias: string; refresh: number }) {
                 readOnly
                 editable={false}
                 theme={theme === "light" ? githubLight : oneDark}
-                height="55vh"
+                height="14rem"
                 aria-label={selected}
                 basicSetup={{
                   lineNumbers: true,

@@ -7,15 +7,18 @@ import { t } from "@/lib/i18n";
 export default function WorkspaceAttention({
   to,
   label,
+  onOpen,
 }: {
   to: string;
   label: string;
+  onOpen?: () => void;
 }) {
   const target = document.getElementById("workspace-attention");
   return target
     ? createPortal(
         <div role="status"><Link
           to={to}
+          onClick={onOpen}
           className="flex items-center gap-2 border-b border-pc-border bg-pc-elevated px-4 py-2 text-sm text-pc-accent"
         >
           <Bell className="h-4 w-4 shrink-0" />

@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import Sidebar from '@/components/layout/Sidebar';
+import WorkspaceSettings from '@/components/WorkspaceSettings';
 import Header from '@/components/layout/Header';
 import ReloadBanner from '@/components/layout/ReloadBanner';
 import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
@@ -11,15 +11,8 @@ import { t } from '@/lib/i18n';
 import { routeTitleKey } from '@/lib/navigation';
 
 export default function Layout() {
-  const { pathname, search } = useLocation();
+  const { pathname } = useLocation();
   const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-
-  // Close the mobile drawer on route change.
-  useEffect(() => {
-    setSidebarOpen(false);
-  }, [pathname, search]);
-
   // Per-route browser tab title.
   useEffect(() => {
     const seg = pathname.split('/').filter(Boolean);
@@ -37,17 +30,9 @@ export default function Layout() {
   }, [pathname]);
 
   return (
-    <div className="min-h-screen bg-pc-base text-pc-text">
-      {/* Fixed slim icon rail (desktop) + drawer (mobile). */}
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-
-      {/* Main area — offset by the fixed 56px rail on desktop, full-width on
-          mobile. The rail is always slim, so the offset is constant. */}
-      <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
-        <Header
-          onMenuToggle={() => setSidebarOpen((v) => !v)}
-          onOpenPalette={openPalette}
-        />
+    <WorkspaceSettings><div className="min-h-screen bg-pc-base text-pc-text">
+      <div className="flex h-dvh min-w-0 flex-col">
+        <Header onOpenPalette={openPalette} />
         <ReloadBanner />
         <UnsavedChangesBanner />
         <div id="workspace-attention" />
@@ -66,6 +51,6 @@ export default function Layout() {
       {/* Command palette — mounted once for the whole app. Toggled globally
           via ⌘K / Ctrl+K and from the Header search trigger. */}
       <CommandPalette open={paletteOpen} onClose={closePalette} />
-    </div>
+    </div></WorkspaceSettings>
   );
 }

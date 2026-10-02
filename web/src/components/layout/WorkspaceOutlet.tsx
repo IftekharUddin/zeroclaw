@@ -2,7 +2,7 @@ import { createContext, useContext, useRef, type ReactNode } from "react";
 import { useLocation, useOutlet } from "react-router-dom";
 import { ErrorBoundary } from "@/App";
 
-const VisibleWorkspace = createContext(true);
+export const VisibleWorkspace = createContext(true);
 export const useWorkspaceVisible = () => useContext(VisibleWorkspace);
 
 /** Live work belongs to the app session, not the currently selected page.
@@ -16,12 +16,12 @@ export default function WorkspaceOutlet() {
     ? "chat"
     : pathname === "/code"
       ? "code"
-      : null;
-  const mounted = useRef<Partial<Record<"chat" | "code", ReactNode>>>({});
+      : pathname === "/sops" || pathname.startsWith("/sops/") ? "sop" : null;
+  const mounted = useRef<Partial<Record<"chat" | "code" | "sop", ReactNode>>>({});
   if (active) mounted.current[active] = outlet;
   return (
     <>
-      {(["chat", "code"] as const).map((key) => (
+      {(["chat", "code", "sop"] as const).map((key) => (
         <div key={key} hidden={active !== key} className="h-full">
           <VisibleWorkspace.Provider value={active === key}>
             <ErrorBoundary>{mounted.current[key]}</ErrorBoundary>

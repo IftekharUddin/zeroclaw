@@ -300,16 +300,11 @@ fs.mkdirSync(out, { recursive: true });
     console.error("PAGE ERROR:", e.message);
   });
   await page.goto(appUrl);
-  await page.getByRole("heading", { name: "Your workspace" }).waitFor();
-  await page.getByText("Plan the next release", { exact: true }).waitFor();
+  for (const name of ["Agent", "Code", "S.O.P"]) {
+    await page.getByRole("link", { name, exact: true }).waitFor();
+  }
+  assert.equal(await page.getByRole("navigation", { name: "Primary" }).count(), 0);
   await page.screenshot({ path: out + "/home-desktop.png", fullPage: true });
-  await page.getByText("Plan the next release", { exact: true }).click();
-  await page.getByRole("dialog", { name: "Session", exact: true }).waitFor();
-  await page
-    .getByText("Let’s start with the release checklist.", { exact: true })
-    .waitFor();
-  await page.keyboard.press("Escape");
-  await page.getByRole("dialog").waitFor({ state: "hidden" });
   await page.keyboard.press("Control+k");
   await page
     .getByRole("textbox", { name: "Search features, sessions, settings…" })
@@ -328,11 +323,10 @@ fs.mkdirSync(out, { recursive: true });
     path: out + "/settings-search-result.png",
     fullPage: true,
   });
-  await page.keyboard.press("Control+k");
-  await page
-    .getByRole("textbox", { name: "Search features, sessions, settings…" })
-    .fill("Code");
-  await page.getByRole("option").filter({ hasText: "Code" }).first().click();
+  assert.equal(new URL(page.url()).pathname, "/");
+  await page.keyboard.press("Escape");
+  await page.getByRole("dialog", { name: "Settings", exact: true }).waitFor({ state: "hidden" });
+  await page.getByRole("link", { name: "Code", exact: true }).click();
   await page
     .getByRole("textbox", { name: "Describe a code change or ask a question…" })
     .waitFor();
@@ -348,7 +342,7 @@ fs.mkdirSync(out, { recursive: true });
   await page.waitForTimeout(250);
   await page.screenshot({ path: out + "/code-approval.png", fullPage: true });
   await page.getByRole("link", { name: "Home", exact: true }).first().click();
-  await page.getByRole("heading", { name: "Your workspace" }).waitFor();
+  await page.getByRole("link", { name: "Agent", exact: true }).waitFor();
   assert.equal(codeRunning, true);
   await page.getByRole("link", { name: "Needs your attention · Code" }).click();
   await page.getByText("Run project tests", { exact: true }).waitFor();
@@ -367,9 +361,8 @@ fs.mkdirSync(out, { recursive: true });
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   await page.screenshot({ path: out + "/code-mobile.png", fullPage: true });
-  await page.getByRole("button", { name: "Open menu" }).click();
   await page.getByRole("link", { name: "Home", exact: true }).last().click();
-  await page.getByRole("heading", { name: "Your workspace" }).waitFor();
+  await page.getByRole("link", { name: "Agent", exact: true }).waitFor();
   await page.screenshot({ path: out + "/home-mobile.png", fullPage: true });
   assert.equal(
     await page.evaluate(
@@ -377,21 +370,17 @@ fs.mkdirSync(out, { recursive: true });
     ),
     true,
   );
-  // A cold, unconfigured daemon must not advertise actions that cannot run.
+  // Home keeps the three entry points; unavailable workspaces offer setup.
   capabilities = false;
+  await page.getByRole("link", { name: "Code", exact: true }).click();
   await page.reload();
   await page.getByRole("link", { name: "Quickstart", exact: true }).waitFor();
-  assert.equal(
-    await page.getByRole("link", { name: "Open code workspace" }).count(),
-    0,
-  );
-  await page.getByText("Plan the next release", { exact: true }).waitFor();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   capabilities = true;
   await page.evaluate(() => localStorage.setItem('zeroclaw-theme', JSON.stringify({ theme: 'light', accent: 'cyan' })));
   await page.setViewportSize({ width: 1440, height: 980 });
   await page.reload();
-  await page.getByRole('link', { name: 'Open code workspace' }).waitFor();
-  await page.getByText('Plan the next release', { exact: true }).waitFor();
+  await page.getByRole('link', { name: 'Code', exact: true }).waitFor();
   await page.screenshot({ path: out + '/home-light.png', fullPage: true });
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ passed: true, codeSockets, evidence: out }));

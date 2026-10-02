@@ -22,48 +22,54 @@ cargo web install       # npm install in web/
 
 ## Workspace navigation
 
-The home page (`/`) shows recent sessions, current web/code tasks and workflow
-runs, and actions supported by the connected daemon. Availability comes from
-`GET /api/workspace`, which resolves configured agents with the setup readiness
-checks and probes the local RPC listener. An unavailable service does not hide
-history from other services. Operational metrics and channel, memory, cost, and
-health tabs live at `/system`; existing `/?tab=...` bookmarks still work.
+Home (`/`) offers **Agent**, **Code**, and **S.O.P**. There is no global navigation
+rail. A compact header switches workspaces and exposes search; appearance,
+language, and sign-out live in its overflow menu. Operational pages remain
+available through search and their existing URLs.
 
-![Home with recent sessions and running work](assets/workspace-home.png)
+Agent resumes the browser's last active agent conversation. Its sidebar switches
+between configured agents while open conversations stay connected. The active
+agent's settings button opens its existing schema-driven editor in a modal.
+Code restores the last selected code session, falling back to the newest eligible
+session when that selection no longer exists. Its sidebar lists previous code
+sessions, and a collapsible workspace file preview sits beneath the conversation.
 
-The daily navigation rail links Home, Sessions, Agents, Code, Workflows, and
-Runs. All features remain in the expanded menu and command palette. Use
-**Cmd+K / Ctrl+K** to search features, session names, agent aliases, and settings.
-Setting results open the owning form and tab and focus the field. Search uses
-schema metadata and paths, never setting values or secrets. The header's
-settings button opens the configuration for the current feature.
+**Cmd+K / Ctrl+K** opens search scoped to the current feature. Agent and Code
+search include the active agent's schema-declared provider and profile references;
+"Search everything" expands to all features, history, and settings. Selecting a
+field opens a focused editor without changing the workspace URL or connection.
+"All related settings" opens the owning form. Edits use the existing config draft
+store, gateway validation, save operations, and reload indicators. Shared profile
+and provider forms identify their owner because changes affect all agents using
+them. Search never indexes secret values.
 
-Session history opens a transcript first. Idle gateway sessions offer a resume
-link when their agent is dispatchable. Chat and Code stay mounted while moving
-between pages, so navigating to settings does not disconnect active work.
-Pending approvals appear above the current page with a link back to their task.
-Logging out, closing the window, or refreshing still closes those connections;
-Code asks the browser to confirm leaving during active work.
+The SOP workspace has a searchable carousel above its focused visual editor.
+The side panel offers editable JSON and an optional coding assistant. Source
+changes are validated through the gateway graph endpoint before applying to the
+local draft; saving remains an explicit action. Fields and graph controls edit
+that same draft. Drafts are scoped by SOP so switching items preserves edits.
+Opened editors and assistants remain mounted during workspace navigation, and
+pending assistant approvals link back to the owning SOP. Run activity reports
+active and failed runs from the existing runs API, with links to their details.
+Opening the assistant alone does not call a model; "Insert current SOP definition"
+adds visible context to its composer for the operator to review and send.
 
-The Code workspace (`/code`) uses the daemon's existing zerocode RPC dispatcher
-through the authenticated `/ws/code` bridge. It supports session history,
-streaming output, tool approvals, choice questions, cancellation, and a read-only
-workspace file preview. Agents edit files through their normal runtime tools
-and permission checks. Opening the page alone does not start a model call.
-**Cmd+Enter / Ctrl+Enter** sends the composer. Tasks resumed from another client
-are reconciled against runtime state until they finish.
+The Code workspace uses the daemon's zerocode RPC dispatcher through the paired
+`/ws/code` bridge. It supports session history, streaming output, approvals,
+choice questions, cancellation, and read-only file previews. Agents edit files
+through their runtime tools and existing permission checks. **Cmd+Enter /
+Ctrl+Enter** sends a prompt. Refreshing or closing the browser still disconnects
+clients; active code turns and unsaved SOP edits request browser confirmation.
 
-![Code workspace with a tool approval and file preview](assets/workspace-code.png)
-
-The Tauri desktop wrapper loads this same web application. These changes add no
-native commands, filesystem permissions, or separate desktop configuration.
-Browser checks do not substitute for a packaged desktop smoke test when
-changing the Tauri wrapper itself.
+Availability comes from `GET /api/workspace`. Empty or unavailable workspaces
+provide setup or reconnect paths. Operational metrics remain at `/system`, and
+existing `/?tab=...` bookmarks still work. The Tauri wrapper loads this same web
+application; this change adds no native commands or filesystem permissions.
 
 ### Browser verification
 
 `web/scripts/workspace-smoke.cjs` exercises the real web renderer with synthetic
-HTTP and RPC fixtures. It covers transcript navigation, keyboard settings search
+HTTP and RPC fixtures. It covers the three workspace entries, modal settings search
 and focus, approvals across page changes, stale turn events, resumed task
 recovery, unavailable capabilities, mobile layout, and light mode. It writes
 screenshots to `/tmp/zeroclaw-workspace-evidence` by default.

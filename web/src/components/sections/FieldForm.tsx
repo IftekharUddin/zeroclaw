@@ -24,9 +24,12 @@ import {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link } from "react-router-dom";
+import { aliasRefSource } from "@/lib/configReferences";
+import { useConfigLocation } from "@/lib/configLocation";
 import {
   ExternalLink,
   Eye,
@@ -750,25 +753,6 @@ function leafSingleAliasKind(path: string): keyof AgentOptionsResponse | null {
 // kind but omits `alias_source` (older builds): the generic resolver still works
 // — covering provider refs (incl. tts/transcription/classifier) that have no
 // AgentOptionsResponse list, so they get a real dropdown, not a stuck spinner.
-const ALIAS_REF_TYPE_TO_SOURCE: Record<string, string> = {
-  ModelProviderRef: "model_providers",
-  TtsProviderRef: "tts_providers",
-  TranscriptionProviderRef: "transcription_providers",
-  RiskProfileRef: "risk_profiles",
-  RuntimeProfileRef: "runtime_profiles",
-  ChannelRef: "channels",
-};
-
-// The `resolve-alias-source` query value for an alias-ref entry: prefer the
-// daemon-declared `alias_source`; else derive it from the `<Type>Ref` type_hint.
-// Returns null for non-alias-ref entries or unmapped ref types.
-function aliasRefSource(entry: ListResponseEntry): string | null {
-  if (entry.kind !== "alias-ref") return null;
-  if (entry.alias_source) return entry.alias_source;
-  const m = entry.type_hint?.match(/(\w+Ref)\b/);
-  return (m && ALIAS_REF_TYPE_TO_SOURCE[m[1] ?? ""]) ?? null;
-}
-
 // Cross-section navigation map for agent alias-ref fields. Each entry
 // answers: "where does this field's source live in /config/?"
 // Used both by the empty-state hint and the per-item edit-jump links.
@@ -972,16 +956,19 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const [schema, setSchema] = useState<Record<string, unknown> | undefined>(
       undefined,
     );
-    const location = useLocation();
+    const formRoot = useRef<HTMLDivElement>(null);
+    const location = useConfigLocation();
     const fieldTarget = new URLSearchParams(location.search).get('field');
     const [filter, setFilter] = useState("");
     useEffect(() => { setFilter(''); }, [fieldTarget]);
     useEffect(() => {
       if (loading || !fieldTarget || !entries.some((entry) => entry.path === fieldTarget)) return;
       const frame = requestAnimationFrame(() => {
-        const input = document.getElementById(fieldTarget)
-          ?? [...document.querySelectorAll<HTMLElement>('[data-config-field]')].find((node) => node.dataset.configField === fieldTarget)
-          ?? [...document.querySelectorAll<HTMLElement>('[data-config-prefix]')].find((node) => fieldTarget.startsWith(`${node.dataset.configPrefix}.`));
+        const root = formRoot.current;
+        if (!root) return;
+        const input = [...root.querySelectorAll<HTMLElement>('[id]')].find((node) => node.id === fieldTarget)
+          ?? [...root.querySelectorAll<HTMLElement>('[data-config-field]')].find((node) => node.dataset.configField === fieldTarget)
+          ?? [...root.querySelectorAll<HTMLElement>('[data-config-prefix]')].find((node) => fieldTarget.startsWith(`${node.dataset.configPrefix}.`));
         const row = input?.closest('[data-config-field]') ?? input;
         row?.scrollIntoView({ block: 'center', behavior: 'instant' });
         const focus = input?.matches('input, select, textarea, button') ? input : input?.querySelector<HTMLElement>('input, select, textarea, button') ?? input;
@@ -1414,7 +1401,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     }
 
     return (
-      <div
+      <div ref={formRoot}
         className={
           inlineSaveBar
             ? "flex flex-col"
