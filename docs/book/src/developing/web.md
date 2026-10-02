@@ -31,7 +31,8 @@ runtime APIs; unavailable data is shown as unknown rather than zero.
 **Agent**, **Code**, **S.O.P**, and **Admin** form a centered switcher in the persistent
 header, including on Home. The page scrolls below it. There is no global
 navigation rail. Search, appearance, language, and sign-out remain available
-from the header. **ZeroClaw Dark/Light** are the default blue-accent palettes.
+from the header. **Default Dark/Light** restore the original UI palette: charcoal or light gray
+with cyan accents. They are the defaults when no appearance preference is saved.
 The softer graphite/teal and ivory/green palettes remain available as
 **Calm Dark/Light** under **Appearance > Themes**. Switching appearance modes
 keeps these dark/light pairs together. Primary-button text contrasts with the

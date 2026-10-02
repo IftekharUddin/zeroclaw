@@ -246,10 +246,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const resolvedId = resolveColorTheme(s.theme, s.colorTheme);
     const ct = colorThemeMap[resolvedId];
     const themeVars = ct?.vars ?? colorThemeMap[DEFAULT_DARK_THEME].vars;
-    // The default accent follows the ZeroClaw or Calm palette in each scheme.
-    // Explicit alternative accents and other named themes retain their colors.
-    const paletteAccent = s.accent === 'cyan' &&
-      (ct?.family === 'zeroclaw' || ct?.family === 'calm');
+    // Calm uses its own accent; other palettes keep the original accent override behavior.
+    const paletteAccent = s.accent === 'cyan' && ct?.family === 'calm';
     const colors = {
       ...themeVars,
       ...(paletteAccent ? {} : accents[s.accent]),

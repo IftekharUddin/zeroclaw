@@ -32,9 +32,9 @@ export const colorThemes: ColorThemeDef[] = themesData as unknown as ColorThemeD
 export const colorThemeMap: Record<ColorThemeId, ColorThemeDef> =
   Object.fromEntries(colorThemes.map(t => [t.id, t])) as Record<ColorThemeId, ColorThemeDef>;
 
-// Keep the existing IDs for saved preferences; these are the ZeroClaw defaults.
-export const DEFAULT_DARK_THEME: ColorThemeId = 'operator-dark';
-export const DEFAULT_LIGHT_THEME: ColorThemeId = 'operator-light';
+// Use the original UI palette for fresh installs and legacy preference fallbacks.
+export const DEFAULT_DARK_THEME: ColorThemeId = 'default-dark';
+export const DEFAULT_LIGHT_THEME: ColorThemeId = 'default-light';
 
 export function themeForScheme(id: ColorThemeId, scheme: 'dark' | 'light'): ColorThemeId {
   const current = colorThemeMap[id];
