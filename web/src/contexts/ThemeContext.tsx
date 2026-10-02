@@ -246,9 +246,22 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const resolvedId = resolveColorTheme(s.theme, s.colorTheme);
     const ct = colorThemeMap[resolvedId];
     const themeVars = ct?.vars ?? colorThemeMap[DEFAULT_DARK_THEME].vars;
-    applyVars({
+    // The default accent follows the curated Operator palette in each scheme.
+    // Explicit alternative accents and other named themes retain their colors.
+    const paletteAccent = s.accent === 'cyan' &&
+      (resolvedId === DEFAULT_DARK_THEME || resolvedId === DEFAULT_LIGHT_THEME);
+    const colors = {
       ...themeVars,
-      ...accents[s.accent],
+      ...(paletteAccent ? {} : accents[s.accent]),
+    };
+    const rgb = colors['--pc-accent']!.slice(1).match(/.{2}/g)!.map((part) => {
+      const channel = parseInt(part, 16) / 255;
+      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    const luminance = rgb[0]! * 0.2126 + rgb[1]! * 0.7152 + rgb[2]! * 0.0722;
+    applyVars({
+      ...colors,
+      '--pc-accent-foreground': luminance > 0.179 ? '#000000' : '#ffffff',
       ...fontVars(s.uiFont, s.monoFont, s.uiFontSize, s.monoFontSize),
     });
   }, []);

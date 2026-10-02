@@ -22,10 +22,18 @@ cargo web install       # npm install in web/
 
 ## Workspace navigation
 
-Home (`/`) offers **Agent**, **Code**, and **S.O.P**. There is no global navigation
-rail. A compact header switches workspaces and exposes search; appearance,
-language, and sign-out live in its overflow menu. Operational pages remain
-available through search and their existing URLs.
+Home (`/`) summarizes ready agents, active work, recorded daily model spend,
+and system health, followed by recent sessions and SOP activity. The three main
+workspaces have short descriptions, and an expandable feature directory keeps
+supporting tools discoverable. These read-only views use existing gateway and
+runtime APIs; unavailable data is shown as unknown rather than zero.
+
+**Agent**, **Code**, and **S.O.P** form a centered switcher in the persistent
+header, including on Home. The page scrolls below it. There is no global
+navigation rail. Search, appearance, language, and sign-out remain available
+from the header. The default Operator palettes use softer graphite/teal and
+ivory/green surfaces, with contrasting primary-button text derived from the
+active accent. Other named palettes and explicit accent choices remain available.
 
 Agent resumes the browser's last active agent conversation. Its sidebar switches
 between configured agents while open conversations stay connected. The active

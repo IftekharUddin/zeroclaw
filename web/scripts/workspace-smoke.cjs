@@ -119,6 +119,8 @@ fs.mkdirSync(out, { recursive: true });
         process: {},
         nodes: { connected: [], mdns_peers: [] },
       };
+    else if (u.pathname === "/api/cost")
+      body = { daily_cost_usd: 1.24, monthly_cost_usd: 8.50, session_cost_usd: 1.24, total_tokens: 12000, request_count: 8, by_model: {}, by_agent: {} };
     else if (u.pathname === "/api/workspace")
       body = {
         agents: capabilities ? ["builder", "reviewer"] : [],
@@ -153,7 +155,7 @@ fs.mkdirSync(out, { recursive: true });
             current_step: 1,
             total_steps: 4,
             started_at: new Date().toISOString(),
-            status: "Running",
+            status: "running",
           },
         ],
       };
