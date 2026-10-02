@@ -1,5 +1,5 @@
 import { createContext, useState, useEffect, useCallback, type ReactNode } from 'react';
-import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, type ColorThemeId } from './colorThemes';
+import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, themeForScheme, type ColorThemeId } from './colorThemes';
 
 // ── Types (was ThemeContextDef.ts) ───────────────────────────────────────────
 
@@ -43,7 +43,7 @@ export interface ThemeContextValue {
 export const ThemeContext = createContext<ThemeContextValue>({
   theme: 'dark',
   accent: 'cyan',
-  colorTheme: 'operator-dark',
+  colorTheme: DEFAULT_DARK_THEME,
   uiFont: 'system',
   monoFont: 'jetbrains',
   uiFontSize: 15,
@@ -114,7 +114,7 @@ interface StoredTheme {
 const DEFAULTS: StoredTheme = {
   theme: 'dark',
   accent: 'cyan',
-  colorTheme: 'operator-dark',
+  colorTheme: DEFAULT_DARK_THEME,
   uiFont: 'system',
   monoFont: 'jetbrains',
   uiFontSize: 15,
@@ -206,7 +206,7 @@ function resolveColorTheme(mode: ThemeMode, colorTheme: ColorThemeId): ColorThem
     if (ct && ((preferLight && ct.scheme === 'light') || (!preferLight && ct.scheme === 'dark'))) {
       return colorTheme;
     }
-    return preferLight ? DEFAULT_LIGHT_THEME : DEFAULT_DARK_THEME;
+    return themeForScheme(colorTheme, preferLight ? 'light' : 'dark');
   }
   if (mode === 'oled') return 'oled-black';
   return colorTheme;
@@ -246,10 +246,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const resolvedId = resolveColorTheme(s.theme, s.colorTheme);
     const ct = colorThemeMap[resolvedId];
     const themeVars = ct?.vars ?? colorThemeMap[DEFAULT_DARK_THEME].vars;
-    // The default accent follows the curated Operator palette in each scheme.
+    // The default accent follows the ZeroClaw or Calm palette in each scheme.
     // Explicit alternative accents and other named themes retain their colors.
     const paletteAccent = s.accent === 'cyan' &&
-      (resolvedId === DEFAULT_DARK_THEME || resolvedId === DEFAULT_LIGHT_THEME);
+      (ct?.family === 'zeroclaw' || ct?.family === 'calm');
     const colors = {
       ...themeVars,
       ...(paletteAccent ? {} : accents[s.accent]),
@@ -274,8 +274,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       // System mode should preserve the user's current palette and defer scheme resolution to OS preference.
       targetScheme === null || (currentCt && currentCt.scheme === targetScheme) ? colorTheme : (
         t === 'oled' ? 'oled-black' :
-        t === 'light' ? DEFAULT_LIGHT_THEME :
-        DEFAULT_DARK_THEME
+        themeForScheme(colorTheme, t === 'light' ? 'light' : 'dark')
       );
     setThemeState(t);
     setColorThemeState(newColorTheme);

@@ -31,9 +31,11 @@ runtime APIs; unavailable data is shown as unknown rather than zero.
 **Agent**, **Code**, **S.O.P**, and **Admin** form a centered switcher in the persistent
 header, including on Home. The page scrolls below it. There is no global
 navigation rail. Search, appearance, language, and sign-out remain available
-from the header. The default Operator palettes use softer graphite/teal and
-ivory/green surfaces, with contrasting primary-button text derived from the
-active accent. Other named palettes and explicit accent choices remain available.
+from the header. **ZeroClaw Dark/Light** are the default blue-accent palettes.
+The softer graphite/teal and ivory/green palettes remain available as
+**Calm Dark/Light** under **Appearance > Themes**. Switching appearance modes
+keeps these dark/light pairs together. Primary-button text contrasts with the
+active accent; other named palettes and explicit accent choices remain available.
 
 Admin (`/admin`) collects dashboards for system health, spending, channels,
 memory, sessions, workflow runs, logs, and diagnostics, plus agent/resource
