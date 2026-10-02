@@ -12,6 +12,7 @@ import {
   Layers3,
   Puzzle,
   Settings2,
+  ShieldCheck,
   Monitor,
   Smartphone,
   Stethoscope,
@@ -336,7 +337,7 @@ function Overview() {
 
       <section aria-label={t('home.workspaces')}>
         <h2 className="mb-3 text-sm font-medium">{t('home.workspaces')}</h2>
-        <div className="grid gap-3 md:grid-cols-3">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           {[
             {
               to: '/agent',
@@ -356,6 +357,7 @@ function Overview() {
               description: 'home.sop_description',
               icon: Workflow,
             },
+            { to: '/admin', label: 'workspace.admin', description: 'admin.description', icon: ShieldCheck },
           ].map(({ to, label, description, icon: Icon }) => (
             <Link
               key={to}

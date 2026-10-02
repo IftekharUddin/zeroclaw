@@ -4,6 +4,7 @@ import AgentLanding from '../pages/AgentLanding';
 import Layout from '../components/layout/Layout';
 import {
   AcpConsole,
+  Admin,
   AgentChat,
   AgentWorkspaceExplorer,
   AgentsList,
@@ -42,6 +43,7 @@ export const Router = () => (
     <Routes>
       <Route element={<Layout />}>
         <Route path="/" element={<Home />} />
+        <Route path="/admin" element={<Admin />} />
         <Route path="/system" element={<Dashboard />} />
         <Route path="/sessions" element={<Sessions />} />
         <Route path="/code" element={<Code />} />

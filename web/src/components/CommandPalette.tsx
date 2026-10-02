@@ -362,7 +362,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
         </div>
 
         {scope && <div className="flex items-center gap-2 border-b border-pc-border px-3.5 py-2 text-xs">
-          <button type="button" aria-pressed={currentOnly} onClick={() => { setCurrentOnly(true); setSelected(0); }} className={`rounded-md px-2 py-1 ${currentOnly ? 'bg-pc-elevated text-pc-text' : 'text-pc-text-muted'}`}>{t('workspace.current_settings')} · {decodeURIComponent(scope.split('/').slice(-1)[0] ?? '')}</button>
+          <button type="button" aria-pressed={currentOnly} onClick={() => { setCurrentOnly(true); setSelected(0); }} className={`rounded-md px-2 py-1 ${currentOnly ? 'bg-pc-elevated text-pc-text' : 'text-pc-text-muted'}`}>{t('workspace.current_settings')} · {scope === '/config' ? t('workspace.admin') : decodeURIComponent(scope.split('/').slice(-1)[0] ?? '')}</button>
           <button type="button" aria-pressed={!currentOnly} onClick={() => { setCurrentOnly(false); setSelected(0); }} className={`rounded-md px-2 py-1 ${!currentOnly ? 'bg-pc-elevated text-pc-text' : 'text-pc-text-muted'}`}>{t('workspace.search_all')}</button>
         </div>}
         {/* Results */}

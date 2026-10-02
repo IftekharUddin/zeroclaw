@@ -22,3 +22,5 @@ export const RunDetail = lazy(() => import('../pages/RunDetail'));
 export const Home = lazy(() => import('../pages/Home'));
 export const Sessions = lazy(() => import('../pages/Sessions'));
 export const Code = lazy(() => import('../pages/Code'));
+
+export const Admin = lazy(() => import('../pages/Admin'));

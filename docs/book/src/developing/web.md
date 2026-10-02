@@ -23,17 +23,27 @@ cargo web install       # npm install in web/
 ## Workspace navigation
 
 Home (`/`) summarizes ready agents, active work, recorded daily model spend,
-and system health, followed by recent sessions and SOP activity. The three main
+and system health, followed by recent sessions and SOP activity. The main
 workspaces have short descriptions, and an expandable feature directory keeps
 supporting tools discoverable. These read-only views use existing gateway and
 runtime APIs; unavailable data is shown as unknown rather than zero.
 
-**Agent**, **Code**, and **S.O.P** form a centered switcher in the persistent
+**Agent**, **Code**, **S.O.P**, and **Admin** form a centered switcher in the persistent
 header, including on Home. The page scrolls below it. There is no global
 navigation rail. Search, appearance, language, and sign-out remain available
 from the header. The default Operator palettes use softer graphite/teal and
 ivory/green surfaces, with contrasting primary-button text derived from the
 active accent. Other named palettes and explicit accent choices remain available.
+
+Admin (`/admin`) collects dashboards for system health, spending, channels,
+memory, sessions, workflow runs, logs, and diagnostics, plus agent/resource
+management and advanced tools. Its searchable directory uses the shared
+navigation catalogue. Quick settings resolve available sections and labels from
+the gateway's configuration catalogue and open the existing floating editor.
+Searching the directory includes all available settings sections; Cmd/Ctrl+K on
+Admin searches configuration fields. Admin remains selected on management and
+operational routes, while workflow run details belong to S.O.P. This is a
+navigation grouping, not a new permission role or authentication boundary.
 
 Agent resumes the browser's last active agent conversation. Its sidebar switches
 between configured agents while open conversations stay connected. The active
@@ -77,7 +87,7 @@ application; this change adds no native commands or filesystem permissions.
 ### Browser verification
 
 `web/scripts/workspace-smoke.cjs` exercises the real web renderer with synthetic
-HTTP and RPC fixtures. It covers the three workspace entries, modal settings search
+HTTP and RPC fixtures. It covers the workspace entries, modal settings search
 and focus, approvals across page changes, stale turn events, resumed task
 recovery, unavailable capabilities, mobile layout, and light mode. It writes
 screenshots to `/tmp/zeroclaw-workspace-evidence` by default.

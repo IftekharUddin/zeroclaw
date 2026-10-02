@@ -302,7 +302,7 @@ fs.mkdirSync(out, { recursive: true });
     console.error("PAGE ERROR:", e.message);
   });
   await page.goto(appUrl);
-  for (const name of ["Agent", "Code", "S.O.P"]) {
+  for (const name of ["Agent", "Code", "S.O.P", "Admin"]) {
     await page.getByRole("link", { name, exact: true }).waitFor();
   }
   assert.equal(await page.getByRole("navigation", { name: "Primary" }).count(), 0);
@@ -372,7 +372,7 @@ fs.mkdirSync(out, { recursive: true });
     ),
     true,
   );
-  // Home keeps the three entry points; unavailable workspaces offer setup.
+  // Home keeps the workspace entry points; unavailable workspaces offer setup.
   capabilities = false;
   await page.getByRole("link", { name: "Code", exact: true }).click();
   await page.reload();

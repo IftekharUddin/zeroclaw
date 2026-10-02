@@ -6,6 +6,7 @@ import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 import { SettingsModal } from '@/components/SettingsModal';
 import { useWorkspaceSettings } from '@/components/WorkspaceSettings';
+import { activeWorkspace } from '@/lib/navigation';
 
 export default function Header({
   onOpenPalette,
@@ -13,6 +14,7 @@ export default function Header({
   onOpenPalette: () => void;
 }) {
   const { pathname } = useLocation();
+  const workspace = activeWorkspace(pathname);
   const { logout } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
   const openSettings = useWorkspaceSettings();
@@ -20,7 +22,7 @@ export default function Header({
   const [menu, setMenu] = useState(false);
   return (
     <>
-      <header className="relative z-40 grid h-16 shrink-0 grid-cols-[1fr_auto_1fr] items-center border-b border-pc-border bg-pc-surface px-3 sm:px-6">
+      <header className="relative z-40 grid min-h-16 shrink-0 grid-cols-[1fr_auto_1fr] items-center border-b border-pc-border bg-pc-surface px-2 sm:px-6">
         <Link
           to="/"
           aria-label={t('home.title')}
@@ -37,14 +39,15 @@ export default function Header({
             ['/agent', 'workspace.agent'],
             ['/code', 'nav.code'],
             ['/sops', 'workspace.sop'],
+            ['/admin', 'workspace.admin'],
           ].map(([to, label]) => {
-            const active = pathname.startsWith(to!);
+            const active = workspace === to;
             return (
               <Link
                 key={to}
                 to={to!}
                 aria-current={active ? 'page' : undefined}
-                className={`rounded-lg px-2 py-1.5 font-medium transition-colors sm:px-5 ${active ? 'bg-pc-elevated text-pc-accent shadow-sm' : 'text-pc-text-secondary hover:bg-pc-surface hover:text-pc-text'}`}
+                className={`rounded-lg px-1.5 py-1.5 text-xs font-medium min-[400px]:px-2 min-[400px]:text-sm transition-colors sm:px-5 ${active ? 'bg-pc-elevated text-pc-accent shadow-sm' : 'text-pc-text-secondary hover:bg-pc-surface hover:text-pc-text'}`}
               >
                 {t(label!)}
               </Link>
@@ -57,7 +60,7 @@ export default function Header({
             onClick={onOpenPalette}
             aria-label={t('workspace.search_settings')}
             title={t('workspace.search_settings')}
-            className="flex items-center gap-2 rounded-lg p-1.5 text-pc-text-muted hover:bg-pc-elevated hover:text-pc-text sm:p-2"
+            className="hidden min-[400px]:flex items-center gap-2 rounded-lg p-1.5 text-pc-text-muted hover:bg-pc-elevated hover:text-pc-text sm:p-2"
           >
             <Search className="h-4 w-4" />
             <kbd className="hidden text-xs lg:inline">⌘ K</kbd>
@@ -81,6 +84,12 @@ export default function Header({
               onClick={() => setMenu(false)}
             />
             <div className="absolute right-4 top-14 z-10 w-56 rounded-xl border border-pc-border bg-pc-surface p-2 text-sm shadow-xl">
+              <button
+                className="w-full rounded-lg p-2 text-left hover:bg-pc-elevated min-[400px]:hidden"
+                onClick={() => { setMenu(false); onOpenPalette(); }}
+              >
+                {t('workspace.search_settings')}
+              </button>
               <button
                 className="w-full rounded-lg p-2 text-left hover:bg-pc-elevated"
                 onClick={() => {
