@@ -259,7 +259,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const luminance = rgb[0]! * 0.2126 + rgb[1]! * 0.7152 + rgb[2]! * 0.0722;
     applyVars({
       ...colors,
-      '--pc-accent-foreground': luminance > 0.179 ? '#000000' : '#ffffff',
+      '--pc-accent-foreground': ct?.family === 'calm' && luminance > 0.179 ? '#000000' : '#ffffff',
       ...fontVars(s.uiFont, s.monoFont, s.uiFontSize, s.monoFontSize),
     });
   }, []);

@@ -76,7 +76,7 @@
   --pc-accent-dim: rgba(34, 211, 238, 0.3);
   --pc-accent-glow: rgba(34, 211, 238, 0.1);
   --pc-accent-rgb: 34, 211, 238;
-  --pc-accent-foreground: #000000;
+  --pc-accent-foreground: #ffffff;
 
   /* Link text — derived from the per-theme accent so it tracks every palette. */
   --pc-text-link: var(--pc-accent-light);
