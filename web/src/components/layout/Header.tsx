@@ -22,7 +22,7 @@ export default function Header({
   const [menu, setMenu] = useState(false);
   return (
     <>
-      <header className="relative z-40 grid min-h-16 shrink-0 grid-cols-[1fr_auto_1fr] items-center border-b border-pc-border bg-pc-surface px-2 sm:px-6">
+      <header className="relative z-40 grid min-h-16 shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-y-2 border-b border-pc-border bg-pc-surface px-2 py-2 sm:px-6 lg:py-0">
         <Link
           to="/"
           aria-label={t('home.title')}
@@ -54,23 +54,24 @@ export default function Header({
             );
           })}
         </nav>
-        <div className="flex items-center justify-end gap-0 sm:gap-1">
+        <div className="contents lg:flex lg:items-center lg:justify-end lg:gap-2">
           <button
             type="button"
             onClick={onOpenPalette}
             aria-label={t('workspace.search_settings')}
-            title={t('workspace.search_settings')}
-            className="hidden min-[400px]:flex items-center gap-2 rounded-lg p-1.5 text-pc-text-muted hover:bg-pc-elevated hover:text-pc-text sm:p-2"
+            aria-keyshortcuts="Meta+K Control+K"
+            className="col-span-3 row-start-2 flex min-w-0 items-center gap-2 rounded-lg border border-pc-border bg-pc-base px-3 py-2 text-pc-text-secondary hover:bg-pc-elevated hover:text-pc-text"
           >
-            <Search className="h-4 w-4" />
-            <kbd className="hidden text-xs lg:inline">⌘ K</kbd>
+            <Search className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate text-left text-xs">{t('workspace.search_settings')}</span>
+            <kbd className="shrink-0 whitespace-nowrap rounded border border-pc-border px-1.5 py-0.5 text-xs">⌘ K / Ctrl K</kbd>
           </button>
           <button
             type="button"
             onClick={() => setMenu(!menu)}
             aria-expanded={menu}
             aria-label={t('workspace.more')}
-            className="rounded-lg p-1.5 text-pc-text-muted hover:bg-pc-elevated hover:text-pc-text sm:p-2"
+            className="col-start-3 row-start-1 justify-self-end rounded-lg p-1.5 text-pc-text-muted hover:bg-pc-elevated hover:text-pc-text sm:p-2"
           >
             <MoreHorizontal className="h-4 w-4" />
           </button>
@@ -84,12 +85,6 @@ export default function Header({
               onClick={() => setMenu(false)}
             />
             <div className="absolute right-4 top-14 z-10 w-56 rounded-xl border border-pc-border bg-pc-surface p-2 text-sm shadow-xl">
-              <button
-                className="w-full rounded-lg p-2 text-left hover:bg-pc-elevated min-[400px]:hidden"
-                onClick={() => { setMenu(false); onOpenPalette(); }}
-              >
-                {t('workspace.search_settings')}
-              </button>
               <button
                 className="w-full rounded-lg p-2 text-left hover:bg-pc-elevated"
                 onClick={() => {

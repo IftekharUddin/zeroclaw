@@ -55,8 +55,11 @@ Code restores the last selected code session, falling back to the newest eligibl
 session when that selection no longer exists. Its sidebar lists previous code
 sessions, and a collapsible workspace file preview sits beneath the conversation.
 
-**Cmd+K / Ctrl+K** opens search scoped to the current feature. Agent and Code
-search include the active agent's schema-declared provider and profile references;
+**Cmd+K / Ctrl+K** opens search scoped to the current feature. The persistent
+header shows a **Search settings** button with both shortcuts at every screen
+width; on narrower screens it occupies a second row below the workspace switcher.
+Agent and Code search include the active agent's schema-declared provider and
+profile references;
 "Search everything" expands to all features, history, and settings. Selecting a
 field opens a focused editor without changing the workspace URL or connection.
 "All related settings" opens the owning form. Edits use the existing config draft
