@@ -67,16 +67,50 @@ store, gateway validation, save operations, and reload indicators. Shared profil
 and provider forms identify their owner because changes affect all agents using
 them. Search never indexes secret values.
 
-The SOP workspace has a searchable carousel above its focused visual editor.
-The side panel offers editable JSON and an optional coding assistant. Source
-changes are validated through the gateway graph endpoint before applying to the
-local draft; saving remains an explicit action. Fields and graph controls edit
-that same draft. Drafts are scoped by SOP so switching items preserves edits.
-Opened editors and assistants remain mounted during workspace navigation, and
-pending assistant approvals link back to the owning SOP. Run activity reports
-active and failed runs from the existing runs API, with links to their details.
-Opening the assistant alone does not call a model; "Insert current SOP definition"
-adds visible context to its composer for the operator to review and send.
+The SOP workspace centers manual authoring on a full-height node canvas, with
+zoom, fit, drag, and wiring controls. The searchable library on the left can be
+hidden. One toggleable panel on the right contains **Runs**, **Node**, and
+**Agent** tabs. Selecting a node opens its inspector; SOP settings and triggers
+use the same panel. The palette creates agent tasks, planned tool actions,
+conditional branches, and approval checkpoints. Deterministic workflows also
+offer a bounded wait capability. These are presets for existing runtime step
+fields, not new execution kinds.
+
+New SOPs open the helper with a **Start blank** option. Each sent helper message
+includes the current draft as inspectable context. A complete JSON proposal can
+be validated by the gateway and applied to the draft; saving remains explicit.
+The helper uses an ordinary configured Code agent and its existing permissions.
+Opening it alone does not call a model. Editors and opened helpers remain
+mounted while switching SOPs or workspaces, including when a new SOP is saved.
+Pending assistant approvals link back to the owning SOP.
+
+Fields, graph edits, applied proposals, and **Advanced / Source** share one
+local draft. Per-SOP session-storage recovery keeps unsaved edits in the browser
+tab; it is not a shared definition store. Source changes must be applied or
+reset before other edits or saving. Saving reloads the backend-normalized
+step numbers and bindings. **Reset to saved** restores the persisted definition.
+
+**Run** displays the current saved graph with the existing live overlay. The
+Runs tab switches between active runs across SOPs and recent runs for the
+selected SOP, and can start a saved workflow with a manual trigger. The Node
+tab inspects captured tool arguments, results, and errors. Existing approval,
+deny, and safe-stop controls use the gateway's decision APIs; an accepted stop
+remains visible while the current step drains. Run selection preserves the
+editor draft and rejects late updates from a previously selected run.
+
+The current backend does not bind a run to an immutable definition revision,
+so the canvas labels its use of the current saved definition. Deferred work
+beyond v1 has no milestone: [persistent SOP managers and conversations][sop-manager],
+[run-definition revisions][sop-revisions], [helper authority and live adaptation][sop-authority],
+[reviewable gate artifacts and supported decisions][sop-approval],
+[shared named groups][sop-groups], and [child-SOP composition][sop-nested].
+
+[sop-manager]: https://github.com/zeroclaw-labs/zeroclaw/issues/11546
+[sop-revisions]: https://github.com/zeroclaw-labs/zeroclaw/issues/11547
+[sop-authority]: https://github.com/zeroclaw-labs/zeroclaw/issues/11548
+[sop-approval]: https://github.com/zeroclaw-labs/zeroclaw/issues/11549
+[sop-groups]: https://github.com/zeroclaw-labs/zeroclaw/issues/11550
+[sop-nested]: https://github.com/zeroclaw-labs/zeroclaw/issues/11551
 
 The Code workspace uses the daemon's zerocode RPC dispatcher through the paired
 `/ws/code` bridge. It supports session history, streaming output, approvals,
@@ -105,6 +139,18 @@ module; when omitted, Node resolves `playwright` normally. `WEB_SMOKE_URL` and
 
 ```sh
 node web/scripts/workspace-smoke.cjs
+```
+
+`web/scripts/sop-workspace-smoke.cjs` exercises SOP draft recovery, explicit save
+and reset, gateway validation failures, zoomed node movement and undo, quick run
+switching, approvals, accepted cancellation during a refresh outage, helper
+proposals, and helper-session retention on first save. It checks keyboard tabs
+and 390px/320px layouts with synthetic HTTP/RPC fixtures and writes screenshots
+to `/tmp/zeroclaw-sop-evidence`. Start Vite on port 5179 and use the same environment
+overrides as the workspace script:
+
+```sh
+node web/scripts/sop-workspace-smoke.cjs
 ```
 
 These fixtures verify browser behavior without model calls. The gateway's

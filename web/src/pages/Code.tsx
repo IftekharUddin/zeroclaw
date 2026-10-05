@@ -1,3 +1,4 @@
+import { SopAssistantMessage, SopPromptMessage } from '@/components/SopProposal';
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Link,
@@ -72,12 +73,14 @@ interface Update {
 export default function Code({
   embedded = false,
   contextText,
+  sopAssistant,
   onBusyChange,
   attentionTarget,
   onAttentionOpen,
 }: {
   embedded?: boolean;
   contextText?: string;
+  sopAssistant?: { onApply: (source: string) => Promise<void> };
   attentionTarget?: string;
   onAttentionOpen?: () => void;
   onBusyChange?: (busy: boolean) => void;
@@ -451,7 +454,9 @@ export default function Code({
 
   const send = async () => {
     if (!prompt.trim() || !ready || busy) return;
-    const text = prompt.trim();
+    const text = sopAssistant && contextText
+      ? `${prompt.trim()}\n\n${t('sop_workspace.assistant_instructions')}\n\n\`\`\`json\n${contextText}\n\`\`\``
+      : prompt.trim();
     const client = clientRef.current;
     const turn = ++turnRef.current;
     setBusy(true);
@@ -696,9 +701,9 @@ export default function Code({
             <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
               {messages.length === 0 && (
                 <div className="py-8">
-                  <h3 className="font-medium">{t("code.start_title")}</h3>
+                  <h3 className="font-medium">{t(sopAssistant ? "sop_workspace.helper_title" : "code.start_title")}</h3>
                   <p className="mt-2 text-sm text-pc-text-muted">
-                    {t("code.start_hint")}
+                    {t(sopAssistant ? "sop_workspace.helper_hint" : "code.start_hint")}
                   </p>
                 </div>
               )}
@@ -726,9 +731,13 @@ export default function Code({
                         : "chat-markdown text-sm break-words"
                     }
                   >
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {message.content}
-                    </ReactMarkdown>
+                    {sopAssistant && message.role === 'user' ? (
+                      <SopPromptMessage message={message.content} />
+                    ) : sopAssistant && message.role === 'assistant' ? (
+                      <SopAssistantMessage message={message.content} onApply={sopAssistant.onApply} />
+                    ) : (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                    )}
                   </div>
                 ),
               )}
@@ -764,7 +773,13 @@ export default function Code({
                 void send();
               }}
             >
-              {contextText && (
+              {sopAssistant && contextText && (
+                <details className="mb-3 text-xs text-pc-text-muted">
+                  <summary className="cursor-pointer">{t('sop_workspace.context_included')}</summary>
+                  <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-pc-elevated p-2">{contextText}</pre>
+                </details>
+              )}
+              {contextText && !sopAssistant && (
                 <button
                   type="button"
                   className="mb-2 text-xs text-pc-accent"
@@ -781,8 +796,8 @@ export default function Code({
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
                 rows={3}
-                aria-label={t("code.prompt")}
-                placeholder={t("code.prompt")}
+                aria-label={t(sopAssistant ? "sop_workspace.helper_prompt" : "code.prompt")}
+                placeholder={t(sopAssistant ? "sop_workspace.helper_prompt" : "code.prompt")}
                 disabled={!ready}
                 className="input-electric w-full resize-y p-3 text-sm"
                 onKeyDown={(event) => {

@@ -5,6 +5,7 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { useTheme } from '@/hooks/useTheme';
 import { graphDraft, type Sop } from '@/lib/sops';
 import { t } from '@/lib/i18n';
+import { isSopDraft } from '@/lib/sopDraft';
 
 export default function SopSourceEditor({
   draft,
@@ -51,17 +52,7 @@ export default function SopSourceEditor({
     const original = latest.current;
     try {
       const value: unknown = JSON.parse(source);
-      if (
-        !value ||
-        typeof value !== 'object' ||
-        !('name' in value) ||
-        typeof value.name !== 'string' ||
-        !('steps' in value) ||
-        !Array.isArray(value.steps) ||
-        !('triggers' in value) ||
-        !Array.isArray(value.triggers)
-      )
-        throw new Error(t('workspace.invalid_sop'));
+      if (!isSopDraft(value)) throw new Error(t('workspace.invalid_sop'));
       const next = { ...draft, ...value } as Sop;
       // The gateway deserializer and graph validator own the SOP contract.
       const graph = await graphDraft(next);

@@ -376,7 +376,7 @@ fs.mkdirSync(out, { recursive: true });
   capabilities = false;
   await page.getByRole("link", { name: "Code", exact: true }).click();
   await page.reload();
-  await page.getByRole("link", { name: "Quickstart", exact: true }).waitFor();
+  await page.getByRole("link", { name: "Feature settings", exact: true }).waitFor();
   await page.getByRole("link", { name: "Home", exact: true }).click();
   capabilities = true;
   await page.evaluate(() => localStorage.setItem('zeroclaw-theme', JSON.stringify({ theme: 'light', accent: 'cyan' })));
