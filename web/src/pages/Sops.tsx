@@ -29,7 +29,6 @@ import {
   sopDecisionModes,
   type DecisionModelOption,
   type SopDecisionSpec,
-  deleteSop,
   wireDraft,
   graphDraft,
   triggerSources,

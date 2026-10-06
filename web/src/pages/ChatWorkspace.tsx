@@ -5,6 +5,7 @@ import { type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar
 import { useWorkspaceVisible } from '@/components/layout/WorkspaceOutlet';
 import { useNavigate } from 'react-router-dom';
 import AgentSidebar from '@/components/AgentSidebar';
+import ColonyWorkspace from '@/pages/ColonyWorkspace';
 import {
   applySessionChange,
   loadPersisted,
@@ -32,7 +33,7 @@ export interface ChatWorkspaceProps {
   /** Alias from the `/agent/:alias` route — opened + activated on mount and
    * whenever it changes (deep links / "Open chat"), without remounting the
    * workspace. */
-  initialAlias: string;
+  initialAlias?: string;
   initialSessionId?: string;
 }
 
@@ -48,10 +49,13 @@ export interface ChatWorkspaceProps {
 export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWorkspaceProps) {
   const visible = useWorkspaceVisible();
   const navigate = useNavigate();
-  const persisted = useRef<Partial<PersistedState>>(loadPersisted());
+  const persisted = useRef<Partial<PersistedState>>(initialAlias ? loadPersisted() : {});
+  const [colonyMode, setColonyMode] = useState(false);
+  const [colonyOpened, setColonyOpened] = useState(false);
 
   const [tabs, setTabs] = useState<ChatTab[]>(() => {
     const stored = persisted.current.tabs ?? [];
+    if (!initialAlias) return stored;
     // The route's agent is always open, but only add it when it is not already
     // there — a deep link should land on the existing pane, not fork a new one.
     return stored.some((tb) => matchesChatRequest(tb, initialAlias, initialSessionId))
@@ -63,6 +67,7 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
   // route settled. Prefer the pane that was active when the workspace was
   // stored, so reloading with two panes of one agent returns to the right one.
   const [activeKey, setActiveKey] = useState<string>(() => {
+    if (!initialAlias) return tabs[0]?.key ?? '';
     const preferred = persisted.current.activeKey;
     const match =
       tabs.find((tb) => tb.key === preferred && matchesChatRequest(tb, initialAlias, initialSessionId)) ??
@@ -109,12 +114,12 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
 
   // Keys of the panes currently visible (so background panes can be `hidden`).
   const visibleKeys = useMemo<Set<string>>(() => {
-    if (!visible) return new Set();
+    if (!visible || colonyMode) return new Set();
     if (effectiveLayout === 'split') {
       return new Set([resolvedSplit[0], resolvedSplit[1]].filter(Boolean) as string[]);
     }
     return new Set(activeTab ? [activeTab.key] : []);
-  }, [effectiveLayout, resolvedSplit, activeTab, visible]);
+  }, [effectiveLayout, resolvedSplit, activeTab, visible, colonyMode]);
 
   // Recompute the rendered indicator map from the status ref. An alias that is
   // currently visible is never shown as unread.
@@ -183,7 +188,7 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
     // above resolved it. Bailing keeps this idempotent under StrictMode's
     // double-invoked effects, which would otherwise re-activate the agent's
     // first pane and undo the restored selection.
-    if (!visible) return;
+    if (!visible || !initialAlias) return;
     const current = tabsRef.current.find((tb) => tb.key === activeKeyRef.current);
     if (current && matchesChatRequest(current, initialAlias, initialSessionId)) return;
 
@@ -246,6 +251,7 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
 
   // ── Tab bar handlers ──────────────────────────────────────────────────
   const selectTab = useCallback((key: string) => {
+    setColonyMode(false);
     setActiveKey(key);
     const tab = tabsRef.current.find((tab) => tab.key === key);
     if (tab) void navigate(`/agent/${encodeURIComponent(tab.alias)}?session=${encodeURIComponent(tab.sessionId)}`, { replace: true });
@@ -260,6 +266,7 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
   // Mint the tab outside the updater: React double-invokes updaters in
   // StrictMode, which would generate two keys and activate the discarded one.
   const openChat = useCallback((alias: string) => {
+    setColonyMode(false);
     const tab = tabForOpenRequest(tabsRef.current, alias);
     setTabs((prev) => [...prev, tab]);
     setActiveKey(tab.key);
@@ -329,12 +336,29 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
         onClose={closeChat}
         onOpen={openChat}
         onToggleLayout={toggleLayout}
+        colonyMode={colonyMode}
+        onToggleColony={() => {
+          setColonyOpened(true);
+          setColonyMode((mode) => !mode);
+        }}
       />
 
+      {colonyOpened && (
+        <div hidden={!colonyMode} className="flex min-h-0 min-w-0 flex-1 [&[hidden]]:hidden">
+          <ColonyWorkspace
+            visible={visible && colonyMode}
+            onOpenAgent={openChat}
+            onShow={() => setColonyMode(true)}
+            attentionTarget={activeTab
+              ? `/agent/${encodeURIComponent(activeTab.alias)}?session=${encodeURIComponent(activeTab.sessionId)}`
+              : '/agent'}
+          />
+        </div>
+      )}
       {/* Content area. Every open chat is mounted here at all times; only CSS
           visibility changes between tab/layout switches, so background sockets
           stay alive. In split layout the two visible panes share the width. */}
-      <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-w-0 min-h-0'}>
+      <div hidden={colonyMode} className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-w-0 min-h-0'} style={colonyMode ? { display: 'none' } : undefined}>
         {tabs.map((tab) => {
           const visible = visibleKeys.has(tab.key);
           // In split, each visible pane takes an equal share of the row.

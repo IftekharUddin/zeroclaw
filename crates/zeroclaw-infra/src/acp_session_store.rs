@@ -1317,7 +1317,8 @@ impl AcpSessionStore {
                         s.created_at,
                         s.last_activity,
                         s.projected_message_count AS message_count,
-                        s.principal_id
+                        s.principal_id,
+                        s.interaction_surface
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -1335,6 +1336,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .context("Failed to query live ACP sessions for agent")?;
@@ -1350,6 +1352,7 @@ impl AcpSessionStore {
                 activity_s,
                 msg_count,
                 principal_id,
+                interaction_surface,
             ) = row.context("Failed to read live ACP session row")?;
             out.push(AcpSessionSummary {
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
@@ -1357,6 +1360,7 @@ impl AcpSessionStore {
                 session_uuid,
                 principal_id,
                 agent_alias: owner_alias,
+                interaction_surface,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,

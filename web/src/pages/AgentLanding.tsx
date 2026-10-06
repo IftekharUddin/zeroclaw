@@ -3,6 +3,7 @@ import { Link, Navigate } from 'react-router-dom';
 import { getWorkspaceAvailability } from '@/lib/api';
 import { loadPersisted } from '@/pages/chatWorkspace.state';
 import { t } from '@/lib/i18n';
+import ChatWorkspace from '@/pages/ChatWorkspace';
 
 export default function AgentLanding() {
   const [target, setTarget] = useState<string | null>(null);
@@ -32,6 +33,7 @@ export default function AgentLanding() {
     };
   }, []);
   if (target) return <Navigate to={target} replace />;
+  if (empty) return <ChatWorkspace />;
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-6 text-sm text-pc-text-muted">
       <p role={error ? 'alert' : 'status'}>

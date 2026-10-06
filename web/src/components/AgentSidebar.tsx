@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { PanelLeft, Search, Settings, X, Columns2 } from 'lucide-react';
+import { PanelLeft, Search, Settings, X, Columns2, Network } from 'lucide-react';
 import { loadAgentPickerSummaries } from '@/lib/agents';
 import { useWorkspaceSettings } from '@/components/WorkspaceSettings';
 import type { ChatTab } from '@/pages/chatWorkspace.state';
@@ -16,6 +16,8 @@ export default function AgentSidebar({
   onClose,
   onOpen,
   onToggleLayout,
+  colonyMode,
+  onToggleColony,
 }: {
   tabs: (ChatTab & { label: string })[];
   activeKey: string;
@@ -26,6 +28,8 @@ export default function AgentSidebar({
   onClose: (key: string) => void;
   onOpen: (alias: string) => void;
   onToggleLayout: () => void;
+  colonyMode: boolean;
+  onToggleColony: () => void;
 }) {
   const [agents, setAgents] = useState<string[]>([]);
   const [query, setQuery] = useState('');
@@ -85,6 +89,35 @@ export default function AgentSidebar({
             className="rounded p-1 text-pc-text-muted hover:text-pc-text"
           >
             <Settings className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        <div
+          className="mx-3 mb-3 flex rounded-lg border border-pc-border bg-pc-elevated p-1"
+          role="group"
+          aria-label={t('workspace.agent')}
+        >
+          <button
+            type="button"
+            aria-pressed={!colonyMode}
+            onClick={() => {
+              if (colonyMode) onToggleColony();
+              setOpen(false);
+            }}
+            className={`min-w-0 flex-1 rounded-md px-2 py-2 text-xs ${!colonyMode ? 'bg-pc-surface text-pc-text shadow-sm' : 'text-pc-text-muted'}`}
+          >
+            {t('colony.chat')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={colonyMode}
+            onClick={() => {
+              if (!colonyMode) onToggleColony();
+              setOpen(false);
+            }}
+            className={`flex min-w-0 flex-1 items-center justify-center gap-1 rounded-md px-2 py-2 text-xs ${colonyMode ? 'bg-pc-surface text-pc-accent shadow-sm' : 'text-pc-text-muted'}`}
+          >
+            <Network className="h-3 w-3" />
+            {t('colony.title')}
           </button>
         </div>
         <label className="mx-3 mb-3 flex items-center gap-2 rounded-lg bg-pc-elevated px-3 py-2">
@@ -153,7 +186,7 @@ export default function AgentSidebar({
             </p>
           )}
         </div>
-        {!splitDisabled && (
+        {!splitDisabled && !colonyMode && (
           <button
             type="button"
             aria-pressed={layout === 'split'}
