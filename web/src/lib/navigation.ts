@@ -1,6 +1,7 @@
 import {
   Activity,
   Bot,
+  Blocks,
   Clock,
   Code2,
   History,
@@ -55,6 +56,7 @@ export const navGroups: NavGroup[] = [
       { to: "/tools", icon: Wrench, labelKey: "nav.tools", adminGroup: "management", descriptionKey: "home.tools_description" },
       { to: "/skills", icon: Sparkles, labelKey: "nav.skills", adminGroup: "management", descriptionKey: "home.skills_description" },
       { to: "/integrations", icon: Puzzle, labelKey: "nav.integrations", adminGroup: "management", descriptionKey: "home.integrations_description" },
+      { to: "/plugins", icon: Blocks, labelKey: "nav.plugins", adminGroup: "management", descriptionKey: "plugins.subtitle" },
       { to: "/cron", icon: Clock, labelKey: "nav.cron", adminGroup: "management", descriptionKey: "home.cron_description" },
     ],
   },
