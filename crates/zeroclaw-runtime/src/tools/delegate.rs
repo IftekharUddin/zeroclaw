@@ -5,8 +5,8 @@ use crate::agent::cost::{
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::loop_::{
-    ActionBudgetScope, LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy,
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    TOOL_LOOP_SESSION_KEY, TOOL_LOOP_THREAD_ID, ToolLoop, apply_text_tool_prompt_policy,
     run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
@@ -3275,11 +3275,11 @@ impl DelegateTool {
             .try_with(|scope| scope.as_ref().map(|scope| scope.generator.clone()))
             .ok()
             .flatten();
-        // Action-budget continuity (same rationale as the parallel spawn):
-        // capture the originating sender scope and sender-role budget so
-        // every admission inside the detached task charges the caller's
-        // buckets, not the fallback __global__ budget.
-        let action_budget_scope = ActionBudgetScope::capture();
+        // Sender-bucket continuity (same rationale as the parallel spawn):
+        // capture the originating sender scope so every admission inside the
+        // detached task charges the caller's bucket, not the fallback
+        // __global__ budget.
+        let parent_thread_id = TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).ok().flatten();
         // Captured here and restored inside the task: a background delegation
         // leaves the caller's task, and with it the SOP step scope this call was
         // made under. Backgrounding the work must not widen what it may do.
@@ -3318,7 +3318,8 @@ impl DelegateTool {
         let progress_flusher = zeroclaw_spawn::spawn!(progress_flusher);
 
         zeroclaw_spawn::spawn!(
-            action_budget_scope.scope(
+            TOOL_LOOP_THREAD_ID.scope(
+                parent_thread_id,
                 scope_delegate_session_key(
                     parent_session_key,
                     crate::sop::active_scope::with_inherited_headless_step_scope(
@@ -3368,11 +3369,6 @@ impl DelegateTool {
                     "prompt": full_prompt,
                 });
 
-                // Erase the worker future's type, as the parallel spawn does:
-                // the spawn's `Send` proof otherwise walks every layer of the
-                // delegated loop under the action-budget, session, step and
-                // receipt scopes, and overflows the trait-solver recursion
-                // limit (E0275). A plain `Box::pin` does not stop it.
                 let worker: std::pin::Pin<
                     Box<dyn Future<Output = anyhow::Result<ToolResult>> + Send + '_>,
                 > = Box::pin(inner.execute_sync_with_target_admission(
@@ -3621,13 +3617,12 @@ impl DelegateTool {
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
-        // Action-budget continuity: spawned tasks start with empty
+        // Sender-bucket continuity: spawned tasks start with empty
         // task-locals, so a worker that restores only the session key would
-        // charge the fallback __global__ bucket and escape both the
-        // originating sender's action budget and its sender-role budget.
-        // Capture both before spawning and restore them around each
-        // worker's entire execution.
-        let parent_action_budget_scope = ActionBudgetScope::capture();
+        // charge the fallback __global__ bucket and escape the originating
+        // sender's action budget. Capture the sender scope before spawning
+        // and restore it around each worker's entire execution.
+        let parent_thread_id = TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).ok().flatten();
         for (index, agent_name) in agent_names.iter().enumerate() {
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
@@ -3671,7 +3666,7 @@ impl DelegateTool {
             let originator_chain = self.originator_chain.clone();
             let session_key = parent_session_key.clone();
             let inherited_budget = parent_budget.clone();
-            let action_budget_scope = parent_action_budget_scope.clone();
+            let thread_scope = parent_thread_id.clone();
             let step_scope = parent_step_scope.clone();
             let memory = self.memory.clone();
             let task_control_plane = Arc::clone(&self.task_control_plane);
@@ -3730,7 +3725,8 @@ impl DelegateTool {
                     let agent_name_for_return = agent_name.clone();
                     let result = ExecutionTreeBudget::scope_optional(
                         inherited_budget,
-                        action_budget_scope.scope(
+                        TOOL_LOOP_THREAD_ID.scope(
+                            thread_scope,
                             crate::sop::active_scope::with_inherited_headless_step_scope(
                                 step_scope,
                                 scope_delegate_session_key(session_key, async move {
@@ -5241,7 +5237,6 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::loop_::SenderRoleActionBudget;
     use crate::control_plane::{
         ControlPlaneHandle, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     };
@@ -15596,300 +15591,6 @@ mod tests {
                 "{sender}'s own second hop must be refused by its own exhausted bucket: {bodies:?}"
             );
         }
-    }
-
-    /// Bounded chain in which every agent may take 100 actions, so only a
-    /// sender-role budget can refuse a hop.
-    fn sender_role_budget_chain(temp_dir: &TempDir, nested_provider_uri: &str) -> Arc<Config> {
-        bounded_depth_matrix_fixture(
-            temp_dir,
-            nested_provider_uri,
-            &[
-                ("caller", &["middle"], "budget100"),
-                ("middle", &["leaf"], "budget100"),
-                ("leaf", &[], "budget100"),
-            ],
-            &[("budget100", 3, 100)],
-        )
-    }
-
-    /// A role budget of `max` actions held in the caller's tracker, as the
-    /// channel turn builds it for the originating agent.
-    fn caller_sender_role_budget(tool: &DelegateTool, max: u32) -> SenderRoleActionBudget {
-        SenderRoleActionBudget::new(
-            &tool.security.tracker,
-            "role:sender-a",
-            max,
-            "everyone/guest",
-        )
-    }
-
-    /// Run `execution` the way a channel turn runs a role-bearing sender:
-    /// under the sender's thread scope, with `budget` as its role budget.
-    async fn run_in_sender_role_turn<F: Future>(
-        budget: &SenderRoleActionBudget,
-        execution: F,
-    ) -> F::Output {
-        SenderRoleActionBudget::scope(
-            Some(budget.clone()),
-            crate::agent::loop_::scope_thread_id(Some("sender-a".to_string()), execution),
-        )
-        .await
-    }
-
-    /// Start `middle` as a background hop inside a sender-role turn and wait
-    /// for the detached worker to settle.
-    async fn run_background_hop_in_sender_role_turn(
-        tool: &DelegateTool,
-        budget: &SenderRoleActionBudget,
-    ) -> BackgroundDelegateResult {
-        let execution = tool
-            .execute(json!({"agent": "middle", "prompt": "background hop", "background": true}));
-        let result = run_in_sender_role_turn(budget, execution).await.unwrap();
-        assert!(
-            result.success,
-            "background hop one must succeed: {:?}",
-            result.error
-        );
-        let task_id = result
-            .output
-            .to_string()
-            .lines()
-            .find_map(|line| line.strip_prefix("task_id: "))
-            .map(str::trim)
-            .map(str::to_string)
-            .expect("background delegation must report a task_id");
-        wait_for_terminal_background_result(tool, &task_id).await
-    }
-
-    #[tokio::test]
-    async fn bounded_action_budget_parallel_worker_charges_sender_role_bucket() {
-        // Every agent cap is generous and the sender's role cap is one: hop
-        // one spends the role bucket, so the spawned parallel worker must
-        // charge that same bucket and fail rather than run with no role
-        // budget.
-        let temp = TempDir::new().unwrap();
-        let (server, captured) = start_scripted_chat_server(&[
-            chat_completion_tool_call(
-                DelegateTool::NAME,
-                "call_mid_1",
-                serde_json::json!({"parallel": ["leaf"], "prompt": "subtask"}),
-            ),
-            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
-        ])
-        .await;
-        let config = sender_role_budget_chain(&temp, &server.uri);
-        let tool = bounded_subdelegation_tool(&config);
-        let budget = caller_sender_role_budget(&tool, 1);
-
-        let execution = tool.execute(json!({"agent": "middle", "prompt": "parallel fan out"}));
-        let result = run_in_sender_role_turn(&budget, execution).await.unwrap();
-
-        assert!(result.success, "hop one must succeed: {:?}", result.error);
-        let bodies = captured.lock().unwrap();
-        // Leaf must never be contacted: a worker that dropped the role
-        // budget would admit the hop against the generous agent bucket and
-        // run leaf, adding provider requests.
-        assert_eq!(
-            bodies.len(),
-            2,
-            "middle's loop makes exactly two provider requests: {bodies:?}"
-        );
-        assert!(
-            bodies[1].contains("One or more parallel agents failed"),
-            "the parallel second hop must fail rather than run: {:?}",
-            bodies[1]
-        );
-        assert!(budget.is_exhausted());
-        assert!(
-            !tool.security.tracker.is_exhausted("sender-a", 2),
-            "the refused worker must release its agent slot"
-        );
-    }
-
-    #[tokio::test]
-    async fn bounded_action_budget_parallel_worker_spends_sender_role_bucket_within_cap() {
-        // With room for both hops the worker runs leaf, and its hop lands in
-        // the caller's role bucket: the bucket reaches its cap of two only
-        // if the worker charged it.
-        let temp = TempDir::new().unwrap();
-        let (server, captured) = start_scripted_chat_server(&[
-            chat_completion_tool_call(
-                DelegateTool::NAME,
-                "call_mid_1",
-                serde_json::json!({"parallel": ["leaf"], "prompt": "subtask"}),
-            ),
-            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]}),
-            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
-        ])
-        .await;
-        let config = sender_role_budget_chain(&temp, &server.uri);
-        let tool = bounded_subdelegation_tool(&config);
-        let budget = caller_sender_role_budget(&tool, 2);
-
-        let execution = tool.execute(json!({"agent": "middle", "prompt": "parallel fan out"}));
-        let result = run_in_sender_role_turn(&budget, execution).await.unwrap();
-
-        assert!(result.success, "hop one must succeed: {:?}", result.error);
-        let bodies = captured.lock().unwrap();
-        assert_eq!(
-            bodies.len(),
-            3,
-            "middle, leaf, then middle again reach the provider: {bodies:?}"
-        );
-        assert!(
-            !bodies[2].contains("One or more parallel agents failed"),
-            "the parallel second hop must run within the role cap: {:?}",
-            bodies[2]
-        );
-        assert!(
-            budget.is_exhausted(),
-            "both hops must be charged to the caller's role bucket"
-        );
-    }
-
-    #[tokio::test]
-    async fn bounded_action_budget_background_worker_charges_sender_role_bucket() {
-        // Background variant: the caller's pre-spawn admission spends the
-        // role bucket, and the detached worker running the child's own
-        // delegation must be refused by that bucket after the spawning turn
-        // has already returned.
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("delegate-workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let (server, captured) = start_scripted_chat_server(&[
-            chat_completion_tool_call(
-                DelegateTool::NAME,
-                "call_mid_bg",
-                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
-            ),
-            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
-        ])
-        .await;
-        let config = sender_role_budget_chain(&temp, &server.uri);
-        let tool = bounded_subdelegation_tool(&config)
-            .with_workspace_dir(workspace)
-            .with_task_control_plane(task_control_plane(Arc::new(
-                SqliteTaskStore::new_in_memory().unwrap(),
-            )));
-        let budget = caller_sender_role_budget(&tool, 1);
-
-        let waited = run_background_hop_in_sender_role_turn(&tool, &budget).await;
-
-        assert_eq!(
-            waited.status,
-            BackgroundTaskStatus::Completed,
-            "the background worker must complete: {waited:?}"
-        );
-        let bodies = captured.lock().unwrap();
-        assert_eq!(
-            bodies.len(),
-            2,
-            "middle's background turn makes exactly two provider requests: {bodies:?}"
-        );
-        assert!(
-            bodies[1].contains("action budget exhausted"),
-            "the child's own delegation must be refused by the sender's role bucket: {bodies:?}"
-        );
-        assert!(budget.is_exhausted());
-        assert!(
-            !tool.security.tracker.is_exhausted("sender-a", 2),
-            "the refused worker must release its agent slot"
-        );
-    }
-
-    #[tokio::test]
-    async fn bounded_action_budget_background_worker_spends_sender_role_bucket_within_cap() {
-        // With room for both hops the detached worker runs leaf, and its
-        // hop lands in the caller's role bucket even though the spawning
-        // turn's scope has ended.
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("delegate-workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let (server, captured) = start_scripted_chat_server(&[
-            chat_completion_tool_call(
-                DelegateTool::NAME,
-                "call_mid_bg",
-                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
-            ),
-            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]}),
-            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
-        ])
-        .await;
-        let config = sender_role_budget_chain(&temp, &server.uri);
-        let tool = bounded_subdelegation_tool(&config)
-            .with_workspace_dir(workspace)
-            .with_task_control_plane(task_control_plane(Arc::new(
-                SqliteTaskStore::new_in_memory().unwrap(),
-            )));
-        let budget = caller_sender_role_budget(&tool, 2);
-
-        let waited = run_background_hop_in_sender_role_turn(&tool, &budget).await;
-
-        assert_eq!(
-            waited.status,
-            BackgroundTaskStatus::Completed,
-            "the background worker must complete: {waited:?}"
-        );
-        let bodies = captured.lock().unwrap();
-        assert_eq!(
-            bodies.len(),
-            3,
-            "middle, leaf, then middle again reach the provider: {bodies:?}"
-        );
-        assert!(
-            !bodies[2].contains("action budget exhausted"),
-            "the child's delegation must run within the role cap: {bodies:?}"
-        );
-        assert!(
-            budget.is_exhausted(),
-            "both hops must be charged to the caller's role bucket"
-        );
-    }
-
-    #[tokio::test]
-    async fn independent_target_policy_still_charges_sender_role_bucket() {
-        // An independent target runs on a policy with an action tracker of
-        // its own, so it never spends the caller's agent bucket. The sender's
-        // role budget still binds it: the role bucket lives in the caller's
-        // tracker and travels with the turn, not with the policy.
-        let config = config_with_two_agents("caller", 5, "target", 50);
-        let mut config = (*config).clone();
-        config
-            .agents
-            .get_mut("caller")
-            .unwrap()
-            .delegates
-            .push(DelegateTargetConfig {
-                agent: "target".to_string(),
-                mode: DelegateExecutionMode::Independent,
-            });
-        let config = Arc::new(config);
-        let caller_policy =
-            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
-        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
-            .with_root_config(Arc::clone(&config))
-            .with_caller_alias("caller");
-        let target_policy = tool
-            .policy_for_target("target")
-            .expect("independent explicit delegate must resolve");
-        let budget = caller_sender_role_budget(&tool, 1);
-
-        let (first, second) = run_in_sender_role_turn(&budget, async {
-            (target_policy.record_action(), target_policy.record_action())
-        })
-        .await;
-
-        assert!(first, "the target's first action fits both budgets");
-        assert!(
-            !second,
-            "the caller's role bucket must refuse the target's second action"
-        );
-        assert!(budget.is_exhausted());
-        assert!(
-            !caller_policy.tracker.is_exhausted("sender-a", 1),
-            "the independent target must not charge the caller's agent bucket"
-        );
     }
 
     #[tokio::test]
