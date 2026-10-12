@@ -27,7 +27,7 @@ use support::{admit_fixture, state_service};
 /// is gone, whether a missed deadline or a call that failed inside Wasmtime
 /// discarded it.
 const UNAVAILABLE: &str =
-    "plugin instance is unavailable: a previous call was interrupted before completion";
+    "plugin instance is unavailable: a previous call failed or was interrupted";
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();

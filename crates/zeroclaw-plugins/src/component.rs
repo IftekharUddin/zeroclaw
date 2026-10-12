@@ -778,9 +778,7 @@ pub(crate) fn call_timeout_error(deadline: Duration) -> anyhow::Error {
 /// Error returned after a warm instance has been discarded because a call into
 /// it was interrupted or failed inside Wasmtime.
 pub(crate) fn unavailable_instance_error() -> anyhow::Error {
-    anyhow::Error::msg(
-        "plugin instance is unavailable: a previous call was interrupted before completion",
-    )
+    anyhow::Error::msg("plugin instance is unavailable: a previous call failed or was interrupted")
 }
 
 /// Hint appended to instantiation failures, pointing plugin authors at the
