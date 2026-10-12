@@ -482,10 +482,9 @@ tokio::task_local! {
 /// and the agent's bucket is charged exactly as without a budget.
 ///
 /// The role bucket lives in the tracker this budget carries (the originating
-/// agent's), not in the tracker of whichever policy admits the action. The
-/// budget travels with the turn, so bounded delegates (which share the
-/// caller's tracker), independent delegates (which get a fresh tracker) and
-/// inline subagents all charge the one role bucket.
+/// agent's), not in the tracker of whichever policy admits the action, so
+/// every policy that admits an action inside the turn charges that one
+/// bucket.
 #[derive(Clone)]
 pub struct SenderRoleActionBudget {
     /// The originating agent's tracker, which holds the role bucket.
@@ -8940,10 +8939,6 @@ mod tests {
         .await;
     }
 
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "zeroclaw-config has no zeroclaw-spawn dependency and the race needs real tasks"
-    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn racing_reservations_never_overbook_the_role_bucket() {
         const ROLE_CAP: u32 = 8;
@@ -8963,21 +8958,19 @@ mod tests {
             let settle = std::sync::Arc::clone(&settle);
             // Spawned tasks start without task-locals, so each racer scopes
             // its own clone of the budget.
-            racers.push(tokio::spawn(SenderRoleActionBudget::scope(
-                Some(budget.clone()),
-                async move {
-                    start.wait().await;
-                    let reservation = p.reserve_action();
-                    // Every admitted slot stays in flight until all racers
-                    // have tried, so none is admitted against a freed slot.
-                    settle.wait().await;
-                    let admitted = reservation.is_some();
-                    if let Some(reservation) = reservation {
-                        reservation.commit();
-                    }
-                    admitted
-                },
-            )));
+            let racer = SenderRoleActionBudget::scope(Some(budget.clone()), async move {
+                start.wait().await;
+                let reservation = p.reserve_action();
+                // Every admitted slot stays in flight until all racers have
+                // tried, so none is admitted against a freed slot.
+                settle.wait().await;
+                let admitted = reservation.is_some();
+                if let Some(reservation) = reservation {
+                    reservation.commit();
+                }
+                admitted
+            });
+            racers.push(zeroclaw_spawn::spawn!(racer));
         }
         let mut admitted = 0;
         for racer in racers {
@@ -9059,13 +9052,13 @@ mod tests {
 
     #[tokio::test]
     async fn policies_with_distinct_trackers_charge_one_role_bucket() {
-        // An independent delegate runs on a fresh policy and tracker; the
-        // role bucket stays in the originating agent's tracker.
+        // A second policy with a tracker of its own admits an action inside
+        // the turn; the role bucket stays in the originating agent's tracker.
         let caller = SecurityPolicy {
             max_actions_per_hour: 100,
             ..SecurityPolicy::default()
         };
-        let delegate = SecurityPolicy {
+        let other = SecurityPolicy {
             max_actions_per_hour: 100,
             ..SecurityPolicy::default()
         };
@@ -9073,24 +9066,24 @@ mod tests {
 
         SenderRoleActionBudget::scope(Some(budget), async {
             assert!(caller.record_action());
-            assert!(delegate.record_action());
+            assert!(other.record_action());
             assert!(
                 caller.is_rate_limited(),
-                "the delegate's action counts against the caller's role bucket"
+                "the other policy's action counts against the caller's role bucket"
             );
-            assert!(delegate.is_rate_limited());
+            assert!(other.is_rate_limited());
             assert!(!caller.record_action());
-            assert!(delegate.reserve_action().is_none());
+            assert!(other.reserve_action().is_none());
         })
         .await;
 
         assert_eq!(role_usage(&caller.tracker, "role:sender-a"), Some((2, 0)));
         assert!(
-            delegate.tracker.role_buckets.lock().buckets.is_empty(),
-            "the delegate's own tracker holds no role bucket"
+            other.tracker.role_buckets.lock().buckets.is_empty(),
+            "the other policy's own tracker holds no role bucket"
         );
         assert_eq!(
-            agent_usage(&delegate.tracker, PerSenderTracker::GLOBAL_KEY),
+            agent_usage(&other.tracker, PerSenderTracker::GLOBAL_KEY),
             Some((1, 0))
         );
     }
