@@ -113,6 +113,7 @@ use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_config::policy::SenderRoleActionBudget;
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 #[cfg(test)]
@@ -128,7 +129,7 @@ use zeroclaw_providers::{
 use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    SenderRoleActionBudget, ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
+    ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
     scope_session_key, scope_thread_id, scrub_credentials,
 };
@@ -785,11 +786,11 @@ fn channel_turn_approval(
 /// role nor the agent sets a route does the originating channel ask, as it
 /// does for the agent's own turns.
 fn sender_role_turn_approval(
-    narrowing: &SenderRoleNarrowing,
+    approval: &SenderRoleApproval,
     channels_by_name: &HashMap<String, Arc<dyn Channel>>,
     origin: Option<Arc<dyn Channel>>,
 ) -> (ApprovalManager, Option<Arc<dyn Channel>>) {
-    let approval_channel = match narrowing.approval_route.clone() {
+    let approval_channel = match approval.approval_route.clone() {
         Some(route) => {
             let handles = Arc::new(RwLock::new(channels_by_name.clone()));
             Some(zeroclaw_runtime::agent::agent::routed_approval_channel(
@@ -798,7 +799,7 @@ fn sender_role_turn_approval(
         }
         None => origin,
     };
-    (narrowing.approval_manager.for_new_turn(), approval_channel)
+    (approval.approval_manager.for_new_turn(), approval_channel)
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -3294,24 +3295,27 @@ fn normalize_peer_username(raw: &str) -> String {
 struct SenderRoleTurn {
     group: String,
     risk_profile: String,
-    /// Tool and approval narrowing, present when the role names a risk
-    /// profile other than the agent's own. `None` leaves the turn's tools and
-    /// approvals exactly as the agent's own turn has them.
-    narrowing: Option<SenderRoleNarrowing>,
+    /// Tools the role removes, applied on top of the agent's own per-turn
+    /// exclusions at every autonomy level. A role is an explicit narrowing,
+    /// so an agent running at `full` must not quietly undo it. Besides the
+    /// role's own `excluded_tools`, this holds every tool whose work the role
+    /// cannot follow (see [`sender_role_excluded_tools`]). A role that names
+    /// the agent's own risk profile and only adds a budget removes those
+    /// tools too: their work would run outside the budget, so without them
+    /// all of the turn's work stays inside the budget's scope.
+    excluded_tools: Vec<String>,
+    /// Approval narrowing, present when the role names a risk profile other
+    /// than the agent's own. `None` gates the turn with the agent's own
+    /// approval manager and approval route.
+    approval: Option<SenderRoleApproval>,
     /// The sender's action budget, present when the role names a runtime
     /// profile. It is scoped around the turn's tool loop, so every action
     /// the turn takes must fit it as well as the agent's own budget.
     action_budget: Option<SenderRoleActionBudget>,
 }
 
-/// How a role whose risk profile differs from the agent's narrows a turn.
-struct SenderRoleNarrowing {
-    /// Tools the role removes, applied on top of the agent's own per-turn
-    /// exclusions at every autonomy level. A role is an explicit narrowing,
-    /// so an agent running at `full` must not quietly undo it. Besides the
-    /// role's own `excluded_tools`, this holds every tool whose work the role
-    /// cannot follow (see [`sender_role_excluded_tools`]).
-    excluded_tools: Vec<String>,
+/// How a role whose risk profile differs from the agent's gates approvals.
+struct SenderRoleApproval {
     /// Approval policy for the turn, derived from the narrowed profile. Its
     /// session allowlist starts empty, so an "Always" answered for one side
     /// never carries across to the other.
@@ -3409,8 +3413,9 @@ fn resolve_sender_role_turn(
         .get(agent_alias)
         .map(|agent| agent.risk_profile.trim())
         .unwrap_or_default();
-    // A role naming the agent's own risk profile narrows nothing, but it may
-    // still carry a budget.
+    let registry: &[Box<dyn Tool>] = &ctx.tools_registry[..];
+    // A role naming the agent's own risk profile removes no tool of its own
+    // and keeps the agent's approvals, but it may still carry a budget.
     let narrowing = if role.risk_profile == agent_profile_alias {
         None
     } else {
@@ -3425,18 +3430,17 @@ fn resolve_sender_role_turn(
                 runtime_profiles: vec![role.runtime_profile],
             };
         };
-        let registry: &[Box<dyn Tool>] = &ctx.tools_registry[..];
         let mut narrowed = agent_profile.narrowed_for_sender_role(role_profile);
         // Wrappers are matched against the role's approval gate itself, so an
         // entry the gate accepts for a direct call reaches the wrapper too.
         let direct_gate = ctx.approval_manager.derive_for_risk_profile(&narrowed);
         let wrapped_always_ask = sender_role_wrapped_always_ask(registry, &direct_gate);
         narrowed.always_ask.extend(wrapped_always_ask);
-        Some(SenderRoleNarrowing {
-            excluded_tools: sender_role_excluded_tools(registry, &role_profile.excluded_tools),
+        let approval = SenderRoleApproval {
             approval_manager: ctx.approval_manager.derive_for_risk_profile(&narrowed),
             approval_route: narrowed.approval_route,
-        })
+        };
+        Some((role_profile.excluded_tools.as_slice(), approval))
     };
     let action_budget = match role.runtime_profile.as_deref() {
         None => None,
@@ -3481,10 +3485,17 @@ fn resolve_sender_role_turn(
     if narrowing.is_none() && action_budget.is_none() {
         return SenderRoleOutcome::AgentProfile;
     }
+    let (role_excluded, approval): (&[String], _) = match narrowing {
+        Some((role_excluded, approval)) => (role_excluded, Some(approval)),
+        None => (&[], None),
+    };
     SenderRoleOutcome::Role(Box::new(SenderRoleTurn {
         group: role.group,
         risk_profile: role.risk_profile,
-        narrowing,
+        // A budget-only role loses the tools whose work leaves the turn as
+        // well: that work would run outside the budget.
+        excluded_tools: sender_role_excluded_tools(registry, role_excluded),
+        approval,
         action_budget,
     }))
 }
@@ -3578,11 +3589,11 @@ fn sender_role_wrapped_always_ask(
 
 /// The tools a channel turn may not call: the agent's non-CLI exclusions
 /// (skipped for CLI and `full` autonomy, as before), plus everything the
-/// sender's role narrowing removes.
+/// sender's role removes.
 fn channel_turn_excluded_tools(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    narrowing: Option<&SenderRoleNarrowing>,
+    sender_role: Option<&SenderRoleTurn>,
 ) -> Vec<String> {
     let mut excluded: Vec<String> =
         if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
@@ -3590,8 +3601,8 @@ fn channel_turn_excluded_tools(
         } else {
             ctx.non_cli_excluded_tools.as_ref().clone()
         };
-    if let Some(narrowing) = narrowing {
-        for tool in &narrowing.excluded_tools {
+    if let Some(role) = sender_role {
+        for tool in &role.excluded_tools {
             if !zeroclaw_runtime::agent::tool_execution::is_excluded_tool(tool, &excluded) {
                 excluded.push(tool.clone());
             }
@@ -9373,11 +9384,12 @@ async fn process_channel_message_body(
             "channel turn narrowed by sender role"
         );
     }
-    // A role that only adds a budget narrows nothing, so its turn keeps the
-    // agent's own tools, approval manager and approval channel.
-    let sender_role_narrowing = sender_role
+    // A role that only adds a budget keeps the agent's own approval manager
+    // and approval channel. Like every role turn, its turn loses the tools
+    // whose work leaves the turn (see `SenderRoleTurn::excluded_tools`).
+    let sender_role_approval = sender_role
         .as_deref()
-        .and_then(|role| role.narrowing.as_ref());
+        .and_then(|role| role.approval.as_ref());
     let sender_role_budget = sender_role
         .as_deref()
         .and_then(|role| role.action_budget.as_ref());
@@ -9722,7 +9734,7 @@ async fn process_channel_message_body(
     }
 
     let per_turn_excluded_tools_owned =
-        channel_turn_excluded_tools(ctx.as_ref(), &msg, sender_role_narrowing);
+        channel_turn_excluded_tools(ctx.as_ref(), &msg, sender_role.as_deref());
     let per_turn_excluded_tools: &[String] = &per_turn_excluded_tools_owned;
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
@@ -10257,11 +10269,11 @@ async fn process_channel_message_body(
             (Some(channel), None) => Some(Arc::clone(channel)),
             (None, _) => None,
         };
-    // A role that only adds a budget narrows nothing, so its turn asks for
-    // approval exactly as the agent's own turns do.
-    let (approval_manager, approval_channel) = match sender_role_narrowing {
-        Some(narrowing) => {
-            sender_role_turn_approval(narrowing, ctx.channels_by_name.as_ref(), approval_channel)
+    // A role that only adds a budget asks for approval exactly as the agent's
+    // own turns do.
+    let (approval_manager, approval_channel) = match sender_role_approval {
+        Some(approval) => {
+            sender_role_turn_approval(approval, ctx.channels_by_name.as_ref(), approval_channel)
         }
         None => {
             let active_risk_profile = ctx
@@ -29819,23 +29831,28 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut ctx = channel_runtime_context_with_peer_groups(tmp.path(), HashMap::new());
         ctx.autonomy_level = AutonomyLevel::Full;
         ctx.non_cli_excluded_tools = Arc::new(vec!["agent_only".into()]);
-        let narrowing = SenderRoleNarrowing {
+        let role = SenderRoleTurn {
+            group: "everyone".into(),
+            risk_profile: "guest".into(),
             excluded_tools: vec!["shell".into()],
-            approval_manager: ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-            ),
-            approval_route: None,
+            approval: Some(SenderRoleApproval {
+                approval_manager: ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                ),
+                approval_route: None,
+            }),
+            action_budget: None,
         };
         let msg = sender_role_msg("mallory");
         // `full` still skips the agent's own list, as before, but keeps the role's.
         assert_eq!(
-            channel_turn_excluded_tools(&ctx, &msg, Some(&narrowing)),
+            channel_turn_excluded_tools(&ctx, &msg, Some(&role)),
             vec!["shell".to_string()]
         );
         assert!(channel_turn_excluded_tools(&ctx, &msg, None).is_empty());
         ctx.autonomy_level = AutonomyLevel::Supervised;
         assert_eq!(
-            channel_turn_excluded_tools(&ctx, &msg, Some(&narrowing)),
+            channel_turn_excluded_tools(&ctx, &msg, Some(&role)),
             vec!["agent_only".to_string(), "shell".to_string()]
         );
     }
@@ -29872,16 +29889,16 @@ BTC is currently around $65,000 based on latest tool output."#
             role.action_budget.is_none(),
             "the guest role names no budget"
         );
-        let narrowing = role
-            .narrowing
+        let approval = role
+            .approval
             .as_ref()
-            .expect("a guest role narrows the turn");
+            .expect("a guest role narrows the turn's approvals");
         assert!(
             !ctx.approval_manager.needs_approval("other_tool"),
             "the agent's own manager keeps its session answer"
         );
         assert!(
-            narrowing.approval_manager.needs_approval("other_tool"),
+            approval.approval_manager.needs_approval("other_tool"),
             "a guest turn starts with no session answers"
         );
         // Alice's group names the agent's own profile: no narrowing at all.
@@ -30564,8 +30581,16 @@ BTC is currently around $65,000 based on latest tool output."#
             panic!("a group that adds a budget must resolve to a role");
         };
         assert!(
-            role.narrowing.is_none(),
-            "the agent's own risk profile narrows nothing"
+            role.approval.is_none(),
+            "the agent's own risk profile keeps the agent's approvals"
+        );
+        assert_eq!(
+            role.excluded_tools,
+            SENDER_ROLE_UNFOLLOWED_TOOLS
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect::<Vec<_>>(),
+            "the role removes the tools whose work leaves the turn, and none of the agent's own"
         );
         let budget = role
             .action_budget
@@ -30589,8 +30614,155 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             calls.ran(),
             1,
-            "a role that narrows nothing is still capped by its budget"
+            "a role that keeps the agent's approvals is still capped by its budget"
         );
+    }
+
+    /// [`open_sender_role_config`] with `everyone` made budget-only: the
+    /// group names the agent's own risk profile and adds a budget whose cap
+    /// no test here reaches. A guest keeps the agent's approvals, which
+    /// auto-approve everything, so a call stops only on an exclusion every
+    /// budgeted turn gets. `alice`, named in `owners` with no budget, runs
+    /// with no role at all.
+    fn budget_only_sender_role_config() -> zeroclaw_config::schema::Config {
+        let mut config = open_sender_role_config(open_guest());
+        config.runtime_profiles.insert(
+            "guest".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_actions_per_hour: 100,
+                ..Default::default()
+            },
+        );
+        let everyone = config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group");
+        everyone.risk_profile = Some("owner".into());
+        everyone.runtime_profile = Some("guest".into());
+        config
+    }
+
+    /// Run `sender`'s turn under [`budget_only_sender_role_config`], in which
+    /// the model calls `called` with `tool` registered, and count the runs of
+    /// the tool `executions` belongs to.
+    async fn budget_only_sender_turn_runs(
+        sender: &str,
+        called: &str,
+        tool: Box<dyn Tool>,
+        executions: &AtomicUsize,
+    ) -> usize {
+        let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+        run_sender_turn(
+            budget_only_sender_role_config(),
+            sender,
+            called,
+            vec![tool],
+            vec![room as Arc<dyn Channel>],
+        )
+        .await;
+        executions.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_only_guest_cannot_run_cron_add_or_other_unfollowed_tools() {
+        // `cron_add` first; the other tools whose work leaves the turn take
+        // the same path. A role that adds only a budget narrows no approval,
+        // so the exclusion alone must stop each call. Alice's runs are the
+        // positive control: each tool works when no role applies.
+        let mut failures = Vec::new();
+        for name in [
+            "cron_add",
+            "cron_update",
+            "cron_run",
+            "schedule",
+            "sop_execute",
+            "sop_advance",
+            "sop_approve",
+            "sop_workshop",
+            "send_message_to_peer",
+            "a2a_send",
+            "a2a_cancel",
+            "sessions_send",
+        ] {
+            for (sender, expected) in [("mallory", 0), ("alice", 1)] {
+                let executions = Arc::new(AtomicUsize::new(0));
+                let tool = Box::new(CountingNamedTool {
+                    name: name.to_string(),
+                    launcher: false,
+                    executions: Arc::clone(&executions),
+                });
+                let runs = budget_only_sender_turn_runs(sender, name, tool, &executions).await;
+                if runs != expected {
+                    failures.push(format!(
+                        "{name} for {sender}: {runs} runs, expected {expected}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_only_guest_cannot_reach_cron_add_through_a_wrapper() {
+        // A skill wrapper over `cron_add`, and a wrapper over that wrapper:
+        // the exclusion follows each `wrapped_tool()` chain to its end. Only
+        // the outermost wrapper is registered.
+        let mut failures = Vec::new();
+        for nested in [false, true] {
+            for (sender, expected) in [("mallory", 0), ("alice", 1)] {
+                let executions = Arc::new(AtomicUsize::new(0));
+                let cron_add: Arc<dyn Tool> = Arc::new(CountingNamedTool {
+                    name: "cron_add".to_string(),
+                    launcher: false,
+                    executions: Arc::clone(&executions),
+                });
+                let wrapper = if nested {
+                    skill_wrapper("remind_later", Arc::new(skill_wrapper("remind", cron_add)))
+                } else {
+                    skill_wrapper("remind", cron_add)
+                };
+                let called = wrapper.name().to_string();
+                let runs =
+                    budget_only_sender_turn_runs(sender, &called, Box::new(wrapper), &executions)
+                        .await;
+                if runs != expected {
+                    failures.push(format!(
+                        "{called} over cron_add (nested: {nested}) for {sender}: {runs} runs, expected {expected}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn sender_role_budget_only_guest_cannot_run_a_launcher_without_caller_limits() {
+        // Launchers whose nested runs do not carry the caller's limits, found
+        // by `requires_unrestricted_principal`. The same tool unflagged is
+        // the control that the flag, not the name, removes it, and that a
+        // budget-only guest still runs the agent's other tools.
+        let mut failures = Vec::new();
+        for name in ["delegate", "spawn_subagent", "pipeline"] {
+            for (sender, launcher, expected) in [
+                ("mallory", true, 0),
+                ("mallory", false, 1),
+                ("alice", true, 1),
+            ] {
+                let executions = Arc::new(AtomicUsize::new(0));
+                let tool = Box::new(CountingNamedTool {
+                    name: name.to_string(),
+                    launcher,
+                    executions: Arc::clone(&executions),
+                });
+                let runs = budget_only_sender_turn_runs(sender, name, tool, &executions).await;
+                if runs != expected {
+                    failures.push(format!(
+                        "{name} (flagged: {launcher}) for {sender}: {runs} runs, expected {expected}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]
