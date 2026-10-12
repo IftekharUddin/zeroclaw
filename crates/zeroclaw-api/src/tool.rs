@@ -367,6 +367,25 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
 
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
+    /// True when this tool starts nested execution without carrying the RPC
+    /// principal's current tool and agent ceilings. Constrained RPC sessions
+    /// must omit it. Wrappers forward the target's value so a renamed skill
+    /// cannot bypass that restriction. This describes implementation support,
+    /// not a stored authorization decision.
+    fn requires_unrestricted_principal(&self) -> bool {
+        false
+    }
+
+    /// The tool this one runs, for a wrapper that exposes another tool under
+    /// a different name (a skill's builtin wrapper). A caller that restricts
+    /// tools by name applies the restriction along this chain as well, so a
+    /// renamed wrapper cannot reach a tool the caller excluded or skip an
+    /// approval the caller requires for it. Transparent wrappers that keep
+    /// their inner tool's name forward the inner tool's value.
+    fn wrapped_tool(&self) -> Option<&dyn Tool> {
+        None
+    }
+
     /// Tool name (used in LLM function calling)
     fn name(&self) -> &str;
 

@@ -2,6 +2,7 @@
 
 pub mod approval_channel;
 pub mod attachments;
+pub mod auth;
 pub mod context;
 pub mod dispatch;
 pub mod fs;
@@ -9,6 +10,7 @@ pub mod git;
 pub mod local;
 pub mod locales;
 pub mod session;
+pub mod subscription;
 pub mod transport;
 pub mod tui_identity;
 pub mod turn;

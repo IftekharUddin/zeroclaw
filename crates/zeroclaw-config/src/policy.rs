@@ -546,8 +546,12 @@ impl SenderRoleActionBudget {
 
     /// Run `future` with `budget` as the running turn's sender-role budget.
     /// `None` runs it with no role budget, even inside an outer scope.
-    pub async fn scope<F: Future>(budget: Option<Self>, future: F) -> F::Output {
-        SENDER_ROLE_ACTION_BUDGET.scope(budget, future).await
+    ///
+    /// The returned future is the task-local scope itself, not an `async fn`
+    /// around it, so wrapping a deep future adds no frame of its own to each
+    /// poll of that future.
+    pub fn scope<F: Future>(budget: Option<Self>, future: F) -> impl Future<Output = F::Output> {
+        SENDER_ROLE_ACTION_BUDGET.scope(budget, future)
     }
 
     /// Whether the role bucket is at the role cap. A cap of zero is always
@@ -1815,8 +1819,17 @@ fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
 
         match arg {
             "--" => return args.get(idx + 1).map(|_| idx + 1),
+            // Global options whose value is a separate following token. Git
+            // consumes that token as the option value, so the real subcommand is
+            // the token after it. Missing any of these lets a value that
+            // resembles a read verb hide the actual (possibly mutating)
+            // subcommand from the approval classifier: `git --attr-source log
+            // commit` runs `commit`, not `log`. `-c`/`--config-env` also take a
+            // separate value and are included so this resolver is correct on its
+            // own, independent of the allowlist gate that separately rejects
+            // them.
             "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
-            | "--super-prefix" => {
+            | "--super-prefix" | "--attr-source" | "-c" | "--config-env" => {
                 idx += 2;
             }
             "--bare"
@@ -1842,7 +1855,9 @@ fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
                 || arg.starts_with("--work-tree=")
                 || arg.starts_with("--namespace=")
                 || arg.starts_with("--exec-path=")
-                || arg.starts_with("--super-prefix=") =>
+                || arg.starts_with("--super-prefix=")
+                || arg.starts_with("--attr-source=")
+                || arg.starts_with("--config-env=") =>
             {
                 idx += 1;
             }
@@ -4494,6 +4509,30 @@ impl SecurityPolicy {
             .next()
     }
 
+    /// Canonicalize a caller-supplied path into the same filesystem namespace
+    /// the policy prefixes live in, exactly as the internal readability and
+    /// allowlist checks do before they compare.
+    ///
+    /// Every accessor that takes a `resolved` path — `is_resolved_path_readable`,
+    /// `is_resolved_path_allowed`, `approved_read_root`, `approved_read_roots`,
+    /// `approved_write_roots` — assumes its input is already canonical. Callers
+    /// that authorize a request and then bind the granted operation to a root
+    /// MUST resolve the request once through this accessor and carry the
+    /// returned target into both the check and the operation. Feeding the raw
+    /// request spelling to `approved_read_root` while checking readability on a
+    /// separately resolved target lets an alias that resolves inside an
+    /// entitled root pass readability yet fall out of every configured root
+    /// (returning `None`/`Unconfined`), after which the operation would touch
+    /// the still-swappable raw path outside the boundary. Returns `None` when
+    /// the path cannot be resolved (a symlink cycle, or a target whose parents
+    /// do not exist); the caller MUST fail closed.
+    pub fn resolve_policy_target(&self, path: &Path) -> Option<PathBuf> {
+        if cfg!(windows) && is_null_device(path) {
+            return Some(path.to_path_buf());
+        }
+        resolve_symlinked_path(path)
+    }
+
     /// Return every canonical bounded root that authorizes writing `resolved`.
     ///
     /// This intentionally excludes `allowed_roots_read_only`; callers use it
@@ -5819,6 +5858,59 @@ mod tests {
             p.command_risk_level("touch file.txt"),
             CommandRiskLevel::Medium
         );
+    }
+
+    #[test]
+    fn git_value_taking_global_options_do_not_hide_a_mutating_subcommand() {
+        // Regression for the approval-classification bypass where a value-taking
+        // git global option hid the real subcommand from the risk classifier.
+        //
+        // `--attr-source`, `-c`, and `--config-env` each take a *separate*
+        // following token as their value. Git consumes that token, so the real
+        // subcommand is the one after it. When the resolver skipped only the
+        // flag (not its value), a value that looks like a read verb hid the
+        // actual mutating subcommand and the write was classified Low instead of
+        // Medium, dropping the approval requirement.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            // The value (`log`/`HEAD`) resembles a read verb; the real
+            // subcommand `commit` mutates and must stay Medium.
+            "git --attr-source log commit",
+            "git --attr-source HEAD commit",
+            "git --attr-source=HEAD commit",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Medium,
+                "value-taking global option must not hide the write subcommand: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_attr_source_read_stays_low() {
+        // The fix must not over-approximate: an ordinary read behind
+        // `--attr-source` stays Low so it is not needlessly gated.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git --attr-source HEAD status",
+            "git --attr-source=HEAD log",
+            "git --attr-source HEAD diff",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "ordinary read behind --attr-source should stay low: {command}"
+            );
+        }
     }
 
     #[test]

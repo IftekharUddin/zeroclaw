@@ -87,32 +87,15 @@ fn default_approval_timeout_secs() -> u64 {
 pub struct ApprovalRoute {
     /// A registered channel name (NOT the originator) — the distinct-approver hop.
     pub approver_channel: String,
+    /// The recipient on the approver channel. Blank or absent means unavailable.
+    #[serde(default)]
+    pub approver_recipient: Option<String>,
     /// Behavior when the approver is unreachable. Fail-closed by default.
     #[serde(default)]
     pub on_no_approver: OnNoApprover,
     /// Bound the approver's response window; a timeout denies (DoS guard). Default 120s.
     #[serde(default = "default_approval_timeout_secs")]
     pub timeout_secs: u64,
-    /// Where inside `approver_channel` the prompt goes: a room or chat id on
-    /// that channel (a Discord channel id, a Telegram chat id). `None` keeps
-    /// the originating turn's recipient, which suits session-addressed
-    /// approvers (ACP, TUI) but not room channels, where the originating
-    /// recipient is the room the request came from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recipient: Option<String>,
-}
-
-impl ApprovalRoute {
-    /// The recipient the approver channel should address: the configured
-    /// `recipient` when set and non-blank, else `originating`.
-    #[must_use]
-    pub fn recipient_or<'a>(&'a self, originating: &'a str) -> &'a str {
-        self.recipient
-            .as_deref()
-            .map(str::trim)
-            .filter(|r| !r.is_empty())
-            .unwrap_or(originating)
-    }
 }
 
 impl crate::config::HasPropKind for ApprovalRoute {
@@ -143,6 +126,7 @@ mod tests {
         // Absent optional fields: fail-closed policy + bounded 120s window.
         let r: ApprovalRoute = toml::from_str("approver_channel = \"ops\"").unwrap();
         assert_eq!(r.approver_channel, "ops");
+        assert_eq!(r.approver_recipient, None);
         assert_eq!(
             r.on_no_approver,
             OnNoApprover::Deny,
@@ -155,35 +139,18 @@ mod tests {
     fn approval_route_round_trips() {
         let r = ApprovalRoute {
             approver_channel: "ops".into(),
+            approver_recipient: Some("ops-recipient".into()),
             on_no_approver: OnNoApprover::InheritOriginator,
             timeout_secs: 30,
-            recipient: Some("123456789012345678".into()),
         };
         let s = toml::to_string(&r).unwrap();
         // kebab-case enum on the wire.
         assert!(s.contains("on_no_approver = \"inherit-originator\""), "{s}");
         let back: ApprovalRoute = toml::from_str(&s).unwrap();
         assert_eq!(back.approver_channel, r.approver_channel);
+        assert_eq!(back.approver_recipient, r.approver_recipient);
         assert_eq!(back.on_no_approver, r.on_no_approver);
         assert_eq!(back.timeout_secs, r.timeout_secs);
-        assert_eq!(back.recipient, r.recipient);
-    }
-
-    #[test]
-    fn approval_route_recipient_defaults_to_the_originating_one() {
-        let r: ApprovalRoute = toml::from_str("approver_channel = \"ops\"").unwrap();
-        assert_eq!(r.recipient, None);
-        assert_eq!(r.recipient_or("room-1"), "room-1");
-        let blank = ApprovalRoute {
-            recipient: Some("  ".into()),
-            ..r.clone()
-        };
-        assert_eq!(blank.recipient_or("room-1"), "room-1", "blank is unset");
-        let set = ApprovalRoute {
-            recipient: Some("ops-room".into()),
-            ..r
-        };
-        assert_eq!(set.recipient_or("room-1"), "ops-room");
     }
 
     #[test]
