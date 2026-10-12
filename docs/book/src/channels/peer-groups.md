@@ -232,7 +232,8 @@ agent's profile; `sop_execute`, `sop_advance`, `sop_approve`, and
 peer or an A2A peer) run a turn under its own profile, and `a2a_cancel` over
 those tasks; and `sessions_send`, which plants a message in another session
 for its next turn. A skill wrapper over any of these is excluded as well. Owners, and
-senders no role matches, keep these tools.
+senders no role matches, keep these tools, unless the owners' group adds a
+budget (see [Action budget](#action-budget)).
 
 Current limits:
 
@@ -278,16 +279,27 @@ runtime_profile = "guest"
   `max_cost_per_day_cents` is one of those fields: there is no per-sender
   cost ceiling.
 - `runtime_profile` requires `risk_profile`. To add only a budget, name the
-  agent's own risk profile there: the role then keeps the agent's tools and
-  approvals exactly and adds the budget. Naming the agent's own runtime
-  profile as well gives each sender a budget at the agent's own number.
-  Validation rejects a group that names a budget without a role, and a
-  sender such a group would place is refused rather than run without the
-  budget.
+  agent's own risk profile there: the role then keeps the agent's approvals,
+  adds the budget, and loses only the tools no budgeted turn can call (see
+  below). Naming the agent's own runtime profile as well gives each sender a
+  budget at the agent's own number. Validation rejects a group that names a
+  budget without a role, and a sender such a group would place is refused
+  rather than run without the budget.
+- A turn with a budget cannot call the tools whose work leaves the turn, even
+  when its role only adds a budget. These are the tools a narrowing role
+  loses, listed under [Sender roles](#sender-roles): `cron_add`,
+  `cron_update`, `cron_run`, and `schedule`; `sop_execute`, `sop_advance`,
+  `sop_approve`, and `sop_workshop`; `send_message_to_peer`, `a2a_send`,
+  `a2a_cancel`, and `sessions_send`; and `delegate`, `spawn_subagent`,
+  `pipeline`, and any other tool that starts nested execution without
+  carrying the caller's limits. A skill wrapper over any of them is excluded
+  too. Every tool call a budgeted turn makes therefore runs inside the turn,
+  where each action the budget counts is charged to it. A tool the role
+  keeps, such as `shell`, counts as one action however much the program it
+  runs does; exclude such tools in a narrowing role if that matters.
 - A budget counts only what the agent's own budget counts. Tools that never
   charge the action budget, including WASM plugin tools, are counted by
-  neither, and `cron_add` or `schedule` can start work that later runs
-  outside the budget.
+  neither.
 - A cap of `0` refuses every counted action. A refused action fails with the
   same "Rate limit exceeded" tool error the agent's own budget produces; the
   model carries on and the sender still gets a reply. The system prompt
@@ -308,18 +320,16 @@ runtime_profile = "guest"
   `@user:server` ids are stable, but on a channel that reports a display
   name the budget belongs to the name. A sender who renames starts afresh,
   and two senders who share a name share one budget, so either can spend
-  the other's.
+  the other's. Placement is separate: which role, and so which budget, a
+  sender gets is decided by the matching under [Sender roles](#sender-roles),
+  which compares the sender the channel reports rather than the platform id.
 - Budgets are kept in memory, per agent and channel alias. A sender who
   talks to two agents, or on two aliases of one channel type, has a separate
   budget for each, and every budget starts over when the daemon restarts,
   including a config reload, which rebuilds the channel runtime.
-- The budget follows work that stays inside the sender's turn, including
-  `delegate`'s background and parallel workers and SOP runs that
-  `sop_execute` starts or `sop_advance` moves on, whose steps the turn's tool
-  loop drives and charges. It does not follow work that leaves the turn:
-  cron jobs the sender schedules, messages to peer agents, SOP runs that
-  channel ingress dispatches (before the sender's role is resolved), and
-  runs the headless SOP driver resumes all run without it.
+- SOP runs that channel ingress dispatches for a message start before the
+  sender's role is resolved, so they are not part of the turn and run
+  without the budget.
 - Channels served through [gateway webhooks](../architecture/channel-runtime-lifecycle.md#gateway-webhooks)
   do not run this turn path, so neither roles nor budgets apply to them.
 - Like the rest of sender roles, budgets are read from the config snapshot
