@@ -756,58 +756,74 @@ fn spellings_of(pattern: &[&'static str]) -> Vec<Vec<&'static str>> {
 /// Rewrite every key of `root` spelled as one of [`ALIASED_KEYS`]' aliases to
 /// the spelling the schema writes, keeping its value, comments and position,
 /// so an incremental edit of that setting lands on it rather than beside it.
-/// A table holding two spellings of one setting is refused: the schema
-/// cannot read it, so no save may write over it.
+/// A table holding two spellings of one setting, its written spelling beside
+/// an alias or two of its aliases, is refused: the schema cannot read it, so
+/// no save may write over it.
 pub(crate) fn use_written_spellings(root: &mut toml_edit::Table) -> Result<()> {
     // Outer sections first, so a nested alias is found under the section's
     // written spelling whatever order `ALIASED_KEYS` lists them in.
     let mut aliased: Vec<&(&[&str], &str, &str)> = ALIASED_KEYS.iter().collect();
     aliased.sort_by_key(|(parent, _, _)| parent.len());
     for (parent, alias, written) in aliased {
+        let spellings: Vec<&str> = std::iter::once(*written)
+            .chain(
+                ALIASED_KEYS
+                    .iter()
+                    .filter(|(other_parent, _, other_written)| {
+                        other_parent == parent && other_written == written
+                    })
+                    .map(|(_, other, _)| *other),
+            )
+            .collect();
         let parents = if parent.is_empty() {
             vec![Vec::new()]
         } else {
             expand_doc_path(root, parent)
         };
         for path in parents {
-            let renamed = if path.is_empty() {
-                rename_key_in_place(root, alias, written)
+            let table: &mut dyn RenameableTable = if path.is_empty() {
+                &mut *root
             } else {
-                let Some(item) = item_at(root, &path) else {
-                    continue;
-                };
-                match item {
-                    toml_edit::Item::Table(table) => rename_key_in_place(table, alias, written),
-                    toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => {
-                        rename_key_in_place(table, alias, written)
-                    }
+                match item_at(root, &path) {
+                    Some(toml_edit::Item::Table(table)) => table,
+                    Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(table))) => table,
                     _ => continue,
                 }
             };
-            if !renamed {
+            let held: Vec<String> = spellings
+                .iter()
+                .filter(|spelling| table.has(spelling))
+                .map(|spelling| format!("`{spelling}`"))
+                .collect();
+            if let [first @ .., last] = held.as_slice()
+                && !first.is_empty()
+            {
                 let at = if path.is_empty() {
                     "the top level".to_string()
                 } else {
                     format!("`[{}]`", path.join("."))
                 };
                 anyhow::bail!(
-                    "{at} holds both `{written}` and `{alias}`, two spellings of one setting, \
-                     which the schema cannot read together; keep one before saving"
+                    "{at} holds {} and {last}, spellings of one setting that the schema \
+                     cannot read together; keep one before saving",
+                    first.join(", ")
                 );
             }
+            rename_key_in_place(table, alias, written);
         }
     }
     Ok(())
 }
 
 /// Refuse an older file that still holds two spellings of one setting once
-/// its structural migration has run, as [`use_written_spellings`] refuses a
-/// current one. The migration chooses between some spellings itself (a V1
-/// file's `channels_config` over its `channels`); a conflict it leaves, such
-/// as a heartbeat's `channel` beside its `target`, makes the file unreadable
-/// and the config loaded from it lack that whole section, so a save that
-/// wrote the loaded config over it would drop the section. Only checks: the
-/// chain runs on a copy, and nothing is written.
+/// its structural migration has run, by the check [`use_written_spellings`]
+/// makes of a current one. The migration chooses between some spellings
+/// itself (a V1 file's `channels_config` over its `channels`); a conflict it
+/// leaves, such as a heartbeat's `channel` beside its `target` or a Postgres
+/// entry's `dbURL` beside its `database_url`, makes the file unreadable and
+/// the config loaded from it lack that whole section, so a save that wrote
+/// the loaded config over it would drop the section. Only checks: the chain
+/// runs on a copy, and nothing is written.
 pub(crate) fn refuse_spellings_left_by_migration(existing: &str) -> Result<()> {
     let value: toml::Value = toml::from_str(existing).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
@@ -815,41 +831,13 @@ pub(crate) fn refuse_spellings_left_by_migration(existing: &str) -> Result<()> {
         return Ok(());
     }
     let migrated = run_chain(value, from, &mut Vec::new())?;
-    let Some(root) = migrated.as_table() else {
-        return Ok(());
-    };
-    for (parent, alias, written) in ALIASED_KEYS {
-        for pattern in spellings_of(parent) {
-            let parents = if pattern.is_empty() {
-                vec![Vec::new()]
-            } else {
-                expand_path(root, &pattern)
-            };
-            for path in parents {
-                let holds_both = path
-                    .iter()
-                    .try_fold(root, |table, key| {
-                        table.get(key.as_str()).and_then(toml::Value::as_table)
-                    })
-                    .is_some_and(|table| {
-                        table.contains_key(*alias) && table.contains_key(*written)
-                    });
-                if holds_both {
-                    let at = if path.is_empty() {
-                        "the top level".to_string()
-                    } else {
-                        format!("`[{}]`", path.join("."))
-                    };
-                    anyhow::bail!(
-                        "{at} holds both `{written}` and `{alias}`, two spellings of one \
-                         setting, which the schema cannot read together, and migrating the file \
-                         from V{from} does not choose between them; keep one before saving"
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
+    let mut migrated: toml_edit::DocumentMut = toml::to_string(&migrated)
+        .context("failed to render the migrated config")?
+        .parse()
+        .context("failed to parse the migrated config")?;
+    use_written_spellings(migrated.as_table_mut()).map_err(|err| {
+        anyhow::anyhow!("{err} (the file is V{from}, and migrating it does not choose between them)")
+    })
 }
 
 /// The item at `path` under `root`, or `None`.
@@ -909,14 +897,11 @@ impl RenameableTable for toml_edit::InlineTable {
 }
 
 /// Rename `alias` in `table` to `written`, keeping the entry's place among
-/// its siblings and the comments around its key and value. `false`, with
-/// nothing renamed, when the table holds both spellings.
-fn rename_key_in_place(table: &mut dyn RenameableTable, alias: &str, written: &str) -> bool {
-    if !table.has(alias) {
-        return true;
-    }
-    if table.has(written) {
-        return false;
+/// its siblings and the comments around its key and value. Nothing is
+/// renamed when the table already holds `written`.
+fn rename_key_in_place(table: &mut dyn RenameableTable, alias: &str, written: &str) {
+    if !table.has(alias) || table.has(written) {
+        return;
     }
     table.rebuild(&|key| {
         if key.get() != alias {
@@ -927,7 +912,6 @@ fn rename_key_in_place(table: &mut dyn RenameableTable, alias: &str, written: &s
         *renamed.dotted_decor_mut() = key.dotted_decor().clone();
         renamed
     });
-    true
 }
 
 /// Settings only the V3 layout has that the V1 -> V3 chain also writes into:
