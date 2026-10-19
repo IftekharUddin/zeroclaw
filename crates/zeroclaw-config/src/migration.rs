@@ -7427,13 +7427,14 @@ mention_only = false
         ("channels.notion", "[channels.notion]\ntoken = \"x\"\n"),
     ];
 
-    /// A key retired at V4 means the same under either reading of a file
-    /// with nothing else to decide by, or, where the V1 chain still reads it
-    /// (an agent's `max_tool_iterations` is its V2 iteration limit, the V3
-    /// layout's an inert key), that file is refused rather than read either
-    /// way. Generated from `RETIRED_KEYS`.
+    /// A key retired at V4, in a file with nothing else to decide by, means
+    /// the same under either reading, or sits on an agent holding no current
+    /// agent setting. Such an agent is read as the V2 agent it can only be,
+    /// as before V4: the V1 reading binds it to profiles and reads its
+    /// `max_tool_iterations` as its V2 iteration limit, and changes nothing
+    /// outside the agent and its profiles. Generated from `RETIRED_KEYS`.
     #[test]
-    fn keys_retired_at_v4_read_the_same_or_require_the_version() {
+    fn keys_retired_at_v4_read_the_same_or_as_a_v2_agent() {
         for key in RETIRED_KEYS.iter().filter(|key| key.retired_in >= 4) {
             let path = key.path.join(".").replace(ANY_KEY, "x");
             assert!(
@@ -7448,21 +7449,22 @@ mention_only = false
                 Ok(INFERRED_SCHEMA_VERSION) => {}
                 Ok(1) => {
                     let differ = readings_differ(&file);
-                    assert!(
-                        differ.is_empty(),
-                        "{path}: read as V1 it configures something else, at {differ:?}"
-                    );
+                    if path.starts_with("agents.") {
+                        assert!(
+                            differ.iter().all(|at| ["agents.x", "risk_profiles", "runtime_profiles"]
+                                .iter()
+                                .any(|within| at.starts_with(within))),
+                            "{path}: read as V1 it configures more than its agent, at {differ:?}"
+                        );
+                    } else {
+                        assert!(
+                            differ.is_empty(),
+                            "{path}: read as V1 it configures something else, at {differ:?}"
+                        );
+                    }
                 }
                 Ok(other) => panic!("{path}: read as V{other}"),
-                Err(err) => {
-                    assert!(
-                        !readings_differ(&file).is_empty(),
-                        "{path} is refused although both readings agree: {err}"
-                    );
-                    // It names the key, or the agent table holding it.
-                    let table: Vec<&str> = path.split('.').take(2).collect();
-                    assert!(err.to_string().contains(&table.join(".")), "{path}: {err}");
-                }
+                Err(err) => panic!("{path} is refused: {err}"),
             }
         }
     }
@@ -7514,13 +7516,23 @@ mention_only = false
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains(
-                    "is retired, so if the rest of the file is current, adding \
-                     `schema_version = 4` as its first line is the whole fix"
-                ),
+                err.contains("is retired (")
+                    && err.contains(
+                        "so if the rest of the file is current, adding `schema_version = 4` \
+                         as its first line is the whole fix"
+                    ),
                 "{err}"
             );
         }
+        // It says where the setting lives now.
+        let raw = format!("{HAND_WRITTEN_V3_WITHOUT_VERSION}\n[identity]\nformat = \"openclaw\"\n");
+        let err = detect_version(&toml::from_str(&raw).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("move it to `[agents.<alias>.identity]`"),
+            "{err}"
+        );
         let raw = format!("default_model = \"legacy\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
         let err = detect_version(&toml::from_str(&raw).unwrap())
             .unwrap_err()

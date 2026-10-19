@@ -44558,6 +44558,40 @@ channel = "notion"
         }
     }
 
+    /// A V2 agent holding none of a current agent's settings, only keys V2
+    /// agents had (`max_tool_iterations`, `system_prompt`), with nothing else
+    /// in the file: it is read and migrated as the same file stated as V2,
+    /// and its iteration limit lands where V2's did, in its runtime profile.
+    #[test]
+    async fn v4_review_r5_genuine_v2_agents_still_migrate() {
+        for raw in [
+            "[agents.x]\nmax_tool_iterations = 5\n",
+            "[agents.x]\nsystem_prompt = \"Be brief.\"\n",
+            "[agents.x]\nsystem_prompt = \"Be brief.\"\nmax_tool_iterations = 5\n",
+        ] {
+            assert_eq!(
+                crate::migration::detect_version(&toml::from_str(raw).unwrap()).ok(),
+                Some(1),
+                "{raw}"
+            );
+            reads_like(
+                raw,
+                &format!("schema_version = 2\n{raw}"),
+                &["agents", "risk_profiles", "runtime_profiles"],
+            )
+            .await;
+            if raw.contains("max_tool_iterations") {
+                let loaded = crate::migration::migrate_to_current(raw).unwrap();
+                let profile = loaded.agents["x"].runtime_profile.to_string();
+                assert_eq!(
+                    loaded.runtime_profiles[&profile].max_tool_iterations,
+                    5,
+                    "{raw}"
+                );
+            }
+        }
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.
