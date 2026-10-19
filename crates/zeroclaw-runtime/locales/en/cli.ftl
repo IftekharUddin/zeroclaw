@@ -1152,6 +1152,7 @@ model-switch-catalog-failed = Could not load catalog for configured provider pro
 model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
 model-switch-route-selector-not-allowed = Model ID cannot be a route selector; provide a provider-local model ID.
 cli-config-backed-up = Backed up to {$path}
+cli-config-kept-original = Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw.
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
 cli-plugin-capabilities = Capabilities: {$v}

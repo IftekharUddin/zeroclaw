@@ -13008,6 +13008,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                             let envelope = serde_json::json!({
                                 "migrated": true,
                                 "backup_path": report.backup_path.display().to_string(),
+                                "version_backup_path": report
+                                    .version_backup_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
                                 "schema_version": to,
                                 "notices": report.notices,
                             });
@@ -13021,6 +13025,18 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     "Backed up to"
                                 )
                             );
+                            if let Some(kept) = &report.version_backup_path {
+                                let kept = kept.display().to_string();
+                                let from = report.from_version.to_string();
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-kept-original",
+                                        &[("version", &from), ("path", &kept)],
+                                        "Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw."
+                                    )
+                                );
+                            }
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()

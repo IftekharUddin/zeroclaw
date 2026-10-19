@@ -26537,34 +26537,30 @@ async fn prepare_on_disk_config_for_save(
 }
 
 /// [`crate::migration::keep_version_backup`] for async callers: copy
-/// `config_path` to `<name>.v<version>.backup` unless that copy already
-/// exists. The copy keeps the file's permissions, since it holds the same
-/// secrets.
+/// `config_path` to `<name>.v<version>.backup`, owner-only, unless that copy
+/// already exists.
 pub async fn keep_pre_upgrade_backup(config_path: &Path, version: u32) -> Result<()> {
-    let backup = crate::migration::version_backup_path(config_path, version)?;
-    if fs::try_exists(&backup).await.unwrap_or(false) {
-        return Ok(());
+    let source = config_path.to_path_buf();
+    let kept = tokio::task::spawn_blocking(move || {
+        crate::migration::keep_version_backup(&source, version)
+    })
+    .await
+    .context("keeping the pre-upgrade config copy did not finish")??;
+    if let Some(backup) = kept {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "backup_path": backup.display().to_string(),
+                    "from_version": version,
+                })),
+            &format!(
+                "Kept a copy of the schema V{version} config as {} before saving over it",
+                backup.display()
+            )
+        );
     }
-    fs::copy(config_path, &backup).await.with_context(|| {
-        format!(
-            "failed to keep a copy of {} as {} before saving over it",
-            config_path.display(),
-            backup.display()
-        )
-    })?;
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Success)
-            .with_attrs(::serde_json::json!({
-                "backup_path": backup.display().to_string(),
-                "from_version": version,
-            })),
-        &format!(
-            "Kept a copy of the schema V{version} config as {} before saving over it",
-            backup.display()
-        )
-    );
     Ok(())
 }
 
@@ -43371,6 +43367,12 @@ channel = "notion"
         config.save().await.unwrap();
         let backup = tmp.path().join("config.toml.v3.backup");
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the lasting copy is owner-only, got {mode:o}");
+        }
 
         std::fs::write(tmp.path().join("config.toml"), "schema_version = 3\n").unwrap();
         config.save().await.unwrap();

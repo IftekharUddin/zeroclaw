@@ -1040,6 +1040,7 @@ cli-config-catalog-unavailable-manual = {"  "}⚠ {$provider} のカタログを
 model-switch-catalog-failed = 設定済みプロバイダープロファイル {$provider} のカタログを読み込めませんでした: {$error}
 model-switch-provider-not-allowed = 有効なエフォートルーティングポリシーでは、{$provider} へのモデル切り替えは許可されていません。
 cli-config-backed-up = {$path} にバックアップしました
+cli-config-kept-original = スキーマ V{$version} の元のファイルを {$path} に保存しました（所有者のみ読み取り可）。このコピーは置き換えられず、移行で削除されたシークレットも含んだままです。以前の ZeroClaw に戻す必要がなくなったら削除してください。
 cli-plugin-name-version = プラグイン: {$name} v{$version}
 cli-plugin-description = 説明: {$desc}
 cli-plugin-capabilities = 機能: {$v}

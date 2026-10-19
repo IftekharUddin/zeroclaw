@@ -1323,9 +1323,11 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     // later retirement-only one of a current file. Keep the pre-upgrade
     // original as well, once per version, where nothing replaces it.
     let from = detect_version(&toml::from_str(&raw).context("failed to parse config TOML")?)?;
-    if from < CURRENT_SCHEMA_VERSION {
-        keep_version_backup(path, from)?;
-    }
+    let kept_original = if from < CURRENT_SCHEMA_VERSION {
+        keep_version_backup(path, from)?
+    } else {
+        None
+    };
     let parent = path.parent().with_context(|| {
         format!(
             "config path {} has no parent directory",
@@ -1412,6 +1414,8 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
 
     Ok(Some(MigrateReport {
         backup_path,
+        version_backup_path: kept_original,
+        from_version: from,
         to_version: CURRENT_SCHEMA_VERSION,
         notices,
     }))
@@ -1428,22 +1432,47 @@ pub fn version_backup_path(config_path: &Path, version: u32) -> Result<std::path
 }
 
 /// Copy `config_path` to [`version_backup_path`] unless that copy already
-/// exists. It is written once and never replaced, so the original of each
-/// version survives every later migration and save. The copy keeps the
-/// file's permissions, since it holds the same secrets.
-pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<()> {
+/// exists, and return the copy's path when this call wrote it. It is written
+/// once and never replaced, so the original of each version survives every
+/// later migration and save. Because it lasts and can hold the plaintext
+/// secrets of keys the migration retires, it is created owner-only (0600 on
+/// Unix) whatever the mode of the file it copies.
+pub fn keep_version_backup(
+    config_path: &Path,
+    version: u32,
+) -> Result<Option<std::path::PathBuf>> {
     let backup = version_backup_path(config_path, version)?;
     if backup.exists() {
-        return Ok(());
+        return Ok(None);
     }
-    std::fs::copy(config_path, &backup).with_context(|| {
+    let failed = || {
         format!(
             "failed to keep a copy of {} as {} before rewriting it",
             config_path.display(),
             backup.display()
         )
-    })?;
-    Ok(())
+    };
+    let mut source = std::fs::File::open(config_path).with_context(failed)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut copy = match options.open(&backup) {
+        Ok(copy) => copy,
+        // Another writer kept it first; that copy is the original too.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(err) => return Err(anyhow::Error::from(err)).with_context(failed),
+    };
+    if let Err(err) = std::io::copy(&mut source, &mut copy).and_then(|_| copy.sync_all()) {
+        // A partial copy would be kept forever in place of the original.
+        drop(copy);
+        let _ = std::fs::remove_file(&backup);
+        return Err(anyhow::Error::from(err)).with_context(failed);
+    }
+    Ok(Some(backup))
 }
 
 /// Fsync the directory entry so a subsequent rename inside it is durable.
@@ -1478,6 +1507,11 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct MigrateReport {
     pub backup_path: std::path::PathBuf,
+    /// The lasting owner-only copy of the pre-upgrade original
+    /// (`<name>.v<version>.backup`), when this migration wrote it. `None` when
+    /// the file was already current or an earlier migration kept that copy.
+    pub version_backup_path: Option<std::path::PathBuf>,
+    pub from_version: u32,
     pub to_version: u32,
     /// What the migration changed or assumed, for the operator.
     pub notices: Vec<MigrationNotice>,
@@ -5047,20 +5081,36 @@ optional = ["*"]
         let path = dir.path().join("config.toml");
         let original = "schema_version = 3\n\n[security.nevis]\nenabled = true\n";
         std::fs::write(&path, original).unwrap();
-        migrate_file_in_place(&path)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let report = migrate_file_in_place(&path)
             .unwrap()
             .expect("a V3 file migrates");
         let versioned = dir.path().join("config.toml.v3.backup");
+        assert_eq!(report.version_backup_path.as_deref(), Some(versioned.as_path()));
+        assert_eq!(report.from_version, 3);
         assert_eq!(std::fs::read_to_string(&versioned).unwrap(), original);
+        // The lasting copy can hold retired secrets: owner-only, whatever the
+        // mode of the file it copied.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&versioned).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "got {mode:o}");
+        }
 
         // A retired key pasted back into the V4 file: the next migration is
         // retirement-only and replaces `.backup`, not the versioned copy.
         let mut current = std::fs::read_to_string(&path).unwrap();
         current.push_str("\n[security.nevis]\nenabled = true\n");
         std::fs::write(&path, &current).unwrap();
-        migrate_file_in_place(&path)
+        let report = migrate_file_in_place(&path)
             .unwrap()
             .expect("the retired key is removed");
+        assert_eq!(report.version_backup_path, None, "a current file keeps no copy");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("config.toml.backup")).unwrap(),
             current

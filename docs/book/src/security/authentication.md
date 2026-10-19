@@ -586,18 +586,23 @@ save that follows an edit, whether a full save or the incremental save the
 CLI, dashboard and RPC use for a single edit. An incremental save runs only
 when something was edited, so an untouched config keeps the table until one
 of those happens. The removal touches only that table; comments and other
-sections keep their bytes. `config migrate` keeps the original, including
-any `client_secret`, in its `.backup` copy. Nothing is converted
-automatically: the replacement stack needs values (an audience, profile
-grants) the old table never held.
+sections keep their bytes. Nothing is converted automatically: the
+replacement stack needs values (an audience, profile grants) the old table
+never held.
 
-**Before you upgrade**, copy `config.toml` somewhere protected. Every save
-after the upgrade writes `config.toml.bak` next to the file for the
-duration of the write and removes it once the write is durable, so a
-`.bak` is not a lasting backup. Any copy you keep yourself still carries
-the retired table, including a plaintext `client_secret` if one was
-configured, so treat those copies as secret material and revoke the
-Nevis client credential at the IdP once you no longer need it.
+**ZeroClaw keeps two copies of the original.** The first time anything
+rewrites a V3 file (`zeroclaw config migrate`, or the first save from the
+CLI, dashboard, RPC or Quickstart), it copies the file to
+`config.toml.v3.backup`. That copy is created readable only by you, is
+never replaced, and is the way back to an older ZeroClaw. `config migrate`
+also writes `config.toml.backup`, which the next migration replaces. Both
+copies keep the retired table, including any plaintext `client_secret`.
+Every save also writes `config.toml.bak` for the duration of the write and
+removes it once the write is durable, so a `.bak` is not a backup.
+
+**After you upgrade**, treat `config.toml.v3.backup`, `config.toml.backup`
+and any copy you kept yourself as secret material. Delete them once you no
+longer need to downgrade, and revoke the Nevis client credential at the IdP.
 
 Field by field:
 
