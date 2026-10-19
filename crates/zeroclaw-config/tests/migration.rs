@@ -1975,8 +1975,11 @@ max_results = 5
 fn rename_subkey_drops_v2_form_when_operator_already_wrote_v3_form() {
     // Defensive: an operator who hand-edited their config to use the V3
     // qualified key but left the V2 stale key behind should not double-error
-    // — V3 wins, V2 is dropped silently.
+    // — V3 wins, V2 is dropped silently. The file states its version: with
+    // none, the V3 key beside older settings is refused as a mix of layouts
+    // rather than guessed.
     let raw = r#"
+schema_version = 1
 default_provider = "openai"
 default_model = "gpt-4o-mini"
 
@@ -1989,6 +1992,12 @@ funnel = true
 "#;
     let cfg = migrate_to_current(raw).expect("V3-key-wins semantics");
     assert_eq!(cfg.tunnel.tunnel_provider, "tailscale");
+
+    let unversioned = raw.replacen("schema_version = 1\n", "", 1);
+    let err = migrate_to_current(&unversioned)
+        .expect_err("an unversioned mix of layouts is refused")
+        .to_string();
+    assert!(err.contains("tunnel.tunnel_provider"), "{err}");
 }
 
 #[test]

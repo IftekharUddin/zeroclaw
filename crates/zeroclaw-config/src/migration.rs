@@ -639,8 +639,8 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
 /// Settings only the V3 layout has that the V1 -> V3 chain also writes into:
 /// beside the older setting it comes from, a migration would merge the two
 /// and keep only one, so each is evidence of the V3 layout. None of them
-/// existed in V2: the last V2 `Config`, before #6398, had none of these
-/// sections or keys. The V2 sections the chain also writes into
+/// existed in V2: the last V2 `Config`, before the V3 multi-agent schema,
+/// had none of these sections or keys. The V2 sections the chain also writes into
 /// (`[scheduler]`) are no evidence. [`ANY_KEY`] matches any key; each must
 /// hold a value. Pinned by
 /// `a_legacy_setting_beside_what_its_migration_writes_is_refused`.
@@ -6722,7 +6722,7 @@ mention_only = false
         assert!(readings_differ(&file).is_empty());
     }
 
-    // ── Round 4: every spelling the types accept, every destination ─
+    // ── Every spelling the types accept, every destination ──────
 
     /// The keys the current schema accepts at `parent`, a dotted path whose
     /// `*` stands for any alias.
