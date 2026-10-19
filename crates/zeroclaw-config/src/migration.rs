@@ -387,11 +387,11 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                     "config has no schema_version and mixes the V3 layout with an older one"
                 );
                 let fix = match retired {
-                    Some(path) => format!(
-                        "`{path}` is retired, so if the rest of the file is current, adding \
-                         `schema_version = 4` as its first line is the whole fix: the current \
-                         layout then drops it with a notice. If the whole file is older, add \
-                         `schema_version = 1` or `schema_version = 2` instead"
+                    Some((path, reason)) => format!(
+                        "`{path}` is retired ({reason}), so if the rest of the file is current, \
+                         adding `schema_version = 4` as its first line is the whole fix: the \
+                         current layout then drops it with a notice. If the whole file is \
+                         older, add `schema_version = 1` or `schema_version = 2` instead"
                     ),
                     None => "Rewrite the older settings in the current layout and add \
                              `schema_version = 4` as the first line, or, if the whole file is \
@@ -447,12 +447,13 @@ enum UnversionedShape {
     NotV3,
     /// A section only the V3 layout has beside a setting only an older one
     /// has. Either reading reshapes or drops part of the file, so neither is
-    /// chosen. `retired` names the older setting when the current layout
-    /// retires it anyway, so stating the current version is the whole fix.
+    /// chosen. `retired` names the older setting, and the reason, when the
+    /// current layout retires it anyway, so stating the current version is
+    /// the whole fix.
     Mixed {
         current: String,
         legacy: String,
-        retired: Option<String>,
+        retired: Option<(String, &'static str)>,
     },
     /// A child table of an alias-keyed section reads both as a field of a V2
     /// entry and as a V3 alias, so the operator must state the version.
@@ -555,9 +556,15 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
 /// named `extra_headers`, so the version is required. Any other file keeps
 /// the V1 reading. With no older setting in it, that reading configures what
 /// the V3 reading would (pinned by
-/// `a_file_with_no_layout_evidence_reads_the_same_as_v1_and_as_v3`). An empty
-/// provider family or channel type is no evidence either way: it holds
-/// nothing to lose.
+/// `a_file_with_no_layout_evidence_reads_the_same_as_v1_and_as_v3`), with one
+/// deliberate difference: an agent holding no current agent setting, such as
+/// one with only `system_prompt` or `max_tool_iterations`, is read as the V2
+/// agent it can only be, as before V4. The V1 reading binds it to profiles
+/// and moves its `max_tool_iterations` to its runtime profile, where V2 read
+/// it; the V3 reading would leave an agent with no model provider and retire
+/// the limit (pinned by `keys_retired_at_v4_read_the_same_or_as_a_v2_agent`).
+/// An empty provider family or channel type is no evidence either way: it
+/// holds nothing to lose.
 ///
 /// A V4 file has the V3 shape, so an unversioned V4 file is read as V3 too;
 /// its V3 -> V4 step changes nothing it has not already done.
@@ -659,34 +666,8 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             Some(detail) => UnversionedShape::Ambiguous { detail },
             None => UnversionedShape::V3,
         },
-        (None, Some(_)) => UnversionedShape::NotV3,
-        (None, None) => match agent_read_differently_by_each_layout(table) {
-            Some(alias) => UnversionedShape::Ambiguous {
-                detail: format!(
-                    "`[agents.{alias}]` holds none of a current agent's settings, so the older \
-                     layouts' migration rewrites it (profile references, `max_tool_iterations` \
-                     as its iteration limit) where the current layout leaves it, and nothing \
-                     else in the file tells the layouts apart"
-                ),
-            },
-            None => UnversionedShape::NotV3,
-        },
+        (None, _) => UnversionedShape::NotV3,
     }
-}
-
-/// An agent the V1 -> V3 chain rewrites although no key of it marks either
-/// layout: one holding no current agent setting (see [`V3_AGENT_FIELDS`]) and
-/// no V2-only one. The chain gives every such agent `default` profile
-/// references and reads its `max_tool_iterations`, which the current layout
-/// retires, as its V2 iteration limit, so in a file holding nothing else
-/// that tells the layouts apart it reads differently each way. Pinned by
-/// `keys_retired_at_v4_read_the_same_or_require_the_version`.
-fn agent_read_differently_by_each_layout(table: &toml::Table) -> Option<&str> {
-    let agents = table.get("agents").and_then(toml::Value::as_table)?;
-    agents
-        .iter()
-        .find(|(_, agent)| agent.is_table())
-        .map(|(alias, _)| alias.as_str())
 }
 
 /// Keys the current schema reads under a second spelling (its serde
@@ -922,7 +903,9 @@ fn holds_a_value(value: &toml::Value) -> bool {
 /// provider `provider`, or a V2-only setting (see [`v2_only_marker`]). A
 /// provider or channel section holding fields directly is found by
 /// [`unversioned_shape`], which reads those sections.
-fn legacy_layout_evidence(table: &toml::Table) -> Option<(String, Option<String>)> {
+fn legacy_layout_evidence(
+    table: &toml::Table,
+) -> Option<(String, Option<(String, &'static str)>)> {
     if let Some(path) = LEGACY_LAYOUT_PATHS
         .iter()
         .flat_map(|pattern| spellings_of(pattern))
@@ -930,7 +913,7 @@ fn legacy_layout_evidence(table: &toml::Table) -> Option<(String, Option<String>
     {
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
         let dotted = path.join(".");
-        let retired = retired_key_covering(&segments).map(|_| dotted.clone());
+        let retired = retired_key_covering(&segments).map(|key| (dotted.clone(), key.reason));
         return Some((format!("`{dotted}` is a pre-V3 setting"), retired));
     }
     if let Some(cron) = table.get("cron").and_then(toml::Value::as_table)
