@@ -26575,8 +26575,6 @@ fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
     for notice in retired {
         let path = match notice {
             crate::migration::MigrationNotice::Removed { path, .. } => path.as_str(),
-            crate::migration::MigrationNotice::Renamed { from, .. }
-            | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
             crate::migration::MigrationNotice::AssumedV1
             | crate::migration::MigrationNotice::InferredV3
             | crate::migration::MigrationNotice::IgnoredEnvOverride { .. } => continue,

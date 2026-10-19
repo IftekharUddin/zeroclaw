@@ -152,28 +152,6 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
             &[("variable", variable), ("reason", reason)],
             format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
         ),
-        MigrationNotice::Renamed { from, to, reason } => ta(
-            "cli-config-retired-key-renamed",
-            &[
-                ("from", from),
-                ("to", to),
-                ("path", path),
-                ("reason", reason),
-            ],
-            format!("warning: moved retired config key `{from}` to `{to}` in {path}: {reason}"),
-        ),
-        MigrationNotice::RenameConflict { from, to, reason } => ta(
-            "cli-config-retired-key-rename-conflict",
-            &[
-                ("from", from),
-                ("to", to),
-                ("path", path),
-                ("reason", reason),
-            ],
-            format!(
-                "warning: dropped retired config key `{from}` from {path} without moving it, because `{to}` is already set: {reason}"
-            ),
-        ),
     }
 }
 

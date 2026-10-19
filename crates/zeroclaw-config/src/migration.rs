@@ -35,19 +35,6 @@ pub enum MigrationNotice {
         variable: String,
         reason: &'static str,
     },
-    /// A retired key was moved to its replacement.
-    Renamed {
-        from: String,
-        to: String,
-        reason: &'static str,
-    },
-    /// A retired key was removed without being moved, because its
-    /// replacement was already set (the replacement wins).
-    RenameConflict {
-        from: String,
-        to: String,
-        reason: &'static str,
-    },
 }
 
 impl MigrationNotice {
@@ -81,34 +68,17 @@ impl MigrationNotice {
             Self::IgnoredEnvOverride { variable, reason } => {
                 format!("ignored `{variable}`, which sets a retired config key: {reason}")
             }
-            Self::Renamed { from, to, reason } => {
-                format!("moved retired config key `{from}` to `{to}`: {reason}")
-            }
-            Self::RenameConflict { from, to, reason } => format!(
-                "removed retired config key `{from}` without moving it, because `{to}` \
-                 is already set: {reason}"
-            ),
         }
     }
 }
 
-/// How a retired key is carried into the schema version that retires it.
-#[derive(Debug, Clone, Copy)]
-pub enum Retirement {
-    /// Delete the key (and everything under it).
-    Remove,
-    /// Move the key's value to `to`, unless `to` is already set.
-    Rename { to: &'static [&'static str] },
-}
-
 /// A [`RetiredKey::path`] segment that matches every key of the table at that
 /// level, e.g. `&["agents", ANY_KEY, "max_tool_iterations"]` retires the key in
-/// every `[agents.<alias>]` block. In a [`Retirement::Rename`] target, each
-/// `ANY_KEY` is filled with the key the matching source wildcard matched, in
-/// order.
+/// every `[agents.<alias>]` block.
 pub const ANY_KEY: &str = "*";
 
-/// One retired config key.
+/// One retired config key. The migration that reaches `retired_in` deletes
+/// it, with everything under it.
 #[derive(Debug, Clone, Copy)]
 pub struct RetiredKey {
     /// The schema version whose migration step retires the key.
@@ -116,7 +86,6 @@ pub struct RetiredKey {
     /// Path from the config root, one segment per table key. [`ANY_KEY`]
     /// matches every key at its level.
     pub path: &'static [&'static str],
-    pub retirement: Retirement,
     /// Why it was retired and what to use instead. Shown to the operator.
     pub reason: &'static str,
 }
@@ -130,7 +99,6 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 4,
         path: &["security", "nevis"],
-        retirement: Retirement::Remove,
         reason: "the Nevis IAM integration was removed; configure `[oidc.<alias>]` with \
                  `[users]` and `[permission_profiles]` instead",
     },
@@ -139,49 +107,41 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "compact_context"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "max_tool_iterations"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "max_history_messages"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "max_context_tokens"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "memory_recall_limit"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "parallel_tools"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "tool_dispatcher"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "strict_tool_parsing"],
-        retirement: Retirement::Remove,
         reason: INERT_AGENT_TUNABLE,
     },
     RetiredKey {
@@ -192,7 +152,6 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
             "context_compression",
             "summary_model",
         ],
-        retirement: Retirement::Remove,
         reason: "the deprecated bare model id had no provider identity and was never read; \
                  `summary_provider` replaced it (context compression itself is not \
                  currently implemented in the runtime)",
@@ -205,19 +164,16 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 2,
         path: &["node_transport"],
-        retirement: Retirement::Remove,
         reason: "the legacy HMAC node transport was removed",
     },
     RetiredKey {
         retired_in: 4,
         path: &["channels", "wati"],
-        retirement: Retirement::Remove,
         reason: RETIRED_WATI,
     },
     RetiredKey {
         retired_in: 4,
         path: &["channels_config", "wati"],
-        retirement: Retirement::Remove,
         reason: RETIRED_WATI,
     },
     // Spellings no schema field reads, so serde would ignore them silently.
@@ -229,21 +185,18 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 4,
         path: &["twitter"],
-        retirement: Retirement::Remove,
         reason: "a top-level `[twitter]` section is not read; configure the Twitter channel as \
                  `[channels.twitter.<alias>]`",
     },
     RetiredKey {
         retired_in: 4,
         path: &["reddit"],
-        retirement: Retirement::Remove,
         reason: "a top-level `[reddit]` section is not read; configure the Reddit channel as \
                  `[channels.reddit.<alias>]`",
     },
     RetiredKey {
         retired_in: 4,
         path: &["channels", "notion"],
-        retirement: Retirement::Remove,
         reason: "a `[channels.notion]` table is not read; Notion is configured in the top-level \
                  `[notion]` section, whose database poller is the `notion` channel",
     },
@@ -253,7 +206,6 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 3,
         path: &["gateway", "pairing_dashboard", "code_length"],
-        retirement: Retirement::Remove,
         reason: "the dashboard no longer has its own pairing-code length; \
                  `[gateway.pairing_code]` `length` sets it for every pairing surface",
     },
@@ -263,50 +215,42 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 3,
         path: &["swarms"],
-        retirement: Retirement::Remove,
         reason: "swarms were removed in V3",
     },
     RetiredKey {
         retired_in: 3,
         path: &["reliability", "fallback_providers"],
-        retirement: Retirement::Remove,
         reason: RETIRED_GLOBAL_FALLBACK,
     },
     RetiredKey {
         retired_in: 3,
         path: &["reliability", "model_fallbacks"],
-        retirement: Retirement::Remove,
         reason: RETIRED_GLOBAL_FALLBACK,
     },
     RetiredKey {
         retired_in: 3,
         path: &["tts", "default_provider"],
-        retirement: Retirement::Remove,
         reason: "there is no global default TTS provider; set `tts_provider` on each \
                  `[agents.<alias>]` instead",
     },
     RetiredKey {
         retired_in: 3,
         path: &["transcription", "default_provider"],
-        retirement: Retirement::Remove,
         reason: RETIRED_GLOBAL_TRANSCRIPTION,
     },
     RetiredKey {
         retired_in: 3,
         path: &["transcription", "default_model_provider"],
-        retirement: Retirement::Remove,
         reason: RETIRED_GLOBAL_TRANSCRIPTION,
     },
     RetiredKey {
         retired_in: 3,
         path: &["transcription", "default_transcription_provider"],
-        retirement: Retirement::Remove,
         reason: RETIRED_GLOBAL_TRANSCRIPTION,
     },
     RetiredKey {
         retired_in: 3,
         path: &["identity"],
-        retirement: Retirement::Remove,
         reason: "identity is set per agent; move it to `[agents.<alias>.identity]`",
     },
 ];
@@ -1700,35 +1644,13 @@ fn apply_retired_keys_to_doc_table(
     for key in table.iter().filter(|key| key.retired_in == version) {
         for concrete in expand_doc_path(root, key.path) {
             let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
-            let Some(taken) = take_doc_path(root, &segments, key.path) else {
+            if take_doc_path(root, &segments, key.path).is_none() {
                 continue;
-            };
-            let from = segments.join(".");
-            let notice = match key.retirement {
-                Retirement::Remove => MigrationNotice::Removed {
-                    path: from,
-                    reason: key.reason,
-                },
-                Retirement::Rename { to } => {
-                    let target = fill_wildcards(to, key.path, &segments);
-                    let target: Vec<&str> = target.iter().map(String::as_str).collect();
-                    let to_path = target.join(".");
-                    if put_doc_path_if_vacant(root, &target, taken) {
-                        MigrationNotice::Renamed {
-                            from,
-                            to: to_path,
-                            reason: key.reason,
-                        }
-                    } else {
-                        MigrationNotice::RenameConflict {
-                            from,
-                            to: to_path,
-                            reason: key.reason,
-                        }
-                    }
-                }
-            };
-            notices.push(notice);
+            }
+            notices.push(MigrationNotice::Removed {
+                path: segments.join("."),
+                reason: key.reason,
+            });
         }
     }
 }
@@ -1808,49 +1730,6 @@ fn keep_empty_table_rendered(item: &mut toml_edit::Item) {
     }
 }
 
-/// [`put_path_if_vacant`] over a document. Missing parents are created as
-/// implicit tables, so no empty header is written for them.
-fn put_doc_path_if_vacant(
-    root: &mut toml_edit::Table,
-    path: &[&str],
-    item: toml_edit::Item,
-) -> bool {
-    let Some((last, parents)) = path.split_last() else {
-        return false;
-    };
-    // Check the whole path first, so a refusal creates no parent tables.
-    let mut probe: Option<&dyn toml_edit::TableLike> = Some(&*root);
-    for segment in parents {
-        probe = match probe.and_then(|table| table.get(segment)) {
-            None => None,
-            Some(item) => match item.as_table_like() {
-                Some(next) => Some(next),
-                None => return false,
-            },
-        };
-    }
-    if probe.is_some_and(|table| table.contains_key(last)) {
-        return false;
-    }
-    let mut table: &mut dyn toml_edit::TableLike = root;
-    for segment in parents {
-        if !table.contains_key(segment) {
-            let mut implicit = toml_edit::Table::new();
-            implicit.set_implicit(true);
-            table.insert(segment, toml_edit::Item::Table(implicit));
-        }
-        let Some(next) = table
-            .get_mut(segment)
-            .and_then(toml_edit::Item::as_table_like_mut)
-        else {
-            return false;
-        };
-        table = next;
-    }
-    table.insert(last, item);
-    true
-}
-
 /// Give every table on the path to a retired key an explicit header if the
 /// retirement left it empty. An implicit table renders as nothing once empty,
 /// so without this an alias whose only content was retired (for example a
@@ -1861,8 +1740,6 @@ fn keep_emptied_tables_visible(root: &mut toml_edit::Table, notices: &[Migration
     for notice in notices {
         let from = match notice {
             MigrationNotice::Removed { path, .. } => path,
-            MigrationNotice::Renamed { from, .. }
-            | MigrationNotice::RenameConflict { from, .. } => from,
             MigrationNotice::AssumedV1
             | MigrationNotice::InferredV3
             | MigrationNotice::IgnoredEnvOverride { .. } => continue,
@@ -1915,35 +1792,13 @@ fn apply_retired_keys(
     for key in table.iter().filter(|key| key.retired_in == version) {
         for concrete in expand_path(root, key.path) {
             let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
-            let Some(taken) = take_path(root, &segments, key.path) else {
+            if take_path(root, &segments, key.path).is_none() {
                 continue;
-            };
-            let from = segments.join(".");
-            let notice = match key.retirement {
-                Retirement::Remove => MigrationNotice::Removed {
-                    path: from,
-                    reason: key.reason,
-                },
-                Retirement::Rename { to } => {
-                    let target = fill_wildcards(to, key.path, &segments);
-                    let target: Vec<&str> = target.iter().map(String::as_str).collect();
-                    let to_path = target.join(".");
-                    if put_path_if_vacant(root, &target, taken) {
-                        MigrationNotice::Renamed {
-                            from,
-                            to: to_path,
-                            reason: key.reason,
-                        }
-                    } else {
-                        MigrationNotice::RenameConflict {
-                            from,
-                            to: to_path,
-                            reason: key.reason,
-                        }
-                    }
-                }
-            };
-            notices.push(notice);
+            }
+            notices.push(MigrationNotice::Removed {
+                path: segments.join("."),
+                reason: key.reason,
+            });
         }
     }
 }
@@ -1985,26 +1840,6 @@ fn expand_path(root: &toml::Table, pattern: &[&str]) -> Vec<Vec<String>> {
     out
 }
 
-/// Fill each [`ANY_KEY`] in `target` with the key the corresponding
-/// [`ANY_KEY`] in `pattern` matched in `matched`, in order.
-fn fill_wildcards(target: &[&str], pattern: &[&str], matched: &[&str]) -> Vec<String> {
-    let mut captured = pattern
-        .iter()
-        .zip(matched)
-        .filter(|(segment, _)| **segment == ANY_KEY)
-        .map(|(_, key)| (*key).to_string());
-    target
-        .iter()
-        .map(|segment| {
-            if *segment == ANY_KEY {
-                captured.next().unwrap_or_else(|| ANY_KEY.to_string())
-            } else {
-                (*segment).to_string()
-            }
-        })
-        .collect()
-}
-
 /// Remove and return the value at `path`, if every segment exists. A
 /// container the removal leaves empty is dropped too when [`prunable`] allows
 /// it for that level of `pattern`.
@@ -2029,39 +1864,6 @@ fn take_path(root: &mut toml::Table, path: &[&str], pattern: &[&str]) -> Option<
 /// when empty, so it is always kept.
 fn prunable(pattern: &[&str]) -> bool {
     pattern.first().is_some_and(|segment| *segment != ANY_KEY)
-}
-
-/// Insert `value` at `path`, creating missing parent tables. Returns `false`,
-/// leaving the config unchanged, when `path` is already set or a parent
-/// segment is not a table.
-fn put_path_if_vacant(root: &mut toml::Table, path: &[&str], value: toml::Value) -> bool {
-    let Some((last, parents)) = path.split_last() else {
-        return false;
-    };
-    // Check the whole path first, so a refusal creates no parent tables.
-    let mut probe = Some(&*root);
-    for segment in parents {
-        probe = match probe.and_then(|table| table.get(*segment)) {
-            None => None,
-            Some(toml::Value::Table(next)) => Some(next),
-            Some(_) => return false,
-        };
-    }
-    if probe.is_some_and(|table| table.contains_key(*last)) {
-        return false;
-    }
-    let mut table = root;
-    for segment in parents {
-        let entry = table
-            .entry((*segment).to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let Some(next) = entry.as_table_mut() else {
-            return false;
-        };
-        table = next;
-    }
-    table.insert((*last).to_string(), value);
-    true
 }
 
 pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
@@ -5100,7 +4902,7 @@ mention_only = false
     fn a_retirement_never_names_a_key_the_schema_still_reads() {
         let sections = current_top_level_sections();
         for key in RETIRED_KEYS {
-            if let ([section], Retirement::Remove) = (key.path, key.retirement) {
+            if let [section] = key.path {
                 assert!(
                     *section == ANY_KEY || !sections.contains(*section),
                     "`{section}` is a current top-level section and cannot be retired"
@@ -5292,14 +5094,6 @@ optional = ["*"]
                 key.path
             );
             assert!(!key.path.is_empty() && !key.reason.is_empty(), "{key:?}");
-            if let Retirement::Rename { to } = key.retirement {
-                let wildcards = |p: &[&str]| p.iter().filter(|s| **s == ANY_KEY).count();
-                assert!(
-                    wildcards(to) <= wildcards(key.path),
-                    "{:?}: a rename target cannot use more wildcards than its source",
-                    key.path
-                );
-            }
         }
     }
 
@@ -5393,42 +5187,34 @@ summary_model = "opus"
         assert!(migrated.contains("agents = \"not-a-table\""));
     }
 
-    const TEST_RENAMES: &[RetiredKey] = &[
+    const TEST_RETIREMENTS: &[RetiredKey] = &[
         RetiredKey {
             retired_in: 9,
             path: &["old", "knob"],
-            retirement: Retirement::Rename {
-                to: &["new", "section", "knob"],
-            },
-            reason: "renamed for the test",
+            reason: "retired for the test",
         },
         RetiredKey {
             retired_in: 8,
             path: &["other"],
-            retirement: Retirement::Remove,
             reason: "a different version",
         },
         RetiredKey {
             retired_in: 7,
             path: &["bots", ANY_KEY, "old_limit"],
-            retirement: Retirement::Rename {
-                to: &["bots", ANY_KEY, "limits", "max"],
-            },
-            reason: "wildcard rename for the test",
+            reason: "wildcard retirement for the test",
         },
     ];
 
     fn apply(raw: &str, version: u32) -> (toml::Value, Vec<MigrationNotice>) {
         let mut value: toml::Value = toml::from_str(raw).unwrap();
         let mut notices = Vec::new();
-        apply_retired_keys(&mut value, version, TEST_RENAMES, &mut notices);
+        apply_retired_keys(&mut value, version, TEST_RETIREMENTS, &mut notices);
         (value, notices)
     }
 
     #[test]
-    fn a_retired_rename_moves_the_value_and_creates_parents() {
+    fn a_retired_key_is_removed_only_at_its_version() {
         let (value, notices) = apply("other = 1\n[old]\nknob = 7\nkeep = true\n", 9);
-        assert_eq!(value["new"]["section"]["knob"].as_integer(), Some(7));
         assert!(value["old"].get("knob").is_none());
         assert_eq!(value["old"]["keep"].as_bool(), Some(true));
         assert_eq!(
@@ -5438,76 +5224,37 @@ summary_model = "opus"
         );
         assert_eq!(
             notices,
-            vec![MigrationNotice::Renamed {
-                from: "old.knob".to_string(),
-                to: "new.section.knob".to_string(),
-                reason: "renamed for the test",
+            vec![MigrationNotice::Removed {
+                path: "old.knob".to_string(),
+                reason: "retired for the test",
             }]
         );
-    }
 
-    #[test]
-    fn a_retired_rename_never_overwrites_the_replacement() {
-        let (value, notices) = apply("[old]\nknob = 7\n[new.section]\nknob = 1\n", 9);
-        assert_eq!(value["new"]["section"]["knob"].as_integer(), Some(1));
+        let (value, _) = apply("[old]\nknob = 7\n", 9);
         assert!(
             value.get("old").is_none(),
             "a literal container left empty is dropped"
         );
-        assert!(matches!(
-            notices.as_slice(),
-            [MigrationNotice::RenameConflict { from, to, .. }] if from == "old.knob" && to == "new.section.knob"
-        ));
     }
 
     #[test]
-    fn a_blocked_rename_creates_no_parent_tables() {
-        let (value, notices) = apply("new = \"scalar\"\n[old]\nknob = 7\n", 9);
-        assert_eq!(value["new"].as_str(), Some("scalar"));
-        assert!(matches!(
-            notices.as_slice(),
-            [MigrationNotice::RenameConflict { .. }]
-        ));
-
-        let mut root: toml::Table = toml::from_str("[new]\nx = 1\n").unwrap();
-        assert!(!put_path_if_vacant(
-            &mut root,
-            &["new", "x", "deeper"],
-            toml::Value::Integer(2)
-        ));
-        assert_eq!(toml::Value::Table(root)["new"]["x"].as_integer(), Some(1));
-    }
-
-    #[test]
-    fn a_wildcard_rename_keeps_each_value_under_its_own_key() {
-        let (value, notices) = apply(
-            "[bots.a]\nold_limit = 1\n[bots.b]\nold_limit = 2\n[bots.b.limits]\nmax = 9\n[bots.c]\nkeep = 3\n",
-            7,
-        );
-        assert_eq!(value["bots"]["a"]["limits"]["max"].as_integer(), Some(1));
-        assert_eq!(
-            value["bots"]["b"]["limits"]["max"].as_integer(),
-            Some(9),
-            "an existing replacement wins"
-        );
-        assert!(value["bots"]["a"].get("old_limit").is_none());
-        assert!(value["bots"]["b"].get("old_limit").is_none());
-        assert_eq!(value["bots"]["c"]["keep"].as_integer(), Some(3));
-        assert!(
-            value["bots"]["c"].get("limits").is_none(),
-            "no match, no new table"
-        );
-        assert!(notices.contains(&MigrationNotice::Renamed {
-            from: "bots.a.old_limit".to_string(),
-            to: "bots.a.limits.max".to_string(),
-            reason: "wildcard rename for the test",
-        }));
-        assert!(notices.contains(&MigrationNotice::RenameConflict {
-            from: "bots.b.old_limit".to_string(),
-            to: "bots.b.limits.max".to_string(),
-            reason: "wildcard rename for the test",
-        }));
+    fn a_wildcard_retirement_keeps_each_alias() {
+        let raw = "[bots.a]\nold_limit = 1\n\n[bots.b]\nold_limit = 2\n\n[bots.b.limits]\nmax = 9\n";
+        let (value, notices) = apply(raw, 7);
+        let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        let mut doc_notices = Vec::new();
+        apply_retired_keys_to_doc_table(doc.as_table_mut(), 7, TEST_RETIREMENTS, &mut doc_notices);
+        assert_eq!(notices, doc_notices, "both appliers report the same removals");
         assert_eq!(notices.len(), 2);
+        let from_doc: toml::Value = toml::from_str(&doc.to_string()).unwrap();
+        for value in [&value, &from_doc] {
+            assert!(
+                value["bots"]["a"].as_table().unwrap().is_empty(),
+                "an alias emptied by a retirement is kept"
+            );
+            assert!(value["bots"]["b"].get("old_limit").is_none());
+            assert_eq!(value["bots"]["b"]["limits"]["max"].as_integer(), Some(9));
+        }
     }
 
     #[test]
@@ -5648,23 +5395,6 @@ summary_model = "opus"
         let (again, notices) = apply_doc(&out);
         assert!(notices.is_empty());
         assert_eq!(again, out, "a second cleanup changes nothing");
-    }
-
-    #[test]
-    fn doc_cleanup_applies_wildcard_renames_without_overwriting() {
-        let mut doc: toml_edit::DocumentMut =
-            "[bots.a]\nold_limit = 1\n\n[bots.b]\nold_limit = 2\n\n[bots.b.limits]\nmax = 9\n"
-                .parse()
-                .unwrap();
-        let mut notices = Vec::new();
-        apply_retired_keys_to_doc_table(doc.as_table_mut(), 7, TEST_RENAMES, &mut notices);
-        let value: toml::Value = toml::from_str(&doc.to_string()).unwrap();
-        assert_eq!(value["bots"]["a"]["limits"]["max"].as_integer(), Some(1));
-        assert_eq!(value["bots"]["b"]["limits"]["max"].as_integer(), Some(9));
-        assert!(value["bots"]["a"].get("old_limit").is_none());
-        assert!(value["bots"]["b"].get("old_limit").is_none());
-        assert_eq!(notices.len(), 2);
-        assert!(notices.iter().any(|n| matches!(n, MigrationNotice::RenameConflict { from, .. } if from == "bots.b.old_limit")));
     }
 
     #[test]
