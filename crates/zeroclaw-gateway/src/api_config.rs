@@ -4612,6 +4612,10 @@ mod tests {
             !config_path.with_extension("toml.bak").exists(),
             "no backup may be written before the candidate is accepted"
         );
+        assert!(
+            !install.path().join("config.toml.v1.backup").exists(),
+            "nor the lasting pre-upgrade copy"
+        );
         let residue: Vec<std::ffi::OsString> = std::fs::read_dir(install.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
