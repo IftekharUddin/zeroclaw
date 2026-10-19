@@ -468,8 +468,6 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
     &["provider_timeout_secs"],
     &["provider_max_tokens"],
     &["extra_headers"],
-    // V1's channel section, which V2 renamed `[channels]`.
-    &["channels_config"],
     // Sections V3 split into profiles, lifted into agents, or dropped.
     &["autonomy"],
     &["agent"],
@@ -516,15 +514,20 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
 /// (see [`legacy_layout_evidence`]), or a provider or channel section holding
 /// fields directly (`[providers.models.ollama] model = "..."`), the V2 shape.
 ///
-/// Evidence of the V3 layout is a section only it has, which the V1 reading
-/// would reshape:
-/// - an alias-keyed section, `providers.models.<family>` or `channels.<type>`,
+/// Evidence of the V3 layout is a setting only it has, which the V1 reading
+/// would reshape, or merge an older setting into:
+/// - an alias-keyed section, `providers.models.<family>` or `channels.<type>`
+///   (also under `channels_config`, a spelling the current schema accepts),
 ///   meaning a table whose every value is a table
 ///   (`[providers.models.ollama.default]`, `[channels.discord.work]`);
 /// - a child table of a section holding V2 fields that is not one of those
 ///   fields with what it actually holds (see [`holds_a_v2_field`]), so a V3
 ///   alias beside them;
-/// - a declarative cron job, a table under `[cron]` (`[cron.nightly]`).
+/// - a declarative cron job, a table under `[cron]` (`[cron.nightly]`);
+/// - a V3-only setting the chain also writes (see [`v3_only_destination`]):
+///   TTS and transcription provider aliases, the profiles and peer groups,
+///   alias-keyed storage, `tunnel_provider`, `search_provider`, and the keys
+///   of a current agent.
 ///
 /// A file with both is refused as mixed: either reading reshapes or drops
 /// part of it. A file with V3 evidence alone is read as V3, unless a child of
@@ -533,9 +536,7 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
 /// extra_headers]` is either the V2 `openai` profile's headers or a V3 alias
 /// named `extra_headers`, so the version is required. Any other file keeps
 /// the V1 reading. With no older setting in it, that reading configures what
-/// the V3 reading would, except that V2's transcription settings, which both
-/// layouts spell the same, move to the `[providers.transcription]` aliases
-/// V3 gave them (pinned by
+/// the V3 reading would (pinned by
 /// `a_file_with_no_layout_evidence_reads_the_same_as_v1_and_as_v3`). An empty
 /// provider family or channel type is no evidence either way: it holds
 /// nothing to lose.
@@ -550,35 +551,46 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         .and_then(toml::Value::as_table)
         .into_iter()
         .flat_map(|families| {
-            families
-                .iter()
-                .map(|(family, section)| (V2EntryKind::ModelProvider, family.as_str(), section))
+            families.iter().map(|(family, section)| {
+                (
+                    V2EntryKind::ModelProvider,
+                    "providers.models",
+                    family.as_str(),
+                    section,
+                )
+            })
         });
-    let channel_types = table
-        .get("channels")
-        .and_then(toml::Value::as_table)
+    // `channels_config`, V1's name for the section, is also a spelling the
+    // current schema accepts, so both are read by their shape.
+    let channel_types = ["channels", "channels_config"]
         .into_iter()
-        .flat_map(|channels| {
+        .filter_map(|root| {
+            table
+                .get(root)
+                .and_then(toml::Value::as_table)
+                .map(|channels| (root, channels))
+        })
+        .flat_map(|(root, channels)| {
             crate::schema::v2::V3_CHANNEL_TYPES
                 .iter()
-                .filter_map(|kind| {
+                .filter_map(move |kind| {
                     channels
                         .get(*kind)
-                        .map(|section| (V2EntryKind::Channel, *kind, section))
+                        .map(|section| (V2EntryKind::Channel, root, *kind, section))
                 })
         });
 
     let mut current = None;
     let mut legacy = legacy_layout_evidence(table);
     let mut ambiguous = None;
-    for (entry_kind, name, section) in provider_families.chain(channel_types) {
+    for (entry_kind, root, name, section) in provider_families.chain(channel_types) {
         let Some(section) = section.as_table() else {
             continue;
         };
         if section.is_empty() {
             continue;
         }
-        let path = format!("{}.{name}", entry_kind.path());
+        let path = format!("{root}.{name}");
         if !section.values().all(toml::Value::is_table) {
             // A field held directly on the section: the V2 shape.
             legacy
@@ -610,6 +622,9 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
     {
         current.get_or_insert_with(|| format!("`[cron.{name}]` is a V3 cron job"));
     }
+    if current.is_none() {
+        current = v3_only_destination(table);
+    }
 
     match (current, legacy) {
         (Some(current), Some(legacy)) => UnversionedShape::Mixed { current, legacy },
@@ -618,6 +633,93 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             None => UnversionedShape::V3,
         },
         (None, _) => UnversionedShape::NotV3,
+    }
+}
+
+/// Settings only the V3 layout has that the V1 -> V3 chain also writes into:
+/// beside the older setting it comes from, a migration would merge the two
+/// and keep only one, so each is evidence of the V3 layout. None of them
+/// existed in V2: the last V2 `Config`, before #6398, had none of these
+/// sections or keys. The V2 sections the chain also writes into
+/// (`[scheduler]`) are no evidence. [`ANY_KEY`] matches any key; each must
+/// hold a value. Pinned by
+/// `a_legacy_setting_beside_what_its_migration_writes_is_refused`.
+const V3_ONLY_DESTINATIONS: &[&[&str]] = &[
+    &["providers", "tts", ANY_KEY],
+    &["providers", "transcription", ANY_KEY],
+    &["risk_profiles", ANY_KEY],
+    &["runtime_profiles", ANY_KEY],
+    &["peer_groups", ANY_KEY],
+    &["storage", "sqlite"],
+    &["storage", "postgres"],
+    &["storage", "qdrant"],
+    &["storage", "markdown"],
+    &["storage", "lucid"],
+    &["tunnel", "tunnel_provider"],
+    &["web_search", "search_provider"],
+];
+
+/// The keys of a current `[agents.<alias>]`. V2's agents had none of them,
+/// and the chain writes several (`model_provider`, `identity`), so an agent
+/// holding one is evidence of the V3 layout. Kept in step with the schema by
+/// `v3_agent_fields_are_the_current_agent_fields`.
+const V3_AGENT_FIELDS: &[&str] = &[
+    "acp_enable_mcp",
+    "channels",
+    "classifier_provider",
+    "cron_jobs",
+    "delegate_same_risk_profile",
+    "delegates",
+    "enabled",
+    "identity",
+    "knowledge_bundles",
+    "mcp_bundles",
+    "memory",
+    "model_provider",
+    "precheck",
+    "risk_profile",
+    "runtime_profile",
+    "skill_bundles",
+    "summary_provider",
+    "transcription_provider",
+    "tts_provider",
+    "workspace",
+];
+
+/// The first V3-only setting in `table` the chain also writes (see
+/// [`V3_ONLY_DESTINATIONS`] and [`V3_AGENT_FIELDS`]), described, or `None`.
+fn v3_only_destination(table: &toml::Table) -> Option<String> {
+    if let Some(path) = V3_ONLY_DESTINATIONS
+        .iter()
+        .flat_map(|pattern| expand_path(table, pattern))
+        .find(|path| value_at_path(table, path).is_some_and(holds_a_value))
+    {
+        return Some(format!("`{}` is a V3 setting", path.join(".")));
+    }
+    let agents = table.get("agents").and_then(toml::Value::as_table)?;
+    agents.iter().find_map(|(alias, agent)| {
+        let agent = agent.as_table()?;
+        let key = V3_AGENT_FIELDS
+            .iter()
+            .find(|key| agent.get(**key).is_some_and(holds_a_value))?;
+        Some(format!("`agents.{alias}.{key}` is a V3 setting"))
+    })
+}
+
+/// The value at `path` under `table`, or `None`.
+fn value_at_path<'a>(table: &'a toml::Table, path: &[String]) -> Option<&'a toml::Value> {
+    let (first, rest) = path.split_first()?;
+    rest.iter()
+        .try_fold(table.get(first.as_str())?, |value, key| value.get(key.as_str()))
+}
+
+/// Whether `value` holds anything: a scalar, a non-empty array, or a table
+/// with such a value somewhere beneath.
+fn holds_a_value(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => table.values().any(holds_a_value),
+        toml::Value::Array(items) => !items.is_empty(),
+        _ => true,
     }
 }
 
@@ -710,15 +812,6 @@ enum V2EntryKind {
     Channel,
 }
 
-impl V2EntryKind {
-    fn path(self) -> &'static str {
-        match self {
-            Self::ModelProvider => "providers.models",
-            Self::Channel => "channels",
-        }
-    }
-}
-
 /// The child keys of `section` (the `name` family or channel type) that also
 /// read as fields when the section is taken as one V2 entry rather than a
 /// table of V3 aliases.
@@ -777,6 +870,15 @@ fn holds_a_v2_field(kind: V2EntryKind, name: &str, section: &toml::Table, key: &
     let Some(child) = section.get(key).and_then(toml::Value::as_table) else {
         return false;
     };
+    if matches!(kind, V2EntryKind::ModelProvider) {
+        // A family the current schema has no slot for, even under the name
+        // the migration files it by, cannot be probed, and is no evidence
+        // that its child is an alias.
+        let (family, _) = crate::schema::v2::v2_profile_as_v3_entry(name, &toml::Table::new());
+        if !crate::providers::ModelProviders::slot_names().contains(&family.as_str()) {
+            return true;
+        }
+    }
     if child.is_empty() {
         return keys_read_as_v2_entry_fields(kind, name, section)
             .iter()
@@ -818,17 +920,23 @@ fn keeps_every_value(original: &toml::Value, kept: &toml::Value) -> bool {
 }
 
 /// `section` deserialized as one entry of its real type and serialized back,
-/// or `None` when it does not read as a single entry at all.
+/// or `None` when it does not read as a single entry at all. A V2 profile is
+/// first rewritten as the V2 -> V3 step rewrites it, under the family the
+/// step files it by (`grok` as `xai`, a `custom:` URL as `custom`).
 fn round_trip_as_v2_entry(
     kind: V2EntryKind,
     name: &str,
     section: &toml::Table,
 ) -> Option<toml::Table> {
     const PROBE: &str = "__unversioned_shape_probe__";
+    let (name, section) = match kind {
+        V2EntryKind::ModelProvider => crate::schema::v2::v2_profile_as_v3_entry(name, section),
+        V2EntryKind::Channel => (name.to_string(), section.clone()),
+    };
     let mut slot = toml::Table::new();
-    slot.insert(PROBE.to_string(), toml::Value::Table(section.clone()));
+    slot.insert(PROBE.to_string(), toml::Value::Table(section));
     let mut wrapped = toml::Table::new();
-    wrapped.insert(name.to_string(), toml::Value::Table(slot));
+    wrapped.insert(name.clone(), toml::Value::Table(slot));
     let wrapped = toml::Value::Table(wrapped);
     let round_tripped = match kind {
         V2EntryKind::ModelProvider => wrapped
@@ -842,7 +950,7 @@ fn round_trip_as_v2_entry(
     };
     round_tripped
         .as_ref()
-        .and_then(|value| value.get(name))
+        .and_then(|value| value.get(&name))
         .and_then(|slot| slot.get(PROBE))
         .and_then(toml::Value::as_table)
         .cloned()
@@ -6753,6 +6861,28 @@ mention_only = false
         shared.sort_unstable();
         let listed: Vec<&str> = TOLD_APART.iter().map(|(key, _)| *key).collect();
         assert_eq!(shared, listed);
+    }
+
+    /// `V3_AGENT_FIELDS` names exactly the keys a current agent accepts.
+    #[test]
+    fn v3_agent_fields_are_the_current_agent_fields() {
+        let mut accepted = accepted_keys::<crate::schema::AliasedAgentConfig>().to_vec();
+        accepted.sort_unstable();
+        assert_eq!(accepted, V3_AGENT_FIELDS);
+    }
+
+    /// Each V3-only destination is a spelling the current schema reads there.
+    #[test]
+    fn v3_only_destinations_are_current_spellings() {
+        for pattern in V3_ONLY_DESTINATIONS {
+            let named: Vec<&str> = pattern.iter().copied().filter(|key| *key != ANY_KEY).collect();
+            let (key, parent) = named.split_last().unwrap();
+            assert!(
+                accepted_at(&parent.join(".")).contains(key),
+                "`{}` is not a current spelling",
+                pattern.join(".")
+            );
+        }
     }
 
     /// Each provider category's aliases are V3 evidence on their own, and
