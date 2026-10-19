@@ -44924,7 +44924,7 @@ channel = "notion"
                 })
                 .collect();
             let at = |key: &'static str| parent.iter().copied().chain([key]).collect::<Vec<_>>();
-            let written_path = at(*written).join(".");
+            let written_path = at(written).join(".");
             // A value the written spelling reads, other than its default where
             // one of each shape will do.
             let value = [
@@ -44947,7 +44947,7 @@ channel = "notion"
                     "schema_version".to_string(),
                     toml::Value::Integer(i64::from(crate::migration::CURRENT_SCHEMA_VERSION)),
                 );
-                insert_at(&mut file, &at(*written), value.clone());
+                insert_at(&mut file, &at(written), value.clone());
                 crate::migration::migrate_to_current(&toml::to_string(&file).unwrap())
                     .is_ok_and(|config| typed_at(&config, &written_path).is_some())
             })
@@ -44956,9 +44956,9 @@ channel = "notion"
             for version in [1, 2] {
                 let mut single = toml::Table::new();
                 single.insert("schema_version".to_string(), toml::Value::Integer(version));
-                insert_at(&mut single, &at(*written), value.clone());
+                insert_at(&mut single, &at(written), value.clone());
                 let mut both = single.clone();
-                insert_at(&mut both, &at(*alias), value.clone());
+                insert_at(&mut both, &at(alias), value.clone());
                 let single_raw = toml::to_string(&single).unwrap();
                 let both_raw = toml::to_string(&both).unwrap();
                 // What the version's own migration makes of the setting
