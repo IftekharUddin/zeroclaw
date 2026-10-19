@@ -720,7 +720,11 @@ pub(crate) const ALIASED_KEYS: &[(&[&str], &str, &str)] = &[
         "api_version",
     ),
     (&["providers", "tts", "openai", ANY_KEY], "api_url", "uri"),
-    (&["providers", "tts", "elevenlabs", ANY_KEY], "api_url", "uri"),
+    (
+        &["providers", "tts", "elevenlabs", ANY_KEY],
+        "api_url",
+        "uri",
+    ),
     (&["providers", "tts", "google", ANY_KEY], "api_url", "uri"),
     (&["providers", "tts", "edge", ANY_KEY], "api_url", "uri"),
     (&["providers", "tts", "piper", ANY_KEY], "api_url", "uri"),
@@ -731,14 +735,22 @@ pub(crate) const ALIASED_KEYS: &[(&[&str], &str, &str)] = &[
     (&["storage", "postgres", ANY_KEY], "database_url", "db_url"),
     (&["storage", "postgres", ANY_KEY], "databaseUrl", "db_url"),
     (&["observability"], "runtime_trace_mode", "log_persistence"),
-    (&["observability"], "runtime_trace_path", "log_persistence_path"),
+    (
+        &["observability"],
+        "runtime_trace_path",
+        "log_persistence_path",
+    ),
     (
         &["observability"],
         "runtime_trace_max_entries",
         "log_persistence_max_entries",
     ),
     (&["risk_profiles", ANY_KEY], "allowed_path", "allowed_roots"),
-    (&["risk_profiles", ANY_KEY], "allowed_paths", "allowed_roots"),
+    (
+        &["risk_profiles", ANY_KEY],
+        "allowed_paths",
+        "allowed_roots",
+    ),
     (&["heartbeat"], "channel", "target"),
     (&["heartbeat"], "recipient", "to"),
 ];
@@ -7518,7 +7530,10 @@ mention_only = false
 
     /// Serde aliases in this crate that are not keys of the file, with why.
     const ALIASES_THAT_ARE_NOT_FILE_KEYS: &[(&str, &str)] = &[
-        ("model_provider", "`V1Config`'s spelling, in the legacy catalog"),
+        (
+            "model_provider",
+            "`V1Config`'s spelling, in the legacy catalog",
+        ),
         ("model", "`V1Config`'s spelling, in the legacy catalog"),
         ("noop", "a value of `ObservabilityBackend`"),
         ("opentelemetry", "a value of `ObservabilityBackend`"),
@@ -7602,29 +7617,39 @@ mention_only = false
             // takes only its variants), else a value of each shape.
             let default = value_at(
                 &defaults,
-                &parent.iter().copied().chain([*written]).collect::<Vec<_>>().join("."),
+                &parent
+                    .iter()
+                    .copied()
+                    .chain([*written])
+                    .collect::<Vec<_>>()
+                    .join("."),
             )
             .cloned();
             let duplicate = default
                 .into_iter()
                 .chain([
-                toml::Value::Table(toml::Table::new()),
-                toml::Value::String("probe".into()),
-                toml::Value::Array(Vec::new()),
-                toml::Value::Boolean(true),
-                toml::Value::Integer(1),
-            ])
-            .any(|value| {
-                let mut file = toml::Value::Table(toml::Table::new());
-                for key in [*written, *alias] {
-                    let path = parent.iter().copied().chain([key]).collect::<Vec<_>>().join(".");
-                    set_at(&mut file, &path, value.clone());
-                }
-                file.try_into::<Config>().is_err_and(|err| {
-                    err.to_string()
-                        .contains(&format!("duplicate field `{written}`"))
-                })
-            });
+                    toml::Value::Table(toml::Table::new()),
+                    toml::Value::String("probe".into()),
+                    toml::Value::Array(Vec::new()),
+                    toml::Value::Boolean(true),
+                    toml::Value::Integer(1),
+                ])
+                .any(|value| {
+                    let mut file = toml::Value::Table(toml::Table::new());
+                    for key in [*written, *alias] {
+                        let path = parent
+                            .iter()
+                            .copied()
+                            .chain([key])
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        set_at(&mut file, &path, value.clone());
+                    }
+                    file.try_into::<Config>().is_err_and(|err| {
+                        err.to_string()
+                            .contains(&format!("duplicate field `{written}`"))
+                    })
+                });
             assert!(
                 duplicate,
                 "`{alias}` is not read as `{written}` at `{}`",
@@ -7656,10 +7681,22 @@ mention_only = false
             .unwrap();
         use_written_spellings(doc.as_table_mut()).unwrap();
         let written = doc.to_string();
-        assert!(written.contains("# the channels\n[channels.discord.work]"), "{written}");
-        assert!(written.contains("target = \"telegram\" # where to post"), "{written}");
-        assert!(written.contains("db_url = \"postgres://keep\""), "{written}");
-        assert!(!written.contains("channels_config") && !written.contains("dbURL"), "{written}");
+        assert!(
+            written.contains("# the channels\n[channels.discord.work]"),
+            "{written}"
+        );
+        assert!(
+            written.contains("target = \"telegram\" # where to post"),
+            "{written}"
+        );
+        assert!(
+            written.contains("db_url = \"postgres://keep\""),
+            "{written}"
+        );
+        assert!(
+            !written.contains("channels_config") && !written.contains("dbURL"),
+            "{written}"
+        );
 
         let mut both: toml_edit::DocumentMut =
             "[heartbeat]\nchannel = \"telegram\"\ntarget = \"discord\"\n"

@@ -44327,7 +44327,10 @@ channel = "notion"
                 toml::Value::try_from(crate::migration::migrate_to_current(legacy).unwrap())
                     .unwrap()
                     .to_string();
-            assert!(loaded.contains(kept), "{legacy}: `{kept}` was lost:\n{loaded}");
+            assert!(
+                loaded.contains(kept),
+                "{legacy}: `{kept}` was lost:\n{loaded}"
+            );
         }
     }
 
@@ -44340,7 +44343,10 @@ channel = "notion"
     /// `raw` written to a fresh config path, loaded strictly, changed by
     /// `edit`, which names the paths it changed, and saved incrementally.
     /// Returns the file written and its strict reload.
-    async fn edit_incrementally(raw: &str, edit: impl FnOnce(&mut Config) -> Vec<&'static str>) -> (String, Config) {
+    async fn edit_incrementally(
+        raw: &str,
+        edit: impl FnOnce(&mut Config) -> Vec<&'static str>,
+    ) -> (String, Config) {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::write(&config_path, raw).unwrap();
@@ -44389,7 +44395,12 @@ channel = "notion"
             };
 
             let (written, reloaded) = edit_incrementally(&raw, |config| {
-                config.channels.discord.get_mut("work").unwrap().mention_only = true;
+                config
+                    .channels
+                    .discord
+                    .get_mut("work")
+                    .unwrap()
+                    .mention_only = true;
                 vec!["channels.discord.work.mention_only"]
             })
             .await;
@@ -44398,8 +44409,7 @@ channel = "notion"
             assert!(work.mention_only, "the edit is saved:\n{written}");
             assert_eq!(work.bot_token, "KEEP-DISCORD-TOKEN", "{written}");
             assert_eq!(
-                reloaded.channels.discord["home"].bot_token,
-                "KEEP-HOME-TOKEN",
+                reloaded.channels.discord["home"].bot_token, "KEEP-HOME-TOKEN",
                 "{written}"
             );
 
@@ -44411,8 +44421,7 @@ channel = "notion"
             one_spelling(&written);
             assert!(!reloaded.channels.discord.contains_key("home"), "{written}");
             assert_eq!(
-                reloaded.channels.discord["work"].bot_token,
-                "KEEP-DISCORD-TOKEN",
+                reloaded.channels.discord["work"].bot_token, "KEEP-DISCORD-TOKEN",
                 "{written}"
             );
 
@@ -44425,13 +44434,11 @@ channel = "notion"
             one_spelling(&written);
             assert!(!reloaded.channels.discord.contains_key("home"), "{written}");
             assert_eq!(
-                reloaded.channels.discord["office"].bot_token,
-                "KEEP-HOME-TOKEN",
+                reloaded.channels.discord["office"].bot_token, "KEEP-HOME-TOKEN",
                 "{written}"
             );
             assert_eq!(
-                reloaded.channels.discord["work"].bot_token,
-                "KEEP-DISCORD-TOKEN",
+                reloaded.channels.discord["work"].bot_token, "KEEP-DISCORD-TOKEN",
                 "{written}"
             );
         }
@@ -44442,7 +44449,10 @@ channel = "notion"
     /// one spelling of it, which reloads strictly with the edit.
     #[test]
     async fn v4_review_r5_incremental_edits_keep_one_spelling_of_any_aliased_key() {
-        let current = format!("schema_version = {}\n", crate::migration::CURRENT_SCHEMA_VERSION);
+        let current = format!(
+            "schema_version = {}\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
 
         // `mcpServers` for `[mcp]`.
         let (written, reloaded) = edit_incrementally(
@@ -44465,8 +44475,16 @@ channel = "notion"
             },
         )
         .await;
-        assert_eq!(reloaded.heartbeat.target.as_deref(), Some("discord"), "{written}");
-        assert_eq!(reloaded.heartbeat.to.as_deref(), Some("keep-to"), "{written}");
+        assert_eq!(
+            reloaded.heartbeat.target.as_deref(),
+            Some("discord"),
+            "{written}"
+        );
+        assert_eq!(
+            reloaded.heartbeat.to.as_deref(),
+            Some("keep-to"),
+            "{written}"
+        );
 
         // `dbURL` for a Postgres store's `db_url`, under a keyed alias.
         let (written, reloaded) = edit_incrementally(
@@ -44490,8 +44508,11 @@ channel = "notion"
         let (written, reloaded) = edit_incrementally(
             &format!("{current}\n[risk_profiles.default]\nallowed_paths = [\"/srv/keep\"]\n"),
             |config| {
-                config.risk_profiles.get_mut("default").unwrap().allowed_roots =
-                    vec!["/srv/edited".to_string()];
+                config
+                    .risk_profiles
+                    .get_mut("default")
+                    .unwrap()
+                    .allowed_roots = vec!["/srv/edited".to_string()];
                 vec!["risk_profiles.default.allowed_roots"]
             },
         )
@@ -44528,7 +44549,11 @@ channel = "notion"
                 config.save_dirty().await
             };
             assert!(saved.is_err(), "full={full}");
-            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), raw, "full={full}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap(),
+                raw,
+                "full={full}"
+            );
             assert_eq!(config.dirty_paths, dirty, "full={full}");
         }
     }
