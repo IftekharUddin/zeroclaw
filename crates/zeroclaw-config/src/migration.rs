@@ -800,6 +800,56 @@ pub(crate) fn use_written_spellings(root: &mut toml_edit::Table) -> Result<()> {
     Ok(())
 }
 
+/// Refuse an older file that still holds two spellings of one setting once
+/// its structural migration has run, as [`use_written_spellings`] refuses a
+/// current one. The migration chooses between some spellings itself (a V1
+/// file's `channels_config` over its `channels`); a conflict it leaves, such
+/// as a heartbeat's `channel` beside its `target`, makes the file unreadable
+/// and the config loaded from it lack that whole section, so a save that
+/// wrote the loaded config over it would drop the section. Only checks: the
+/// chain runs on a copy, and nothing is written.
+pub(crate) fn refuse_spellings_left_by_migration(existing: &str) -> Result<()> {
+    let value: toml::Value = toml::from_str(existing).context("failed to parse config TOML")?;
+    let from = detect_version(&value)?;
+    if from >= CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let migrated = run_chain(value, from, &mut Vec::new())?;
+    let Some(root) = migrated.as_table() else {
+        return Ok(());
+    };
+    for (parent, alias, written) in ALIASED_KEYS {
+        for pattern in spellings_of(parent) {
+            let parents = if pattern.is_empty() {
+                vec![Vec::new()]
+            } else {
+                expand_path(root, &pattern)
+            };
+            for path in parents {
+                let holds_both = path
+                    .iter()
+                    .try_fold(root, |table, key| {
+                        table.get(key.as_str()).and_then(toml::Value::as_table)
+                    })
+                    .is_some_and(|table| table.contains_key(*alias) && table.contains_key(*written));
+                if holds_both {
+                    let at = if path.is_empty() {
+                        "the top level".to_string()
+                    } else {
+                        format!("`[{}]`", path.join("."))
+                    };
+                    anyhow::bail!(
+                        "{at} holds both `{written}` and `{alias}`, two spellings of one \
+                         setting, which the schema cannot read together, and migrating the file \
+                         from V{from} does not choose between them; keep one before saving"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The item at `path` under `root`, or `None`.
 fn item_at<'a>(root: &'a mut toml_edit::Table, path: &[String]) -> Option<&'a mut toml_edit::Item> {
     let (first, rest) = path.split_first()?;

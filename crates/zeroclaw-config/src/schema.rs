@@ -26326,9 +26326,12 @@ impl Config {
             // Then sync onto the spelling the snapshot is written in, keeping
             // the comments of a section spelled another way; a current file
             // still holding two live spellings of one setting is refused. An
-            // older file is not renamed: its migration already chose between
-            // its spellings, and the sync writes that choice.
-            if on_disk != OnDiskConfig::NeedsStructuralMigration {
+            // older file is synced as it stands, since its migration chooses
+            // between some spellings (V1's `channels_config` over `channels`)
+            // and the sync writes that choice; one it leaves is refused too.
+            if on_disk == OnDiskConfig::NeedsStructuralMigration {
+                crate::migration::refuse_spellings_left_by_migration(&existing)?;
+            } else {
                 crate::migration::use_written_spellings(doc.as_table_mut())?;
             }
             crate::migration::sync_table(doc.as_table_mut(), &new_table);
