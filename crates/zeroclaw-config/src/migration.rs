@@ -5801,8 +5801,9 @@ mention_only = false
 
     /// The catalog names each top-level setting `V1Config` reads and each
     /// spelling it accepts for one, and none of them is a current section.
-    /// `model_routes` and `embedding_routes` are current sections too; their
-    /// V1 entries are told apart by naming their provider `provider`.
+    /// `model_routes` and `embedding_routes` are current sections too, told
+    /// apart by a route naming `provider`; `channels_config` is a current
+    /// spelling of `channels`, told apart by its shape.
     #[test]
     fn the_legacy_catalog_names_every_v1_setting() {
         let current = current_top_level_sections();
@@ -5845,7 +5846,7 @@ mention_only = false
         for key in written.as_table().unwrap().keys() {
             assert!(
                 top_level.contains(&key.as_str())
-                    || ["model_routes", "embedding_routes"].contains(&key.as_str()),
+                    || ["model_routes", "embedding_routes", "channels_config"].contains(&key.as_str()),
                 "`{key}` is a V1 setting the catalog does not name"
             );
         }
@@ -6202,6 +6203,40 @@ mention_only = false
                 Reading::V1,
             ),
             (
+                "r4: a V3 TTS alias beside a V2 TTS block",
+                "[providers.tts.openai.work]\napi_key = \"KEEP-TTS-KEY\"\nvoice = \"nova\"\n\n\
+                 [tts.openai]\nvoice = \"alloy\"\n"
+                    .to_string(),
+                Reading::Refused,
+            ),
+            (
+                "r4: a V3 transcription alias beside the shared transcription table",
+                "[providers.transcription.openai.work]\nmodel = \"whisper-1\"\n\n\
+                 [transcription.openai]\napi_key = \"KEEP-STT-KEY\"\nmodel = \"keep-shared-model\"\n"
+                    .to_string(),
+                Reading::V3,
+            ),
+            (
+                "r4: a channel alias under the channels_config spelling",
+                "[channels_config.discord.work]\nenabled = true\nbot_token = \"KEEP-DISCORD-TOKEN\"\n"
+                    .to_string(),
+                Reading::V3,
+            ),
+            (
+                "r4: local Whisper settings in the shared transcription table",
+                "[transcription.local_whisper]\nurl = \"http://127.0.0.1:8001/v1/transcribe\"\n\
+                 bearer_token = \"KEEP-LOCAL-TOKEN\"\ntimeout_secs = 17\n"
+                    .to_string(),
+                Reading::V1,
+            ),
+            (
+                "r4: a legacy provider synonym with its header map",
+                "[providers.models.grok]\nmodel = \"grok-4\"\n\n\
+                 [providers.models.grok.extra_headers]\nX-Trace = \"keep-header\"\n"
+                    .to_string(),
+                Reading::V1,
+            ),
+            (
                 "control: a V2 profile with its header map",
                 "[providers.models.openai]\nmodel = \"gpt-4o\"\n\n\
                  [providers.models.openai.extra_headers]\nX-Trace = \"keep\"\n"
@@ -6247,7 +6282,7 @@ mention_only = false
             toml::Value::Table(table) => table,
             other => panic!("the default config is not a table: {other}"),
         };
-        [("fixture", fixture), ("default", defaults)]
+        let mut sections: Vec<(String, toml::Table)> = [("fixture", fixture), ("default", defaults)]
             .into_iter()
             .flat_map(|(source, table)| {
                 table
@@ -6259,6 +6294,104 @@ mention_only = false
                             toml::Table::from_iter([(key, section)]),
                         )
                     })
+            })
+            .collect();
+        // The same sections under every other spelling the schema accepts.
+        for (alias, spelled) in top_level_aliases() {
+            let respelled: Vec<(String, toml::Table)> = sections
+                .iter()
+                .filter_map(|(label, section)| {
+                    section.get(&spelled).map(|content| {
+                        (
+                            format!("{label}, spelled `{alias}`"),
+                            toml::Table::from_iter([(alias.to_string(), content.clone())]),
+                        )
+                    })
+                })
+                .collect();
+            sections.extend(respelled);
+        }
+        sections
+    }
+
+    /// The keys `T` accepts, its serde aliases included: the field list
+    /// serde's derive hands to `deserialize_struct`, which names each alias
+    /// beside its field.
+    fn accepted_keys<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+        #[derive(Debug)]
+        struct Fields(&'static [&'static str]);
+        impl std::fmt::Display for Fields {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{:?}", self.0)
+            }
+        }
+        impl std::error::Error for Fields {}
+        impl serde::de::Error for Fields {
+            fn custom<M: std::fmt::Display>(_: M) -> Self {
+                Fields(&[])
+            }
+        }
+        struct Recorder;
+        impl<'de> serde::Deserializer<'de> for Recorder {
+            type Error = Fields;
+            fn deserialize_any<V: serde::de::Visitor<'de>>(self, _: V) -> Result<V::Value, Fields> {
+                Err(Fields(&[]))
+            }
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Fields> {
+                Err(Fields(fields))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+        let fields = match T::deserialize(Recorder) {
+            Err(Fields(fields)) => fields,
+            Ok(_) => &[],
+        };
+        assert!(
+            !fields.is_empty(),
+            "`{}` lists no fields to serde",
+            std::any::type_name::<T>()
+        );
+        fields
+    }
+
+    /// Each top-level key `Config` accepts that names no section, with the
+    /// section it spells: a file holding both is refused by serde as a
+    /// duplicate field.
+    fn top_level_aliases() -> Vec<(&'static str, String)> {
+        let canonical = current_top_level_sections();
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        let fixture: toml::Value = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        accepted_keys::<Config>()
+            .iter()
+            .copied()
+            .filter(|key| !canonical.contains(*key))
+            .map(|alias| {
+                let spelled = canonical
+                    .iter()
+                    .find(|name| {
+                        let content = fixture
+                            .get(name.as_str())
+                            .or_else(|| defaults.get(name.as_str()))
+                            .cloned()
+                            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+                        let both = toml::Value::Table(toml::Table::from_iter([
+                            ((*name).clone(), content.clone()),
+                            (alias.to_string(), content),
+                        ]));
+                        both.try_into::<Config>()
+                            .is_err_and(|err| err.to_string().contains("duplicate field"))
+                    })
+                    .unwrap_or_else(|| panic!("`{alias}` is accepted by `Config` but spells no section"));
+                (alias, spelled.clone())
             })
             .collect()
     }
@@ -6302,27 +6435,6 @@ mention_only = false
             "the whole V4 fixture, unversioned"
         );
     }
-
-    /// Current fields the V2 -> V3 step also moves: V2's Groq transcription
-    /// settings and per-family STT tables, which V3 copied under
-    /// `[providers.transcription]` and the current schema still reads in
-    /// place. Their shape is the same in both layouts, so a file holding
-    /// nothing else that tells the layouts apart is read as V1, as before
-    /// V4, and these move to the `providers.transcription` alias the V3
-    /// migration gives them.
-    const RELOCATED_BY_THE_V1_READING: &[&str] = &[
-        "transcription.api_key",
-        "transcription.api_url",
-        "transcription.model",
-        "transcription.language",
-        "transcription.initial_prompt",
-        "transcription.openai",
-        "transcription.deepgram",
-        "transcription.assemblyai",
-        "transcription.google",
-        "transcription.local_whisper",
-        "providers.transcription",
-    ];
 
     /// Every leaf path under `value`, arrays counted as leaves.
     fn leaf_paths(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
@@ -6372,19 +6484,36 @@ mention_only = false
         paths.dedup();
         paths
             .into_iter()
-            .filter(|path| {
-                !RELOCATED_BY_THE_V1_READING
-                    .iter()
-                    .any(|moved| path == moved || path.starts_with(&format!("{moved}.")))
-            })
             .filter(|path| value_at(&typed_v1, path) != value_at(&typed_v3, path))
             .collect()
     }
 
+    /// The sections only the V3 layout has, which a file read as V3 holds:
+    /// alias-keyed providers of every category and channels, cron jobs, the
+    /// profiles and peer groups, the alias-keyed storage backends, the
+    /// renamed tunnel and search providers, and agents.
+    const V3_ONLY_SECTIONS: &[&[&str]] = &[
+        &["providers", "models"],
+        &["providers", "tts"],
+        &["providers", "transcription"],
+        &["cron"],
+        &["risk_profiles"],
+        &["runtime_profiles"],
+        &["peer_groups"],
+        &["storage", "sqlite"],
+        &["storage", "postgres"],
+        &["storage", "qdrant"],
+        &["storage", "markdown"],
+        &["storage", "lucid"],
+        &["tunnel", "tunnel_provider"],
+        &["web_search", "search_provider"],
+        &["agents"],
+    ];
+
     /// A file with no section that tells the layouts apart is read as V1,
-    /// and that reading configures exactly what the V3 reading would, apart
-    /// from [`RELOCATED_BY_THE_V1_READING`]. Checked for each current
-    /// section, and for the whole V4 fixture without its V3-only sections.
+    /// and that reading configures exactly what the V3 reading would. Checked
+    /// for each current section under each spelling, and for the whole V4
+    /// fixture without its V3-only sections.
     #[test]
     fn a_file_with_no_layout_evidence_reads_the_same_as_v1_and_as_v3() {
         for (label, section) in current_layout_sections() {
@@ -6399,11 +6528,17 @@ mention_only = false
         }
 
         let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
-        for key in ["schema_version", "tools", "cron"] {
+        for key in ["schema_version", "tools"] {
             fixture.remove(key);
         }
-        if let Some(toml::Value::Table(providers)) = fixture.get_mut("providers") {
-            providers.remove("models");
+        for path in V3_ONLY_SECTIONS {
+            let (last, parents) = path.split_last().unwrap();
+            let parent = parents.iter().try_fold(&mut fixture, |table, key| {
+                table.get_mut(*key).and_then(toml::Value::as_table_mut)
+            });
+            if let Some(parent) = parent {
+                parent.remove(*last);
+            }
         }
         if let Some(toml::Value::Table(channels)) = fixture.get_mut("channels") {
             for kind in crate::schema::v2::V3_CHANNEL_TYPES {
@@ -6419,41 +6554,300 @@ mention_only = false
         assert!(differ.is_empty(), "the V1 reading differs at {differ:?}");
     }
 
-    /// The fields [`RELOCATED_BY_THE_V1_READING`] excuses do move under the
-    /// V1 reading, to the alias the V3 migration gives them, and stay where
-    /// they are under the V3 reading. Both are places the current schema
-    /// reads.
+    /// The current `[transcription]` still reads V2's Groq settings and
+    /// per-family STT tables, spelled as V2 spelled them, so the V1 reading
+    /// leaves them where they are, with every value: no move to a
+    /// `[providers.transcription]` alias whose fields differ (`uri` for
+    /// `url`, no endpoint for Groq).
     #[test]
-    fn the_v1_reading_relocates_only_the_shared_transcription_fields() {
+    fn the_v1_reading_keeps_the_shared_transcription_settings_in_place() {
         let file: toml::Table = toml::from_str(
-            "[transcription]\nmodel = \"whisper-keep\"\n\n\
-             [transcription.openai]\nmodel = \"whisper-1\"\n",
+            "[transcription]\napi_url = \"https://stt.example.invalid/v1\"\n\
+             model = \"whisper-keep\"\n\n\
+             [transcription.openai]\nmodel = \"whisper-1\"\n\n\
+             [transcription.google]\nlanguage_code = \"de-DE\"\n\n\
+             [transcription.local_whisper]\nurl = \"http://127.0.0.1:8001/v1/transcribe\"\n\
+             bearer_token = \"KEEP-LOCAL-TOKEN\"\ntimeout_secs = 17\n",
         )
         .unwrap();
         assert_eq!(
             detect_version(&toml::Value::Table(file.clone())).ok(),
             Some(1)
         );
-        let (_, as_v1) = stated_reading(&file, 1);
-        let (_, as_v3) = stated_reading(&file, 3);
+        let (as_v1, typed_v1) = stated_reading(&file, 1);
+        for (path, kept) in [
+            ("transcription.api_url", "https://stt.example.invalid/v1"),
+            ("transcription.model", "whisper-keep"),
+            ("transcription.openai.model", "whisper-1"),
+            ("transcription.google.language_code", "de-DE"),
+            (
+                "transcription.local_whisper.url",
+                "http://127.0.0.1:8001/v1/transcribe",
+            ),
+            ("transcription.local_whisper.bearer_token", "KEEP-LOCAL-TOKEN"),
+        ] {
+            assert_eq!(
+                value_at(&typed_v1, path).and_then(toml::Value::as_str),
+                Some(kept),
+                "{path}"
+            );
+        }
         assert_eq!(
-            value_at(&as_v1, "providers.transcription.groq.default.model")
-                .and_then(toml::Value::as_str),
-            Some("whisper-keep")
+            value_at(&typed_v1, "transcription.local_whisper.timeout_secs")
+                .and_then(toml::Value::as_integer),
+            Some(17)
         );
-        assert_eq!(
-            value_at(&as_v1, "providers.transcription.openai.default.model")
-                .and_then(toml::Value::as_str),
-            Some("whisper-1")
+        assert!(
+            value_at(&as_v1, "providers.transcription").is_none(),
+            "nothing moves under `[providers.transcription]`: {as_v1:#?}"
         );
-        assert_eq!(
-            value_at(&as_v3, "transcription.model").and_then(toml::Value::as_str),
-            Some("whisper-keep")
-        );
-        assert_eq!(
-            value_at(&as_v3, "transcription.openai.model").and_then(toml::Value::as_str),
-            Some("whisper-1")
-        );
+        assert!(readings_differ(&file).is_empty());
+    }
+
+    // ── Round 4: every spelling the types accept, every destination ─
+
+    /// The keys the current schema accepts at `parent`, a dotted path whose
+    /// `*` stands for any alias.
+    fn accepted_at(parent: &str) -> &'static [&'static str] {
+        use crate::schema::{
+            AliasedAgentConfig, ChannelsConfig, CostConfig, EmbeddingRouteConfig, MemoryConfig,
+            ModelRouteConfig, PairingDashboardConfig, ReliabilityConfig, SecurityConfig,
+            StorageConfig, TranscriptionConfig, TtsConfig, TunnelConfig, WebSearchConfig,
+        };
+        match parent {
+            "" => accepted_keys::<Config>(),
+            "providers" => accepted_keys::<crate::providers::Providers>(),
+            "security" => accepted_keys::<SecurityConfig>(),
+            "reliability" => accepted_keys::<ReliabilityConfig>(),
+            "memory" => accepted_keys::<MemoryConfig>(),
+            "storage" => accepted_keys::<StorageConfig>(),
+            "cost" => accepted_keys::<CostConfig>(),
+            "tts" => accepted_keys::<TtsConfig>(),
+            "transcription" => accepted_keys::<TranscriptionConfig>(),
+            "gateway.pairing_dashboard" => accepted_keys::<PairingDashboardConfig>(),
+            "tunnel" => accepted_keys::<TunnelConfig>(),
+            "web_search" => accepted_keys::<WebSearchConfig>(),
+            "channels" => accepted_keys::<ChannelsConfig>(),
+            "agents.*" => accepted_keys::<AliasedAgentConfig>(),
+            "model_routes" => accepted_keys::<ModelRouteConfig>(),
+            "embedding_routes" => accepted_keys::<EmbeddingRouteConfig>(),
+            other => panic!("no type is mapped for `{other}`; add it to `accepted_at`"),
+        }
+    }
+
+    /// No older-layout setting is a spelling the current schema reads where
+    /// it is: its key is neither a field nor a serde alias of the type at its
+    /// parent. The accepted keys come from the types, aliases included, so a
+    /// spelling such as `channels_config`, an alias of `channels`, cannot be
+    /// taken for an older layout.
+    #[test]
+    fn no_legacy_layout_path_is_a_current_spelling() {
+        // The mapping names the right types: each accepts every key the
+        // default config or the fixture writes there.
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        let fixture: toml::Value = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        for parent in [
+            "",
+            "providers",
+            "security",
+            "reliability",
+            "memory",
+            "storage",
+            "cost",
+            "tts",
+            "transcription",
+            "gateway.pairing_dashboard",
+            "tunnel",
+            "web_search",
+            "channels",
+        ] {
+            let written = if parent.is_empty() {
+                defaults.as_table()
+            } else {
+                value_at(&defaults, parent)
+                    .or_else(|| value_at(&fixture, parent))
+                    .and_then(toml::Value::as_table)
+            }
+            .unwrap_or_else(|| panic!("nothing is written at `{parent}`"));
+            for key in written.keys() {
+                assert!(
+                    accepted_at(parent).contains(&key.as_str()),
+                    "`{parent}` is mapped to a type that does not read `{key}`"
+                );
+            }
+        }
+        for agent in fixture["agents"].as_table().unwrap().values() {
+            for key in agent.as_table().unwrap().keys() {
+                assert!(accepted_at("agents.*").contains(&key.as_str()), "{key}");
+            }
+        }
+
+        for pattern in LEGACY_LAYOUT_PATHS {
+            let (key, parent) = pattern.split_last().unwrap();
+            let parent = parent.join(".");
+            assert!(
+                !accepted_at(&parent).contains(key),
+                "`{}` is a spelling the current schema reads",
+                pattern.join(".")
+            );
+        }
+        for key in V2_ONLY_AGENT_KEYS {
+            assert!(!accepted_at("agents.*").contains(key), "agents.*.{key}");
+        }
+        for routes in ["model_routes", "embedding_routes"] {
+            assert!(
+                !accepted_at(routes).contains(&"provider"),
+                "{routes} entries read `provider`"
+            );
+        }
+    }
+
+    /// The top-level spellings the current schema accepts that an older
+    /// typed lens (`V1Config`, `V2Config`) also reads, so the chain reshapes
+    /// them, and how the detector tells the layouts apart there. Generated
+    /// from the types: a new shared spelling fails until it is listed here
+    /// and handled.
+    #[test]
+    fn spellings_shared_with_older_layouts_are_told_apart() {
+        const TOLD_APART: &[(&str, &str)] = &[
+            ("agents", "V2-only agent keys are older; current agent keys are V3"),
+            (
+                "channels",
+                "a channel type holding fields directly is older; alias-keyed is V3",
+            ),
+            ("channels_config", "an alias of `channels`, read the same way"),
+            ("cost", "`cost.prices` is older"),
+            (
+                "cron",
+                "`[[cron.jobs]]` and the subsystem knobs are older; job tables are V3",
+            ),
+            ("embedding_routes", "a route naming `provider` is older"),
+            ("model_routes", "a route naming `provider` is older"),
+            (
+                "providers",
+                "a family holding fields directly, or a value on `[providers]`, is older; \
+                 alias-keyed families of every category are V3",
+            ),
+            ("schema_version", "it states the version"),
+        ];
+        let read_by_an_older_lens = |key: &str| {
+            let file = toml::Value::Table(toml::Table::from_iter([(
+                key.to_string(),
+                toml::Value::String("x".into()),
+            )]));
+            let v1 = match file.clone().try_into::<V1Config>() {
+                Ok(v1) => !v1.passthrough.contains_key(key),
+                Err(_) => true,
+            };
+            let v2 = match file.try_into::<V2Config>() {
+                Ok(v2) => !v2.passthrough.contains_key(key),
+                Err(_) => true,
+            };
+            v1 || v2
+        };
+        let mut shared: Vec<&str> = accepted_keys::<Config>()
+            .iter()
+            .copied()
+            .filter(|key| read_by_an_older_lens(key))
+            .collect();
+        shared.sort_unstable();
+        let listed: Vec<&str> = TOLD_APART.iter().map(|(key, _)| *key).collect();
+        assert_eq!(shared, listed);
+    }
+
+    /// Each provider category's aliases are V3 evidence on their own, and
+    /// beside an older setting the file is refused.
+    #[test]
+    fn v4_review_r4_every_provider_category_is_v3_evidence() {
+        for alias in [
+            "[providers.models.ollama.work]\nmodel = \"llama3\"\n",
+            "[providers.tts.openai.work]\nvoice = \"nova\"\n",
+            "[providers.transcription.openai.work]\nmodel = \"whisper-1\"\n",
+        ] {
+            assert_eq!(
+                detect_version(&toml::from_str(alias).unwrap()).ok(),
+                Some(INFERRED_SCHEMA_VERSION),
+                "{alias}"
+            );
+            let mixed = format!("default_model = \"legacy\"\n{alias}");
+            assert!(
+                detect_version(&toml::from_str(&mixed).unwrap()).is_err(),
+                "{mixed}"
+            );
+        }
+    }
+
+    /// Destinations the chain writes into that V2 had as well, or whose only
+    /// older source is retired under either reading, so holding one beside
+    /// that source tells nothing about the layout.
+    const DESTINATIONS_SHARED_WITH_V2: &[&str] = &["schema_version", "scheduler", "gateway.pairing_code"];
+
+    /// `value` with every leaf changed: a value no migration would write.
+    fn changed(value: &toml::Value) -> toml::Value {
+        match value {
+            toml::Value::String(text) => toml::Value::String(format!("{text}-v3")),
+            toml::Value::Integer(n) => toml::Value::Integer(n + 1),
+            toml::Value::Float(x) => toml::Value::Float(x + 0.5),
+            toml::Value::Boolean(b) => toml::Value::Boolean(!b),
+            toml::Value::Array(items) if items.is_empty() => {
+                toml::Value::Array(vec![toml::Value::String("v3".into())])
+            }
+            toml::Value::Array(items) => toml::Value::Array(items.iter().map(changed).collect()),
+            toml::Value::Table(table) => toml::Value::Table(
+                table
+                    .iter()
+                    .map(|(key, value)| (key.clone(), changed(value)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// `root` with `value` set at a dotted path, creating tables on the way.
+    fn set_at(root: &mut toml::Value, dotted: &str, value: toml::Value) {
+        let mut keys: Vec<&str> = dotted.split('.').collect();
+        let last = keys.pop().unwrap();
+        let mut table = root.as_table_mut().unwrap();
+        for key in keys {
+            table = table
+                .entry(key)
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .unwrap_or_else(|| panic!("`{dotted}` crosses a value"));
+        }
+        table.insert(last.to_string(), value);
+    }
+
+    /// An older setting beside a V3 value at a place its own migration
+    /// writes is refused: read as V1, the migration would merge the two and
+    /// keep only one. Generated from the chain: every leaf it writes for each
+    /// older-layout example is tried.
+    #[test]
+    fn a_legacy_setting_beside_what_its_migration_writes_is_refused() {
+        for (path, raw) in LEGACY_LAYOUT_EXAMPLES {
+            let legacy: toml::Value = toml::from_str(raw).unwrap();
+            let migrated = run_chain(legacy.clone(), 1, &mut Vec::new())
+                .unwrap_or_else(|err| panic!("{path}: {err:#}"));
+            let mut written = Vec::new();
+            leaf_paths(&migrated, "", &mut written);
+            for leaf in written {
+                if value_at(&legacy, &leaf).is_some()
+                    || DESTINATIONS_SHARED_WITH_V2
+                        .iter()
+                        .any(|shared| leaf == *shared || leaf.starts_with(&format!("{shared}.")))
+                {
+                    continue;
+                }
+                let mut file = legacy.clone();
+                set_at(&mut file, &leaf, changed(value_at(&migrated, &leaf).unwrap()));
+                assert!(
+                    detect_version(&file).is_err(),
+                    "{path} beside a V3 value at `{leaf}`, which its migration writes, \
+                     must be refused as mixed:\n{}",
+                    toml::to_string(&file).unwrap()
+                );
+            }
+        }
     }
 
     // ── V4 retirements of keys no schema field reads ────────────────

@@ -43907,6 +43907,245 @@ channel = "notion"
         }
     }
 
+    /// Every path refuses `raw`, which has no `schema_version`, with the file
+    /// and the dirty set unchanged: detection, `config migrate`, and a full
+    /// and an incremental save.
+    async fn refused_on_every_path(raw: &str) {
+        assert!(
+            crate::migration::detect_version(&toml::from_str(raw).unwrap()).is_err(),
+            "{raw}"
+        );
+        assert!(
+            crate::migration::migrate_file_with_notices(raw).is_err(),
+            "{raw}"
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, raw).unwrap();
+        assert!(
+            crate::migration::migrate_file_in_place(&config_path).is_err(),
+            "{raw}"
+        );
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), raw);
+        for full in [false, true] {
+            let mut config = crate::migration::migrate_to_current_salvaged(raw).config;
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            let dirty = config.dirty_paths.clone();
+            let saved = if full {
+                config.save().await
+            } else {
+                config.save_dirty().await
+            };
+            assert!(saved.is_err(), "full={full}: {raw}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap(),
+                raw,
+                "full={full}"
+            );
+            assert_eq!(config.dirty_paths, dirty, "full={full}");
+        }
+    }
+
+    /// The subtrees of `config` at the dotted `paths`, as TOML.
+    fn subtrees(config: &Config, paths: &[&str]) -> Vec<Option<toml::Value>> {
+        let value = toml::Value::try_from(config).unwrap();
+        paths
+            .iter()
+            .map(|path| {
+                path.split('.')
+                    .try_fold(&value, |value, key| value.get(key))
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// `raw`, which has no `schema_version`, configures at `paths` exactly
+    /// what `control` does, on every path: strict and resilient load
+    /// (nothing dropped), `config migrate`, and a full and an incremental
+    /// save, each reloaded strictly.
+    async fn reads_like(raw: &str, control: &str, paths: &[&str]) {
+        let control = crate::migration::migrate_to_current(control)
+            .unwrap_or_else(|err| panic!("control: {err:#}"));
+        let expected = subtrees(&control, paths);
+        let strict = crate::migration::migrate_to_current(raw)
+            .unwrap_or_else(|err| panic!("{raw}: strict load failed: {err:#}"));
+        assert_eq!(subtrees(&strict, paths), expected, "{raw}: strict load");
+        let resilient = crate::migration::migrate_to_current_salvaged(raw);
+        assert!(
+            resilient.dropped.is_empty() && resilient.dropped_security.is_empty(),
+            "{raw}: {:?} {:?}",
+            resilient.dropped,
+            resilient.dropped_security
+        );
+        assert_eq!(
+            subtrees(&resilient.config, paths),
+            expected,
+            "{raw}: resilient load"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, raw).unwrap();
+        crate::migration::migrate_file_in_place(&config_path)
+            .unwrap_or_else(|err| panic!("{raw}: migrate failed: {err:#}"));
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let migrated = crate::migration::migrate_to_current(&written)
+            .unwrap_or_else(|err| panic!("{raw}: reload after migrate failed: {err:#}\n{written}"));
+        assert_eq!(subtrees(&migrated, paths), expected, "{raw}: migrate");
+
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, raw).unwrap();
+            let mut config = crate::migration::migrate_to_current(raw).unwrap();
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            if full {
+                config.save().await.unwrap();
+            } else {
+                config.save_dirty().await.unwrap();
+            }
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            let reloaded = crate::migration::migrate_to_current(&written).unwrap_or_else(|err| {
+                panic!("{raw}: full={full}: reload failed: {err:#}\n{written}")
+            });
+            assert_eq!(
+                subtrees(&reloaded, paths),
+                expected,
+                "{raw}: full={full}\n{written}"
+            );
+            assert_eq!(
+                reloaded.observability.backend,
+                ObservabilityBackend::Otel,
+                "{raw}: full={full}: the edit is saved"
+            );
+        }
+    }
+
+    /// A V3 TTS alias beside a V2 TTS block: read as V1, the V2 block's
+    /// migration would replace the alias, so every path refuses.
+    #[test]
+    async fn v4_review_r4_mixed_tts_layout_is_refused() {
+        refused_on_every_path(
+            "[providers.tts.openai.work]\napi_key = \"KEEP-TTS-KEY\"\nvoice = \"nova\"\n\n\
+             [tts.openai]\nvoice = \"alloy\"\n",
+        )
+        .await;
+    }
+
+    /// Current-format files with no `schema_version` that the earlier
+    /// detector read as V1, or refused: each configures what the same file
+    /// stated as V3 does, on every path, with the named values kept.
+    #[test]
+    async fn v4_review_r4_current_layouts_are_kept_on_every_path() {
+        let cases: [(&str, &[&str], &[&str]); 7] = [
+            (
+                // A V3 transcription alias beside the shared table.
+                "[providers.transcription.openai.work]\nmodel = \"whisper-1\"\n\n\
+                 [transcription.openai]\napi_key = \"KEEP-STT-KEY\"\nmodel = \"keep-shared-model\"\n",
+                &["providers.transcription", "transcription"],
+                &["KEEP-STT-KEY", "keep-shared-model", "whisper-1"],
+            ),
+            (
+                // A channel alias under the `channels_config` spelling.
+                "[channels_config.discord.work]\nenabled = true\nbot_token = \"KEEP-DISCORD-TOKEN\"\n",
+                &["channels"],
+                &["KEEP-DISCORD-TOKEN"],
+            ),
+            (
+                // The same, beside a provider alias.
+                "[channels_config.discord.work]\nenabled = true\nbot_token = \"KEEP-DISCORD-TOKEN\"\n\n\
+                 [providers.models.ollama.work]\nmodel = \"keep-model\"\n",
+                &["channels", "providers.models"],
+                &["KEEP-DISCORD-TOKEN", "keep-model"],
+            ),
+            (
+                // Local Whisper settings in the shared table.
+                "[transcription.local_whisper]\nurl = \"http://127.0.0.1:8001/v1/transcribe\"\n\
+                 bearer_token = \"KEEP-LOCAL-TOKEN\"\ntimeout_secs = 17\n",
+                &["transcription", "providers.transcription"],
+                &["KEEP-LOCAL-TOKEN", "http://127.0.0.1:8001/v1/transcribe"],
+            ),
+            (
+                // A Groq endpoint other than the default.
+                "[transcription]\napi_url = \"https://stt.example.invalid/v1\"\nmodel = \"keep-groq-model\"\n",
+                &["transcription", "providers.transcription"],
+                &["https://stt.example.invalid/v1", "keep-groq-model"],
+            ),
+            (
+                // Google STT's language code.
+                "[transcription.google]\napi_key = \"KEEP-GOOGLE-KEY\"\nlanguage_code = \"de-DE\"\n",
+                &["transcription", "providers.transcription"],
+                &["KEEP-GOOGLE-KEY", "de-DE"],
+            ),
+            (
+                // The shared table beside a V3 alias of the same family.
+                "[providers.transcription.local_whisper.work]\nuri = \"http://127.0.0.1:9000/v1/transcribe\"\n\n\
+                 [transcription.local_whisper]\nurl = \"http://127.0.0.1:8001/v1/transcribe\"\n\
+                 bearer_token = \"KEEP-LOCAL-TOKEN\"\n",
+                &["transcription", "providers.transcription"],
+                &["KEEP-LOCAL-TOKEN", "http://127.0.0.1:9000/v1/transcribe"],
+            ),
+        ];
+        for (raw, paths, kept) in cases {
+            let control = format!("schema_version = 3\n{raw}");
+            reads_like(raw, &control, paths).await;
+            let loaded = toml::Value::try_from(
+                crate::migration::migrate_to_current(raw).unwrap(),
+            )
+            .unwrap()
+            .to_string();
+            for value in kept {
+                assert!(loaded.contains(value), "{raw}: `{value}` was lost");
+            }
+        }
+    }
+
+    /// The provider names the V1 -> V3 chain canonicalizes (`grok` is
+    /// `xai`, a `custom:` URL is `custom`) do not make a V2 profile's own
+    /// map field look like a V3 alias: each loads, migrates and saves as the
+    /// same file stated as V1.
+    #[test]
+    async fn v4_review_r4_legacy_provider_synonyms_still_load() {
+        for family in [
+            "grok",
+            "together-ai",
+            "lm-studio",
+            "github-copilot",
+            "qwen-intl",
+            "anthropic-custom",
+            "custom:https://llm.example.invalid/v1",
+        ] {
+            let raw = format!(
+                "[providers.models.\"{family}\"]\nmodel = \"keep-model\"\n\n\
+                 [providers.models.\"{family}\".extra_headers]\nX-Trace = \"keep-header\"\n"
+            );
+            assert_eq!(
+                crate::migration::detect_version(&toml::from_str(&raw).unwrap()).ok(),
+                Some(1),
+                "{raw}"
+            );
+            reads_like(
+                &raw,
+                &format!("schema_version = 1\n{raw}"),
+                &["providers", "agents"],
+            )
+            .await;
+        }
+        // Negative control: content that cannot be the field still makes an
+        // alias beside V2 fields, under a canonical name too.
+        refused_on_every_path(
+            "[providers.models.grok]\nmodel = \"legacy-model\"\n\n\
+             [providers.models.grok.extra_headers]\nmodel = \"keep-model\"\ntemperature = 0.25\n",
+        )
+        .await;
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.
