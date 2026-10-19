@@ -44837,6 +44837,177 @@ channel = "notion"
         assert!(!written.contains("mcpServers"), "{written}");
     }
 
+    /// Two spellings of the heartbeat's target that an older file's migration
+    /// leaves in place: the file cannot be read strictly, the salvaged config
+    /// lacks the whole heartbeat section, and no save may write that over it.
+    #[test]
+    async fn v4_review_r7_legacy_alias_conflicts_block_full_save() {
+        for version in [1, 2] {
+            let raw = format!(
+                "schema_version = {version}\n\n[heartbeat]\nchannel = \"telegram\"\n\
+                 target = \"discord\"\nmessage = \"KEEP-HEARTBEAT-MESSAGE\"\n"
+            );
+            for full in [true, false] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                std::fs::write(&config_path, &raw).unwrap();
+                let mut config = crate::migration::migrate_to_current_salvaged(&raw).config;
+                assert_ne!(
+                    config.heartbeat.message.as_deref(),
+                    Some("KEEP-HEARTBEAT-MESSAGE"),
+                    "V{version}: the salvaged config should lack the heartbeat"
+                );
+                config.config_path = config_path.clone();
+                config.loaded_from = Some(config_path.clone());
+                config.observability.backend = ObservabilityBackend::Otel;
+                config.mark_dirty("observability.backend");
+                let dirty = config.dirty_paths.clone();
+                let saved = if full {
+                    config.save().await
+                } else {
+                    config.save_dirty().await
+                };
+                assert!(saved.is_err(), "V{version}: full={full}");
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    raw,
+                    "V{version}: full={full}"
+                );
+                assert_eq!(config.dirty_paths, dirty, "V{version}: full={full}");
+            }
+        }
+    }
+
+    /// The value at a dotted path of `config` as written, or `None`.
+    fn typed_at(config: &Config, dotted: &str) -> Option<toml::Value> {
+        let value = toml::Value::try_from(config).unwrap();
+        dotted
+            .split('.')
+            .try_fold(&value, |value, key| value.get(key))
+            .cloned()
+    }
+
+    /// `table` with `value` set at `path`, creating tables on the way.
+    fn insert_at(table: &mut toml::Table, path: &[&str], value: toml::Value) {
+        let (last, parents) = path.split_last().unwrap();
+        let mut table = table;
+        for key in parents {
+            table = table
+                .entry(*key)
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .unwrap();
+        }
+        table.insert((*last).to_string(), value);
+    }
+
+    /// For every key the schema reads under two spellings, a V1 and a V2 file
+    /// holding both is either one its migration resolves, so a save writes
+    /// what the same file spelled once would hold, or one every save refuses
+    /// with the file and the dirty set unchanged. Never one a save writes
+    /// over with the setting dropped.
+    #[test]
+    async fn v4_review_r7_every_aliased_key_in_an_older_file_is_resolved_or_refused() {
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        for (parent, alias, written) in crate::migration::ALIASED_KEYS {
+            let parent: Vec<&str> = parent
+                .iter()
+                .map(|key| {
+                    if *key == crate::migration::ANY_KEY {
+                        "probe"
+                    } else {
+                        *key
+                    }
+                })
+                .collect();
+            let at = |key: &'static str| parent.iter().copied().chain([key]).collect::<Vec<_>>();
+            let written_path = at(*written).join(".");
+            // A value the written spelling reads, other than its default where
+            // one of each shape will do.
+            let value = [
+                toml::Value::String("probe".into()),
+                toml::Value::Integer(7),
+                toml::Value::Boolean(true),
+                toml::Value::Array(vec![toml::Value::String("probe".into())]),
+            ]
+            .into_iter()
+            .chain(
+                written_path
+                    .split('.')
+                    .try_fold(&defaults, |value, key| value.get(key))
+                    .cloned(),
+            )
+            .chain([toml::Value::Table(toml::Table::new())])
+            .find(|value| {
+                let mut file = toml::Table::new();
+                file.insert(
+                    "schema_version".to_string(),
+                    toml::Value::Integer(i64::from(crate::migration::CURRENT_SCHEMA_VERSION)),
+                );
+                insert_at(&mut file, &at(*written), value.clone());
+                crate::migration::migrate_to_current(&toml::to_string(&file).unwrap())
+                    .is_ok_and(|config| typed_at(&config, &written_path).is_some())
+            })
+            .unwrap_or_else(|| panic!("no value reads at `{written_path}`"));
+
+            for version in [1, 2] {
+                let mut single = toml::Table::new();
+                single.insert("schema_version".to_string(), toml::Value::Integer(version));
+                insert_at(&mut single, &at(*written), value.clone());
+                let mut both = single.clone();
+                insert_at(&mut both, &at(*alias), value.clone());
+                let single_raw = toml::to_string(&single).unwrap();
+                let both_raw = toml::to_string(&both).unwrap();
+                // What the version's own migration makes of the setting
+                // spelled once.
+                let expected = typed_at(
+                    &crate::migration::migrate_to_current_salvaged(&single_raw).config,
+                    &written_path,
+                );
+                for full in [true, false] {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let config_path = tmp.path().join("config.toml");
+                    std::fs::write(&config_path, &both_raw).unwrap();
+                    let mut config = crate::migration::migrate_to_current_salvaged(&both_raw).config;
+                    config.config_path = config_path.clone();
+                    config.loaded_from = Some(config_path.clone());
+                    config.observability.backend = ObservabilityBackend::Otel;
+                    config.mark_dirty("observability.backend");
+                    let dirty = config.dirty_paths.clone();
+                    let saved = if full {
+                        config.save().await
+                    } else {
+                        config.save_dirty().await
+                    };
+                    let label = format!("`{alias}` beside `{written_path}`, V{version}, full={full}");
+                    let written_file = std::fs::read_to_string(&config_path).unwrap();
+                    match saved {
+                        Err(_) => {
+                            assert_eq!(written_file, both_raw, "{label}");
+                            assert_eq!(config.dirty_paths, dirty, "{label}");
+                        }
+                        Ok(()) => {
+                            let mut reloaded = crate::migration::migrate_to_current(&written_file)
+                                .unwrap_or_else(|err| {
+                                    panic!("{label}: reload failed: {err:#}\n{written_file}")
+                                });
+                            let store = crate::secrets::SecretStore::new(
+                                tmp.path(),
+                                reloaded.secrets.encrypt,
+                            );
+                            reloaded.decrypt_secrets(&store).unwrap();
+                            assert_eq!(
+                                typed_at(&reloaded, &written_path),
+                                expected,
+                                "{label}: the save dropped the setting\n{written_file}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.
