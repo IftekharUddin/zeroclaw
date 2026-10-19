@@ -826,6 +826,9 @@ allowed_private_hosts = []
 enabled = false
 timeout_secs = 30
 
+[tools]
+optional = ["*"]
+
 [transcription]
 
 [trust]
