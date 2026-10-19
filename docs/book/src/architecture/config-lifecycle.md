@@ -185,7 +185,10 @@ copy is owner-only, is written once and never replaced, and is the downgrade
 path: an older binary reads it as is. A file already at that name counts only
 when it holds exactly the bytes about to be rewritten; anything else there is
 left alone and the copy goes to the first free numbered name
-(`config.toml.v3-1.backup`, and so on). It still holds every key the upgrade
+(`config.toml.v3-1.backup`, and so on). A copy an older build left readable
+by others is made owner-only before it counts. On a filesystem without hard
+links the copy is kept under a name of its own instead
+(`config.toml.v3-<random>.backup`). It still holds every key the upgrade
 retired, including plaintext secrets, so delete it once a downgrade is no
 longer needed.
 

@@ -26535,9 +26535,9 @@ async fn prepare_on_disk_config_for_save(
     )
 }
 
-/// [`crate::migration::keep_version_backup`] for async callers: copy
-/// `config_path` to `<name>.v<version>.backup`, owner-only, unless that copy
-/// already exists.
+/// [`crate::migration::keep_version_backup`] for async callers: keep an
+/// owner-only copy of `config_path` as `<name>.v<version>.backup`, or beside
+/// it under a numbered or writer-owned name, unless that copy is already kept.
 pub async fn keep_pre_upgrade_backup(config_path: &Path, version: u32) -> Result<()> {
     let source = config_path.to_path_buf();
     let kept = tokio::task::spawn_blocking(move || {

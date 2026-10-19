@@ -1656,25 +1656,27 @@ pub fn version_backup_path(config_path: &Path, version: u32) -> Result<std::path
     Ok(config_path.with_file_name(format!("{file_name}.v{version}.backup")))
 }
 
-/// Keep a complete copy of `config_path`, as it is now, at
-/// [`version_backup_path`], and return the copy's path when this call wrote
-/// it. It is written once and never replaced, so the original of each version
-/// survives every later migration and save. Because it lasts and can hold the
-/// plaintext secrets of keys the migration retires, it is created owner-only
-/// (0600 on Unix) whatever the mode of the file it copies.
+/// Keep a complete copy of `config_path`, as it is now, beside it, and return
+/// the copy's path when this call wrote it. A kept copy is never replaced or
+/// removed, so the original of each version survives every later migration
+/// and save. Because it lasts and can hold the plaintext secrets of keys the
+/// migration retires, it is owner-only (0600 on Unix) whatever the mode of the
+/// file it copies.
 ///
-/// An existing file counts as the copy only when its bytes equal the file
-/// about to be rewritten. Anything else there (a different revision, or a
-/// partial copy an interrupted older build left) is left exactly as it is,
-/// and the copy goes to the first free numbered name,
-/// `<name>.v<version>-<n>.backup`. A path that is not a regular file is
-/// refused rather than skipped.
+/// The copy is written and synced under a private name, then published with a
+/// hard link at [`version_backup_path`], which never replaces an existing
+/// path. So a file there is never an unfinished copy of this binary's, and
+/// one counts as the copy when its bytes equal the file about to be
+/// rewritten; it is then synced, and made owner-only if an older build left
+/// it readable by others. Anything else there (a different revision, or a
+/// partial copy an older build left) is left exactly as it is, and the copy
+/// goes to the first free numbered name, `<name>.v<version>-<n>.backup`. A
+/// path that is not a regular file is refused rather than skipped.
 ///
-/// A copy is written and synced under a private name, then published with a
-/// hard link, which never replaces an existing path. Where hard links are not
-/// available it is written at its final name opened with `create_new`, which
-/// cannot replace one either; a copy interrupted there is incomplete, so the
-/// byte comparison never takes it for the original.
+/// Where hard links are not available, the synced private copy is renamed to
+/// a name of its own, `<name>.v<version>-<uuid>.backup`, which no other writer
+/// takes for its copy. So no writer counts on a copy another may still fail to
+/// finish, and a failure removes nothing another writer relies on.
 pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<std::path::PathBuf>> {
     let original = std::fs::read(config_path).with_context(|| {
         format!(
@@ -1682,19 +1684,37 @@ pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<st
             config_path.display()
         )
     })?;
+    let mut private: Option<PrivateCopy> = None;
     for n in 0..MAX_VERSION_BACKUPS {
         let candidate = numbered_version_backup_path(config_path, version, n)?;
         match kept_copy_at(&candidate, &original)? {
-            KeptCopy::Same => return Ok(None),
+            KeptCopy::Same(kept) => {
+                confirm_kept_copy(&candidate, &kept)?;
+                return Ok(None);
+            }
             KeptCopy::Other => continue,
             KeptCopy::Absent => {}
         }
-        if publish_version_backup(config_path, &candidate, &original)? {
-            return Ok(Some(candidate));
-        }
-        // Another writer published there first: that copy is complete.
-        if kept_copy_at(&candidate, &original)? == KeptCopy::Same {
-            return Ok(None);
+        let copy = match private.take() {
+            Some(copy) => copy,
+            None => PrivateCopy::write(config_path, version, &original)?,
+        };
+        match hard_link_for_backup(&copy.path, &candidate) {
+            Ok(()) => {
+                sync_parent(&candidate)
+                    .with_context(|| backup_failed(config_path, &candidate))?;
+                return Ok(Some(candidate));
+            }
+            // Another writer published here first. Its copy is complete:
+            // it is the original if the bytes match, else another revision.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                private = Some(copy);
+                if let KeptCopy::Same(kept) = kept_copy_at(&candidate, &original)? {
+                    confirm_kept_copy(&candidate, &kept)?;
+                    return Ok(None);
+                }
+            }
+            Err(_) => return publish_under_own_name(config_path, version, copy).map(Some),
         }
     }
     anyhow::bail!(
@@ -1717,57 +1737,122 @@ fn numbered_version_backup_path(
     if n == 0 {
         return version_backup_path(config_path, version);
     }
-    let file_name = config_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("config path {} has no file name", config_path.display()))?;
+    let file_name = config_file_name(config_path)?;
     Ok(config_path.with_file_name(format!("{file_name}.v{version}-{n}.backup")))
 }
 
+fn config_file_name(config_path: &Path) -> Result<&str> {
+    config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("config path {} has no file name", config_path.display()))
+}
+
+fn backup_failed(config_path: &Path, target: &Path) -> String {
+    format!(
+        "failed to keep a copy of {} as {} before rewriting it",
+        config_path.display(),
+        target.display()
+    )
+}
+
 /// What a backup path holds, compared with the bytes about to be rewritten.
-#[derive(Debug, PartialEq, Eq)]
 enum KeptCopy {
     Absent,
-    /// A regular file with exactly those bytes: the copy is already kept.
-    Same,
+    /// A regular file with exactly those bytes, opened: the copy is kept.
+    Same(std::fs::File),
     /// A regular file with other bytes. It is left as it is.
     Other,
 }
 
 fn kept_copy_at(path: &Path, original: &[u8]) -> Result<KeptCopy> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => {
-            let held = std::fs::read(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            Ok(if held == original {
-                KeptCopy::Same
-            } else {
-                KeptCopy::Other
-            })
+    use std::io::Read as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(KeptCopy::Absent),
+        Err(err) => {
+            return Err(anyhow::Error::from(err))
+                .with_context(|| format!("failed to check {}", path.display()));
         }
-        Ok(_) => anyhow::bail!(
+    };
+    if !meta.file_type().is_file() {
+        anyhow::bail!(
             "{} exists but is not a regular file, so it cannot be a kept pre-upgrade \
              original; move it aside before saving over the config",
             path.display()
-        ),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(KeptCopy::Absent),
-        Err(err) => Err(anyhow::Error::from(err))
-            .with_context(|| format!("failed to check {}", path.display())),
+        );
     }
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let opened = file
+            .metadata()
+            .with_context(|| format!("failed to check {}", path.display()))?;
+        if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            anyhow::bail!(
+                "{} changed while it was being checked; retry the save",
+                path.display()
+            );
+        }
+    }
+    let mut held = Vec::new();
+    file.read_to_end(&mut held)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(if held == original {
+        KeptCopy::Same(file)
+    } else {
+        KeptCopy::Other
+    })
 }
 
-/// Publish `original` at `target`, owner-only, never replacing anything
-/// there. `Ok(false)` when another writer published at `target` first.
-fn publish_version_backup(config_path: &Path, target: &Path, original: &[u8]) -> Result<bool> {
-    use std::io::Write as _;
-    let failed = || {
-        format!(
-            "failed to keep a copy of {} as {} before rewriting it",
-            config_path.display(),
-            target.display()
-        )
-    };
-    let owner_only = || {
+/// Make a copy already kept at `path` as safe as one this call would write
+/// before counting on it: owner-only, and synced with its directory entry. A
+/// copy readable by others that cannot be made owner-only is refused, as the
+/// save would otherwise leave its secrets exposed.
+fn confirm_kept_copy(path: &Path, kept: &std::fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = kept
+            .metadata()
+            .with_context(|| format!("failed to check {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            kept.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!(
+                        "{} can be read by others and could not be made owner-only; \
+                         restrict it (chmod 600) or move it aside before saving over the config",
+                        path.display()
+                    )
+                })?;
+        }
+        kept.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = kept;
+    sync_parent(path).with_context(|| format!("failed to sync the directory of {}", path.display()))
+}
+
+/// A synced, owner-only copy of the config under a private name, removed
+/// when dropped. Publishing links or renames it into place.
+struct PrivateCopy {
+    path: std::path::PathBuf,
+}
+
+impl PrivateCopy {
+    fn write(config_path: &Path, version: u32, original: &[u8]) -> Result<Self> {
+        use std::io::Write as _;
+        let file_name = config_file_name(config_path)?;
+        let path = config_path.with_file_name(format!(
+            ".{file_name}.v{version}.backup.tmp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let failed = || backup_failed(config_path, &path);
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1775,67 +1860,60 @@ fn publish_version_backup(config_path: &Path, target: &Path, original: &[u8]) ->
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        options
-    };
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("backup path {} has no file name", target.display()))?;
-    let temp = target.with_file_name(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
-    let mut copy = owner_only().open(&temp).with_context(failed)?;
-    #[cfg(test)]
-    tests::run_version_backup_hook(config_path, tests::BackupStage::Copying);
-    let written = copy.write_all(original).and_then(|()| copy.sync_all());
-    drop(copy);
-    if let Err(err) = written {
-        let _ = std::fs::remove_file(&temp);
-        return Err(anyhow::Error::from(err)).with_context(failed);
+        let mut file = options.open(&path).with_context(failed)?;
+        let copy = Self { path: path.clone() };
+        #[cfg(test)]
+        tests::run_version_backup_hook(config_path, tests::BackupStage::Copying);
+        file.write_all(original)
+            .and_then(|()| file.sync_all())
+            .with_context(failed)?;
+        Ok(copy)
     }
+}
 
-    let linked = hard_link_for_backup(&temp, target);
-    let _ = std::fs::remove_file(&temp);
-    let published = match linked {
-        Ok(()) => true,
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
-        // No hard links here: write the final name directly. `create_new`
-        // never replaces an existing path, so another writer's copy is safe.
-        Err(_) => {
-            #[cfg(test)]
-            tests::run_version_backup_hook(config_path, tests::BackupStage::Publishing);
-            match owner_only().open(target) {
-                Ok(mut direct) => {
-                    let committed = direct.write_all(original).and_then(|()| {
-                        #[cfg(test)]
-                        {
-                            tests::run_version_backup_hook(
-                                config_path,
-                                tests::BackupStage::FallbackWritten,
-                            );
-                            if tests::fallback_commit_fails() {
-                                return Err(std::io::Error::other(
-                                    "injected failure committing the fallback copy",
-                                ));
-                            }
-                        }
-                        direct.sync_all()
-                    });
-                    if let Err(err) = committed {
-                        drop(direct);
-                        // Ours and incomplete: remove it rather than leave it.
-                        let _ = std::fs::remove_file(target);
-                        return Err(anyhow::Error::from(err)).with_context(failed);
-                    }
-                    true
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(err) => return Err(anyhow::Error::from(err)).with_context(failed),
-            }
-        }
-    };
-    if published && let Some(parent) = target.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        sync_directory(parent).with_context(failed)?;
+impl Drop for PrivateCopy {
+    fn drop(&mut self) {
+        // Gone already once it is renamed into place.
+        let _ = std::fs::remove_file(&self.path);
     }
-    Ok(published)
+}
+
+/// Where hard links are not available: rename the synced private copy to a
+/// name of its own. The name is new, so the rename replaces nothing, and no
+/// other writer counts on this copy, so a failure here leaves nothing anyone
+/// relies on.
+fn publish_under_own_name(
+    config_path: &Path,
+    version: u32,
+    copy: PrivateCopy,
+) -> Result<std::path::PathBuf> {
+    let file_name = config_file_name(config_path)?;
+    let own = config_path.with_file_name(format!(
+        "{file_name}.v{version}-{}.backup",
+        uuid::Uuid::new_v4()
+    ));
+    #[cfg(test)]
+    {
+        tests::run_version_backup_hook(config_path, tests::BackupStage::Publishing);
+        tests::run_version_backup_hook(config_path, tests::BackupStage::FallbackWritten);
+        if tests::fallback_commit_fails() {
+            return Err(anyhow::Error::from(std::io::Error::other(
+                "injected failure committing the fallback copy",
+            )))
+            .with_context(|| backup_failed(config_path, &own));
+        }
+    }
+    std::fs::rename(&copy.path, &own).with_context(|| backup_failed(config_path, &own))?;
+    sync_parent(&own).with_context(|| backup_failed(config_path, &own))?;
+    Ok(own)
+}
+
+/// [`sync_directory`] on the directory holding `path`.
+fn sync_parent(path: &Path) -> Result<()> {
+    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => sync_directory(dir),
+        None => Ok(()),
+    }
 }
 
 /// `std::fs::hard_link`, which a test can make fail to exercise the fallback.
