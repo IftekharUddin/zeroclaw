@@ -43342,13 +43342,23 @@ channel = "notion"
             let tmp = tempfile::TempDir::new().unwrap();
             let config_path = tmp.path().join("config.toml");
             std::fs::write(&config_path, original).unwrap();
+            // Loaded from this path, so the full save gets past the
+            // unproven-overwrite guard and reaches the version check.
             let mut config = Config {
                 config_path: config_path.clone(),
+                loaded_from: Some(config_path.clone()),
                 ..Config::default()
             };
             config.mark_dirty("observability.backend");
-            assert!(config.save_dirty().await.is_err(), "{original}");
-            assert!(config.save().await.is_err(), "{original}");
+            for error in [
+                config.save_dirty().await.unwrap_err(),
+                config.save().await.unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().contains("refusing to save over"),
+                    "{original}: {error:#}"
+                );
+            }
             assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
         }
     }
