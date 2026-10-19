@@ -358,9 +358,8 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
 ];
 
 /// The version a config with no `schema_version` key is read as when its
-/// sections are plainly in the V3 shape: at least one alias-keyed
-/// `providers.models.<family>` or `channels.<type>` section, none holding
-/// fields directly (the V2 shape), and no V1-only top-level key.
+/// layout is plainly V3: it holds a section only the V3 layout has, and
+/// nothing only an older layout has (see [`unversioned_shape`]).
 ///
 /// Fixed at 3, not [`CURRENT_SCHEMA_VERSION`]: V3 is the newest shape such a
 /// file can be recognized by, and reading it as V3 runs every later migration
@@ -375,6 +374,23 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
         None => match unversioned_shape(table) {
             UnversionedShape::V3 => Ok(INFERRED_SCHEMA_VERSION),
             UnversionedShape::NotV3 => Ok(1),
+            UnversionedShape::Mixed { current, legacy } => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "current": current, "legacy": legacy })),
+                    "config has no schema_version and mixes the V3 layout with an older one"
+                );
+                anyhow::bail!(
+                    "config has no `schema_version` and mixes layouts: {current}, but {legacy}. \
+                     Read either way, part of it would be lost, so it is not guessed. Rewrite \
+                     the older settings in the current layout and add `schema_version = 4` as \
+                     the first line, or, if the whole file is older, add `schema_version = 1` \
+                     or `schema_version = 2` instead; `zeroclaw config migrate` then rewrites \
+                     it in the current layout"
+                )
+            }
             UnversionedShape::Ambiguous { detail } => {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -410,34 +426,82 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
     }
 }
 
-/// [`V1_LEGACY_KEYS`] that are also top-level sections of the current schema
-/// (with a different shape), so their presence says nothing about the
-/// version. Kept in step with the schema by
-/// `v1_keys_still_current_are_exactly_the_current_top_level_sections`.
-const V1_KEYS_STILL_CURRENT: &[&str] = &["model_routes", "embedding_routes", "cron"];
-
-/// Spellings `V1Config` accepts for its own keys (serde aliases):
-/// `model_provider` for `default_provider` and `model` for `default_model`.
-/// They mark a V1 file as surely as the keys do. Kept in step with the schema
-/// by `v1_key_aliases_are_not_current_top_level_sections`.
-const V1_KEY_ALIASES: &[&str] = &["model_provider", "model"];
-
-/// How a config with no `schema_version` key reads, by its shape.
+/// How a config with no `schema_version` key reads, by its layout.
 enum UnversionedShape {
-    /// Unmistakably the V3 shape: read it as [`INFERRED_SCHEMA_VERSION`].
+    /// The V3 layout and nothing older: read it as [`INFERRED_SCHEMA_VERSION`].
     V3,
-    /// Not the V3 shape: keep the historical V1 reading.
+    /// Nothing only the V3 layout has: keep the historical V1 reading.
     NotV3,
-    /// Neither reading is safe: the file mixes the V3 layout with an older
-    /// one, a child table reads both as a V2 entry field and as a V3 alias,
-    /// or the V1 reading would drop something the file holds. Either reading
-    /// can lose configuration, so neither is chosen and the operator must
-    /// state the version. `detail` says why.
+    /// A section only the V3 layout has beside a setting only an older one
+    /// has. Either reading reshapes or drops part of the file, so neither is
+    /// chosen.
+    Mixed { current: String, legacy: String },
+    /// A child table of an alias-keyed section reads both as a field of a V2
+    /// entry and as a V3 alias, so the operator must state the version.
+    /// `detail` says which.
     Ambiguous { detail: String },
 }
 
 /// The V2 `[cron]` subsystem knobs, which V3 moved to `[scheduler]`.
 const V2_CRON_KNOBS: &[&str] = &["enabled", "catch_up_on_startup", "max_run_history"];
+
+/// Settings only the layouts before V3 have: the V1 -> V2 -> V3 chain reads,
+/// moves, renames or drops each, and the current schema does not read it
+/// where it is. A file holding one was written in an older layout.
+/// [`legacy_layout_evidence`] adds the shapes a path cannot express. Pinned
+/// both ways: `every_legacy_layout_example_is_read_as_v1_and_refused_beside_v3`
+/// shows the chain reads each and the current schema does not, and
+/// `current_sections_never_read_as_an_older_layout` that no current section
+/// holds one.
+const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
+    // V1's top-level provider settings (`V1Config`) and its spellings of
+    // them, which V2 folded under `[providers]`.
+    &["api_key"],
+    &["api_url"],
+    &["api_path"],
+    &["default_provider"],
+    &["model_provider"],
+    &["default_model"],
+    &["model"],
+    &["model_providers"],
+    &["default_temperature"],
+    &["provider_timeout_secs"],
+    &["provider_max_tokens"],
+    &["extra_headers"],
+    // V1's channel section, which V2 renamed `[channels]`.
+    &["channels_config"],
+    // Sections V3 split into profiles, lifted into agents, or dropped.
+    &["autonomy"],
+    &["agent"],
+    &["swarms"],
+    &["identity"],
+    &["node_transport"],
+    // Settings the V2 -> V3 step moved, renamed or dropped.
+    &["providers", "extra_headers"],
+    &["security", "sandbox"],
+    &["security", "resources"],
+    &["reliability", "fallback_providers"],
+    &["reliability", "model_fallbacks"],
+    &["memory", "qdrant"],
+    &["memory", "postgres"],
+    &["memory", "sqlite_open_timeout_secs"],
+    &["storage", "provider"],
+    &["cost", "prices"],
+    &["tts", "openai"],
+    &["tts", "elevenlabs"],
+    &["tts", "google"],
+    &["tts", "edge"],
+    &["tts", "piper"],
+    &["tts", "default_provider"],
+    &["transcription", "default_provider"],
+    &["transcription", "default_model_provider"],
+    &["transcription", "default_transcription_provider"],
+    &["gateway", "pairing_dashboard", "code_length"],
+    &["tunnel", "provider"],
+    &["web_search", "provider"],
+    &["channels", "discord_history"],
+    &["channels", "feishu"],
+];
 
 /// How a config with no `schema_version` key is to be read.
 ///
@@ -445,33 +509,36 @@ const V2_CRON_KNOBS: &[&str] = &["enabled", "catch_up_on_startup", "max_run_hist
 /// hand-written or template-generated V3 file can omit it too, and running
 /// such a file through the V1 migration silently destroys it: alias-keyed
 /// channel sections collapse into `default`, and declarative cron jobs are
-/// dropped. So the file's layout is weighed both ways.
+/// dropped. So the file's layout is weighed both ways, each by a definition
+/// rather than a guess.
 ///
-/// Evidence of the V3 layout:
+/// Evidence of an older layout is a setting only the layouts before V3 have
+/// (see [`legacy_layout_evidence`]), or a provider or channel section holding
+/// fields directly (`[providers.models.ollama] model = "..."`), the V2 shape.
+///
+/// Evidence of the V3 layout is a section only it has, which the V1 reading
+/// would reshape:
 /// - an alias-keyed section, `providers.models.<family>` or `channels.<type>`,
 ///   meaning a table whose every value is a table
-///   (`[providers.models.ollama.default]`, `[channels.discord.work]`), or a
-///   child table of such a section that is no field of a V2 entry, even beside
-///   flat fields;
+///   (`[providers.models.ollama.default]`, `[channels.discord.work]`);
+/// - a child table of a section holding V2 fields that is not one of those
+///   fields with what it actually holds (see [`holds_a_v2_field`]), so a V3
+///   alias beside them;
 /// - a declarative cron job, a table under `[cron]` (`[cron.nightly]`).
 ///
-/// Evidence of an older layout:
-/// - a V1-only top-level key ([`V1_LEGACY_KEYS`] minus the keys still
-///   current, or one of their [`V1_KEY_ALIASES`]);
-/// - a provider or channel section holding fields directly, the V2 shape
-///   (`[providers.models.ollama] model = "..."`);
-/// - a V2-only setting (see [`v2_only_marker`]);
-/// - the V2 cron layout, `[[cron.jobs]]` or a subsystem knob on `[cron]`.
-///
-/// A file with V3 evidence and none of the older layout is read as V3, unless
-/// a child table of an alias-keyed section also reads as a field of a V2 entry
-/// (see [`keys_read_as_v2_entry_fields`]): `[providers.models.openai.
+/// A file with both is refused as mixed: either reading reshapes or drops
+/// part of it. A file with V3 evidence alone is read as V3, unless a child of
+/// an alias-keyed section also reads as a field of a V2 entry (see
+/// [`keys_read_as_v2_entry_fields`]): `[providers.models.openai.
 /// extra_headers]` is either the V2 `openai` profile's headers or a V3 alias
-/// named `extra_headers`. A file with evidence of both layouts is refused, as
-/// either reading reshapes part of it. A file with only older evidence keeps
-/// the V1 reading. A file with neither is read as V1 only when that reading
-/// keeps every value it holds, if possibly at another path (see
-/// [`v1_reading_drops`]), and is refused otherwise.
+/// named `extra_headers`, so the version is required. Any other file keeps
+/// the V1 reading. With no older setting in it, that reading configures what
+/// the V3 reading would, except that V2's transcription settings, which both
+/// layouts spell the same, move to the `[providers.transcription]` aliases
+/// V3 gave them (pinned by
+/// `a_file_with_no_layout_evidence_reads_the_same_as_v1_and_as_v3`). An empty
+/// provider family or channel type is no evidence either way: it holds
+/// nothing to lose.
 ///
 /// A V4 file has the V3 shape, so an unversioned V4 file is read as V3 too;
 /// its V3 -> V4 step changes nothing it has not already done.
@@ -502,12 +569,7 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         });
 
     let mut current = None;
-    let mut legacy = V1_LEGACY_KEYS
-        .iter()
-        .filter(|key| !V1_KEYS_STILL_CURRENT.contains(key))
-        .chain(V1_KEY_ALIASES)
-        .find(|key| table.contains_key(**key))
-        .map(|key| format!("`{key}` is a pre-V3 setting"));
+    let mut legacy = legacy_layout_evidence(table);
     let mut ambiguous = None;
     for (entry_kind, name, section) in provider_families.chain(channel_types) {
         let Some(section) = section.as_table() else {
@@ -521,13 +583,12 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             // A field held directly on the section: the V2 shape.
             legacy
                 .get_or_insert_with(|| format!("`[{path}]` holds fields directly, the V2 layout"));
-            // A child table that is no field of the V2 entry is a V3 alias
-            // beside those fields: both layouts in one section. Map-valued V2
-            // fields such as `extra_headers` are fields, not aliases.
-            let fields = keys_read_as_v2_entry_fields(entry_kind, name, section);
+            // A child table that is not a field of the V2 entry, with what it
+            // holds, is a V3 alias beside those fields: both layouts in one
+            // section.
             if let Some((alias, _)) = section
                 .iter()
-                .find(|(key, value)| value.is_table() && !fields.contains(*key))
+                .find(|(key, value)| value.is_table() && !holds_a_v2_field(entry_kind, name, section, key))
             {
                 current.get_or_insert_with(|| format!("`[{path}.{alias}]` is a V3 alias"));
             }
@@ -545,97 +606,58 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             ));
         }
     }
-    if let Some(cron) = table.get("cron").and_then(toml::Value::as_table) {
-        if let Some((name, _)) = cron.iter().find(|(_, value)| value.is_table()) {
-            current.get_or_insert_with(|| format!("`[cron.{name}]` is a V3 cron job"));
-        }
-        if let Some(key) = cron
-            .iter()
-            .find(|(key, value)| {
-                (key.as_str() == "jobs" && value.is_array())
-                    || (V2_CRON_KNOBS.contains(&key.as_str()) && !value.is_table())
-            })
-            .map(|(key, _)| key)
-        {
-            legacy.get_or_insert_with(|| format!("`cron.{key}` is the V2 cron layout"));
-        }
-    }
-    if legacy.is_none() {
-        legacy = v2_only_marker(table);
+    if let Some(cron) = table.get("cron").and_then(toml::Value::as_table)
+        && let Some((name, _)) = cron.iter().find(|(_, value)| value.is_table())
+    {
+        current.get_or_insert_with(|| format!("`[cron.{name}]` is a V3 cron job"));
     }
 
     match (current, legacy) {
-        (Some(current), Some(legacy)) => UnversionedShape::Ambiguous {
-            detail: format!("{current} while {legacy}"),
-        },
+        (Some(current), Some(legacy)) => UnversionedShape::Mixed { current, legacy },
         (Some(_), None) => match ambiguous {
             Some(detail) => UnversionedShape::Ambiguous { detail },
             None => UnversionedShape::V3,
         },
-        (None, Some(_)) => UnversionedShape::NotV3,
-        (None, None) => match v1_reading_drops(table) {
-            Some(path) => UnversionedShape::Ambiguous {
-                detail: format!("reading it as V1 would drop `{path}`, which the V3 layout keeps"),
-            },
-            None => UnversionedShape::NotV3,
-        },
+        (None, _) => UnversionedShape::NotV3,
     }
 }
 
-/// The first value an unversioned file holds that reading it as V1 would not
-/// keep anywhere, or `None` when that reading keeps every value. A value the
-/// V1 reading moves to another path counts as kept: older layouts relocate
-/// settings, and only a value that is gone is a loss. Each kept value accounts
-/// for one original value. Retired keys, which the migration reports on its
-/// own, and the tool selector, which it carries across the chain, are not
-/// counted.
-fn v1_reading_drops(table: &toml::Table) -> Option<String> {
-    let mut original = table.clone();
-    original.remove("tools");
-    let migrated = run_chain(toml::Value::Table(original.clone()), 1, &mut Vec::new()).ok()?;
-    let mut kept = Vec::new();
-    collect_values(&migrated, &mut kept);
-    first_dropped_value(&original, &mut kept, &mut Vec::new())
-}
-
-/// Every non-table value under `value`, depth first.
-fn collect_values<'a>(value: &'a toml::Value, out: &mut Vec<&'a toml::Value>) {
-    match value {
-        toml::Value::Table(table) => table.values().for_each(|child| collect_values(child, out)),
-        leaf => out.push(leaf),
+/// The first setting in `table` that only a layout before V3 has, described,
+/// or `None`: a path in [`LEGACY_LAYOUT_PATHS`], the V2 cron layout
+/// (`[[cron.jobs]]`, or a subsystem knob on `[cron]`), a route naming its
+/// provider `provider`, or a V2-only setting (see [`v2_only_marker`]). A
+/// provider or channel section holding fields directly is found by
+/// [`unversioned_shape`], which reads those sections.
+fn legacy_layout_evidence(table: &toml::Table) -> Option<String> {
+    if let Some(path) = LEGACY_LAYOUT_PATHS
+        .iter()
+        .find_map(|pattern| expand_path(table, pattern).into_iter().next())
+    {
+        return Some(format!("`{}` is a pre-V3 setting", path.join(".")));
     }
-}
-
-/// Depth-first, the path of the first non-table value of `original` with no
-/// equal value left in `kept`; each match is removed from `kept`.
-fn first_dropped_value(
-    original: &toml::Table,
-    kept: &mut Vec<&toml::Value>,
-    path: &mut Vec<String>,
-) -> Option<String> {
-    for (key, value) in original {
-        path.push(key.clone());
-        let segments: Vec<&str> = path.iter().map(String::as_str).collect();
-        let dropped = if retired_key_covering(&segments).is_some() {
-            None
-        } else {
-            match value {
-                toml::Value::Table(child) => first_dropped_value(child, kept, path),
-                leaf => match kept.iter().position(|candidate| *candidate == leaf) {
-                    Some(at) => {
-                        kept.swap_remove(at);
-                        None
-                    }
-                    None => Some(path.join(".")),
-                },
-            }
-        };
-        path.pop();
-        if dropped.is_some() {
-            return dropped;
-        }
+    if let Some(cron) = table.get("cron").and_then(toml::Value::as_table)
+        && let Some((key, _)) = cron.iter().find(|(key, value)| {
+            (key.as_str() == "jobs" && value.is_array())
+                || (V2_CRON_KNOBS.contains(&key.as_str()) && !value.is_table())
+        })
+    {
+        return Some(format!("`cron.{key}` is the V2 cron layout"));
     }
-    None
+    if let Some(routes) = ["model_routes", "embedding_routes"]
+        .into_iter()
+        .find(|routes| {
+            table
+                .get(*routes)
+                .and_then(toml::Value::as_array)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.get("provider").is_some()))
+        })
+    {
+        return Some(format!(
+            "`{routes}` entries name their provider `provider`, the V2 spelling of \
+             `model_provider`"
+        ));
+    }
+    v2_only_marker(table)
 }
 
 /// Keys the V2 -> V3 step moves off `[agents.<alias>]` (see
@@ -658,11 +680,10 @@ const V2_ONLY_AGENT_KEYS: &[&str] = &[
     "timeout_secs",
 ];
 
-/// A setting only V2 reads, found in a file whose other sections are in the
-/// V3 shape: a value held directly on `[providers]` (V3 keeps only the
-/// `models`, `tts` and `transcription` tables there) or a V2-only agent key.
-/// Read as V3 it would be ignored; read as V1 the V3 sections would be
-/// reshaped. `None` when there is no such key.
+/// A setting only V2 reads: a value held directly on `[providers]` (V3 keeps
+/// only the `models`, `tts` and `transcription` tables there) or a V2-only
+/// agent key. Read as V3 it would be ignored. `None` when there is no such
+/// key.
 fn v2_only_marker(table: &toml::Table) -> Option<String> {
     if let Some(providers) = table.get("providers").and_then(toml::Value::as_table)
         && let Some((key, _)) = providers.iter().find(|(_, value)| !value.is_table())
@@ -745,6 +766,56 @@ fn survives_with_a_filler(kind: V2EntryKind, name: &str, section: &toml::Table, 
         probe.insert(key.to_string(), toml::Value::Table(child));
         round_trip_as_v2_entry(kind, name, &probe).is_some_and(|entry| entry.contains_key(key))
     })
+}
+
+/// Whether the child table `key` of a section holding V2 fields is one of
+/// those fields with what it actually holds. A child named like no field of
+/// the entry is not, and neither is one named like a field it cannot be: a
+/// float in the `extra_headers` string map, a string in the `pricing` number
+/// map. Either is a V3 alias beside the V2 fields. The name alone, which
+/// [`keys_read_as_v2_entry_fields`] answers, decides only for an empty child.
+fn holds_a_v2_field(kind: V2EntryKind, name: &str, section: &toml::Table, key: &str) -> bool {
+    let Some(child) = section.get(key).and_then(toml::Value::as_table) else {
+        return false;
+    };
+    if child.is_empty() {
+        return keys_read_as_v2_entry_fields(kind, name, section)
+            .iter()
+            .any(|field| field == key);
+    }
+    let mut probe: toml::Table = section
+        .iter()
+        .filter(|(_, value)| !value.is_table())
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect();
+    probe.insert(key.to_string(), toml::Value::Table(child.clone()));
+    round_trip_as_v2_entry(kind, name, &probe)
+        .and_then(|entry| entry.get(key).cloned())
+        .is_some_and(|kept| keeps_every_value(&toml::Value::Table(child.clone()), &kept))
+}
+
+/// Whether `kept` holds every value of `original` at the same path. A number
+/// matches its value as either type, since a float field reads `1` as `1.0`.
+fn keeps_every_value(original: &toml::Value, kept: &toml::Value) -> bool {
+    match (original, kept) {
+        (toml::Value::Table(original), toml::Value::Table(kept)) => {
+            original.iter().all(|(key, value)| {
+                kept.get(key)
+                    .is_some_and(|kept| keeps_every_value(value, kept))
+            })
+        }
+        (toml::Value::Array(original), toml::Value::Array(kept)) => {
+            original.len() == kept.len()
+                && original
+                    .iter()
+                    .zip(kept)
+                    .all(|(original, kept)| keeps_every_value(original, kept))
+        }
+        (toml::Value::Integer(original), toml::Value::Float(_)) => {
+            kept.as_float() == Some(*original as f64)
+        }
+        (original, kept) => original == kept,
+    }
 }
 
 /// `section` deserialized as one entry of its real type and serialized back,
@@ -5658,32 +5729,69 @@ mention_only = false
             .collect()
     }
 
-    /// `V1_KEYS_STILL_CURRENT` must name exactly the V1 legacy keys that are
-    /// also top-level sections today: missing one would let a current file
-    /// that uses it be read as V1; listing a V1-only key would let a V1 file
-    /// be read as V3.
+    /// The catalog names each top-level setting `V1Config` reads and each
+    /// spelling it accepts for one, and none of them is a current section.
+    /// `model_routes` and `embedding_routes` are current sections too; their
+    /// V1 entries are told apart by naming their provider `provider`.
     #[test]
-    fn v1_keys_still_current_are_exactly_the_current_top_level_sections() {
+    fn the_legacy_catalog_names_every_v1_setting() {
         let current = current_top_level_sections();
-        let shared: Vec<&str> = V1_LEGACY_KEYS
+        let top_level: Vec<&str> = LEGACY_LAYOUT_PATHS
             .iter()
-            .copied()
-            .filter(|key| current.contains(*key))
+            .filter(|path| path.len() == 1)
+            .map(|path| path[0])
             .collect();
-        assert_eq!(shared, V1_KEYS_STILL_CURRENT);
-    }
-
-    #[test]
-    fn v1_key_aliases_are_not_current_top_level_sections() {
-        let current = current_top_level_sections();
-        for alias in V1_KEY_ALIASES {
-            assert!(!current.contains(*alias), "`{alias}` is a current section");
+        for key in &top_level {
+            assert!(!current.contains(*key), "`{key}` is a current section");
         }
-        // Each is a serde alias `V1Config` accepts: as the only key, it is read.
-        for alias in V1_KEY_ALIASES {
+
+        let some = || Some(toml::Value::String("x".into()));
+        let table = || toml::Value::Table(toml::Table::from_iter([("k".to_string(), toml::Value::String("x".into()))]));
+        let every_v1_setting = V1Config {
+            api_key: some(),
+            api_url: some(),
+            api_path: some(),
+            default_provider: some(),
+            default_model: some(),
+            model_providers: std::collections::HashMap::from([("ollama".to_string(), table())]),
+            default_temperature: some(),
+            provider_timeout_secs: some(),
+            provider_max_tokens: some(),
+            extra_headers: std::collections::HashMap::from([("X".to_string(), toml::Value::String("x".into()))]),
+            model_routes: vec![table()],
+            embedding_routes: vec![table()],
+            channels_config: Some(table()),
+            passthrough: toml::Table::new(),
+        };
+        let written = toml::Value::try_from(every_v1_setting).unwrap();
+        for key in written.as_table().unwrap().keys() {
+            assert!(
+                top_level.contains(&key.as_str())
+                    || ["model_routes", "embedding_routes"].contains(&key.as_str()),
+                "`{key}` is a V1 setting the catalog does not name"
+            );
+        }
+        for alias in ["model_provider", "model"] {
             let value: toml::Value = toml::from_str(&format!("{alias} = \"x\"\n")).unwrap();
             let v1: V1Config = value.try_into().unwrap();
             assert!(v1.passthrough.is_empty(), "`{alias}` is not a V1Config key");
+            assert!(top_level.contains(&alias), "`{alias}` is not in the catalog");
+        }
+    }
+
+    /// Every path of the catalog has its example, so each is pinned by
+    /// `every_legacy_layout_example_is_read_as_v1_and_refused_beside_v3`, as
+    /// are the V2 cron knobs and V2-only agent keys.
+    #[test]
+    fn every_legacy_layout_path_has_an_example() {
+        let examples: Vec<&str> = LEGACY_LAYOUT_EXAMPLES.iter().map(|(path, _)| *path).collect();
+        let required = LEGACY_LAYOUT_PATHS
+            .iter()
+            .map(|path| path.join("."))
+            .chain(V2_CRON_KNOBS.iter().map(|knob| format!("cron.{knob}")))
+            .chain(V2_ONLY_AGENT_KEYS.iter().map(|key| format!("agents.coder.{key}")));
+        for path in required {
+            assert!(examples.contains(&path.as_str()), "`{path}` has no example");
         }
     }
 
