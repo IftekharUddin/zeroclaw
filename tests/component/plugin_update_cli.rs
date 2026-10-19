@@ -597,7 +597,9 @@ fn installing_an_installed_local_package_points_at_updating_it_from_that_directo
     let plugins = plugins_dir.to_str().expect("utf-8 temp path");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        format!("schema_version = {CURRENT_SCHEMA_VERSION}\n\n[plugins]\nplugins_dir = '{plugins}'\n"),
+        format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n\n[plugins]\nplugins_dir = '{plugins}'\n"
+        ),
     )
     .expect("write config");
     let source = tempfile::tempdir().expect("source dir");

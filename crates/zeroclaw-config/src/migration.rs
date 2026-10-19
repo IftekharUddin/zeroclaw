@@ -2028,7 +2028,12 @@ mod tests {
     #[test]
     fn compatibility_preserves_explicit_sections_before_legacy_serde() {
         let current = format!("schema_version = {CURRENT_SCHEMA_VERSION}\n");
-        for prefix in ["", "schema_version = 2\n", "schema_version = 3\n", current.as_str()] {
+        for prefix in [
+            "",
+            "schema_version = 2\n",
+            "schema_version = 3\n",
+            current.as_str(),
+        ] {
             for section in [
                 "[tools]\n",
                 "[tools]\noptional = []\n",
@@ -2057,7 +2062,12 @@ mod tests {
     #[test]
     fn compatibility_malformed_tools_are_refused_then_salvaged_to_the_default() {
         let current = format!("schema_version = {CURRENT_SCHEMA_VERSION}\n");
-        for prefix in ["", "schema_version = 2\n", "schema_version = 3\n", current.as_str()] {
+        for prefix in [
+            "",
+            "schema_version = 2\n",
+            "schema_version = 3\n",
+            current.as_str(),
+        ] {
             for section in [
                 "tools = false\n",
                 "[tools]\noptional = 42\n",
@@ -5051,10 +5061,7 @@ agents = ["default"]
     fn assert_notion_references_kept(root: &toml::Table) {
         let notion_and_telegram = toml::Value::Array(vec!["notion".into(), "telegram.main".into()]);
         assert_eq!(root["agents"]["default"]["channels"], notion_and_telegram);
-        assert_eq!(
-            root["escalation"]["alert_channels"],
-            notion_and_telegram
-        );
+        assert_eq!(root["escalation"]["alert_channels"], notion_and_telegram);
         assert_eq!(
             root["peer_groups"]["notion_team"]["channel"].as_str(),
             Some("notion")
