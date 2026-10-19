@@ -86,63 +86,78 @@ pub struct RetiredKey {
     /// Path from the config root, one segment per table key. [`ANY_KEY`]
     /// matches every key at its level.
     pub path: &'static [&'static str],
-    /// Why it was retired and what to use instead. Shown to the operator.
+    /// Why it was retired and what to use instead, in English: logs and
+    /// `--json` output carry it as is.
     pub reason: &'static str,
+    /// The Fluent id of [`Self::reason`] in the CLI catalogue
+    /// (`cli-config-retired-reason-*`), which the CLI shows the operator in
+    /// their locale. Entries that share a reason share its id.
+    pub reason_id: &'static str,
 }
 
 /// Every retired key, applied by the migration chain when it reaches
 /// `retired_in`, and again on every load of a current config so a key that
 /// reappears is dropped with a notice rather than silently ignored. Retiring
-/// another key is one entry here plus removing its schema field, and a version
-/// bump (a new `MIGRATION_STEPS` entry) if no pending version already covers it.
+/// another key is one entry here plus removing its schema field, its reason in
+/// every locale's `cli.ftl` (unless it shares one), and a version bump (a new
+/// `MIGRATION_STEPS` entry) if no pending version already covers it.
 pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 4,
         path: &["security", "nevis"],
         reason: "the Nevis IAM integration was removed; configure `[oidc.<alias>]` with \
                  `[users]` and `[permission_profiles]` instead",
+        reason_id: "cli-config-retired-reason-nevis",
     },
-    // Agent-inline runtime tunables: superseded by runtime profiles and never
-    // read from `[agents.<alias>]`, so serde ignored them silently.
+    // Agent-inline runtime tunables: superseded by runtime profiles and no
+    // longer read from `[agents.<alias>]`, so serde ignored them silently.
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "compact_context"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "max_tool_iterations"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "max_history_messages"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "max_context_tokens"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "memory_recall_limit"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "parallel_tools"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "tool_dispatcher"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "strict_tool_parsing"],
         reason: INERT_AGENT_TUNABLE,
+        reason_id: "cli-config-retired-reason-agent-tunable",
     },
     RetiredKey {
         retired_in: 4,
@@ -155,6 +170,7 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         reason: "the deprecated bare model id had no provider identity and was never read; \
                  `summary_provider` replaced it (context compression itself is not \
                  currently implemented in the runtime)",
+        reason_id: "cli-config-retired-reason-summary-model",
     },
     // Retired before V4 and until now handled outside this table: the
     // migration chain stripped `[node_transport]` silently after every step
@@ -165,16 +181,19 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         retired_in: 2,
         path: &["node_transport"],
         reason: "the legacy HMAC node transport was removed",
+        reason_id: "cli-config-retired-reason-node-transport",
     },
     RetiredKey {
         retired_in: 4,
         path: &["channels", "wati"],
         reason: RETIRED_WATI,
+        reason_id: "cli-config-retired-reason-wati",
     },
     RetiredKey {
         retired_in: 4,
         path: &["channels_config", "wati"],
         reason: RETIRED_WATI,
+        reason_id: "cli-config-retired-reason-wati",
     },
     // Spellings no schema field reads, so serde would ignore them silently.
     // Twitter and Reddit stay channels (`[channels.twitter.<alias>]`,
@@ -187,18 +206,21 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         path: &["twitter"],
         reason: "a top-level `[twitter]` section is not read; configure the Twitter channel as \
                  `[channels.twitter.<alias>]`",
+        reason_id: "cli-config-retired-reason-twitter",
     },
     RetiredKey {
         retired_in: 4,
         path: &["reddit"],
         reason: "a top-level `[reddit]` section is not read; configure the Reddit channel as \
                  `[channels.reddit.<alias>]`",
+        reason_id: "cli-config-retired-reason-reddit",
     },
     RetiredKey {
         retired_in: 4,
         path: &["channels", "notion"],
         reason: "a `[channels.notion]` table is not read; Notion is configured in the top-level \
                  `[notion]` section, whose database poller is the `notion` channel",
+        reason_id: "cli-config-retired-reason-notion",
     },
     // Retired by the V2 -> V3 step, whose normalizer also surfaces the shared
     // `[gateway.pairing_code]` policy. This entry covers files already at V3
@@ -208,6 +230,7 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         path: &["gateway", "pairing_dashboard", "code_length"],
         reason: "the dashboard no longer has its own pairing-code length; \
                  `[gateway.pairing_code]` `length` sets it for every pairing surface",
+        reason_id: "cli-config-retired-reason-pairing-code-length",
     },
     // Also dropped by the V2 -> V3 step, which moves or discards them while
     // restructuring. No current field reads them, so a V3 or later file that
@@ -216,42 +239,50 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         retired_in: 3,
         path: &["swarms"],
         reason: "swarms were removed in V3",
+        reason_id: "cli-config-retired-reason-swarms",
     },
     RetiredKey {
         retired_in: 3,
         path: &["reliability", "fallback_providers"],
         reason: RETIRED_GLOBAL_FALLBACK,
+        reason_id: "cli-config-retired-reason-global-fallback",
     },
     RetiredKey {
         retired_in: 3,
         path: &["reliability", "model_fallbacks"],
         reason: RETIRED_GLOBAL_FALLBACK,
+        reason_id: "cli-config-retired-reason-global-fallback",
     },
     RetiredKey {
         retired_in: 3,
         path: &["tts", "default_provider"],
         reason: "there is no global default TTS provider; set `tts_provider` on each \
                  `[agents.<alias>]` instead",
+        reason_id: "cli-config-retired-reason-tts-default",
     },
     RetiredKey {
         retired_in: 3,
         path: &["transcription", "default_provider"],
         reason: RETIRED_GLOBAL_TRANSCRIPTION,
+        reason_id: "cli-config-retired-reason-global-transcription",
     },
     RetiredKey {
         retired_in: 3,
         path: &["transcription", "default_model_provider"],
         reason: RETIRED_GLOBAL_TRANSCRIPTION,
+        reason_id: "cli-config-retired-reason-global-transcription",
     },
     RetiredKey {
         retired_in: 3,
         path: &["transcription", "default_transcription_provider"],
         reason: RETIRED_GLOBAL_TRANSCRIPTION,
+        reason_id: "cli-config-retired-reason-global-transcription",
     },
     RetiredKey {
         retired_in: 3,
         path: &["identity"],
         reason: "identity is set per agent; move it to `[agents.<alias>.identity]`",
+        reason_id: "cli-config-retired-reason-identity",
     },
 ];
 
@@ -271,6 +302,17 @@ pub fn retired_key_covering(path: &[&str]) -> Option<&'static RetiredKey> {
     })
 }
 
+/// The Fluent id of a retirement reason, for showing it in the operator's
+/// locale. Notices carry the English reason (see [`RetiredKey::reason`]);
+/// `None` for text that is not a [`RETIRED_KEYS`] reason.
+#[must_use]
+pub fn retirement_reason_id(reason: &str) -> Option<&'static str> {
+    RETIRED_KEYS
+        .iter()
+        .find(|key| key.reason == reason)
+        .map(|key| key.reason_id)
+}
+
 const RETIRED_GLOBAL_FALLBACK: &str = "the global fallback lists were removed in V3; set \
      `fallback` on each `[providers.models.<type>.<alias>]` instead";
 
@@ -280,7 +322,7 @@ const RETIRED_GLOBAL_TRANSCRIPTION: &str = "there is no global default transcrip
 const RETIRED_WATI: &str = "WATI support was removed; migrate to `[channels.whatsapp.<alias>]` \
      using the Cloud API or WhatsApp Web, then revoke the unused WATI API token";
 
-const INERT_AGENT_TUNABLE: &str = "agent-inline runtime tunables were never read; runtime \
+const INERT_AGENT_TUNABLE: &str = "agent-inline runtime tunables are no longer read; runtime \
      profiles are authoritative, so set this key on the agent's \
      `[runtime_profiles.<profile>]` instead";
 
@@ -5135,6 +5177,30 @@ optional = ["*"]
         assert!(retired_key_covering(&["security"]).is_none());
     }
 
+    /// A reason and its Fluent id go together: entries that share a reason
+    /// share its id, and no id stands for two reasons, so the CLI can find the
+    /// localized text from the English reason a notice carries.
+    #[test]
+    fn retirement_reasons_and_their_ids_correspond() {
+        for key in RETIRED_KEYS {
+            assert!(
+                key.reason_id.starts_with("cli-config-retired-reason-"),
+                "{key:?}"
+            );
+            for other in RETIRED_KEYS {
+                assert_eq!(
+                    key.reason == other.reason,
+                    key.reason_id == other.reason_id,
+                    "{:?} and {:?}",
+                    key.path,
+                    other.path
+                );
+            }
+            assert_eq!(retirement_reason_id(key.reason), Some(key.reason_id));
+        }
+        assert_eq!(retirement_reason_id("not a retirement reason"), None);
+    }
+
     #[test]
     fn every_retired_key_names_a_migrated_version() {
         for key in RETIRED_KEYS {
@@ -5242,16 +5308,19 @@ summary_model = "opus"
             retired_in: 9,
             path: &["old", "knob"],
             reason: "retired for the test",
+            reason_id: "cli-config-retired-reason-test",
         },
         RetiredKey {
             retired_in: 8,
             path: &["other"],
             reason: "a different version",
+            reason_id: "cli-config-retired-reason-test",
         },
         RetiredKey {
             retired_in: 7,
             path: &["bots", ANY_KEY, "old_limit"],
             reason: "wildcard retirement for the test",
+            reason_id: "cli-config-retired-reason-test",
         },
     ];
 
