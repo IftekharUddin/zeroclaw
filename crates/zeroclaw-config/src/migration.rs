@@ -7525,6 +7525,33 @@ mention_only = false
         assert!(!err.contains("is retired"), "{err}");
     }
 
+    /// Both retirement appliers retire a key under every spelling the
+    /// schema accepts for its parents, with the same notices, and the
+    /// lookup used for environment overrides covers those spellings too.
+    #[test]
+    fn both_retirement_appliers_retire_under_every_spelling() {
+        let raw = "schema_version = 4\n\n[channels_config.notion.main]\ntoken = \"x\"\n\n\
+                   [channels_config.wati.old]\napi_token = \"y\"\n";
+        let mut value: toml::Value = toml::from_str(raw).unwrap();
+        let mut value_notices = Vec::new();
+        for version in 2..=CURRENT_SCHEMA_VERSION {
+            apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut value_notices);
+        }
+        let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        let doc_notices = apply_retired_keys_to_doc(doc.as_table_mut());
+        assert_eq!(value_notices, doc_notices);
+        let paths: Vec<String> = doc_notices
+            .iter()
+            .filter_map(|notice| match notice {
+                MigrationNotice::Removed { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(paths.contains(&"channels_config.notion".to_string()), "{paths:?}");
+        assert!(paths.contains(&"channels_config.wati".to_string()), "{paths:?}");
+        assert!(retired_key_covering(&["channels_config", "notion", "main"]).is_some());
+    }
+
     /// Serde aliases in this crate that are not keys of the file, with why.
     const ALIASES_THAT_ARE_NOT_FILE_KEYS: &[(&str, &str)] = &[
         (
@@ -7692,6 +7719,21 @@ mention_only = false
         );
         assert!(
             !written.contains("channels_config") && !written.contains("dbURL"),
+            "{written}"
+        );
+
+        // A comment above a renamed key and the key's place survive too.
+        let mut scalars: toml_edit::DocumentMut = "[heartbeat]\n# Route heartbeat to the team room.\n\
+            channel = \"telegram\" # delivery channel\nmessage = \"keep\"\n"
+            .parse()
+            .unwrap();
+        use_written_spellings(scalars.as_table_mut()).unwrap();
+        let written = scalars.to_string();
+        assert!(
+            written.contains(
+                "# Route heartbeat to the team room.\ntarget = \"telegram\" # delivery channel\n\
+                 message = \"keep\""
+            ),
             "{written}"
         );
 

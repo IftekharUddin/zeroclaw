@@ -44591,6 +44591,238 @@ channel = "notion"
         }
     }
 
+    /// A retired table under one spelling of the channels section beside the
+    /// live section under the other loads strictly, so it saves too: the
+    /// retired table goes first, and one spelling is left. Both arrangements,
+    /// no version, V3 and V4, full and incremental saves; and a file whose
+    /// two roots hold only retired tables.
+    #[test]
+    async fn v4_review_r6_retired_only_channel_root_does_not_block_save() {
+        const LIVE_UNDER_ALIAS: &str =
+            "[channels_config.discord.work]\nenabled = true\nbot_token = \"KEEP-DISCORD-TOKEN\"\n";
+        const LIVE_UNDER_CHANNELS: &str =
+            "[channels.discord.work]\nenabled = true\nbot_token = \"KEEP-DISCORD-TOKEN\"\n";
+        let arrangements = [
+            format!("[channels.wati.old]\napi_token = \"RETIRED-WATI-TOKEN\"\n\n{LIVE_UNDER_ALIAS}"),
+            format!(
+                "[channels_config.wati.old]\napi_token = \"RETIRED-WATI-TOKEN\"\n\n{LIVE_UNDER_CHANNELS}"
+            ),
+            // Both roots retired-only; something live elsewhere.
+            "[channels.wati.a]\napi_token = \"RETIRED-WATI-TOKEN\"\n\n\
+             [channels_config.wati.b]\napi_token = \"RETIRED-WATI-TOKEN\"\n\n\
+             [gateway]\nport = 42617\n"
+                .to_string(),
+        ];
+        let mut rx = capture_log_events();
+        let mut case = 0;
+        for body in &arrangements {
+            for version in ["", "schema_version = 3\n", "schema_version = 4\n"] {
+                let raw = format!("{version}{body}");
+                for full in [false, true] {
+                    case += 1;
+                    let test_case = format!("v4-review-r6-retired-root-{case}");
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let config_path = tmp.path().join("config.toml");
+                    std::fs::write(&config_path, &raw).unwrap();
+                    let mut config = crate::migration::migrate_to_current(&raw)
+                        .unwrap_or_else(|err| panic!("{raw}: strict load failed: {err:#}"));
+                    config.config_path = config_path.clone();
+                    config.loaded_from = Some(config_path.clone());
+                    config.observability.backend = ObservabilityBackend::Otel;
+                    config.mark_dirty("observability.backend");
+                    let saved = ::zeroclaw_log::scope!(test_case: test_case.as_str(), => async {
+                        if full {
+                            config.save().await
+                        } else {
+                            config.save_dirty().await
+                        }
+                    })
+                    .await;
+                    saved.unwrap_or_else(|err| panic!("{raw}: full={full}: {err:#}"));
+
+                    let written = std::fs::read_to_string(&config_path).unwrap();
+                    let mut reloaded = crate::migration::migrate_to_current(&written)
+                        .unwrap_or_else(|err| panic!("{raw}: full={full}: {err:#}\n{written}"));
+                    let store =
+                        crate::secrets::SecretStore::new(tmp.path(), reloaded.secrets.encrypt);
+                    reloaded.decrypt_secrets(&store).unwrap();
+                    assert_eq!(
+                        reloaded.observability.backend,
+                        ObservabilityBackend::Otel,
+                        "{raw}: full={full}"
+                    );
+                    if body.contains("discord") {
+                        assert_eq!(
+                            reloaded.channels.discord["work"].bot_token,
+                            "KEEP-DISCORD-TOKEN",
+                            "{raw}: full={full}\n{written}"
+                        );
+                    } else {
+                        assert_eq!(reloaded.gateway.port, 42617, "{raw}: full={full}");
+                    }
+                    let table: toml::Table = toml::from_str(&written).unwrap();
+                    assert!(
+                        !(table.contains_key("channels") && table.contains_key("channels_config")),
+                        "{raw}: full={full}: two spellings\n{written}"
+                    );
+                    assert!(
+                        !written.contains("RETIRED-WATI-TOKEN"),
+                        "{raw}: full={full}: the retired table is kept\n{written}"
+                    );
+                    let mut reported = false;
+                    loop {
+                        let event = match rx.try_recv() {
+                            Ok(event) => event,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(_) => break,
+                        };
+                        // Reported as a retirement, or, where an older
+                        // file was migrated first, as part of that migration.
+                        reported |= event
+                            .pointer("/attributes/test_case")
+                            .and_then(|v| v.as_str())
+                            == Some(test_case.as_str())
+                            && ["/attributes/retired_config", "/attributes/saved_notice/path"]
+                                .iter()
+                                .filter_map(|at| event.pointer(at).and_then(|v| v.as_str()))
+                                .any(|path| path.contains("wati"));
+                    }
+                    assert!(reported, "{raw}: full={full}: the retirement is not reported");
+                }
+            }
+        }
+    }
+
+    /// A retired table under the `channels_config` spelling is retired on
+    /// load, by `config migrate` and by both saves, and the live top-level
+    /// `[notion]` section stays.
+    #[test]
+    async fn v4_review_r6_retirements_apply_under_every_spelling() {
+        let raw = format!(
+            "schema_version = {}\n\n[tools]\noptional = [\"*\"]\n\n\
+             [notion]\ndatabase_id = \"keep-db\"\n\n\
+             [channels_config.notion.main]\ntoken = \"RETIRED-NOTION-SENTINEL\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        let removed = |notices: &[crate::migration::MigrationNotice]| {
+            notices.iter().any(|notice| {
+                matches!(notice, crate::migration::MigrationNotice::Removed { path, .. }
+                    if path == "channels_config.notion")
+            })
+        };
+        let (migrated, notices) = crate::migration::migrate_file_with_notices(&raw)
+            .unwrap()
+            .expect("config migrate retires the table");
+        assert!(removed(&notices), "{notices:?}");
+        assert!(!migrated.contains("RETIRED-NOTION-SENTINEL"), "{migrated}");
+        assert!(migrated.contains("keep-db"), "{migrated}");
+        let load = crate::migration::migrate_to_current_salvaged(&raw);
+        assert!(removed(&load.notices), "{:?}", load.notices);
+        assert_eq!(load.config.notion.database_id, "keep-db");
+
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, &raw).unwrap();
+            let mut config = crate::migration::migrate_to_current(&raw).unwrap();
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            if full {
+                config.save().await.unwrap();
+            } else {
+                config.save_dirty().await.unwrap();
+            }
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            assert!(!written.contains("RETIRED-NOTION-SENTINEL"), "full={full}\n{written}");
+            let reloaded = crate::migration::migrate_to_current(&written).unwrap();
+            assert_eq!(reloaded.notion.database_id, "keep-db", "full={full}");
+        }
+    }
+
+    /// Renaming an aliased key keeps the comment above it and its place among
+    /// its siblings, through an unrelated incremental save.
+    #[test]
+    async fn v4_review_r6_alias_rename_keeps_comments_and_order() {
+        let raw = format!(
+            "schema_version = {}\n\n[heartbeat]\n# Route heartbeat to the team room.\n\
+             channel = \"telegram\" # delivery channel\nmessage = \"keep\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        let (written, reloaded) = edit_incrementally(&raw, |config| {
+            config.observability.backend = ObservabilityBackend::Otel;
+            vec!["observability.backend"]
+        })
+        .await;
+        assert!(
+            written.contains(
+                "# Route heartbeat to the team room.\ntarget = \"telegram\" # delivery channel\n\
+                 message = \"keep\""
+            ),
+            "{written}"
+        );
+        assert_eq!(reloaded.heartbeat.target.as_deref(), Some("telegram"));
+    }
+
+    /// A full save over an explicitly versioned V1 file that also holds the
+    /// V2 name of its channels section writes the migrated snapshot, as
+    /// before: the V1 reading already chose `channels_config`.
+    #[test]
+    async fn v4_review_r6_full_save_over_a_v1_file_with_both_channel_spellings() {
+        const RAW: &str = "schema_version = 1\n\n[channels]\ncli = false\n\n\
+            [channels_config.telegram]\nbot_token = \"keep-telegram\"\n";
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, RAW).unwrap();
+            let mut config = crate::migration::migrate_to_current(RAW).unwrap();
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            if full {
+                config.save().await
+            } else {
+                config.save_dirty().await
+            }
+            .unwrap_or_else(|err| panic!("full={full}: {err:#}"));
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            let mut reloaded = crate::migration::migrate_to_current(&written)
+                .unwrap_or_else(|err| panic!("full={full}: {err:#}\n{written}"));
+            let store = crate::secrets::SecretStore::new(tmp.path(), reloaded.secrets.encrypt);
+            reloaded.decrypt_secrets(&store).unwrap();
+            assert_eq!(
+                reloaded.channels.telegram["default"].bot_token,
+                "keep-telegram",
+                "full={full}\n{written}"
+            );
+            let table: toml::Table = toml::from_str(&written).unwrap();
+            assert!(
+                !table.contains_key("channels_config"),
+                "full={full}: two spellings\n{written}"
+            );
+        }
+    }
+
+    /// An aliased key under an aliased section: both are renamed, whatever
+    /// order the alias table lists them in.
+    #[test]
+    async fn v4_review_r6_nested_aliases_both_rename() {
+        let raw = format!(
+            "schema_version = {}\n\n[mcpServers]\nenabled = true\n\n\
+             [[mcpServers.mcpServers]]\nname = \"fs\"\ntransport = \"stdio\"\ncommand = \"keep-command\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        let (written, reloaded) = edit_incrementally(&raw, |config| {
+            config.mcp.deferred_loading = !config.mcp.deferred_loading;
+            vec!["mcp.deferred_loading"]
+        })
+        .await;
+        assert_eq!(reloaded.mcp.servers[0].command, "keep-command", "{written}");
+        assert!(!written.contains("mcpServers"), "{written}");
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.
