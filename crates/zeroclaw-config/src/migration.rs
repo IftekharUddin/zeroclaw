@@ -84,7 +84,9 @@ pub struct RetiredKey {
     /// The schema version whose migration step retires the key.
     pub retired_in: u32,
     /// Path from the config root, one segment per table key. [`ANY_KEY`]
-    /// matches every key at its level.
+    /// matches every key at its level. It covers every spelling the schema
+    /// accepts for its keys too (see [`ALIASED_KEYS`]): `channels.wati` also
+    /// retires `channels_config.wati`.
     pub path: &'static [&'static str],
     /// Why it was retired and what to use instead, in English: logs and
     /// `--json` output carry it as is.
@@ -189,12 +191,6 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         reason: RETIRED_WATI,
         reason_id: "cli-config-retired-reason-wati",
     },
-    RetiredKey {
-        retired_in: 4,
-        path: &["channels_config", "wati"],
-        reason: RETIRED_WATI,
-        reason_id: "cli-config-retired-reason-wati",
-    },
     // Spellings no schema field reads, so serde would ignore them silently.
     // Twitter and Reddit stay channels (`[channels.twitter.<alias>]`,
     // `[channels.reddit.<alias>]`) and Notion stays the top-level `[notion]`
@@ -293,12 +289,13 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
 #[must_use]
 pub fn retired_key_covering(path: &[&str]) -> Option<&'static RetiredKey> {
     RETIRED_KEYS.iter().find(|key| {
-        key.path.len() <= path.len()
-            && key
-                .path
-                .iter()
-                .zip(path)
-                .all(|(pattern, segment)| *pattern == ANY_KEY || pattern == segment)
+        spellings_of(key.path).iter().any(|pattern| {
+            pattern.len() <= path.len()
+                && pattern
+                    .iter()
+                    .zip(path)
+                    .all(|(pattern, segment)| *pattern == ANY_KEY || pattern == segment)
+        })
     })
 }
 
@@ -762,20 +759,32 @@ fn spellings_of(pattern: &[&'static str]) -> Vec<Vec<&'static str>> {
 /// A table holding two spellings of one setting is refused: the schema
 /// cannot read it, so no save may write over it.
 pub(crate) fn use_written_spellings(root: &mut toml_edit::Table) -> Result<()> {
-    for (parent, alias, written) in ALIASED_KEYS {
+    // Outer sections first, so a nested alias is found under the section's
+    // written spelling whatever order `ALIASED_KEYS` lists them in.
+    let mut aliased: Vec<&(&[&str], &str, &str)> = ALIASED_KEYS.iter().collect();
+    aliased.sort_by_key(|(parent, _, _)| parent.len());
+    for (parent, alias, written) in aliased {
         let parents = if parent.is_empty() {
             vec![Vec::new()]
         } else {
             expand_doc_path(root, parent)
         };
         for path in parents {
-            let Some(table) = table_like_at(root, &path) else {
-                continue;
+            let renamed = if path.is_empty() {
+                rename_key_in_place(root, alias, written)
+            } else {
+                let Some(item) = item_at(root, &path) else {
+                    continue;
+                };
+                match item {
+                    toml_edit::Item::Table(table) => rename_key_in_place(table, alias, written),
+                    toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => {
+                        rename_key_in_place(table, alias, written)
+                    }
+                    _ => continue,
+                }
             };
-            if !table.contains_key(alias) {
-                continue;
-            }
-            if table.contains_key(written) {
+            if !renamed {
                 let at = if path.is_empty() {
                     "the top level".to_string()
                 } else {
@@ -786,24 +795,83 @@ pub(crate) fn use_written_spellings(root: &mut toml_edit::Table) -> Result<()> {
                      which the schema cannot read together; keep one before saving"
                 );
             }
-            if let Some(item) = table.remove(alias) {
-                table.insert(written, item);
-            }
         }
     }
     Ok(())
 }
 
-/// The table or inline table at `path` under `root`, or `None`.
-fn table_like_at<'a>(
-    root: &'a mut toml_edit::Table,
-    path: &[String],
-) -> Option<&'a mut dyn toml_edit::TableLike> {
-    let mut table: &mut dyn toml_edit::TableLike = root;
-    for key in path {
-        table = table.get_mut(key)?.as_table_like_mut()?;
+/// The item at `path` under `root`, or `None`.
+fn item_at<'a>(root: &'a mut toml_edit::Table, path: &[String]) -> Option<&'a mut toml_edit::Item> {
+    let (first, rest) = path.split_first()?;
+    let mut item = root.get_mut(first)?;
+    for key in rest {
+        item = item.as_table_like_mut()?.get_mut(key)?;
     }
-    Some(table)
+    Some(item)
+}
+
+/// A table or inline table whose keys [`rename_key_in_place`] can rename.
+trait RenameableTable {
+    fn entry_keys(&self) -> Vec<String>;
+    fn has(&self, key: &str) -> bool;
+    /// Rebuild the table in its own order, `rename` deciding each key.
+    fn rebuild(&mut self, rename: &dyn Fn(toml_edit::Key) -> toml_edit::Key);
+}
+
+impl RenameableTable for toml_edit::Table {
+    fn entry_keys(&self) -> Vec<String> {
+        self.iter().map(|(key, _)| key.to_string()).collect()
+    }
+    fn has(&self, key: &str) -> bool {
+        self.contains_key(key)
+    }
+    fn rebuild(&mut self, rename: &dyn Fn(toml_edit::Key) -> toml_edit::Key) {
+        let keys = self.entry_keys();
+        let entries: Vec<(toml_edit::Key, toml_edit::Item)> =
+            keys.iter().filter_map(|key| self.remove_entry(key)).collect();
+        for (key, item) in entries {
+            self.insert_formatted(&rename(key), item);
+        }
+    }
+}
+
+impl RenameableTable for toml_edit::InlineTable {
+    fn entry_keys(&self) -> Vec<String> {
+        self.iter().map(|(key, _)| key.to_string()).collect()
+    }
+    fn has(&self, key: &str) -> bool {
+        self.contains_key(key)
+    }
+    fn rebuild(&mut self, rename: &dyn Fn(toml_edit::Key) -> toml_edit::Key) {
+        let keys = self.entry_keys();
+        let entries: Vec<(toml_edit::Key, toml_edit::Value)> =
+            keys.iter().filter_map(|key| self.remove_entry(key)).collect();
+        for (key, value) in entries {
+            self.insert_formatted(&rename(key), value);
+        }
+    }
+}
+
+/// Rename `alias` in `table` to `written`, keeping the entry's place among
+/// its siblings and the comments around its key and value. `false`, with
+/// nothing renamed, when the table holds both spellings.
+fn rename_key_in_place(table: &mut dyn RenameableTable, alias: &str, written: &str) -> bool {
+    if !table.has(alias) {
+        return true;
+    }
+    if table.has(written) {
+        return false;
+    }
+    table.rebuild(&|key| {
+        if key.get() != alias {
+            return key;
+        }
+        let mut renamed = toml_edit::Key::new(written);
+        *renamed.leaf_decor_mut() = key.leaf_decor().clone();
+        *renamed.dotted_decor_mut() = key.dotted_decor().clone();
+        renamed
+    });
+    true
 }
 
 /// Settings only the V3 layout has that the V1 -> V3 chain also writes into:
@@ -2418,18 +2486,21 @@ fn apply_retired_keys_to_doc_table(
     notices: &mut Vec<MigrationNotice>,
 ) {
     for key in table.iter().filter(|key| key.retired_in == version) {
-        for concrete in expand_doc_path(root, key.path) {
-            let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
-            if take_doc_path(root, &segments, key.path).is_none() {
-                continue;
+        for pattern in spellings_of(key.path) {
+            for concrete in expand_doc_path(root, &pattern) {
+                let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
+                if take_doc_path(root, &segments, &pattern).is_none() {
+                    continue;
+                }
+                notices.push(MigrationNotice::Removed {
+                    path: segments.join("."),
+                    reason: key.reason,
+                });
             }
-            notices.push(MigrationNotice::Removed {
-                path: segments.join("."),
-                reason: key.reason,
-            });
         }
     }
 }
+
 
 /// [`expand_path`] over a document: every concrete path `pattern` matches,
 /// descending through header, dotted and inline tables alike.
@@ -2570,15 +2641,17 @@ fn apply_retired_keys(
         return;
     };
     for key in table.iter().filter(|key| key.retired_in == version) {
-        for concrete in expand_path(root, key.path) {
-            let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
-            if take_path(root, &segments, key.path).is_none() {
-                continue;
+        for pattern in spellings_of(key.path) {
+            for concrete in expand_path(root, &pattern) {
+                let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
+                if take_path(root, &segments, &pattern).is_none() {
+                    continue;
+                }
+                notices.push(MigrationNotice::Removed {
+                    path: segments.join("."),
+                    reason: key.reason,
+                });
             }
-            notices.push(MigrationNotice::Removed {
-                path: segments.join("."),
-                reason: key.reason,
-            });
         }
     }
 }

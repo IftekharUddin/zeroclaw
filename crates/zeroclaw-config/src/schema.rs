@@ -26249,7 +26249,7 @@ impl Config {
         } else {
             String::new()
         };
-        prepare_on_disk_config_for_save(&config_path, &existing).await?;
+        let on_disk = prepare_on_disk_config_for_save(&config_path, &existing).await?;
         let zeroclaw_dir = config_path
             .parent()
             .context("Config path must have a parent directory")?;
@@ -26317,16 +26317,20 @@ impl Config {
             let mut doc: toml_edit::DocumentMut = existing
                 .parse()
                 .context("Failed to parse existing config for comment preservation")?;
-            // Sync onto the spelling the snapshot is written in, keeping the
-            // comments of a section spelled another way; a file holding both
-            // spellings of one setting is refused.
-            crate::migration::use_written_spellings(doc.as_table_mut())?;
             // Apply the `RETIRED_KEYS` policy to the file on disk before
             // syncing, as the load path and `save_dirty` do. The sync would
             // drop a retired key anyway, since the typed config has no field
             // for it, but silently: one written by another handle after this
             // config loaded would leave without the notice it is owed.
             let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+            // Then sync onto the spelling the snapshot is written in, keeping
+            // the comments of a section spelled another way; a current file
+            // still holding two live spellings of one setting is refused. An
+            // older file is not renamed: its migration already chose between
+            // its spellings, and the sync writes that choice.
+            if on_disk != OnDiskConfig::NeedsStructuralMigration {
+                crate::migration::use_written_spellings(doc.as_table_mut())?;
+            }
             crate::migration::sync_table(doc.as_table_mut(), &new_table);
             (doc, retired)
         };
@@ -26425,6 +26429,17 @@ impl Config {
         let mut doc: toml_edit::DocumentMut = existing
             .parse()
             .context("Failed to parse existing config for incremental save")?;
+        // Remove retired keys from the file, using the same `RETIRED_KEYS`
+        // policy the load path applies. Loading drops them, so they are never
+        // dirty paths, and an incremental save reparses the original file and
+        // rewrites only dirty paths: without this, a retired table (and a
+        // plaintext secret it may carry, as `[security.nevis]` can) would
+        // outlive every ordinary CLI, dashboard or RPC edit. Only retired
+        // keys are touched; comments and unrelated ciphertext elsewhere in
+        // the file are preserved. It runs first, as on load, so a retired
+        // table under one spelling of a section does not count as a second
+        // spelling of the live one.
+        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
         // A setting the file spells another way the schema accepts
         // (`channels_config` for `channels`) is renamed to the spelling the
         // dirty paths use, so an edit lands on it rather than beside it.
@@ -26454,16 +26469,6 @@ impl Config {
                 &builtin_tool_selection_value(&config_to_save),
             );
         }
-
-        // Remove retired keys from the file, using the same `RETIRED_KEYS`
-        // policy the load path applies. Loading drops them, so they are never
-        // dirty paths, and an incremental save reparses the original file and
-        // rewrites only dirty paths: without this, a retired table (and a
-        // plaintext secret it may carry, as `[security.nevis]` can) would
-        // outlive every ordinary CLI, dashboard or RPC edit. Only retired
-        // keys are touched; comments and unrelated ciphertext elsewhere in
-        // the file are preserved.
-        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
 
         // Stamp the current schema version. An incremental save writes
         // current-schema-shaped sections (e.g. the dashboard saving a single
