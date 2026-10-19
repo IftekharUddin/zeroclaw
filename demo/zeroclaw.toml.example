@@ -23,15 +23,11 @@ schema_version = 4
 # The launchers inject OPENROUTER_API_KEY into the openrouter.agent_demo alias
 # below without storing the key in this file.
 
-[providers.models.openrouter.default]
-name = "openrouter"
-uri = "https://openrouter.ai/api/v1"
-temperature = 0.3
-max_tokens = 1024
-
 [providers.models.openrouter.agent_demo]
+uri = "https://openrouter.ai/api/v1"
 model = "meta-llama/llama-3.1-8b-instruct"  # Good balance for tool use; swap for a stronger model on OpenRouter as needed (e.g. sonnet, gpt-4o, etc.)
 temperature = 0.3
+max_tokens = 1024
 
 # ─── Hardware peripherals ──────────────────────────────────────────────────
 # Simulated ESP32 board via the esp32_sim example (dev-sim path).

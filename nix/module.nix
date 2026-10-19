@@ -200,7 +200,7 @@ let
           '';
           description = ''
             ZeroClaw configuration as a Nix attrset. Set `schema_version` to
-            the version the attrset is written for (`3` for the current
+            the version the attrset is written for (`4` for the current
             shape). The module renders the attrset as written and does not add
             it: a file without it is read as the oldest schema and migrated,
             unless its sections are plainly in the current shape.
