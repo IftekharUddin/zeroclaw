@@ -43224,7 +43224,10 @@ channel = "notion"
                 crate::providers::ChannelRef::new("telegram.main"),
             ]
         );
-        assert_eq!(reloaded.escalation.alert_channels, vec!["notion".to_string()]);
+        assert_eq!(
+            reloaded.escalation.alert_channels,
+            vec!["notion".to_string()]
+        );
         assert!(reloaded.peer_groups.contains_key("notion_team"));
     }
 

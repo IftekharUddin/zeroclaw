@@ -1479,10 +1479,7 @@ pub fn version_backup_path(config_path: &Path, version: u32) -> Result<std::path
 /// later migration and save. Because it lasts and can hold the plaintext
 /// secrets of keys the migration retires, it is created owner-only (0600 on
 /// Unix) whatever the mode of the file it copies.
-pub fn keep_version_backup(
-    config_path: &Path,
-    version: u32,
-) -> Result<Option<std::path::PathBuf>> {
+pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<std::path::PathBuf>> {
     let backup = version_backup_path(config_path, version)?;
     if backup.exists() {
         return Ok(None);
@@ -2125,8 +2122,9 @@ mod tests {
 
     #[test]
     fn current_explicit_selector_is_noop_even_with_unrelated_nan() {
-        let raw =
-            format!("schema_version = {CURRENT_SCHEMA_VERSION}\nmetric = nan\n[tools]\noptional = []\n");
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\nmetric = nan\n[tools]\noptional = []\n"
+        );
         assert!(migrate_file(&raw).unwrap().is_none());
     }
 
@@ -5051,15 +5049,20 @@ agents = ["default"]
     /// The references to the `notion` channel that
     /// [`V3_WITH_NOTION_CHANNEL`] holds, which every path must keep.
     fn assert_notion_references_kept(root: &toml::Table) {
-        let notion_and_telegram =
-            toml::Value::Array(vec!["notion".into(), "telegram.main".into()]);
+        let notion_and_telegram = toml::Value::Array(vec!["notion".into(), "telegram.main".into()]);
         assert_eq!(root["agents"]["default"]["channels"], notion_and_telegram);
-        assert_eq!(root["escalation"]["alert_channels"], notion_and_telegram);
+        assert_eq!(
+            root["escalation"]["alert_channels"],
+            notion_and_telegram
+        );
         assert_eq!(
             root["peer_groups"]["notion_team"]["channel"].as_str(),
             Some("notion")
         );
-        assert!(root.contains_key("notion"), "the poller's own section stays");
+        assert!(
+            root.contains_key("notion"),
+            "the poller's own section stays"
+        );
     }
 
     #[test]
@@ -5132,7 +5135,10 @@ optional = ["*"]
             .unwrap()
             .expect("a V3 file migrates");
         let versioned = dir.path().join("config.toml.v3.backup");
-        assert_eq!(report.version_backup_path.as_deref(), Some(versioned.as_path()));
+        assert_eq!(
+            report.version_backup_path.as_deref(),
+            Some(versioned.as_path())
+        );
         assert_eq!(report.from_version, 3);
         assert_eq!(std::fs::read_to_string(&versioned).unwrap(), original);
         // The lasting copy can hold retired secrets: owner-only, whatever the
@@ -5152,7 +5158,10 @@ optional = ["*"]
         let report = migrate_file_in_place(&path)
             .unwrap()
             .expect("the retired key is removed");
-        assert_eq!(report.version_backup_path, None, "a current file keeps no copy");
+        assert_eq!(
+            report.version_backup_path, None,
+            "a current file keeps no copy"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("config.toml.backup")).unwrap(),
             current
@@ -5358,12 +5367,16 @@ summary_model = "opus"
 
     #[test]
     fn a_wildcard_retirement_keeps_each_alias() {
-        let raw = "[bots.a]\nold_limit = 1\n\n[bots.b]\nold_limit = 2\n\n[bots.b.limits]\nmax = 9\n";
+        let raw =
+            "[bots.a]\nold_limit = 1\n\n[bots.b]\nold_limit = 2\n\n[bots.b.limits]\nmax = 9\n";
         let (value, notices) = apply(raw, 7);
         let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
         let mut doc_notices = Vec::new();
         apply_retired_keys_to_doc_table(doc.as_table_mut(), 7, TEST_RETIREMENTS, &mut doc_notices);
-        assert_eq!(notices, doc_notices, "both appliers report the same removals");
+        assert_eq!(
+            notices, doc_notices,
+            "both appliers report the same removals"
+        );
         assert_eq!(notices.len(), 2);
         let from_doc: toml::Value = toml::from_str(&doc.to_string()).unwrap();
         for value in [&value, &from_doc] {
