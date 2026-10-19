@@ -664,6 +664,7 @@ const V3_ONLY_DESTINATIONS: &[&[&str]] = &[
 /// holding one is evidence of the V3 layout. Kept in step with the schema by
 /// `v3_agent_fields_are_the_current_agent_fields`.
 const V3_AGENT_FIELDS: &[&str] = &[
+    "a2a",
     "acp_enable_mcp",
     "channels",
     "classifier_provider",
