@@ -44881,98 +44881,45 @@ channel = "notion"
         }
     }
 
-    /// The value at a dotted path of `config` as written, or `None`.
-    fn typed_at(config: &Config, dotted: &str) -> Option<toml::Value> {
-        let value = toml::Value::try_from(config).unwrap();
-        dotted
-            .split('.')
-            .try_fold(&value, |value, key| value.get(key))
-            .cloned()
-    }
-
-    /// `table` with `value` set at `path`, creating tables on the way.
-    fn insert_at(table: &mut toml::Table, path: &[&str], value: toml::Value) {
-        let (last, parents) = path.split_last().unwrap();
-        let mut table = table;
-        for key in parents {
-            table = table
-                .entry(*key)
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                .as_table_mut()
-                .unwrap();
-        }
-        table.insert((*last).to_string(), value);
-    }
-
-    /// For every key the schema reads under two spellings, a V1 and a V2 file
-    /// holding both is either one its migration resolves, so a save writes
-    /// what the same file spelled once would hold, or one every save refuses
-    /// with the file and the dirty set unchanged. Never one a save writes
-    /// over with the setting dropped.
+    /// Two spellings of one setting, neither the one the schema writes,
+    /// that an older file's migration leaves in place: the file cannot be
+    /// read strictly and the salvaged config lacks the section, so every save
+    /// refuses, naming the two spellings the file holds, with the file and
+    /// the dirty set unchanged.
     #[test]
-    async fn v4_review_r7_every_aliased_key_in_an_older_file_is_resolved_or_refused() {
-        let defaults = toml::Value::try_from(Config::default()).unwrap();
-        for (parent, alias, written) in crate::migration::ALIASED_KEYS {
-            let parent: Vec<&str> = parent
-                .iter()
-                .map(|key| {
-                    if *key == crate::migration::ANY_KEY {
-                        "probe"
-                    } else {
-                        *key
-                    }
-                })
-                .collect();
-            let at = |key: &'static str| parent.iter().copied().chain([key]).collect::<Vec<_>>();
-            let written_path = at(written).join(".");
-            // A value the written spelling reads, other than its default where
-            // one of each shape will do.
-            let value = [
-                toml::Value::String("probe".into()),
-                toml::Value::Integer(7),
-                toml::Value::Boolean(true),
-                toml::Value::Array(vec![toml::Value::String("probe".into())]),
-            ]
-            .into_iter()
-            .chain(
-                written_path
-                    .split('.')
-                    .try_fold(&defaults, |value, key| value.get(key))
-                    .cloned(),
-            )
-            .chain([toml::Value::Table(toml::Table::new())])
-            .find(|value| {
-                let mut file = toml::Table::new();
-                file.insert(
-                    "schema_version".to_string(),
-                    toml::Value::Integer(i64::from(crate::migration::CURRENT_SCHEMA_VERSION)),
-                );
-                insert_at(&mut file, &at(written), value.clone());
-                crate::migration::migrate_to_current(&toml::to_string(&file).unwrap())
-                    .is_ok_and(|config| typed_at(&config, &written_path).is_some())
-            })
-            .unwrap_or_else(|| panic!("no value reads at `{written_path}`"));
-
+    async fn v4_review_r8_alias_only_conflicts_block_every_save() {
+        let sections = [
+            (
+                ["dbURL", "database_url"],
+                "[storage.postgres.work]\ndbURL = \"postgres://localhost/one\"\n\
+                 database_url = \"postgres://localhost/two\"\ntable = \"KEEP-STORAGE-TABLE\"\n",
+            ),
+            (
+                ["dbURL", "databaseUrl"],
+                "[storage.postgres.work]\ndbURL = \"postgres://localhost/one\"\n\
+                 databaseUrl = \"postgres://localhost/two\"\ntable = \"KEEP-STORAGE-TABLE\"\n",
+            ),
+            (
+                ["database_url", "databaseUrl"],
+                "[storage.postgres.work]\ndatabase_url = \"postgres://localhost/one\"\n\
+                 databaseUrl = \"postgres://localhost/two\"\ntable = \"KEEP-STORAGE-TABLE\"\n",
+            ),
+            (
+                ["allowed_path", "allowed_paths"],
+                "[risk_profiles.work]\nallowed_path = [\"/srv/one\"]\n\
+                 allowed_paths = [\"/srv/two\"]\nallowed_commands = [\"keep-command\"]\n",
+            ),
+        ];
+        for (spellings, section) in sections {
             for version in [1, 2] {
-                let mut single = toml::Table::new();
-                single.insert("schema_version".to_string(), toml::Value::Integer(version));
-                insert_at(&mut single, &at(written), value.clone());
-                let mut both = single.clone();
-                insert_at(&mut both, &at(alias), value.clone());
-                let single_raw = toml::to_string(&single).unwrap();
-                let both_raw = toml::to_string(&both).unwrap();
-                // What the version's own migration makes of the setting
-                // spelled once.
-                let expected = typed_at(
-                    &crate::migration::migrate_to_current_salvaged(&single_raw).config,
-                    &written_path,
+                let raw = format!(
+                    "schema_version = {version}\n\n[gateway]\nport = 42617\n\n{section}"
                 );
                 for full in [true, false] {
                     let tmp = tempfile::TempDir::new().unwrap();
                     let config_path = tmp.path().join("config.toml");
-                    std::fs::write(&config_path, &both_raw).unwrap();
-                    let mut config =
-                        crate::migration::migrate_to_current_salvaged(&both_raw).config;
+                    std::fs::write(&config_path, &raw).unwrap();
+                    let mut config = crate::migration::migrate_to_current_salvaged(&raw).config;
                     config.config_path = config_path.clone();
                     config.loaded_from = Some(config_path.clone());
                     config.observability.backend = ObservabilityBackend::Otel;
@@ -44983,34 +44930,347 @@ channel = "notion"
                     } else {
                         config.save_dirty().await
                     };
-                    let label =
-                        format!("`{alias}` beside `{written_path}`, V{version}, full={full}");
-                    let written_file = std::fs::read_to_string(&config_path).unwrap();
+                    let err = saved
+                        .err()
+                        .unwrap_or_else(|| panic!("V{version}: full={full}: saved\n{section}"));
+                    let message = format!("{err:#}");
+                    for spelling in spellings {
+                        assert!(
+                            message.contains(&format!("`{spelling}`")),
+                            "V{version}: full={full}: {message}"
+                        );
+                    }
+                    assert_eq!(
+                        std::fs::read_to_string(&config_path).unwrap(),
+                        raw,
+                        "V{version}: full={full}"
+                    );
+                    assert_eq!(config.dirty_paths, dirty, "V{version}: full={full}");
+                }
+            }
+        }
+    }
+
+    /// The value at a dotted path of `config` as written, or `None`. A
+    /// numeric segment indexes an array.
+    fn typed_at(config: &Config, dotted: &str) -> Option<toml::Value> {
+        let value = toml::Value::try_from(config).unwrap();
+        dotted
+            .split('.')
+            .try_fold(&value, |value, key| match key.parse::<usize>() {
+                Ok(index) if value.is_array() => value.get(index),
+                _ => value.get(key),
+            })
+            .cloned()
+    }
+
+    /// Two spellings of one setting as an older file writes them, and what
+    /// must become of a V1 and a V2 file holding both.
+    struct SpellingCase {
+        /// The `ALIASED_KEYS` parent pattern the two spellings sit under.
+        parent: Vec<&'static str>,
+        spellings: [&'static str; 2],
+        /// The file's body with only the first spelling, then with both.
+        single: String,
+        both: String,
+        /// Where the setting is read after migration, and the value there, as
+        /// TOML and never a default, of the file spelled once and of a file
+        /// whose migration chooses between the two.
+        read_at: String,
+        value: String,
+        /// Whether the V1 migration itself chooses between the two.
+        resolved_by_v1: bool,
+    }
+
+    /// A case whose `[header]` holds `first = value`, then `second = other`
+    /// beside it.
+    fn spelling_case(
+        parent: &[&'static str],
+        header: &str,
+        [first, second]: [&'static str; 2],
+        [value, other]: [&str; 2],
+        read_at: &str,
+    ) -> SpellingCase {
+        SpellingCase {
+            parent: parent.to_vec(),
+            spellings: [first, second],
+            single: format!("[{header}]\n{first} = {value}\n"),
+            both: format!("[{header}]\n{first} = {value}\n{second} = {other}\n"),
+            read_at: read_at.to_string(),
+            value: value.to_string(),
+            resolved_by_v1: false,
+        }
+    }
+
+    /// For each aliased key, its written spelling beside each alias and each
+    /// two of its aliases, laid out as a V1 or V2 file holds them.
+    fn spelling_cases() -> Vec<SpellingCase> {
+        use crate::migration::ANY_KEY;
+        let mut cases = vec![
+            // V1 read `channels_config` and wrote it over `channels`.
+            SpellingCase {
+                parent: Vec::new(),
+                spellings: ["channels", "channels_config"],
+                single: "[channels.telegram]\nbot_token = \"KEEP-TG\"\n".to_string(),
+                both: "[channels.telegram]\nbot_token = \"OTHER-TG\"\n\n\
+                       [channels_config.telegram]\nbot_token = \"KEEP-TG\"\n"
+                    .to_string(),
+                read_at: "channels.telegram.default.bot_token".to_string(),
+                value: "\"KEEP-TG\"".to_string(),
+                resolved_by_v1: true,
+            },
+            SpellingCase {
+                parent: Vec::new(),
+                spellings: ["mcp", "mcpServers"],
+                single: "[mcp]\ndeferred_loading = true\n".to_string(),
+                both: "[mcp]\ndeferred_loading = true\n\n[mcpServers]\nenabled = false\n"
+                    .to_string(),
+                read_at: "mcp.deferred_loading".to_string(),
+                value: "true".to_string(),
+                resolved_by_v1: false,
+            },
+            SpellingCase {
+                parent: vec!["mcp"],
+                spellings: ["servers", "mcpServers"],
+                single: "[[mcp.servers]]\nname = \"keep\"\ntransport = \"stdio\"\n\
+                         command = \"keep-command\"\n"
+                    .to_string(),
+                both: "[[mcp.servers]]\nname = \"keep\"\ntransport = \"stdio\"\n\
+                       command = \"keep-command\"\n\n[[mcp.mcpServers]]\nname = \"other\"\n\
+                       transport = \"stdio\"\ncommand = \"other-command\"\n"
+                    .to_string(),
+                read_at: "mcp.servers.0.command".to_string(),
+                value: "\"keep-command\"".to_string(),
+                resolved_by_v1: false,
+            },
+            SpellingCase {
+                parent: vec!["skills"],
+                spellings: ["install_suggestions", "install-suggestions"],
+                single: "[skills.install_suggestions]\nenabled = true\n".to_string(),
+                both: "[skills.install_suggestions]\nenabled = true\n\n\
+                       [skills.install-suggestions]\nenabled = false\n"
+                    .to_string(),
+                read_at: "skills.install_suggestions.enabled".to_string(),
+                value: "true".to_string(),
+                resolved_by_v1: false,
+            },
+        ];
+        // An older file holds an Azure profile's fields on the family; the
+        // migration files them under its `default` alias.
+        for spellings in [
+            ["resource", "azure_openai_resource"],
+            ["deployment", "azure_openai_deployment"],
+            ["api_version", "azure_openai_api_version"],
+        ] {
+            cases.push(spelling_case(
+                &["providers", "models", "azure", ANY_KEY],
+                "providers.models.azure",
+                spellings,
+                ["\"keep-azure\"", "\"other-azure\""],
+                &format!("providers.models.azure.default.{}", spellings[0]),
+            ));
+        }
+        // V2 held TTS settings under `[tts.<family>]`; the migration files
+        // them under `[providers.tts.<family>.default]`.
+        for family in ["openai", "elevenlabs", "google", "edge", "piper"] {
+            cases.push(spelling_case(
+                &["providers", "tts", family, ANY_KEY],
+                &format!("tts.{family}"),
+                ["uri", "api_url"],
+                [
+                    "\"https://keep.example.invalid/tts\"",
+                    "\"https://other.example.invalid/tts\"",
+                ],
+                &format!("providers.tts.{family}.default.uri"),
+            ));
+        }
+        for section in ["composio", "microsoft365"] {
+            cases.push(spelling_case(
+                &[section],
+                section,
+                ["enabled", "enable"],
+                ["true", "false"],
+                &format!("{section}.enabled"),
+            ));
+        }
+        for spellings in [
+            ["db_url", "dbURL"],
+            ["db_url", "database_url"],
+            ["db_url", "databaseUrl"],
+            ["dbURL", "database_url"],
+            ["dbURL", "databaseUrl"],
+            ["database_url", "databaseUrl"],
+        ] {
+            cases.push(spelling_case(
+                &["storage", "postgres", ANY_KEY],
+                "storage.postgres.work",
+                spellings,
+                ["\"postgres://keep\"", "\"postgres://other\""],
+                "storage.postgres.work.db_url",
+            ));
+        }
+        for (spellings, values) in [
+            (["log_persistence", "runtime_trace_mode"], ["\"full\"", "\"none\""]),
+            (
+                ["log_persistence_path", "runtime_trace_path"],
+                ["\"state/keep-trace.jsonl\"", "\"state/other-trace.jsonl\""],
+            ),
+            (
+                ["log_persistence_max_entries", "runtime_trace_max_entries"],
+                ["77", "88"],
+            ),
+        ] {
+            cases.push(spelling_case(
+                &["observability"],
+                "observability",
+                spellings,
+                values,
+                &format!("observability.{}", spellings[0]),
+            ));
+        }
+        for spellings in [
+            ["allowed_roots", "allowed_path"],
+            ["allowed_roots", "allowed_paths"],
+            ["allowed_path", "allowed_paths"],
+        ] {
+            cases.push(spelling_case(
+                &["risk_profiles", ANY_KEY],
+                "risk_profiles.work",
+                spellings,
+                ["[\"/srv/keep\"]", "[\"/srv/other\"]"],
+                "risk_profiles.work.allowed_roots",
+            ));
+        }
+        for spellings in [["target", "channel"], ["to", "recipient"]] {
+            cases.push(spelling_case(
+                &["heartbeat"],
+                "heartbeat",
+                spellings,
+                ["\"keep\"", "\"other\""],
+                &format!("heartbeat.{}", spellings[0]),
+            ));
+        }
+        cases
+    }
+
+    /// For every pair of spellings of every aliased key, a V1 and a V2 file
+    /// holding both either saves with the setting's value kept, where the
+    /// migration itself chooses between them (V1's `channels_config` over
+    /// `channels`), or is refused by every save with the file and the dirty
+    /// set unchanged. The same file spelled once must load strictly with the
+    /// value, never a default, where the migration files it, so a lost
+    /// setting cannot pass for a kept one. Every failure is listed.
+    #[test]
+    async fn v4_review_r8_every_aliased_key_in_an_older_file_keeps_its_value_or_is_refused() {
+        let cases = spelling_cases();
+
+        // Each alias beside its written spelling, and each two aliases of one
+        // key, has a case.
+        let has_case = |parent: &[&str], one: &str, two: &str| {
+            cases.iter().any(|case| {
+                case.parent == parent
+                    && (case.spellings == [one, two] || case.spellings == [two, one])
+            })
+        };
+        for (parent, alias, written) in crate::migration::ALIASED_KEYS {
+            assert!(
+                has_case(parent, alias, written),
+                "no case for `{alias}` beside `{written}`"
+            );
+            for (other_parent, other, other_written) in crate::migration::ALIASED_KEYS {
+                if other_parent == parent && other_written == written && other != alias {
+                    assert!(
+                        has_case(parent, alias, other),
+                        "no case for `{alias}` beside `{other}`"
+                    );
+                }
+            }
+        }
+
+        let mut failures = Vec::new();
+        for case in &cases {
+            let value: toml::Table = toml::from_str(&format!("value = {}", case.value)).unwrap();
+            let value = &value["value"];
+            for version in [1, 2] {
+                let label = format!(
+                    "`{}` beside `{}`, V{version}",
+                    case.spellings[0], case.spellings[1]
+                );
+                let single = format!("schema_version = {version}\n\n{}", case.single);
+                match crate::migration::migrate_to_current(&single) {
+                    Ok(config) if typed_at(&config, &case.read_at).as_ref() == Some(value) => {}
+                    Ok(config) => {
+                        failures.push(format!(
+                            "{label}: spelled once, `{}` reads {:?}, not {value}",
+                            case.read_at,
+                            typed_at(&config, &case.read_at)
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        failures.push(format!("{label}: spelled once, it does not load: {err:#}"));
+                        continue;
+                    }
+                }
+
+                let both = format!("schema_version = {version}\n\n{}", case.both);
+                let resolved = case.resolved_by_v1 && version == 1;
+                for full in [true, false] {
+                    let label = format!("{label}, full={full}");
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let config_path = tmp.path().join("config.toml");
+                    std::fs::write(&config_path, &both).unwrap();
+                    let mut config = crate::migration::migrate_to_current_salvaged(&both).config;
+                    config.config_path = config_path.clone();
+                    config.loaded_from = Some(config_path.clone());
+                    config.observability.backend = ObservabilityBackend::Otel;
+                    config.mark_dirty("observability.backend");
+                    let dirty = config.dirty_paths.clone();
+                    let saved = if full {
+                        config.save().await
+                    } else {
+                        config.save_dirty().await
+                    };
+                    let written = std::fs::read_to_string(&config_path).unwrap();
                     match saved {
-                        Err(_) => {
-                            assert_eq!(written_file, both_raw, "{label}");
-                            assert_eq!(config.dirty_paths, dirty, "{label}");
-                        }
+                        Err(err) if resolved => failures.push(format!(
+                            "{label}: refused although the migration chooses: {err:#}"
+                        )),
+                        Err(_) if written != both || config.dirty_paths != dirty => failures
+                            .push(format!("{label}: refused, but the file or dirty set changed")),
+                        Err(_) => {}
                         Ok(()) => {
-                            let mut reloaded = crate::migration::migrate_to_current(&written_file)
-                                .unwrap_or_else(|err| {
-                                    panic!("{label}: reload failed: {err:#}\n{written_file}")
+                            let read = crate::migration::migrate_to_current(&written)
+                                .and_then(|mut reloaded| {
+                                    let store = crate::secrets::SecretStore::new(
+                                        tmp.path(),
+                                        reloaded.secrets.encrypt,
+                                    );
+                                    reloaded.decrypt_secrets(&store)?;
+                                    Ok(typed_at(&reloaded, &case.read_at))
                                 });
-                            let store = crate::secrets::SecretStore::new(
-                                tmp.path(),
-                                reloaded.secrets.encrypt,
-                            );
-                            reloaded.decrypt_secrets(&store).unwrap();
-                            assert_eq!(
-                                typed_at(&reloaded, &written_path),
-                                expected,
-                                "{label}: the save dropped the setting\n{written_file}"
-                            );
+                            match read {
+                                Ok(read) if resolved && read.as_ref() == Some(value) => {}
+                                Ok(read) => failures.push(format!(
+                                    "{label}: saved over two spellings; `{}` now reads {read:?}",
+                                    case.read_at
+                                )),
+                                Err(err) => failures.push(format!(
+                                    "{label}: saved over two spellings, and the file no longer \
+                                     loads: {err:#}"
+                                )),
+                            }
                         }
                     }
                 }
             }
         }
+        assert!(
+            failures.is_empty(),
+            "{} failures:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
