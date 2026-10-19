@@ -26308,25 +26308,24 @@ impl Config {
 
         // If an existing config file is present, sync the new values onto it
         // to preserve comments and formatting. Otherwise, use the fresh serialization.
-        let mut doc: toml_edit::DocumentMut = if existing.is_empty() {
-            new_toml
+        let (doc, retired) = if existing.is_empty() {
+            let doc: toml_edit::DocumentMut = new_toml
                 .parse()
-                .context("Failed to parse serialized config for retirement")?
+                .context("Failed to parse serialized config for retirement")?;
+            (doc, Vec::new())
         } else {
             let mut doc: toml_edit::DocumentMut = existing
                 .parse()
                 .context("Failed to parse existing config for comment preservation")?;
+            // Apply the `RETIRED_KEYS` policy to the file on disk before
+            // syncing, as the load path and `save_dirty` do. The sync would
+            // drop a retired key anyway, since the typed config has no field
+            // for it, but silently: one written by another handle after this
+            // config loaded would leave without the notice it is owed.
+            let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
             crate::migration::sync_table(doc.as_table_mut(), &new_table);
-            doc
+            (doc, retired)
         };
-
-        // Apply the `RETIRED_KEYS` policy to what is about to be written, as
-        // the load path and `save_dirty` do. Most retired keys have no schema
-        // field and so cannot come out of serialization, but a retired channel
-        // is also removed from live fields (`[agents.<alias>] channels`,
-        // `[peer_groups.<name>] channel`), and a reference to it held in the
-        // typed config would otherwise be written straight back.
-        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
 
         // sync_table preserves existing decor verbatim, so newly inserted
         // sections lack the blank-line gap before their header until the
