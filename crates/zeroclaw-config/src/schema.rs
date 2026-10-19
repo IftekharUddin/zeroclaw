@@ -26574,13 +26574,11 @@ pub async fn keep_pre_upgrade_backup(config_path: &Path, version: u32) -> Result
 fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
     for notice in retired {
         let path = match notice {
-            crate::migration::MigrationNotice::Removed { path, .. }
-            | crate::migration::MigrationNotice::ReferenceRemoved { path, .. } => path.as_str(),
+            crate::migration::MigrationNotice::Removed { path, .. } => path.as_str(),
             crate::migration::MigrationNotice::Renamed { from, .. }
             | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
             crate::migration::MigrationNotice::AssumedV1
             | crate::migration::MigrationNotice::InferredV3
-            | crate::migration::MigrationNotice::ReferenceKept { .. }
             | crate::migration::MigrationNotice::IgnoredEnvOverride { .. } => continue,
         };
         ::zeroclaw_log::record!(
@@ -43127,101 +43125,148 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         );
     }
 
-    /// A typed config still holding references to a retired channel type, as
-    /// an in-process edit could restore them after load removed them: a
-    /// `notion.work` entry in an agent's channel list beside a live telegram
-    /// one, and a peer group bound to it beside one bound to telegram. The
-    /// typed fields accept any channel reference, so only the save can drop
-    /// them.
-    fn config_with_retired_channel_references(config_path: std::path::PathBuf) -> Config {
+    /// A typed config whose agent, escalation and peer group name the `notion`
+    /// channel, which the top-level `[notion]` poller registers. Retiring the
+    /// never-read `[channels.notion]` table must not touch these references.
+    fn config_with_notion_poller_references(config_path: std::path::PathBuf) -> Config {
         let mut config: Config = toml::from_str(
             r#"schema_version = 4
+
+[notion]
+enabled = true
 
 [channels.telegram.main]
 bot_token = "telegram-token"
 
 [agents.default]
-channels = ["notion.work", "telegram.main"]
+channels = ["notion", "telegram.main"]
+
+[escalation]
+alert_channels = ["notion"]
 
 [peer_groups.notion_team]
-channel = "notion.work"
-
-[peer_groups.telegram_team]
-channel = "telegram.main"
+channel = "notion"
 "#,
         )
-        .expect("the typed fields accept a retired channel reference");
+        .expect("the poller references load");
         config.config_path = config_path;
         config
     }
 
-    /// The agent's retired channel entry is gone from the written file and
-    /// its reload; the peer group bound to it is a hard reference and is
-    /// kept for the operator; the live telegram references stay.
-    fn assert_retired_channel_references_gone(written: &str) {
+    /// Every `notion` reference is still in the written file and its reload.
+    fn assert_notion_poller_references_kept(written: &str) {
         let on_disk: toml::Value = toml::from_str(written).unwrap();
         assert_eq!(
             on_disk["agents"]["default"]["channels"],
-            toml::Value::Array(vec!["telegram.main".into()]),
+            toml::Value::Array(vec!["notion".into(), "telegram.main".into()]),
             "got:\n{written}"
         );
-        assert!(written.contains("telegram_team"), "got:\n{written}");
+        assert_eq!(
+            on_disk["escalation"]["alert_channels"],
+            toml::Value::Array(vec!["notion".into()]),
+            "got:\n{written}"
+        );
+        assert_eq!(
+            on_disk["peer_groups"]["notion_team"]["channel"].as_str(),
+            Some("notion"),
+            "got:\n{written}"
+        );
+        assert!(!written.contains("NOTION-SENTINEL"), "got:\n{written}");
         let reloaded =
             crate::migration::migrate_to_current(written).expect("the written file loads");
         assert_eq!(
             reloaded.agents["default"].channels,
-            vec![crate::providers::ChannelRef::new("telegram.main")]
+            vec![
+                crate::providers::ChannelRef::new("notion"),
+                crate::providers::ChannelRef::new("telegram.main"),
+            ]
         );
+        assert_eq!(reloaded.escalation.alert_channels, vec!["notion".to_string()]);
         assert!(reloaded.peer_groups.contains_key("notion_team"));
-        assert!(reloaded.peer_groups.contains_key("telegram_team"));
     }
 
-    #[test]
-    async fn save_removes_retired_channel_references_from_a_new_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        let config = config_with_retired_channel_references(config_path.clone());
-        config.save().await.unwrap();
-        assert_retired_channel_references_gone(&std::fs::read_to_string(&config_path).unwrap());
-    }
-
-    #[test]
-    async fn save_removes_retired_channel_references_from_an_existing_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_path = tmp.path().join("config.toml");
+    /// An existing current file holding the never-read `[channels.notion]`
+    /// table next to the poller references.
+    fn write_file_with_unread_notion_table(config_path: &std::path::Path) {
         std::fs::write(
-            &config_path,
+            config_path,
             format!(
                 "schema_version = {}\n\n# Operator note that must survive the save.\n\
-                 [channels.telegram.main]\nbot_token = \"telegram-token\"\n",
+                 [notion]\nenabled = true\n\n\
+                 [channels.notion.main]\ntoken = \"NOTION-SENTINEL\"\n\n\
+                 [channels.telegram.main]\nbot_token = \"telegram-token\"\n\n\
+                 [agents.default]\nchannels = [\"notion\", \"telegram.main\"]\n\n\
+                 [escalation]\nalert_channels = [\"notion\"]\n\n\
+                 [peer_groups.notion_team]\nchannel = \"notion\"\n",
                 crate::migration::CURRENT_SCHEMA_VERSION
             ),
         )
         .unwrap();
-        let config = config_with_retired_channel_references(config_path.clone());
+    }
+
+    #[test]
+    async fn save_keeps_notion_poller_references_in_a_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let config = config_with_notion_poller_references(config_path.clone());
+        config.save().await.unwrap();
+        assert_notion_poller_references_kept(&std::fs::read_to_string(&config_path).unwrap());
+    }
+
+    #[test]
+    async fn save_keeps_notion_poller_references_in_an_existing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        write_file_with_unread_notion_table(&config_path);
+        let mut config = config_with_notion_poller_references(config_path.clone());
+        config.loaded_from = Some(config_path.clone());
         config.save().await.unwrap();
         let written = std::fs::read_to_string(&config_path).unwrap();
         assert!(
             written.contains("# Operator note that must survive the save."),
             "got:\n{written}"
         );
-        assert_retired_channel_references_gone(&written);
+        assert_notion_poller_references_kept(&written);
     }
 
     #[test]
-    async fn save_dirty_on_a_missing_file_removes_retired_channel_references() {
-        // With no file yet, `save_dirty` falls back to a full save, which must
-        // apply the same retirement pass.
+    async fn save_dirty_keeps_notion_poller_references_on_an_unrelated_edit() {
+        // The incremental save is what a dashboard or CLI edit runs: it must
+        // drop the never-read table but leave the agent, escalation and peer
+        // group bound to the poller.
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
-        let mut config = config_with_retired_channel_references(config_path.clone());
+        write_file_with_unread_notion_table(&config_path);
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let mut config = crate::migration::migrate_to_current(&raw).expect("the file loads");
+        config.config_path = config_path.clone();
+        config.loaded_from = Some(config_path.clone());
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("backend = \"otel\""), "got:\n{written}");
+        assert!(
+            written.contains("# Operator note that must survive the save."),
+            "got:\n{written}"
+        );
+        assert_notion_poller_references_kept(&written);
+    }
+
+    #[test]
+    async fn save_dirty_on_a_missing_file_keeps_notion_poller_references() {
+        // With no file yet, `save_dirty` falls back to a full save, which
+        // applies the same retirement pass.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut config = config_with_notion_poller_references(config_path.clone());
         config.mark_dirty("agents.default.channels");
         config.save_dirty().await.unwrap();
         assert!(
             config.dirty_paths.is_empty(),
             "a successful save clears the dirty set"
         );
-        assert_retired_channel_references_gone(&std::fs::read_to_string(&config_path).unwrap());
+        assert_notion_poller_references_kept(&std::fs::read_to_string(&config_path).unwrap());
     }
 
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and

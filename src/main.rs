@@ -147,36 +147,6 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
             &[("key", key), ("path", path), ("reason", reason)],
             format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
         ),
-        MigrationNotice::ReferenceRemoved {
-            path: key,
-            reference,
-            reason,
-        } => ta(
-            "cli-config-retired-reference-removed",
-            &[
-                ("reference", reference),
-                ("key", key),
-                ("path", path),
-                ("reason", reason),
-            ],
-            format!("warning: removed `{reference}` from `{key}` in {path}: {reason}"),
-        ),
-        MigrationNotice::ReferenceKept {
-            path: key,
-            reference,
-            reason,
-        } => ta(
-            "cli-config-retired-reference-kept",
-            &[
-                ("reference", reference),
-                ("key", key),
-                ("path", path),
-                ("reason", reason),
-            ],
-            format!(
-                "warning: kept `{reference}` in `{key}` in {path} although its channel is retired: {reason}"
-            ),
-        ),
         MigrationNotice::IgnoredEnvOverride { variable, reason } => ta(
             "cli-config-env-override-retired",
             &[("variable", variable), ("reason", reason)],
