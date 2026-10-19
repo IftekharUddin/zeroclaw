@@ -44216,7 +44216,7 @@ channel = "notion"
                     .and_then(|v| v.as_str())
                     == Some(test_case)
                     && event
-                        .pointer("/attributes/notice/kind")
+                        .pointer("/attributes/saved_notice/kind")
                         .and_then(|v| v.as_str())
                         == Some("assumed_v1")
                 {

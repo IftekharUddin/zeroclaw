@@ -6467,6 +6467,12 @@ mention_only = false
                 PropKind::Float => current
                     .parse::<f64>()
                     .map_or_else(|_| "1.5".to_string(), |x| (x + 0.5).to_string()),
+                // A provider reference is current content only in the dotted
+                // `<family>.<alias>` form; a bare one is the form the older
+                // layouts' migration completes.
+                PropKind::String if field.name.ends_with("provider") => {
+                    "probe.default".to_string()
+                }
                 PropKind::String if current.is_empty() => "probe".to_string(),
                 PropKind::String => format!("{current}-probe"),
                 PropKind::Enum => {
@@ -7180,7 +7186,12 @@ mention_only = false
                         !readings_differ(&file).is_empty(),
                         "{path} is refused although both readings agree: {err}"
                     );
-                    assert!(err.to_string().contains(path), "{path}: {err}");
+                    // It names the key, or the agent table holding it.
+                    let table: Vec<&str> = path.split('.').take(2).collect();
+                    assert!(
+                        err.to_string().contains(&table.join(".")),
+                        "{path}: {err}"
+                    );
                 }
             }
         }
