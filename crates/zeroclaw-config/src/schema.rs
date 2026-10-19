@@ -43543,7 +43543,11 @@ channel = "notion"
     /// leave a complete copy of it, or refuse.
     #[test]
     async fn v4_review_r2_existing_partial_backup_cannot_authorize_save() {
-        for partial in ["", "schema_version = 2\n", "schema_version = 2\n\n[identity\n"] {
+        for partial in [
+            "",
+            "schema_version = 2\n",
+            "schema_version = 2\n\n[identity\n",
+        ] {
             for route in ["save_dirty", "save", "migrate"] {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let config_path = tmp.path().join("config.toml");
@@ -43595,14 +43599,18 @@ channel = "notion"
         // HOME, which other tests change while this one runs.
         let as_value = |config: &Config| {
             let value = toml::Value::try_from(config).unwrap();
-            (value.get("providers").cloned(), value.get("agents").cloned())
+            (
+                value.get("providers").cloned(),
+                value.get("agents").cloned(),
+            )
         };
         for raw in [
             "model_provider = \"ollama\"\nmodel = \"llama3\"\n",
             "default_provider = \"ollama\"\nmodel = \"llama3\"\n",
         ] {
-            let control = crate::migration::migrate_to_current(&format!("schema_version = 1\n{raw}"))
-                .expect("the file stated as V1 loads");
+            let control =
+                crate::migration::migrate_to_current(&format!("schema_version = 1\n{raw}"))
+                    .expect("the file stated as V1 loads");
             let strict = crate::migration::migrate_to_current(raw)
                 .unwrap_or_else(|err| panic!("{raw}: strict load failed: {err:#}"));
             assert_eq!(as_value(&strict), as_value(&control), "{raw}");
@@ -43619,9 +43627,10 @@ channel = "notion"
             std::fs::write(&config_path, raw).unwrap();
             crate::migration::migrate_file_in_place(&config_path)
                 .unwrap_or_else(|err| panic!("{raw}: migrate failed: {err:#}"));
-            let migrated =
-                crate::migration::migrate_to_current(&std::fs::read_to_string(&config_path).unwrap())
-                    .unwrap();
+            let migrated = crate::migration::migrate_to_current(
+                &std::fs::read_to_string(&config_path).unwrap(),
+            )
+            .unwrap();
             assert_eq!(as_value(&migrated), as_value(&control), "{raw}: migrate");
 
             let mut expected = control.clone();
@@ -43644,7 +43653,11 @@ channel = "notion"
                     &std::fs::read_to_string(&config_path).unwrap(),
                 )
                 .unwrap();
-                assert_eq!(as_value(&reloaded), as_value(&expected), "{raw}: full={full}");
+                assert_eq!(
+                    as_value(&reloaded),
+                    as_value(&expected),
+                    "{raw}: full={full}"
+                );
                 assert_eq!(
                     reloaded.observability.backend,
                     ObservabilityBackend::Otel,

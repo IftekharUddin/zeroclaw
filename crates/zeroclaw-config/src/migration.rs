@@ -1746,9 +1746,7 @@ fn publish_version_backup(config_path: &Path, target: &Path, original: &[u8]) ->
             }
         }
     };
-    if published
-        && let Some(parent) = target.parent().filter(|dir| !dir.as_os_str().is_empty())
-    {
+    if published && let Some(parent) = target.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         sync_directory(parent).with_context(failed)?;
     }
     Ok(published)
@@ -2288,7 +2286,8 @@ mod tests {
         let dirs = NO_HARD_LINKS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        link.parent().is_some_and(|dir| dirs.iter().any(|d| d == dir))
+        link.parent()
+            .is_some_and(|dir| dirs.iter().any(|d| d == dir))
     }
 
     fn set_no_hard_links(dir: &Path, on: bool) {
