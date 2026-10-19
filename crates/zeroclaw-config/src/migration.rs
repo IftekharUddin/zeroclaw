@@ -442,7 +442,9 @@ const V2_CRON_KNOBS: &[&str] = &["enabled", "catch_up_on_startup", "max_run_hist
 /// Evidence of the V3 layout:
 /// - an alias-keyed section, `providers.models.<family>` or `channels.<type>`,
 ///   meaning a table whose every value is a table
-///   (`[providers.models.ollama.default]`, `[channels.discord.work]`);
+///   (`[providers.models.ollama.default]`, `[channels.discord.work]`), or a
+///   child table of such a section that is no field of a V2 entry, even beside
+///   flat fields;
 /// - a declarative cron job, a table under `[cron]` (`[cron.nightly]`).
 ///
 /// Evidence of an older layout:
@@ -510,6 +512,16 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             // A field held directly on the section: the V2 shape.
             legacy
                 .get_or_insert_with(|| format!("`[{path}]` holds fields directly, the V2 layout"));
+            // A child table that is no field of the V2 entry is a V3 alias
+            // beside those fields: both layouts in one section. Map-valued V2
+            // fields such as `extra_headers` are fields, not aliases.
+            let fields = keys_read_as_v2_entry_fields(entry_kind, name, section);
+            if let Some((alias, _)) = section
+                .iter()
+                .find(|(key, value)| value.is_table() && !fields.contains(*key))
+            {
+                current.get_or_insert_with(|| format!("`[{path}.{alias}]` is a V3 alias"));
+            }
             continue;
         }
         current.get_or_insert_with(|| format!("`[{path}]` is in the V3 layout"));
