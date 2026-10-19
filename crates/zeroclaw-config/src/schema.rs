@@ -26371,6 +26371,7 @@ impl Config {
                 config_path.display()
             )
         })?;
+        let mut migrated = Vec::new();
         if prepare_on_disk_config_for_save(&config_path, &existing).await?
             == OnDiskConfig::NeedsStructuralMigration
         {
@@ -26381,8 +26382,11 @@ impl Config {
             // on disk through the typed chain, then edit the result. Writing
             // the running config whole instead would drop what another
             // handle saved since this config was loaded.
-            if let Some(migrated) = crate::migration::migrate_file(&existing)? {
-                existing = migrated;
+            if let Some((rewritten, notices)) =
+                crate::migration::migrate_file_with_notices(&existing)?
+            {
+                existing = rewritten;
+                migrated = notices;
             }
         }
 
@@ -26469,6 +26473,7 @@ impl Config {
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
         write_config_atomically(&config_path, &toml_str).await?;
+        log_migration_saved(&migrated);
         log_retirements_saved(&retired);
         self.clear_dirty();
         Ok(())
@@ -26561,6 +26566,21 @@ pub async fn keep_pre_upgrade_backup(config_path: &Path, version: u32) -> Result
         );
     }
     Ok(())
+}
+
+/// Log what the structural migration of an older file changed, when an
+/// incremental save carried the file through it. Called only once the file
+/// is durably replaced, like [`log_retirements_saved`].
+fn log_migration_saved(notices: &[crate::migration::MigrationNotice]) {
+    for notice in notices {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({ "saved_notice": notice })),
+            &format!("Updated config.toml on save: {}", notice.message())
+        );
+    }
 }
 
 /// Log each retired key a save removed from `config.toml`. Called only once
