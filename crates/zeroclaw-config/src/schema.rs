@@ -43315,6 +43315,158 @@ channel = "notion"
         assert_notion_poller_references_kept(&std::fs::read_to_string(&config_path).unwrap());
     }
 
+    /// A current-format file with only a declarative cron job and no
+    /// `schema_version`.
+    const UNVERSIONED_CRON: &str = "[cron.nightly]\ncommand = \"echo keep\"\n\
+        schedule = { kind = \"cron\", expr = \"0 0 * * *\" }\n";
+
+    fn keeps_the_nightly_job(raw: &str) -> bool {
+        let Ok(value) = toml::from_str::<toml::Value>(raw) else {
+            return false;
+        };
+        let job = &value["cron"]["nightly"];
+        job.get("command").and_then(toml::Value::as_str) == Some("echo keep")
+            && job
+                .get("schedule")
+                .and_then(|schedule| schedule.get("expr"))
+                .and_then(toml::Value::as_str)
+                == Some("0 0 * * *")
+    }
+
+    /// Reading that file as V1 would drop the job. Every path must keep it or
+    /// refuse with the file untouched.
+    #[test]
+    async fn v4_review_unversioned_cron_is_preserved_or_refused() {
+        let stated = crate::migration::migrate_to_current(&format!(
+            "schema_version = {}\n{UNVERSIONED_CRON}",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        ))
+        .expect("with its version stated the job loads");
+        assert_eq!(stated.cron["nightly"].command.as_deref(), Some("echo keep"));
+
+        match crate::migration::migrate_file_with_notices(UNVERSIONED_CRON) {
+            Ok(Some((migrated, _))) => assert!(keeps_the_nightly_job(&migrated), "{migrated}"),
+            Ok(None) | Err(_) => {}
+        }
+
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, UNVERSIONED_CRON).unwrap();
+            let mut config = crate::migration::migrate_to_current_salvaged(UNVERSIONED_CRON).config;
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            let saved = if full {
+                config.save().await
+            } else {
+                config.save_dirty().await
+            };
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            match saved {
+                Ok(()) => assert!(
+                    keeps_the_nightly_job(&written),
+                    "full={full}: the job was lost; got:\n{written}"
+                ),
+                Err(_) => assert_eq!(written, UNVERSIONED_CRON, "full={full}"),
+            }
+        }
+    }
+
+    /// Something that is not a finished copy at the pre-upgrade backup path
+    /// must stop a save that would rewrite the original.
+    #[test]
+    async fn v4_review_version_backup_directory_blocks_save() {
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, V2_FILE_WITH_STRUCTURAL_INPUTS).unwrap();
+            std::fs::create_dir(tmp.path().join("config.toml.v2.backup")).unwrap();
+            let mut config = crate::migration::migrate_to_current(V2_FILE_WITH_STRUCTURAL_INPUTS)
+                .expect("the V2 file loads, migrated in memory");
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            let dirty = config.dirty_paths.clone();
+            let saved = if full {
+                config.save().await
+            } else {
+                config.save_dirty().await
+            };
+            assert!(saved.is_err(), "full={full}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap(),
+                V2_FILE_WITH_STRUCTURAL_INPUTS,
+                "full={full}"
+            );
+            assert_eq!(config.dirty_paths, dirty, "full={full}");
+        }
+    }
+
+    /// A retired table another handle wrote after this config loaded is
+    /// removed by a full save, which reports it once, after the replace.
+    #[test]
+    async fn v4_review_full_save_reports_disk_retirements() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let current = format!(
+            "schema_version = {}\n\n[observability]\nbackend = \"none\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &current).unwrap();
+        let mut config = crate::migration::migrate_to_current(&current).unwrap();
+        config.config_path = config_path.clone();
+        config.loaded_from = Some(config_path.clone());
+        let appended =
+            format!("{current}\n[security.nevis]\nclient_secret = \"retired-test-sentinel\"\n");
+        std::fs::write(&config_path, &appended).unwrap();
+
+        let mut rx = capture_log_events();
+        let test_case = "v4-review-full-save-retirement";
+        let retirement_events = |rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>| {
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event
+                    .pointer("/attributes/test_case")
+                    .and_then(|v| v.as_str())
+                    == Some(test_case)
+                    && event
+                        .pointer("/attributes/retired_config")
+                        .and_then(|v| v.as_str())
+                        == Some("security.nevis")
+                {
+                    events.push(event);
+                }
+            }
+            events
+        };
+
+        // A directory blocks the pre-commit backup copy, so the replace fails.
+        let backup_path = tmp.path().join("config.toml.bak");
+        std::fs::create_dir(&backup_path).unwrap();
+        let blocked = ::zeroclaw_log::scope!(test_case: test_case, => config.save()).await;
+        assert!(blocked.is_err());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), appended);
+        assert!(
+            retirement_events(&mut rx).is_empty(),
+            "a failed replace must not report the removal"
+        );
+
+        std::fs::remove_dir(backup_path).unwrap();
+        ::zeroclaw_log::scope!(test_case: test_case, => config.save())
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("retired-test-sentinel"), "{written}");
+        assert_eq!(
+            retirement_events(&mut rx).len(),
+            1,
+            "the removal is reported once"
+        );
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.

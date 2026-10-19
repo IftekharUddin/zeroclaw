@@ -1505,6 +1505,8 @@ pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<st
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
         Err(err) => return Err(anyhow::Error::from(err)).with_context(failed),
     };
+    #[cfg(test)]
+    tests::run_version_backup_hook(config_path);
     if let Err(err) = std::io::copy(&mut source, &mut copy).and_then(|_| copy.sync_all()) {
         // A partial copy would be kept forever in place of the original.
         drop(copy);
@@ -1999,6 +2001,163 @@ pub(crate) fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test-only stand-in for a crash or a second writer inside
+    /// `keep_version_backup`, once its file exists and before the copy is
+    /// complete. Keyed by the config's directory so other tests are unaffected.
+    type BackupHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+    static VERSION_BACKUP_HOOK: std::sync::Mutex<Option<(std::path::PathBuf, BackupHook)>> =
+        std::sync::Mutex::new(None);
+    /// Serializes the tests that install the hook.
+    static VERSION_BACKUP_HOOK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn run_version_backup_hook(config_path: &Path) {
+        let hook = VERSION_BACKUP_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(dir, _)| config_path.parent() == Some(dir.as_path()))
+            .map(|(_, hook)| hook.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn set_version_backup_hook(dir: &Path, hook: Option<BackupHook>) {
+        *VERSION_BACKUP_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            hook.map(|hook| (dir.to_path_buf(), hook));
+    }
+
+    const V2_BACKUP_ORIGINAL: &str =
+        "schema_version = 2\n\n[identity]\nformat = \"openclaw\"\n\n[gateway]\nport = 42617\n";
+
+    /// A process killed while the pre-upgrade copy is being written must not
+    /// leave something a later run takes for the finished copy.
+    #[test]
+    fn v4_review_interrupted_version_backup_cannot_authorize_rewrite() {
+        let _serial = VERSION_BACKUP_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, V2_BACKUP_ORIGINAL).unwrap();
+
+        fn crash() {
+            panic!("simulated crash mid-backup");
+        }
+        set_version_backup_hook(dir.path(), Some(std::sync::Arc::new(crash) as BackupHook));
+        let crashed = std::panic::catch_unwind(|| migrate_file_in_place(&path));
+        set_version_backup_hook(dir.path(), None);
+        assert!(crashed.is_err(), "the failpoint must fire");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            V2_BACKUP_ORIGINAL,
+            "nothing is rewritten before the copy is kept"
+        );
+
+        let retried = migrate_file_in_place(&path);
+        let backup = version_backup_path(&path, 2).unwrap();
+        match retried {
+            Ok(_) => assert_eq!(
+                std::fs::read_to_string(&backup).unwrap(),
+                V2_BACKUP_ORIGINAL,
+                "a retry that rewrites the file must leave a complete original"
+            ),
+            Err(_) => assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_BACKUP_ORIGINAL),
+        }
+    }
+
+    /// A second writer must not take another writer's unfinished copy for a
+    /// kept original.
+    #[test]
+    fn v4_review_concurrent_version_backup_waits_for_a_complete_copy() {
+        let _serial = VERSION_BACKUP_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, V2_BACKUP_ORIGINAL).unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let reached_tx = std::sync::Mutex::new(Some(reached_tx));
+        let go_rx = std::sync::Mutex::new(go_rx);
+        set_version_backup_hook(
+            dir.path(),
+            Some(std::sync::Arc::new(move || {
+                // Only the first writer pauses. Take the sender in its own
+                // statement so the lock is released before it blocks.
+                let first = reached_tx.lock().unwrap().take();
+                if let Some(tx) = first {
+                    tx.send(()).unwrap();
+                    let _ = go_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(30));
+                }
+            }) as BackupHook),
+        );
+        let first = {
+            let path = path.clone();
+            std::thread::spawn(move || keep_version_backup(&path, 2))
+        };
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the first writer reaches the failpoint");
+        let second = keep_version_backup(&path, 2);
+        let backup = version_backup_path(&path, 2).unwrap();
+        let seen_by_second = std::fs::read_to_string(&backup).unwrap_or_default();
+        go_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        set_version_backup_hook(dir.path(), None);
+
+        assert!(second.is_ok(), "{second:?}");
+        assert_eq!(
+            seen_by_second, V2_BACKUP_ORIGINAL,
+            "when the second writer returns, the kept original must be complete"
+        );
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), V2_BACKUP_ORIGINAL);
+    }
+
+    /// Unversioned files whose sections mix the V3 layout with older ones are
+    /// refused rather than read as V1, which would reshape the V3 sections.
+    #[test]
+    fn v4_review_mixed_unversioned_shapes_are_refused() {
+        for raw in [
+            format!("default_model = \"legacy\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}"),
+            format!("{HAND_WRITTEN_V3_WITHOUT_VERSION}\n[swarms.old]\nstrategy = \"sequential\"\n"),
+            "[providers.models.openai.work]\nmodel = \"gpt-4o\"\n\n[channels.discord]\nbot_token = \"t\"\n"
+                .to_string(),
+        ] {
+            let v: toml::Value = toml::from_str(&raw).unwrap();
+            assert!(detect_version(&v).is_err(), "{raw}");
+            assert!(migrate_file_with_notices(&raw).is_err(), "{raw}");
+            let dir = setup_temp_config_dir();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &raw).unwrap();
+            assert!(migrate_file_in_place(&path).is_err(), "{raw}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+    }
+
+    /// The parsed-value and document appliers report the same removals in the
+    /// same order, whatever order the aliases appear in the file.
+    #[test]
+    fn v4_review_appliers_agree_on_order() {
+        let raw = "schema_version = 4\n\n[agents.z]\ncompact_context = true\n\n[agents.a]\ncompact_context = true\n";
+        let mut value: toml::Value = toml::from_str(raw).unwrap();
+        let mut value_notices = Vec::new();
+        for version in 2..=CURRENT_SCHEMA_VERSION {
+            apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut value_notices);
+        }
+        let (out, doc_notices) = apply_doc(raw);
+        assert_eq!(value_notices, doc_notices);
+        let from_doc: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(value, from_doc);
+    }
 
     // Existing-document compatibility and explicit selector intent.
     #[test]
@@ -4741,6 +4900,12 @@ mention_only = false
             format!("[cron.nightly]\nschedule = \"0 0 * * *\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
         let v: toml::Value = toml::from_str(&raw).unwrap();
         assert_eq!(detect_version(&v).unwrap(), INFERRED_SCHEMA_VERSION);
+
+        // A declarative job is V3 evidence on its own, without provider or
+        // channel sections beside it.
+        let raw = "[cron.nightly]\ncommand = \"echo keep\"\nschedule = { kind = \"cron\", expr = \"0 0 * * *\" }\n";
+        let v: toml::Value = toml::from_str(raw).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), INFERRED_SCHEMA_VERSION);
     }
 
     #[test]
@@ -5373,8 +5538,9 @@ summary_model = "opus"
 
     #[test]
     fn a_wildcard_retirement_keeps_each_alias() {
+        // `z` before `a`: the file's order is not the sorted order.
         let raw =
-            "[bots.a]\nold_limit = 1\n\n[bots.b]\nold_limit = 2\n\n[bots.b.limits]\nmax = 9\n";
+            "[bots.z]\nold_limit = 1\n\n[bots.a]\nold_limit = 2\n\n[bots.a.limits]\nmax = 9\n";
         let (value, notices) = apply(raw, 7);
         let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
         let mut doc_notices = Vec::new();
@@ -5387,11 +5553,11 @@ summary_model = "opus"
         let from_doc: toml::Value = toml::from_str(&doc.to_string()).unwrap();
         for value in [&value, &from_doc] {
             assert!(
-                value["bots"]["a"].as_table().unwrap().is_empty(),
+                value["bots"]["z"].as_table().unwrap().is_empty(),
                 "an alias emptied by a retirement is kept"
             );
-            assert!(value["bots"]["b"].get("old_limit").is_none());
-            assert_eq!(value["bots"]["b"]["limits"]["max"].as_integer(), Some(9));
+            assert!(value["bots"]["a"].get("old_limit").is_none());
+            assert_eq!(value["bots"]["a"]["limits"]["max"].as_integer(), Some(9));
         }
     }
 
