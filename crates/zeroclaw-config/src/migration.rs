@@ -586,10 +586,9 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             // A child table that is not a field of the V2 entry, with what it
             // holds, is a V3 alias beside those fields: both layouts in one
             // section.
-            if let Some((alias, _)) = section
-                .iter()
-                .find(|(key, value)| value.is_table() && !holds_a_v2_field(entry_kind, name, section, key))
-            {
+            if let Some((alias, _)) = section.iter().find(|(key, value)| {
+                value.is_table() && !holds_a_v2_field(entry_kind, name, section, key)
+            }) {
                 current.get_or_insert_with(|| format!("`[{path}.{alias}]` is a V3 alias"));
             }
             continue;
@@ -1701,8 +1700,7 @@ pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<st
         };
         match hard_link_for_backup(&copy.path, &candidate) {
             Ok(()) => {
-                sync_parent(&candidate)
-                    .with_context(|| backup_failed(config_path, &candidate))?;
+                sync_parent(&candidate).with_context(|| backup_failed(config_path, &candidate))?;
                 return Ok(Some(candidate));
             }
             // Another writer published here first. Its copy is complete:
@@ -2758,10 +2756,7 @@ mod tests {
                  writers; got {:?}",
                 kept_v2_copies(dir.path())
             ),
-            Err(_) => assert_eq!(
-                std::fs::read_to_string(&path).unwrap(),
-                V2_BACKUP_ORIGINAL
-            ),
+            Err(_) => assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_BACKUP_ORIGINAL),
         }
     }
 
@@ -2795,10 +2790,7 @@ mod tests {
                 "a save after the crash must leave a complete original; got {:?}",
                 kept_v2_copies(dir.path())
             ),
-            Err(_) => assert_eq!(
-                std::fs::read_to_string(&path).unwrap(),
-                V2_BACKUP_ORIGINAL
-            ),
+            Err(_) => assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_BACKUP_ORIGINAL),
         }
     }
 
@@ -5824,7 +5816,12 @@ mention_only = false
         }
 
         let some = || Some(toml::Value::String("x".into()));
-        let table = || toml::Value::Table(toml::Table::from_iter([("k".to_string(), toml::Value::String("x".into()))]));
+        let table = || {
+            toml::Value::Table(toml::Table::from_iter([(
+                "k".to_string(),
+                toml::Value::String("x".into()),
+            )]))
+        };
         let every_v1_setting = V1Config {
             api_key: some(),
             api_url: some(),
@@ -5835,7 +5832,10 @@ mention_only = false
             default_temperature: some(),
             provider_timeout_secs: some(),
             provider_max_tokens: some(),
-            extra_headers: std::collections::HashMap::from([("X".to_string(), toml::Value::String("x".into()))]),
+            extra_headers: std::collections::HashMap::from([(
+                "X".to_string(),
+                toml::Value::String("x".into()),
+            )]),
             model_routes: vec![table()],
             embedding_routes: vec![table()],
             channels_config: Some(table()),
@@ -5853,7 +5853,10 @@ mention_only = false
             let value: toml::Value = toml::from_str(&format!("{alias} = \"x\"\n")).unwrap();
             let v1: V1Config = value.try_into().unwrap();
             assert!(v1.passthrough.is_empty(), "`{alias}` is not a V1Config key");
-            assert!(top_level.contains(&alias), "`{alias}` is not in the catalog");
+            assert!(
+                top_level.contains(&alias),
+                "`{alias}` is not in the catalog"
+            );
         }
     }
 
@@ -5862,12 +5865,19 @@ mention_only = false
     /// are the V2 cron knobs and V2-only agent keys.
     #[test]
     fn every_legacy_layout_path_has_an_example() {
-        let examples: Vec<&str> = LEGACY_LAYOUT_EXAMPLES.iter().map(|(path, _)| *path).collect();
+        let examples: Vec<&str> = LEGACY_LAYOUT_EXAMPLES
+            .iter()
+            .map(|(path, _)| *path)
+            .collect();
         let required = LEGACY_LAYOUT_PATHS
             .iter()
             .map(|path| path.join("."))
             .chain(V2_CRON_KNOBS.iter().map(|knob| format!("cron.{knob}")))
-            .chain(V2_ONLY_AGENT_KEYS.iter().map(|key| format!("agents.coder.{key}")));
+            .chain(
+                V2_ONLY_AGENT_KEYS
+                    .iter()
+                    .map(|key| format!("agents.coder.{key}")),
+            );
         for path in required {
             assert!(examples.contains(&path.as_str()), "`{path}` has no example");
         }
@@ -5926,7 +5936,10 @@ mention_only = false
             "memory.qdrant",
             "[memory.qdrant]\nurl = \"http://localhost:6333\"\n",
         ),
-        ("memory.postgres", "[memory.postgres]\nvector_enabled = true\n"),
+        (
+            "memory.postgres",
+            "[memory.postgres]\nvector_enabled = true\n",
+        ),
         (
             "memory.sqlite_open_timeout_secs",
             "[memory]\nsqlite_open_timeout_secs = 5\n",
@@ -5941,11 +5954,20 @@ mention_only = false
             "[cost.prices.\"openai/gpt-4o\"]\ninput = 2.5\noutput = 10.0\n",
         ),
         ("tts.openai", "[tts.openai]\nvoice = \"alloy\"\n"),
-        ("tts.elevenlabs", "[tts.elevenlabs]\nmodel_id = \"eleven_v2\"\n"),
+        (
+            "tts.elevenlabs",
+            "[tts.elevenlabs]\nmodel_id = \"eleven_v2\"\n",
+        ),
         ("tts.google", "[tts.google]\nlanguage_code = \"en-US\"\n"),
         ("tts.edge", "[tts.edge]\nbinary_path = \"edge-tts\"\n"),
-        ("tts.piper", "[tts.piper]\napi_url = \"http://localhost:5000\"\n"),
-        ("tts.default_provider", "[tts]\ndefault_provider = \"openai\"\n"),
+        (
+            "tts.piper",
+            "[tts.piper]\napi_url = \"http://localhost:5000\"\n",
+        ),
+        (
+            "tts.default_provider",
+            "[tts]\ndefault_provider = \"openai\"\n",
+        ),
         (
             "transcription.default_provider",
             "[transcription]\ndefault_provider = \"groq\"\n",
@@ -5963,7 +5985,10 @@ mention_only = false
             "[gateway.pairing_dashboard]\ncode_length = 8\n",
         ),
         ("tunnel.provider", "[tunnel]\nprovider = \"cloudflare\"\n"),
-        ("web_search.provider", "[web_search]\nprovider = \"brave\"\n"),
+        (
+            "web_search.provider",
+            "[web_search]\nprovider = \"brave\"\n",
+        ),
         (
             "channels.discord_history",
             "[channels.discord_history]\nbot_token = \"t\"\n",
@@ -5979,13 +6004,19 @@ mention_only = false
             "providers.models.ollama",
             "[providers.models.ollama]\nmodel = \"llama3\"\n",
         ),
-        ("channels.discord", "[channels.discord]\nbot_token = \"t\"\n"),
+        (
+            "channels.discord",
+            "[channels.discord]\nbot_token = \"t\"\n",
+        ),
         (
             "cron.jobs",
             "[[cron.jobs]]\nname = \"nightly\"\ncommand = \"echo\"\nschedule = \"0 0 * * *\"\n",
         ),
         ("cron.enabled", "[cron]\nenabled = true\n"),
-        ("cron.catch_up_on_startup", "[cron]\ncatch_up_on_startup = true\n"),
+        (
+            "cron.catch_up_on_startup",
+            "[cron]\ncatch_up_on_startup = true\n",
+        ),
         ("cron.max_run_history", "[cron]\nmax_run_history = 10\n"),
         (
             "model_routes",
@@ -5996,10 +6027,19 @@ mention_only = false
             "[[embedding_routes]]\nhint = \"default\"\nprovider = \"openai\"\n\
              model = \"text-embedding-3-small\"\n",
         ),
-        ("agents.coder.provider", "[agents.coder]\nprovider = \"openai\"\n"),
+        (
+            "agents.coder.provider",
+            "[agents.coder]\nprovider = \"openai\"\n",
+        ),
         ("agents.coder.model", "[agents.coder]\nmodel = \"gpt-4o\"\n"),
-        ("agents.coder.api_key", "[agents.coder]\napi_key = \"sk-agent\"\n"),
-        ("agents.coder.temperature", "[agents.coder]\ntemperature = 0.3\n"),
+        (
+            "agents.coder.api_key",
+            "[agents.coder]\napi_key = \"sk-agent\"\n",
+        ),
+        (
+            "agents.coder.temperature",
+            "[agents.coder]\ntemperature = 0.3\n",
+        ),
         (
             "agents.coder.max_iterations",
             "[agents.coder]\nmax_iterations = 5\n",
@@ -6022,7 +6062,10 @@ mention_only = false
             "agents.coder.agentic_timeout_secs",
             "[agents.coder]\nagentic_timeout_secs = 60\n",
         ),
-        ("agents.coder.timeout_secs", "[agents.coder]\ntimeout_secs = 30\n"),
+        (
+            "agents.coder.timeout_secs",
+            "[agents.coder]\ntimeout_secs = 30\n",
+        ),
     ];
 
     /// A declarative cron job, the V3 layout, appended to a file.
@@ -6038,7 +6081,10 @@ mention_only = false
         for (path, raw) in LEGACY_LAYOUT_EXAMPLES {
             let value: toml::Value =
                 toml::from_str(raw).unwrap_or_else(|err| panic!("{path}: {err}"));
-            assert!(value_at(&value, path).is_some(), "{path}: not in its example");
+            assert!(
+                value_at(&value, path).is_some(),
+                "{path}: not in its example"
+            );
             assert_eq!(
                 detect_version(&value).ok(),
                 Some(1),
@@ -6047,7 +6093,9 @@ mention_only = false
 
             let mixed = format!("{raw}{V3_LAYOUT_PROBE}");
             let err = detect_version(&toml::from_str(&mixed).unwrap())
-                .expect_err(&format!("{path}: beside a V3 cron job the file mixes layouts"))
+                .expect_err(&format!(
+                    "{path}: beside a V3 cron job the file mixes layouts"
+                ))
                 .to_string();
             assert!(err.contains(path), "{path}: the refusal names it: {err}");
 
@@ -6094,7 +6142,9 @@ mention_only = false
             ),
             (
                 "r1: stale swarms beside V3 sections",
-                format!("{HAND_WRITTEN_V3_WITHOUT_VERSION}\n[swarms.old]\nstrategy = \"sequential\"\n"),
+                format!(
+                    "{HAND_WRITTEN_V3_WITHOUT_VERSION}\n[swarms.old]\nstrategy = \"sequential\"\n"
+                ),
                 Reading::Refused,
             ),
             (
@@ -6244,8 +6294,7 @@ mention_only = false
                 "{label}: refused on its own"
             );
         }
-        let mut fixture: toml::Table =
-            toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
         fixture.remove("schema_version");
         assert_eq!(
             detect_version(&toml::Value::Table(fixture)).ok(),
@@ -6343,11 +6392,13 @@ mention_only = false
                 continue;
             }
             let differ = readings_differ(&section);
-            assert!(differ.is_empty(), "{label}: the V1 reading differs at {differ:?}");
+            assert!(
+                differ.is_empty(),
+                "{label}: the V1 reading differs at {differ:?}"
+            );
         }
 
-        let mut fixture: toml::Table =
-            toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
         for key in ["schema_version", "tools", "cron"] {
             fixture.remove(key);
         }

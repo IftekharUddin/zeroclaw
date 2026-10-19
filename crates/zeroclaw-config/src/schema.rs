@@ -43690,8 +43690,8 @@ channel = "notion"
             crate::migration::detect_version(&toml::from_str(flat).unwrap()).unwrap(),
             1
         );
-        let control = toml::Value::try_from(crate::migration::migrate_to_current(flat).unwrap())
-            .unwrap();
+        let control =
+            toml::Value::try_from(crate::migration::migrate_to_current(flat).unwrap()).unwrap();
         assert_eq!(
             control["providers"]["models"]["openai"]["default"]["extra_headers"]["X-Trace"]
                 .as_str(),
@@ -43786,10 +43786,16 @@ channel = "notion"
     async fn v4_review_r3_legacy_storage_layout_still_loads() {
         // The storage the migration writes. Other defaults (data paths)
         // derive from HOME, which other tests change while this one runs.
-        let storage = |config: &Config| toml::Value::try_from(config).unwrap().get("storage").cloned();
-        let control =
-            crate::migration::migrate_to_current(&format!("schema_version = 1\n{LEGACY_STORAGE_LAYOUT}"))
-                .expect("the file stated as V1 loads");
+        let storage = |config: &Config| {
+            toml::Value::try_from(config)
+                .unwrap()
+                .get("storage")
+                .cloned()
+        };
+        let control = crate::migration::migrate_to_current(&format!(
+            "schema_version = 1\n{LEGACY_STORAGE_LAYOUT}"
+        ))
+        .expect("the file stated as V1 loads");
         let sqlite = control
             .storage
             .sqlite
@@ -43838,9 +43844,10 @@ channel = "notion"
             } else {
                 config.save_dirty().await.unwrap();
             }
-            let reloaded =
-                crate::migration::migrate_to_current(&std::fs::read_to_string(&config_path).unwrap())
-                    .unwrap();
+            let reloaded = crate::migration::migrate_to_current(
+                &std::fs::read_to_string(&config_path).unwrap(),
+            )
+            .unwrap();
             assert_eq!(storage(&reloaded), storage(&control), "full={full}");
             assert_eq!(
                 reloaded.observability.backend,
