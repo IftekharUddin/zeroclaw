@@ -43667,6 +43667,239 @@ channel = "notion"
         }
     }
 
+    /// A flat V2 profile with a child named like one of its map fields whose
+    /// content cannot be that field (a float header, a string price): a V3
+    /// alias beside V2 fields.
+    const MAP_NAMED_ALIASES: [&str; 2] = [
+        "[providers.models.openai]\nmodel = \"legacy-model\"\n\n\
+         [providers.models.openai.extra_headers]\nmodel = \"keep-model\"\ntemperature = 0.25\n",
+        "[providers.models.openai]\nmodel = \"legacy-model\"\n\n\
+         [providers.models.openai.pricing]\nmodel = \"keep-model\"\ntemperature = 0.25\n",
+    ];
+
+    /// Reading such a file as V1 moves the alias under `default` as a field
+    /// it cannot be, so every path refuses with the file and the dirty set
+    /// unchanged.
+    #[test]
+    async fn v4_review_r3_mixed_map_named_alias_is_refused() {
+        // Positive control: a genuine V2 header map keeps the V1 reading and
+        // its header.
+        let flat = "[providers.models.openai]\nmodel = \"gpt-4o\"\n\n\
+                    [providers.models.openai.extra_headers]\nX-Trace = \"keep\"\n";
+        assert_eq!(
+            crate::migration::detect_version(&toml::from_str(flat).unwrap()).unwrap(),
+            1
+        );
+        let control = toml::Value::try_from(crate::migration::migrate_to_current(flat).unwrap())
+            .unwrap();
+        assert_eq!(
+            control["providers"]["models"]["openai"]["default"]["extra_headers"]["X-Trace"]
+                .as_str(),
+            Some("keep")
+        );
+
+        for raw in MAP_NAMED_ALIASES {
+            // Without the stale flat field, and stated as V3, the child is a
+            // valid alias.
+            let alias = if raw.contains(".pricing]") {
+                "pricing"
+            } else {
+                "extra_headers"
+            };
+            let stated = format!(
+                "schema_version = 3\n{}",
+                raw.replacen("model = \"legacy-model\"\n", "", 1)
+            );
+            let stated = toml::Value::try_from(
+                crate::migration::migrate_to_current(&stated)
+                    .unwrap_or_else(|err| panic!("{stated}: {err:#}")),
+            )
+            .unwrap();
+            assert_eq!(
+                stated["providers"]["models"]["openai"][alias]["model"].as_str(),
+                Some("keep-model"),
+                "{alias}"
+            );
+
+            assert!(
+                crate::migration::detect_version(&toml::from_str(raw).unwrap()).is_err(),
+                "{raw}"
+            );
+            assert!(
+                crate::migration::migrate_file_with_notices(raw).is_err(),
+                "{raw}"
+            );
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, raw).unwrap();
+            assert!(
+                crate::migration::migrate_file_in_place(&config_path).is_err(),
+                "{raw}"
+            );
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), raw);
+            for full in [false, true] {
+                let mut config = crate::migration::migrate_to_current_salvaged(raw).config;
+                config.config_path = config_path.clone();
+                config.loaded_from = Some(config_path.clone());
+                config.observability.backend = ObservabilityBackend::Otel;
+                config.mark_dirty("observability.backend");
+                let dirty = config.dirty_paths.clone();
+                let saved = if full {
+                    config.save().await
+                } else {
+                    config.save_dirty().await
+                };
+                assert!(saved.is_err(), "full={full}: {raw}");
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    raw,
+                    "full={full}"
+                );
+                assert_eq!(config.dirty_paths, dirty, "full={full}");
+            }
+        }
+    }
+
+    /// The V2 storage layout, with no `schema_version`.
+    const LEGACY_STORAGE_LAYOUT: &str = "[storage.provider.config]\nprovider = \"sqlite\"\n\
+        db_url = \"sqlite:///tmp/review-memory.db\"\nconnect_timeout_secs = 17\n";
+
+    /// Every regular file kept as `config.toml.v1…backup`, any numbering.
+    fn kept_v1_copies(dir: &std::path::Path) -> Vec<String> {
+        let mut copies: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("config.toml.v1") && name.ends_with(".backup")
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect();
+        copies.sort();
+        copies
+    }
+
+    /// That layout is an older one the migration supports, so it loads,
+    /// strict and resilient, and migrates and saves exactly as the same file
+    /// stated as V1, keeping the original before the file is rewritten.
+    #[test]
+    async fn v4_review_r3_legacy_storage_layout_still_loads() {
+        // The storage the migration writes. Other defaults (data paths)
+        // derive from HOME, which other tests change while this one runs.
+        let storage = |config: &Config| toml::Value::try_from(config).unwrap().get("storage").cloned();
+        let control =
+            crate::migration::migrate_to_current(&format!("schema_version = 1\n{LEGACY_STORAGE_LAYOUT}"))
+                .expect("the file stated as V1 loads");
+        let sqlite = control
+            .storage
+            .sqlite
+            .get("default")
+            .expect("the V2 sqlite settings become the default sqlite store");
+        assert_eq!(sqlite.path.as_deref(), Some("/tmp/review-memory.db"));
+        assert_eq!(sqlite.open_timeout_secs, Some(17));
+
+        let strict = crate::migration::migrate_to_current(LEGACY_STORAGE_LAYOUT)
+            .unwrap_or_else(|err| panic!("strict load failed: {err:#}"));
+        assert_eq!(storage(&strict), storage(&control));
+        let resilient = crate::migration::migrate_to_current_salvaged(LEGACY_STORAGE_LAYOUT);
+        assert!(
+            resilient.dropped_security.is_empty(),
+            "{:?}",
+            resilient.dropped_security
+        );
+        assert_eq!(storage(&resilient.config), storage(&control));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, LEGACY_STORAGE_LAYOUT).unwrap();
+        crate::migration::migrate_file_in_place(&config_path)
+            .unwrap_or_else(|err| panic!("migrate failed: {err:#}"));
+        let migrated =
+            crate::migration::migrate_to_current(&std::fs::read_to_string(&config_path).unwrap())
+                .unwrap();
+        assert_eq!(storage(&migrated), storage(&control), "migrate");
+        assert!(
+            kept_v1_copies(tmp.path()).contains(&LEGACY_STORAGE_LAYOUT.to_string()),
+            "migrate keeps the original: {:?}",
+            kept_v1_copies(tmp.path())
+        );
+
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, LEGACY_STORAGE_LAYOUT).unwrap();
+            let mut config = crate::migration::migrate_to_current(LEGACY_STORAGE_LAYOUT).unwrap();
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            if full {
+                config.save().await.unwrap();
+            } else {
+                config.save_dirty().await.unwrap();
+            }
+            let reloaded =
+                crate::migration::migrate_to_current(&std::fs::read_to_string(&config_path).unwrap())
+                    .unwrap();
+            assert_eq!(storage(&reloaded), storage(&control), "full={full}");
+            assert_eq!(
+                reloaded.observability.backend,
+                ObservabilityBackend::Otel,
+                "full={full}: the edit is saved"
+            );
+            assert!(
+                kept_v1_copies(tmp.path()).contains(&LEGACY_STORAGE_LAYOUT.to_string()),
+                "full={full}: the original is kept: {:?}",
+                kept_v1_copies(tmp.path())
+            );
+        }
+    }
+
+    /// A kept copy can hold the secrets of keys the migration retires, so one
+    /// an older build left readable by others is made owner-only before it
+    /// counts as kept, or the rewrite is refused.
+    #[cfg(unix)]
+    #[test]
+    async fn v4_review_r3_reused_backup_is_made_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const V3_WITH_SECRET: &str =
+            "schema_version = 3\n\n[security.nevis]\nclient_secret = \"retired-test-sentinel\"\n";
+        for route in ["migrate", "save_dirty", "save"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, V3_WITH_SECRET).unwrap();
+            let backup = tmp.path().join("config.toml.v3.backup");
+            std::fs::write(&backup, V3_WITH_SECRET).unwrap();
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let outcome = if route == "migrate" {
+                crate::migration::migrate_file_in_place(&config_path).map(|_| ())
+            } else {
+                let mut config = crate::migration::migrate_to_current(V3_WITH_SECRET).unwrap();
+                config.config_path = config_path.clone();
+                config.loaded_from = Some(config_path.clone());
+                config.observability.backend = ObservabilityBackend::Otel;
+                config.mark_dirty("observability.backend");
+                if route == "save" {
+                    config.save().await
+                } else {
+                    config.save_dirty().await
+                }
+            };
+            match outcome {
+                Ok(()) => assert_eq!(
+                    std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{route}: the kept copy must be owner-only"
+                ),
+                Err(_) => assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    V3_WITH_SECRET,
+                    "{route}"
+                ),
+            }
+        }
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.

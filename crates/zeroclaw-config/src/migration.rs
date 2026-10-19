@@ -1733,7 +1733,22 @@ fn publish_version_backup(config_path: &Path, target: &Path, original: &[u8]) ->
             tests::run_version_backup_hook(config_path, tests::BackupStage::Publishing);
             match owner_only().open(target) {
                 Ok(mut direct) => {
-                    if let Err(err) = direct.write_all(original).and_then(|()| direct.sync_all()) {
+                    let committed = direct.write_all(original).and_then(|()| {
+                        #[cfg(test)]
+                        {
+                            tests::run_version_backup_hook(
+                                config_path,
+                                tests::BackupStage::FallbackWritten,
+                            );
+                            if tests::fallback_commit_fails() {
+                                return Err(std::io::Error::other(
+                                    "injected failure committing the fallback copy",
+                                ));
+                            }
+                        }
+                        direct.sync_all()
+                    });
+                    if let Err(err) = committed {
                         drop(direct);
                         // Ours and incomplete: remove it rather than leave it.
                         let _ = std::fs::remove_file(target);
@@ -2270,6 +2285,26 @@ mod tests {
         /// The copy is complete, hard-linking failed, and the fallback is
         /// about to publish it.
         Publishing,
+        /// Hard-linking failed and the fallback copy holds every byte, but is
+        /// not yet committed.
+        FallbackWritten,
+    }
+
+    /// The writer thread whose fallback commit fails, set by a test's hook.
+    static FAILING_FALLBACK_COMMIT: std::sync::Mutex<Option<std::thread::ThreadId>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) fn fallback_commit_fails() -> bool {
+        *FAILING_FALLBACK_COMMIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(std::thread::current().id())
+    }
+
+    fn set_failing_fallback_commit(writer: Option<std::thread::ThreadId>) {
+        *FAILING_FALLBACK_COMMIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer;
     }
 
     type BackupHook = std::sync::Arc<dyn Fn(BackupStage) + Send + Sync>;
@@ -2485,18 +2520,136 @@ mod tests {
         set_no_hard_links(dir.path(), false);
 
         assert!(second.is_ok(), "{second:?}");
-        let base = version_backup_path(&path, 2).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&base).unwrap(),
-            LATER,
-            "the copy published first is never replaced"
+        let kept = kept_v2_copies(dir.path());
+        assert!(
+            kept.contains(&LATER.to_string()),
+            "the copy published first is never replaced: {kept:?}"
         );
         if first.is_ok() {
             assert!(
-                kept_v2_copies(dir.path()).contains(&EARLIER.to_string()),
-                "the other snapshot is kept too: {:?}",
-                kept_v2_copies(dir.path())
+                kept.contains(&EARLIER.to_string()),
+                "the other snapshot is kept too: {kept:?}"
             );
+        }
+    }
+
+    /// A real incremental save over the V2 config at `path`, as the daemon
+    /// runs one.
+    fn save_dirty_over(path: &Path) -> Result<()> {
+        let mut config = migrate_to_current(&std::fs::read_to_string(path).unwrap())
+            .expect("the V2 file loads, migrated in memory");
+        config.config_path = path.to_path_buf();
+        config.loaded_from = Some(path.to_path_buf());
+        config.observability.backend = crate::schema::ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(config.save_dirty())
+    }
+
+    /// Where hard links are missing, a copy is not kept until it is complete
+    /// and committed. Another writer must not count it as kept before then:
+    /// if the commit then fails and the copy is removed, a config that writer
+    /// rewrote is left with no original.
+    #[test]
+    fn v4_review_r3_fallback_copy_cannot_be_accepted_before_commit() {
+        let _serial = VERSION_BACKUP_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, V2_BACKUP_ORIGINAL).unwrap();
+        set_no_hard_links(dir.path(), true);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let reached_tx = std::sync::Mutex::new(Some(reached_tx));
+        let go_rx = std::sync::Mutex::new(go_rx);
+        set_version_backup_hook(
+            dir.path(),
+            Some(std::sync::Arc::new(move |stage| {
+                if stage != BackupStage::FallbackWritten {
+                    return;
+                }
+                let first = reached_tx.lock().unwrap().take();
+                if let Some(tx) = first {
+                    // This writer's commit fails once it resumes.
+                    set_failing_fallback_commit(Some(std::thread::current().id()));
+                    tx.send(()).unwrap();
+                    let _ = go_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(30));
+                }
+            }) as BackupHook),
+        );
+        // Writer A writes its copy and pauses before committing it.
+        let first = {
+            let path = path.clone();
+            std::thread::spawn(move || keep_version_backup(&path, 2))
+        };
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the first writer reaches the commit point");
+        // Writer B saves over the config meanwhile.
+        let saved = save_dirty_over(&path);
+        go_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        set_version_backup_hook(dir.path(), None);
+        set_failing_fallback_commit(None);
+        set_no_hard_links(dir.path(), false);
+
+        assert!(first.is_err(), "the injected commit failure must fire");
+        match saved {
+            Ok(()) => assert!(
+                kept_v2_copies(dir.path()).contains(&V2_BACKUP_ORIGINAL.to_string()),
+                "the save rewrote the config, so a complete original must survive both \
+                 writers; got {:?}",
+                kept_v2_copies(dir.path())
+            ),
+            Err(_) => assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                V2_BACKUP_ORIGINAL
+            ),
+        }
+    }
+
+    /// A writer killed before its fallback copy is committed must not leave
+    /// something a later save takes for the original.
+    #[test]
+    fn v4_review_r3_interrupted_fallback_copy_is_never_trusted() {
+        let _serial = VERSION_BACKUP_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, V2_BACKUP_ORIGINAL).unwrap();
+        set_no_hard_links(dir.path(), true);
+
+        fn crash(stage: BackupStage) {
+            if stage == BackupStage::FallbackWritten {
+                panic!("simulated crash before the fallback copy is committed");
+            }
+        }
+        set_version_backup_hook(dir.path(), Some(std::sync::Arc::new(crash) as BackupHook));
+        let crashed = std::panic::catch_unwind(|| keep_version_backup(&path, 2));
+        set_version_backup_hook(dir.path(), None);
+        let saved = save_dirty_over(&path);
+        set_no_hard_links(dir.path(), false);
+
+        assert!(crashed.is_err(), "the failpoint must fire");
+        match saved {
+            Ok(()) => assert!(
+                kept_v2_copies(dir.path()).contains(&V2_BACKUP_ORIGINAL.to_string()),
+                "a save after the crash must leave a complete original; got {:?}",
+                kept_v2_copies(dir.path())
+            ),
+            Err(_) => assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                V2_BACKUP_ORIGINAL
+            ),
         }
     }
 
@@ -5532,6 +5685,538 @@ mention_only = false
             let v1: V1Config = value.try_into().unwrap();
             assert!(v1.passthrough.is_empty(), "`{alias}` is not a V1Config key");
         }
+    }
+
+    // ── The layouts before V3, and files with no version ────────────
+
+    /// The value at a dotted path, or `None`.
+    fn value_at<'a>(value: &'a toml::Value, dotted: &str) -> Option<&'a toml::Value> {
+        dotted
+            .split('.')
+            .try_fold(value, |value, key| value.get(key))
+    }
+
+    /// One file per way an older layout differs from the current one, each
+    /// with the path a refusal names.
+    const LEGACY_LAYOUT_EXAMPLES: &[(&str, &str)] = &[
+        ("api_key", "api_key = \"sk-v1\"\n"),
+        ("api_url", "api_url = \"https://llm.example.invalid/v1\"\n"),
+        ("api_path", "api_path = \"/v1/chat/completions\"\n"),
+        ("default_provider", "default_provider = \"ollama\"\n"),
+        ("model_provider", "model_provider = \"ollama\"\n"),
+        ("default_model", "default_model = \"llama3\"\n"),
+        ("model", "model = \"llama3\"\n"),
+        (
+            "model_providers",
+            "[model_providers.ollama]\nmodel = \"llama3\"\n",
+        ),
+        ("default_temperature", "default_temperature = 0.4\n"),
+        ("provider_timeout_secs", "provider_timeout_secs = 30\n"),
+        ("provider_max_tokens", "provider_max_tokens = 2048\n"),
+        ("extra_headers", "[extra_headers]\nX-Trace = \"v1\"\n"),
+        (
+            "channels_config",
+            "[channels_config.telegram]\nbot_token = \"t\"\n",
+        ),
+        ("autonomy", "[autonomy]\nmax_actions_per_hour = 7\n"),
+        ("agent", "[agent]\nmax_tool_iterations = 9\n"),
+        ("swarms", "[swarms.old]\nstrategy = \"sequential\"\n"),
+        ("identity", "[identity]\nformat = \"openclaw\"\n"),
+        ("node_transport", "[node_transport]\nenabled = true\n"),
+        ("security.sandbox", "[security.sandbox]\nenabled = true\n"),
+        (
+            "security.resources",
+            "[security.resources]\nmax_memory_mb = 512\n",
+        ),
+        (
+            "reliability.fallback_providers",
+            "[reliability]\nfallback_providers = [\"openai\"]\n",
+        ),
+        (
+            "reliability.model_fallbacks",
+            "[reliability.model_fallbacks]\ngpt-4o = [\"gpt-4o-mini\"]\n",
+        ),
+        (
+            "memory.qdrant",
+            "[memory.qdrant]\nurl = \"http://localhost:6333\"\n",
+        ),
+        ("memory.postgres", "[memory.postgres]\nvector_enabled = true\n"),
+        (
+            "memory.sqlite_open_timeout_secs",
+            "[memory]\nsqlite_open_timeout_secs = 5\n",
+        ),
+        (
+            "storage.provider",
+            "[storage.provider.config]\nprovider = \"sqlite\"\n\
+             db_url = \"sqlite:///tmp/review-memory.db\"\nconnect_timeout_secs = 17\n",
+        ),
+        (
+            "cost.prices",
+            "[cost.prices.\"openai/gpt-4o\"]\ninput = 2.5\noutput = 10.0\n",
+        ),
+        ("tts.openai", "[tts.openai]\nvoice = \"alloy\"\n"),
+        ("tts.elevenlabs", "[tts.elevenlabs]\nmodel_id = \"eleven_v2\"\n"),
+        ("tts.google", "[tts.google]\nlanguage_code = \"en-US\"\n"),
+        ("tts.edge", "[tts.edge]\nbinary_path = \"edge-tts\"\n"),
+        ("tts.piper", "[tts.piper]\napi_url = \"http://localhost:5000\"\n"),
+        ("tts.default_provider", "[tts]\ndefault_provider = \"openai\"\n"),
+        (
+            "transcription.default_provider",
+            "[transcription]\ndefault_provider = \"groq\"\n",
+        ),
+        (
+            "transcription.default_model_provider",
+            "[transcription]\ndefault_model_provider = \"groq\"\n",
+        ),
+        (
+            "transcription.default_transcription_provider",
+            "[transcription]\ndefault_transcription_provider = \"groq\"\n",
+        ),
+        (
+            "gateway.pairing_dashboard.code_length",
+            "[gateway.pairing_dashboard]\ncode_length = 8\n",
+        ),
+        ("tunnel.provider", "[tunnel]\nprovider = \"cloudflare\"\n"),
+        ("web_search.provider", "[web_search]\nprovider = \"brave\"\n"),
+        (
+            "channels.discord_history",
+            "[channels.discord_history]\nbot_token = \"t\"\n",
+        ),
+        ("channels.feishu", "[channels.feishu]\napp_id = \"a\"\n"),
+        ("providers.fallback", "[providers]\nfallback = \"openai\"\n"),
+        ("providers.api_key", "[providers]\napi_key = \"sk-v2\"\n"),
+        (
+            "providers.extra_headers",
+            "[providers.extra_headers]\nX-Trace = \"v2\"\n",
+        ),
+        (
+            "providers.models.ollama",
+            "[providers.models.ollama]\nmodel = \"llama3\"\n",
+        ),
+        ("channels.discord", "[channels.discord]\nbot_token = \"t\"\n"),
+        (
+            "cron.jobs",
+            "[[cron.jobs]]\nname = \"nightly\"\ncommand = \"echo\"\nschedule = \"0 0 * * *\"\n",
+        ),
+        ("cron.enabled", "[cron]\nenabled = true\n"),
+        ("cron.catch_up_on_startup", "[cron]\ncatch_up_on_startup = true\n"),
+        ("cron.max_run_history", "[cron]\nmax_run_history = 10\n"),
+        (
+            "model_routes",
+            "[[model_routes]]\nhint = \"fast\"\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n",
+        ),
+        (
+            "embedding_routes",
+            "[[embedding_routes]]\nhint = \"default\"\nprovider = \"openai\"\n\
+             model = \"text-embedding-3-small\"\n",
+        ),
+        ("agents.coder.provider", "[agents.coder]\nprovider = \"openai\"\n"),
+        ("agents.coder.model", "[agents.coder]\nmodel = \"gpt-4o\"\n"),
+        ("agents.coder.api_key", "[agents.coder]\napi_key = \"sk-agent\"\n"),
+        ("agents.coder.temperature", "[agents.coder]\ntemperature = 0.3\n"),
+        (
+            "agents.coder.max_iterations",
+            "[agents.coder]\nmax_iterations = 5\n",
+        ),
+        (
+            "agents.coder.allowed_tools",
+            "[agents.coder]\nallowed_tools = [\"shell\"]\n",
+        ),
+        ("agents.coder.agentic", "[agents.coder]\nagentic = true\n"),
+        ("agents.coder.max_depth", "[agents.coder]\nmax_depth = 2\n"),
+        (
+            "agents.coder.skills_directory",
+            "[agents.coder]\nskills_directory = \"skills\"\n",
+        ),
+        (
+            "agents.coder.memory_namespace",
+            "[agents.coder]\nmemory_namespace = \"coder\"\n",
+        ),
+        (
+            "agents.coder.agentic_timeout_secs",
+            "[agents.coder]\nagentic_timeout_secs = 60\n",
+        ),
+        ("agents.coder.timeout_secs", "[agents.coder]\ntimeout_secs = 30\n"),
+    ];
+
+    /// A declarative cron job, the V3 layout, appended to a file.
+    const V3_LAYOUT_PROBE: &str = "\n[cron.zz_layout_probe]\ncommand = \"echo keep\"\n\
+        schedule = { kind = \"cron\", expr = \"0 0 * * *\" }\n";
+
+    /// Each older-layout example is legacy only: the V1 -> V3 chain reads it,
+    /// and the current schema does not read it where it is. So alone it
+    /// keeps the V1 reading, and beside a V3 section the file is refused,
+    /// naming it, as either reading would reshape part of the file.
+    #[test]
+    fn every_legacy_layout_example_is_read_as_v1_and_refused_beside_v3() {
+        for (path, raw) in LEGACY_LAYOUT_EXAMPLES {
+            let value: toml::Value =
+                toml::from_str(raw).unwrap_or_else(|err| panic!("{path}: {err}"));
+            assert!(value_at(&value, path).is_some(), "{path}: not in its example");
+            assert_eq!(
+                detect_version(&value).ok(),
+                Some(1),
+                "{path}: an older layout keeps the V1 reading"
+            );
+
+            let mixed = format!("{raw}{V3_LAYOUT_PROBE}");
+            let err = detect_version(&toml::from_str(&mixed).unwrap())
+                .expect_err(&format!("{path}: beside a V3 cron job the file mixes layouts"))
+                .to_string();
+            assert!(err.contains(path), "{path}: the refusal names it: {err}");
+
+            let migrated = run_chain(value.clone(), 1, &mut Vec::new())
+                .unwrap_or_else(|err| panic!("{path}: {err:#}"));
+            assert_ne!(
+                value_at(&migrated, path),
+                value_at(&value, path),
+                "{path}: the V1 -> V3 chain leaves it where it is"
+            );
+            if let Ok(current) = migrate_to_current(&format!("schema_version = 3\n{raw}")) {
+                let current = toml::Value::try_from(current).unwrap();
+                assert_ne!(
+                    value_at(&current, path),
+                    value_at(&value, path),
+                    "{path}: the current schema reads it where it is, so it is not legacy only"
+                );
+            }
+        }
+    }
+
+    /// Every counterexample the V4 reviews found for a file with no
+    /// `schema_version`, with how it must be read.
+    #[test]
+    fn v4_review_unversioned_counterexamples_read_as_required() {
+        #[derive(Debug, PartialEq)]
+        enum Reading {
+            V1,
+            V3,
+            Refused,
+        }
+        let cases: Vec<(&str, String, Reading)> = vec![
+            (
+                "r1: a cron job alone",
+                "[cron.nightly]\ncommand = \"echo keep\"\n\
+                 schedule = { kind = \"cron\", expr = \"0 0 * * *\" }\n"
+                    .to_string(),
+                Reading::V3,
+            ),
+            (
+                "r1: a stale default_model beside V3 sections",
+                format!("default_model = \"legacy\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}"),
+                Reading::Refused,
+            ),
+            (
+                "r1: stale swarms beside V3 sections",
+                format!("{HAND_WRITTEN_V3_WITHOUT_VERSION}\n[swarms.old]\nstrategy = \"sequential\"\n"),
+                Reading::Refused,
+            ),
+            (
+                "r1: a flat channel beside a provider alias",
+                "[providers.models.openai.work]\nmodel = \"gpt-4o\"\n\n\
+                 [channels.discord]\nbot_token = \"t\"\n"
+                    .to_string(),
+                Reading::Refused,
+            ),
+            (
+                "r2: flat provider fields and an alias in one section",
+                "[providers.models.ollama]\nmodel = \"legacy-model\"\n\n\
+                 [providers.models.ollama.work]\nmodel = \"keep-work-model\"\n"
+                    .to_string(),
+                Reading::Refused,
+            ),
+            (
+                "r2: flat channel fields and an alias in one section",
+                "[channels.discord]\nbot_token = \"legacy-token\"\n\n\
+                 [channels.discord.work]\nbot_token = \"keep-work-token\"\n"
+                    .to_string(),
+                Reading::Refused,
+            ),
+            (
+                "r2: V1 model_provider and model",
+                "model_provider = \"ollama\"\nmodel = \"llama3\"\n".to_string(),
+                Reading::V1,
+            ),
+            (
+                "r2: V1 default_provider and model",
+                "default_provider = \"ollama\"\nmodel = \"llama3\"\n".to_string(),
+                Reading::V1,
+            ),
+            (
+                "r3: an alias named extra_headers beside flat fields",
+                "[providers.models.openai]\nmodel = \"legacy-model\"\n\n\
+                 [providers.models.openai.extra_headers]\nmodel = \"keep-model\"\n\
+                 temperature = 0.25\n"
+                    .to_string(),
+                Reading::Refused,
+            ),
+            (
+                "r3: an alias named pricing beside flat fields",
+                "[providers.models.openai]\nmodel = \"legacy-model\"\n\n\
+                 [providers.models.openai.pricing]\nmodel = \"keep-model\"\n\
+                 temperature = 0.25\n"
+                    .to_string(),
+                Reading::Refused,
+            ),
+            (
+                "r3: the legacy storage layout",
+                "[storage.provider.config]\nprovider = \"sqlite\"\n\
+                 db_url = \"sqlite:///tmp/review-memory.db\"\nconnect_timeout_secs = 17\n"
+                    .to_string(),
+                Reading::V1,
+            ),
+            (
+                "control: a V2 profile with its header map",
+                "[providers.models.openai]\nmodel = \"gpt-4o\"\n\n\
+                 [providers.models.openai.extra_headers]\nX-Trace = \"keep\"\n"
+                    .to_string(),
+                Reading::V1,
+            ),
+            (
+                "control: the V3 file the inference exists for",
+                HAND_WRITTEN_V3_WITHOUT_VERSION.to_string(),
+                Reading::V3,
+            ),
+        ];
+        for (case, raw, required) in cases {
+            let value: toml::Value = toml::from_str(&raw).unwrap();
+            let reading = match detect_version(&value) {
+                Ok(1) => Reading::V1,
+                Ok(INFERRED_SCHEMA_VERSION) => Reading::V3,
+                Ok(other) => panic!("{case}: read as V{other}"),
+                Err(_) => Reading::Refused,
+            };
+            assert_eq!(reading, required, "{case}");
+            if required == Reading::Refused {
+                assert!(migrate_file_with_notices(&raw).is_err(), "{case}");
+                continue;
+            }
+            migrate_to_current(&raw).unwrap_or_else(|err| panic!("{case}: {err:#}"));
+            let resilient = migrate_to_current_salvaged(&raw);
+            assert!(
+                resilient.dropped.is_empty() && resilient.dropped_security.is_empty(),
+                "{case}: {:?} {:?}",
+                resilient.dropped,
+                resilient.dropped_security
+            );
+        }
+    }
+
+    /// The top-level sections of the current layout, each as a file of its
+    /// own: every section of the bundled V4 fixture, and every section the
+    /// default config writes.
+    fn current_layout_sections() -> Vec<(String, toml::Table)> {
+        let fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let defaults = match toml::Value::try_from(Config::default()).unwrap() {
+            toml::Value::Table(table) => table,
+            other => panic!("the default config is not a table: {other}"),
+        };
+        [("fixture", fixture), ("default", defaults)]
+            .into_iter()
+            .flat_map(|(source, table)| {
+                table
+                    .into_iter()
+                    .filter(|(key, _)| key != "schema_version" && key != "tools")
+                    .map(move |(key, section)| {
+                        (
+                            format!("{source}: {key}"),
+                            toml::Table::from_iter([(key, section)]),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// `section` with the V3 layout probe beside it.
+    fn beside_the_v3_layout(section: &toml::Table) -> toml::Value {
+        let mut file = toml::Value::Table(section.clone());
+        let probe: toml::Value = toml::from_str(V3_LAYOUT_PROBE).unwrap();
+        let cron = file
+            .as_table_mut()
+            .unwrap()
+            .entry("cron")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        cron.as_table_mut()
+            .unwrap()
+            .extend(probe["cron"].as_table().unwrap().clone());
+        file
+    }
+
+    /// Nothing in the current layout counts as an older layout: a file
+    /// holding any current section beside a V3 one is read as V3, never
+    /// refused as mixed. Alone, no current section is refused.
+    #[test]
+    fn current_sections_never_read_as_an_older_layout() {
+        for (label, section) in current_layout_sections() {
+            assert_eq!(
+                detect_version(&beside_the_v3_layout(&section)).ok(),
+                Some(INFERRED_SCHEMA_VERSION),
+                "{label}: read as an older layout"
+            );
+            assert!(
+                detect_version(&toml::Value::Table(section.clone())).is_ok(),
+                "{label}: refused on its own"
+            );
+        }
+        let mut fixture: toml::Table =
+            toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        fixture.remove("schema_version");
+        assert_eq!(
+            detect_version(&toml::Value::Table(fixture)).ok(),
+            Some(INFERRED_SCHEMA_VERSION),
+            "the whole V4 fixture, unversioned"
+        );
+    }
+
+    /// Current fields the V2 -> V3 step also moves: V2's Groq transcription
+    /// settings and per-family STT tables, which V3 copied under
+    /// `[providers.transcription]` and the current schema still reads in
+    /// place. Their shape is the same in both layouts, so a file holding
+    /// nothing else that tells the layouts apart is read as V1, as before
+    /// V4, and these move to the `providers.transcription` alias the V3
+    /// migration gives them.
+    const RELOCATED_BY_THE_V1_READING: &[&str] = &[
+        "transcription.api_key",
+        "transcription.api_url",
+        "transcription.model",
+        "transcription.language",
+        "transcription.initial_prompt",
+        "transcription.openai",
+        "transcription.deepgram",
+        "transcription.assemblyai",
+        "transcription.google",
+        "transcription.local_whisper",
+        "providers.transcription",
+    ];
+
+    /// Every leaf path under `value`, arrays counted as leaves.
+    fn leaf_paths(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, child) in table {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    leaf_paths(child, &path, out);
+                }
+            }
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    /// `file` stated as schema `version` and loaded: the migrated value, and
+    /// the typed config read from it.
+    fn stated_reading(file: &toml::Table, version: u32) -> (toml::Value, toml::Value) {
+        let mut stated = file.clone();
+        stated.insert(
+            "schema_version".to_string(),
+            toml::Value::Integer(i64::from(version)),
+        );
+        let raw = toml::to_string(&stated).unwrap();
+        let (migrated, _) =
+            migrate_value(&raw).unwrap_or_else(|err| panic!("V{version}: {err:#}\n{raw}"));
+        let config: Config = migrated
+            .clone()
+            .try_into()
+            .unwrap_or_else(|err| panic!("V{version}: {err:#}\n{raw}"));
+        (migrated, toml::Value::try_from(config).unwrap())
+    }
+
+    /// The paths at which reading `file` as V1 and as V3 configures something
+    /// different. Only paths either migrated file holds are compared, so
+    /// defaults derived from the environment (`HOME`) do not count.
+    fn readings_differ(file: &toml::Table) -> Vec<String> {
+        let (as_v1, typed_v1) = stated_reading(file, 1);
+        let (as_v3, typed_v3) = stated_reading(file, 3);
+        let mut paths = Vec::new();
+        leaf_paths(&as_v1, "", &mut paths);
+        leaf_paths(&as_v3, "", &mut paths);
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .filter(|path| {
+                !RELOCATED_BY_THE_V1_READING
+                    .iter()
+                    .any(|moved| path == moved || path.starts_with(&format!("{moved}.")))
+            })
+            .filter(|path| value_at(&typed_v1, path) != value_at(&typed_v3, path))
+            .collect()
+    }
+
+    /// A file with no section that tells the layouts apart is read as V1,
+    /// and that reading configures exactly what the V3 reading would, apart
+    /// from [`RELOCATED_BY_THE_V1_READING`]. Checked for each current
+    /// section, and for the whole V4 fixture without its V3-only sections.
+    #[test]
+    fn a_file_with_no_layout_evidence_reads_the_same_as_v1_and_as_v3() {
+        for (label, section) in current_layout_sections() {
+            if detect_version(&toml::Value::Table(section.clone())).ok() != Some(1) {
+                continue;
+            }
+            let differ = readings_differ(&section);
+            assert!(differ.is_empty(), "{label}: the V1 reading differs at {differ:?}");
+        }
+
+        let mut fixture: toml::Table =
+            toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        for key in ["schema_version", "tools", "cron"] {
+            fixture.remove(key);
+        }
+        if let Some(toml::Value::Table(providers)) = fixture.get_mut("providers") {
+            providers.remove("models");
+        }
+        if let Some(toml::Value::Table(channels)) = fixture.get_mut("channels") {
+            for kind in crate::schema::v2::V3_CHANNEL_TYPES {
+                channels.remove(*kind);
+            }
+        }
+        assert_eq!(
+            detect_version(&toml::Value::Table(fixture.clone())).ok(),
+            Some(1),
+            "the fixture without its V3-only sections"
+        );
+        let differ = readings_differ(&fixture);
+        assert!(differ.is_empty(), "the V1 reading differs at {differ:?}");
+    }
+
+    /// The fields [`RELOCATED_BY_THE_V1_READING`] excuses do move under the
+    /// V1 reading, to the alias the V3 migration gives them, and stay where
+    /// they are under the V3 reading. Both are places the current schema
+    /// reads.
+    #[test]
+    fn the_v1_reading_relocates_only_the_shared_transcription_fields() {
+        let file: toml::Table = toml::from_str(
+            "[transcription]\nmodel = \"whisper-keep\"\n\n\
+             [transcription.openai]\nmodel = \"whisper-1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_version(&toml::Value::Table(file.clone())).ok(),
+            Some(1)
+        );
+        let (_, as_v1) = stated_reading(&file, 1);
+        let (_, as_v3) = stated_reading(&file, 3);
+        assert_eq!(
+            value_at(&as_v1, "providers.transcription.groq.default.model")
+                .and_then(toml::Value::as_str),
+            Some("whisper-keep")
+        );
+        assert_eq!(
+            value_at(&as_v1, "providers.transcription.openai.default.model")
+                .and_then(toml::Value::as_str),
+            Some("whisper-1")
+        );
+        assert_eq!(
+            value_at(&as_v3, "transcription.model").and_then(toml::Value::as_str),
+            Some("whisper-keep")
+        );
+        assert_eq!(
+            value_at(&as_v3, "transcription.openai.model").and_then(toml::Value::as_str),
+            Some("whisper-1")
+        );
     }
 
     // ── V4 retirements of keys no schema field reads ────────────────
