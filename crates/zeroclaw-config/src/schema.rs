@@ -45193,16 +45193,15 @@ channel = "notion"
             let value = &value["value"];
             for version in [1, 2] {
                 let label = format!(
-                    "`{}` beside `{}`, V{version}",
-                    case.spellings[0], case.spellings[1]
+                    "`{}` beside `{}` for `{}`, V{version}",
+                    case.spellings[0], case.spellings[1], case.read_at
                 );
                 let single = format!("schema_version = {version}\n\n{}", case.single);
                 match crate::migration::migrate_to_current(&single) {
                     Ok(config) if typed_at(&config, &case.read_at).as_ref() == Some(value) => {}
                     Ok(config) => {
                         failures.push(format!(
-                            "{label}: spelled once, `{}` reads {:?}, not {value}",
-                            case.read_at,
+                            "{label}: spelled once, it reads {:?}, not {value}",
                             typed_at(&config, &case.read_at)
                         ));
                         continue;
@@ -45252,8 +45251,7 @@ channel = "notion"
                             match read {
                                 Ok(read) if resolved && read.as_ref() == Some(value) => {}
                                 Ok(read) => failures.push(format!(
-                                    "{label}: saved over two spellings; `{}` now reads {read:?}",
-                                    case.read_at
+                                    "{label}: saved over two spellings; it now reads {read:?}"
                                 )),
                                 Err(err) => failures.push(format!(
                                     "{label}: saved over two spellings, and the file no longer \
