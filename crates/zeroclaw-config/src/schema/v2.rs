@@ -4480,8 +4480,7 @@ mod fs_db_migration_tests {
             "refused, left in place"
         );
 
-        ::zeroclaw_log::try_install_capture_subscriber();
-        let mut events = ::zeroclaw_log::subscribe_or_install();
+        let mut events = crate::capture_log_events();
         let again = migrate_v2_to_v3_install_filesystem(install).expect("second run");
 
         assert!(again.backup_dir.is_none(), "{again:?}");
