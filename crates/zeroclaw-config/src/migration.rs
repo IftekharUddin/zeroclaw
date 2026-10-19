@@ -836,7 +836,9 @@ pub(crate) fn refuse_spellings_left_by_migration(existing: &str) -> Result<()> {
         .parse()
         .context("failed to parse the migrated config")?;
     use_written_spellings(migrated.as_table_mut()).map_err(|err| {
-        anyhow::anyhow!("{err} (the file is V{from}, and migrating it does not choose between them)")
+        anyhow::anyhow!(
+            "{err} (the file is V{from}, and migrating it does not choose between them)"
+        )
     })
 }
 

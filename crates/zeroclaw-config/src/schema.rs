@@ -44912,9 +44912,8 @@ channel = "notion"
         ];
         for (spellings, section) in sections {
             for version in [1, 2] {
-                let raw = format!(
-                    "schema_version = {version}\n\n[gateway]\nport = 42617\n\n{section}"
-                );
+                let raw =
+                    format!("schema_version = {version}\n\n[gateway]\nport = 42617\n\n{section}");
                 for full in [true, false] {
                     let tmp = tempfile::TempDir::new().unwrap();
                     let config_path = tmp.path().join("config.toml");
@@ -45110,7 +45109,10 @@ channel = "notion"
             ));
         }
         for (spellings, values) in [
-            (["log_persistence", "runtime_trace_mode"], ["\"full\"", "\"none\""]),
+            (
+                ["log_persistence", "runtime_trace_mode"],
+                ["\"full\"", "\"none\""],
+            ),
             (
                 ["log_persistence_path", "runtime_trace_path"],
                 ["\"state/keep-trace.jsonl\"", "\"state/other-trace.jsonl\""],
@@ -45235,19 +45237,21 @@ channel = "notion"
                         Err(err) if resolved => failures.push(format!(
                             "{label}: refused although the migration chooses: {err:#}"
                         )),
-                        Err(_) if written != both || config.dirty_paths != dirty => failures
-                            .push(format!("{label}: refused, but the file or dirty set changed")),
+                        Err(_) if written != both || config.dirty_paths != dirty => failures.push(
+                            format!("{label}: refused, but the file or dirty set changed"),
+                        ),
                         Err(_) => {}
                         Ok(()) => {
-                            let read = crate::migration::migrate_to_current(&written)
-                                .and_then(|mut reloaded| {
+                            let read = crate::migration::migrate_to_current(&written).and_then(
+                                |mut reloaded| {
                                     let store = crate::secrets::SecretStore::new(
                                         tmp.path(),
                                         reloaded.secrets.encrypt,
                                     );
                                     reloaded.decrypt_secrets(&store)?;
                                     Ok(typed_at(&reloaded, &case.read_at))
-                                });
+                                },
+                            );
                             match read {
                                 Ok(read) if resolved && read.as_ref() == Some(value) => {}
                                 Ok(read) => failures.push(format!(
