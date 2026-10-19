@@ -44971,7 +44971,8 @@ channel = "notion"
                     let tmp = tempfile::TempDir::new().unwrap();
                     let config_path = tmp.path().join("config.toml");
                     std::fs::write(&config_path, &both_raw).unwrap();
-                    let mut config = crate::migration::migrate_to_current_salvaged(&both_raw).config;
+                    let mut config =
+                        crate::migration::migrate_to_current_salvaged(&both_raw).config;
                     config.config_path = config_path.clone();
                     config.loaded_from = Some(config_path.clone());
                     config.observability.backend = ObservabilityBackend::Otel;
@@ -44982,7 +44983,8 @@ channel = "notion"
                     } else {
                         config.save_dirty().await
                     };
-                    let label = format!("`{alias}` beside `{written_path}`, V{version}, full={full}");
+                    let label =
+                        format!("`{alias}` beside `{written_path}`, V{version}, full={full}");
                     let written_file = std::fs::read_to_string(&config_path).unwrap();
                     match saved {
                         Err(_) => {

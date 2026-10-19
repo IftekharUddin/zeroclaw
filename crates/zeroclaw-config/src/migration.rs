@@ -831,7 +831,9 @@ pub(crate) fn refuse_spellings_left_by_migration(existing: &str) -> Result<()> {
                     .try_fold(root, |table, key| {
                         table.get(key.as_str()).and_then(toml::Value::as_table)
                     })
-                    .is_some_and(|table| table.contains_key(*alias) && table.contains_key(*written));
+                    .is_some_and(|table| {
+                        table.contains_key(*alias) && table.contains_key(*written)
+                    });
                 if holds_both {
                     let at = if path.is_empty() {
                         "the top level".to_string()
