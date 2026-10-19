@@ -6528,9 +6528,7 @@ mention_only = false
                 // A provider reference is current content only in the dotted
                 // `<family>.<alias>` form; a bare one is the form the older
                 // layouts' migration completes.
-                PropKind::String if field.name.ends_with("provider") => {
-                    "probe.default".to_string()
-                }
+                PropKind::String if field.name.ends_with("provider") => "probe.default".to_string(),
                 PropKind::String if current.is_empty() => "probe".to_string(),
                 PropKind::String => format!("{current}-probe"),
                 PropKind::Enum => {
@@ -7192,21 +7190,51 @@ mention_only = false
 
     /// One file per key retired at V4, which a V3 file may still hold.
     const KEYS_RETIRED_AT_V4: &[(&str, &str)] = &[
-        ("security.nevis", "[security.nevis]\nclient_secret = \"x\"\n"),
-        ("agents.x.compact_context", "[agents.x]\ncompact_context = true\n"),
-        ("agents.x.max_tool_iterations", "[agents.x]\nmax_tool_iterations = 40\n"),
-        ("agents.x.max_history_messages", "[agents.x]\nmax_history_messages = 10\n"),
-        ("agents.x.max_context_tokens", "[agents.x]\nmax_context_tokens = 1000\n"),
-        ("agents.x.memory_recall_limit", "[agents.x]\nmemory_recall_limit = 5\n"),
-        ("agents.x.parallel_tools", "[agents.x]\nparallel_tools = true\n"),
-        ("agents.x.tool_dispatcher", "[agents.x]\ntool_dispatcher = \"native\"\n"),
-        ("agents.x.strict_tool_parsing", "[agents.x]\nstrict_tool_parsing = true\n"),
+        (
+            "security.nevis",
+            "[security.nevis]\nclient_secret = \"x\"\n",
+        ),
+        (
+            "agents.x.compact_context",
+            "[agents.x]\ncompact_context = true\n",
+        ),
+        (
+            "agents.x.max_tool_iterations",
+            "[agents.x]\nmax_tool_iterations = 40\n",
+        ),
+        (
+            "agents.x.max_history_messages",
+            "[agents.x]\nmax_history_messages = 10\n",
+        ),
+        (
+            "agents.x.max_context_tokens",
+            "[agents.x]\nmax_context_tokens = 1000\n",
+        ),
+        (
+            "agents.x.memory_recall_limit",
+            "[agents.x]\nmemory_recall_limit = 5\n",
+        ),
+        (
+            "agents.x.parallel_tools",
+            "[agents.x]\nparallel_tools = true\n",
+        ),
+        (
+            "agents.x.tool_dispatcher",
+            "[agents.x]\ntool_dispatcher = \"native\"\n",
+        ),
+        (
+            "agents.x.strict_tool_parsing",
+            "[agents.x]\nstrict_tool_parsing = true\n",
+        ),
         (
             "runtime_profiles.x.context_compression.summary_model",
             "[runtime_profiles.x.context_compression]\nsummary_model = \"haiku\"\n",
         ),
         ("channels.wati", "[channels.wati]\napi_token = \"x\"\n"),
-        ("channels_config.wati", "[channels_config.wati]\napi_token = \"x\"\n"),
+        (
+            "channels_config.wati",
+            "[channels_config.wati]\napi_token = \"x\"\n",
+        ),
         ("twitter", "[twitter]\nbearer_token = \"x\"\n"),
         ("reddit", "[reddit]\nclient_id = \"x\"\n"),
         ("channels.notion", "[channels.notion]\ntoken = \"x\"\n"),
@@ -7246,10 +7274,7 @@ mention_only = false
                     );
                     // It names the key, or the agent table holding it.
                     let table: Vec<&str> = path.split('.').take(2).collect();
-                    assert!(
-                        err.to_string().contains(&table.join(".")),
-                        "{path}: {err}"
-                    );
+                    assert!(err.to_string().contains(&table.join(".")), "{path}: {err}");
                 }
             }
         }
@@ -7281,7 +7306,10 @@ mention_only = false
         // its fields.
         let raw = "[channels.git]\nrepos = [\"zeroclaw-labs/zeroclaw\"]\n\n\
                    [channels.git.events.push]\nbogus = 1\n";
-        assert!(detect_version(&toml::from_str(raw).unwrap()).is_err(), "{raw}");
+        assert!(
+            detect_version(&toml::from_str(raw).unwrap()).is_err(),
+            "{raw}"
+        );
     }
 
     /// When the older part of a mixed file is a key the current layout
@@ -7299,8 +7327,10 @@ mention_only = false
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains("is retired, so if the rest of the file is current, adding \
-                     `schema_version = 4` as its first line is the whole fix"),
+                err.contains(
+                    "is retired, so if the rest of the file is current, adding \
+                     `schema_version = 4` as its first line is the whole fix"
+                ),
                 "{err}"
             );
         }
