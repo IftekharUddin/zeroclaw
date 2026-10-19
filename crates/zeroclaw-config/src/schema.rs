@@ -40335,6 +40335,55 @@ group_policy = "disabled"
         );
     }
 
+    #[test]
+    async fn save_dirty_over_an_unmigrated_v1_file_keeps_its_agent() {
+        // A V1 file (no `schema_version`, top-level provider globals) loads
+        // migrated in memory. An unrelated incremental save must not label
+        // the legacy body current: the next load would then skip the
+        // migration that synthesizes its agent, and the agent would vanish.
+        const V1_FILE: &str = "default_provider = \"openrouter\"\n\
+            default_model = \"anthropic/claude-sonnet-4\"\n\
+            \n\
+            [gateway]\n\
+            port = 42617\n";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, V1_FILE).unwrap();
+        let mut config = crate::migration::migrate_to_current(V1_FILE)
+            .expect("the V1 file loads, migrated in memory");
+        assert!(
+            config.agents.contains_key("default"),
+            "load-time migration synthesizes the default agent"
+        );
+        config.config_path = config_path.clone();
+        // Another handle saves a key after this config was loaded.
+        std::fs::write(&config_path, format!("locale = \"fr\"\n{V1_FILE}")).unwrap();
+
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded = crate::migration::migrate_to_current(&written).expect("it reloads");
+        assert!(
+            reloaded.agents.contains_key("default"),
+            "the V1 file's agent must survive an incremental save; got:\n{written}"
+        );
+        assert_eq!(
+            reloaded.schema_version,
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        assert!(
+            written.contains("backend = \"otel\""),
+            "dirty value must still be written; got:\n{written}"
+        );
+        assert_eq!(
+            reloaded.locale.as_deref(),
+            Some("fr"),
+            "a key another handle saved must survive; got:\n{written}"
+        );
+    }
+
     /// Regression for the per-field `[[mcp.servers]]` editor: after
     /// `d06ed25` shipped the natural-key arm, in-memory edits succeed
     /// (the TUI / dashboard show the new value) but `save_dirty` is
