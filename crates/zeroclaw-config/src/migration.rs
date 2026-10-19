@@ -4574,9 +4574,8 @@ client_secret = "plaintext-nevis-secret"
     #[test]
     fn current_config_is_left_alone() {
         // The tool selector is stated, so there is nothing to normalize either.
-        let raw = format!(
-            "schema_version = {CURRENT_SCHEMA_VERSION}\n[tools]\noptional = [\"*\"]\n"
-        );
+        let raw =
+            format!("schema_version = {CURRENT_SCHEMA_VERSION}\n[tools]\noptional = [\"*\"]\n");
         assert_eq!(migrate_file_with_notices(&raw).unwrap(), None);
     }
 
