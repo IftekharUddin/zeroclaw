@@ -44011,9 +44011,12 @@ channel = "notion"
                 config.save_dirty().await.unwrap();
             }
             let written = std::fs::read_to_string(&config_path).unwrap();
-            let reloaded = crate::migration::migrate_to_current(&written).unwrap_or_else(|err| {
+            let mut reloaded = crate::migration::migrate_to_current(&written).unwrap_or_else(|err| {
                 panic!("{raw}: full={full}: reload failed: {err:#}\n{written}")
             });
+            // A full save encrypts secrets; read them back as a load does.
+            let store = crate::secrets::SecretStore::new(tmp.path(), reloaded.secrets.encrypt);
+            reloaded.decrypt_secrets(&store).unwrap();
             assert_eq!(
                 subtrees(&reloaded, paths),
                 expected,
