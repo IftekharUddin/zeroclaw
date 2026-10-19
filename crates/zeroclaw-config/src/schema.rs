@@ -43591,7 +43591,12 @@ channel = "notion"
     /// as V1.
     #[test]
     async fn v4_review_r2_v1_provider_aliases_still_load() {
-        let as_value = |config: &Config| toml::Value::try_from(config).unwrap();
+        // What the V1 fold writes. Other defaults (data paths) derive from
+        // HOME, which other tests change while this one runs.
+        let as_value = |config: &Config| {
+            let value = toml::Value::try_from(config).unwrap();
+            (value.get("providers").cloned(), value.get("agents").cloned())
+        };
         for raw in [
             "model_provider = \"ollama\"\nmodel = \"llama3\"\n",
             "default_provider = \"ollama\"\nmodel = \"llama3\"\n",
@@ -43640,6 +43645,11 @@ channel = "notion"
                 )
                 .unwrap();
                 assert_eq!(as_value(&reloaded), as_value(&expected), "{raw}: full={full}");
+                assert_eq!(
+                    reloaded.observability.backend,
+                    ObservabilityBackend::Otel,
+                    "{raw}: full={full}: the edit is saved"
+                );
             }
         }
     }
