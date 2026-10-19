@@ -26,6 +26,7 @@ mod client_crypto;
 mod clipboard;
 mod color_depth;
 mod config;
+mod config_application;
 mod config_manager;
 mod dashboard;
 mod diff;
@@ -693,6 +694,7 @@ fn force_restore_terminal() {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableBracketedPaste,
+            crossterm::style::Print(config_manager::mouse_shift_capture_sequence(false)),
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );

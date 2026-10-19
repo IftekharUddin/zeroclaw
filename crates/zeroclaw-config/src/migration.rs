@@ -747,24 +747,6 @@ struct Migrated {
 /// hidden without `-v`.
 fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
     let from = detect_version(&value)?;
-    if from == CURRENT_SCHEMA_VERSION {
-        // A retired key can reappear in a current file (hand-edited, or
-        // copied from an old example). The schema no longer has a field for
-        // it, so serde would silently ignore it; drop it and say so instead.
-        let mut value = value;
-        let mut notices = Vec::new();
-        for version in 2..=CURRENT_SCHEMA_VERSION {
-            apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
-        }
-        if !notices.iter().any(MigrationNotice::changes_file) {
-            // Nothing to write. Notices about what was left for the operator
-            // are reported by `Config::validate`, which flags each dangling
-            // reference on every load.
-            return Ok(None);
-        }
-        log_notices(&notices);
-        return Ok(Some(Migrated { value, notices }));
-    }
     if from > CURRENT_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             ERROR,
@@ -780,10 +762,59 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         );
     }
-    let mut notices: Vec<MigrationNotice> = unversioned_notice(&value, from).into_iter().collect();
-    let value = run_chain(value, from, &mut notices)?;
+    // Legacy typed schemas may discard the `[tools]` selector. Carry the exact
+    // raw value across their chain, including malformed values: strict
+    // deserialize must reject those, and salvage drops them like any other
+    // invalid section.
+    let mut value = value;
+    let original_tools = value
+        .as_table_mut()
+        .context("config root must be a TOML table")?
+        .remove("tools");
+    let selector_omitted = original_tools.is_none();
+    let (mut value, notices) = if from == CURRENT_SCHEMA_VERSION {
+        // A retired key can reappear in a current file (hand-edited, or
+        // copied from an old example). The schema no longer has a field for
+        // it, so serde would silently ignore it; drop it and say so instead.
+        let mut notices = Vec::new();
+        for version in 2..=CURRENT_SCHEMA_VERSION {
+            apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
+        }
+        if !notices.iter().any(MigrationNotice::changes_file) {
+            // No retired key to write. Notices about what was left for the
+            // operator are reported by `Config::validate`, which flags each
+            // dangling reference on every load.
+            if !selector_omitted {
+                return Ok(None);
+            }
+            notices.clear();
+        }
+        (value, notices)
+    } else {
+        let mut notices: Vec<MigrationNotice> =
+            unversioned_notice(&value, from).into_iter().collect();
+        let value = run_chain(value, from, &mut notices)?;
+        (value, notices)
+    };
+    value
+        .as_table_mut()
+        .context("migrated config is not a TOML table")?
+        .insert(
+            "tools".to_string(),
+            original_tools.unwrap_or_else(omitted_tool_selection),
+        );
     log_notices(&notices);
     Ok(Some(Migrated { value, notices }))
+}
+
+/// The `[tools]` selector a config that omits it is read with: the full
+/// default selection. It is the only persisted compatibility state, so every
+/// migration route writes it.
+fn omitted_tool_selection() -> toml::Value {
+    toml::Value::Table(toml::Table::from_iter([(
+        "optional".to_string(),
+        toml::Value::Array(vec![toml::Value::String("*".to_string())]),
+    )]))
 }
 
 fn log_notices(notices: &[MigrationNotice]) {
@@ -818,11 +849,22 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     if (FIRST_RETIREMENT_ONLY_VERSION..=CURRENT_SCHEMA_VERSION).contains(&from)
         && let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>()
     {
+        let selector_omitted = !value
+            .as_table()
+            .is_some_and(|table| table.contains_key("tools"));
         let mut notices: Vec<MigrationNotice> =
             unversioned_notice(&value, from).into_iter().collect();
         notices.extend(apply_retired_keys_to_doc(doc.as_table_mut()));
-        if from == CURRENT_SCHEMA_VERSION && !notices.iter().any(MigrationNotice::changes_file) {
+        if from == CURRENT_SCHEMA_VERSION
+            && !selector_omitted
+            && !notices.iter().any(MigrationNotice::changes_file)
+        {
             return Ok(None);
+        }
+        if selector_omitted {
+            // Add only the omitted selector; existing values, inline comments
+            // and decor stay exact.
+            doc.insert("tools", toml_value_to_edit_item(&omitted_tool_selection()));
         }
         stamp_doc_schema_version(doc.as_table_mut());
         log_notices(&notices);
@@ -906,6 +948,15 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
     };
 
     let mut value = value;
+    // Generation creates a new installation, even when the requested schema
+    // is historical. Write its full default selection so the document states
+    // it and `config migrate` has nothing to normalize.
+    let tools = toml::Value::try_from(crate::builtin_tools::BuiltinToolsConfig::default())
+        .context("failed to serialize default tool selection")?;
+    value
+        .as_table_mut()
+        .context("generated config root is not a TOML table")?
+        .insert("tools".to_string(), tools);
     if opts.encrypt_secrets {
         let store_dir = opts.secret_store_dir.context(
             "--encrypt requires a secret-store directory \
@@ -1525,7 +1576,8 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 /// Result of an on-disk migration. Returned by `migrate_file_in_place` when
-/// migration ran (vs. `Ok(None)` when input was already current).
+/// migration or compatibility normalization ran (vs. `Ok(None)` when neither
+/// the schema nor the persisted selector needs updating).
 #[derive(Debug, Clone)]
 pub struct MigrateReport {
     pub backup_path: std::path::PathBuf,
@@ -2365,6 +2417,133 @@ pub(crate) fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Existing-document compatibility and explicit selector intent.
+    #[test]
+    fn compatibility_omission_is_shared_by_all_migration_routes() {
+        let current = format!("schema_version = {CURRENT_SCHEMA_VERSION}\n");
+        for raw in [
+            "default_model_provider = \"openai\"\ndefault_model = \"test-model\"\n",
+            "schema_version = 2\n",
+            "schema_version = 3\n",
+            current.as_str(),
+        ] {
+            let (value, _) = migrate_value(raw).unwrap();
+            assert_eq!(
+                value["tools"]["optional"],
+                toml::Value::Array(vec![toml::Value::String("*".into())])
+            );
+            assert_eq!(migrate_to_current(raw).unwrap().tools.optional, ["*"]);
+            assert_eq!(migrate_to_current_resilient(raw).tools.optional, ["*"]);
+            let migrated = migrate_file(raw)
+                .unwrap()
+                .expect("omission needs normalization");
+            assert_eq!(migrate_to_current(&migrated).unwrap().tools.optional, ["*"]);
+            assert!(migrate_file(&migrated).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn compatibility_preserves_explicit_sections_before_legacy_serde() {
+        let current = format!("schema_version = {CURRENT_SCHEMA_VERSION}\n");
+        for prefix in ["", "schema_version = 2\n", "schema_version = 3\n", current.as_str()] {
+            for section in [
+                "[tools]\n",
+                "[tools]\noptional = []\n",
+                "[tools]\noptional = [\"calculator\"]\n",
+                "[tools]\noptional = [\"*\"]\n",
+                "[tools]\noptional = [\"not-a-real-tool\"]\n",
+            ] {
+                let raw = format!("{prefix}{section}");
+                let original: toml::Value = toml::from_str(&raw).unwrap();
+                let (migrated, _) = migrate_value(&raw).unwrap();
+                assert_eq!(migrated.get("tools"), original.get("tools"), "{raw}");
+                let strict = migrate_to_current(&raw).unwrap();
+                let resilient = migrate_to_current_resilient(&raw);
+                assert_eq!(strict.tools.optional, resilient.tools.optional);
+                // A section without `optional` takes the full default.
+                let full = section == "[tools]\n" || section.contains("\"*\"");
+                assert_eq!(strict.tools.is_enabled("weather"), full, "{raw}");
+                if let Some(disk) = migrate_file(&raw).unwrap() {
+                    let written: toml::Value = toml::from_str(&disk).unwrap();
+                    assert_eq!(written.get("tools"), original.get("tools"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_malformed_tools_are_refused_then_salvaged_to_the_default() {
+        let current = format!("schema_version = {CURRENT_SCHEMA_VERSION}\n");
+        for prefix in ["", "schema_version = 2\n", "schema_version = 3\n", current.as_str()] {
+            for section in [
+                "tools = false\n",
+                "[tools]\noptional = 42\n",
+                "[tools]\noptional = [false]\n",
+                "[tools]\nunknown_selector = true\n",
+            ] {
+                let raw = format!("{prefix}{section}");
+                let original: toml::Value = toml::from_str(&raw).unwrap();
+                assert_eq!(
+                    migrate_value(&raw).unwrap().0.get("tools"),
+                    original.get("tools")
+                );
+                assert!(migrate_to_current(&raw).is_err());
+                let salvaged = migrate_to_current_salvaged(&raw);
+                assert_eq!(salvaged.config.tools.optional, ["*"]);
+                assert!(salvaged.dropped.iter().any(|path| path == "tools"));
+            }
+        }
+    }
+
+    #[test]
+    fn current_schema_normalization_preserves_comments_backup_and_noop() {
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION} # version comment\n# locale comment\nlocale = \"en\" # inline comment\n"
+        );
+        let raw = raw.as_str();
+        std::fs::write(&path, raw).unwrap();
+        let report = migrate_file_in_place(&path)
+            .unwrap()
+            .expect("normalize omission");
+        assert_eq!(report.to_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(std::fs::read_to_string(&report.backup_path).unwrap(), raw);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.starts_with(raw),
+            "original bytes and comments must stay: {written}"
+        );
+        assert_eq!(migrate_to_current(&written).unwrap().tools.optional, ["*"]);
+        assert!(migrate_file_in_place(&path).unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(std::fs::read_to_string(&report.backup_path).unwrap(), raw);
+    }
+
+    #[test]
+    fn compatibility_normalization_changes_only_availability() {
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n[plugins]\nenabled = false\nauto_discover = false\n[risk_profiles.limited]\nallowed_tools = [\"file_read\"]\n"
+        );
+        let raw = raw.as_str();
+        let original: toml::Value = toml::from_str(raw).unwrap();
+        let (migrated, _) = migrate_value(raw).unwrap();
+        for (key, value) in original.as_table().unwrap() {
+            assert_eq!(migrated.get(key), Some(value), "changed {key}");
+        }
+        let config = migrate_to_current(raw).unwrap();
+        assert!(!config.plugins.enabled);
+        assert!(!config.plugins.auto_discover);
+        assert_eq!(config.risk_profiles["limited"].allowed_tools, ["file_read"]);
+    }
+
+    #[test]
+    fn current_explicit_selector_is_noop_even_with_unrelated_nan() {
+        let raw =
+            format!("schema_version = {CURRENT_SCHEMA_VERSION}\nmetric = nan\n[tools]\noptional = []\n");
+        assert!(migrate_file(&raw).unwrap().is_none());
+    }
 
     #[test]
     fn detect_version_missing_is_v1() {
@@ -4684,12 +4863,12 @@ enabled = "not-a-bool"
     }
 
     #[test]
-    fn migrate_file_in_place_noop_when_already_current() {
+    fn migrate_file_in_place_noop_when_current_and_selector_is_explicit() {
         let dir = setup_temp_config_dir();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            format!("schema_version = {CURRENT_SCHEMA_VERSION}\n"),
+            format!("schema_version = {CURRENT_SCHEMA_VERSION}\n[tools]\noptional = []\n"),
         )
         .unwrap();
 
