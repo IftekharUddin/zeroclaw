@@ -1592,7 +1592,7 @@ pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<st
     }
     let mut copy = options.open(&temp).with_context(failed)?;
     #[cfg(test)]
-    tests::run_version_backup_hook(config_path);
+    tests::run_version_backup_hook(config_path, tests::BackupStage::Copying);
     let written = std::fs::File::open(config_path)
         .and_then(|mut source| std::io::copy(&mut source, &mut copy))
         .and_then(|_| copy.sync_all());
@@ -1602,13 +1602,15 @@ pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<st
         return Err(anyhow::Error::from(err)).with_context(failed);
     }
 
-    let published = match std::fs::hard_link(&temp, &backup) {
+    let published = match hard_link_for_backup(&temp, &backup) {
         // No hard links on this filesystem: a rename also publishes the copy
         // whole, provided nothing is at the backup path yet.
         Err(err)
             if err.kind() != std::io::ErrorKind::AlreadyExists
                 && !std::fs::exists(&backup).unwrap_or(true) =>
         {
+            #[cfg(test)]
+            tests::run_version_backup_hook(config_path, tests::BackupStage::Publishing);
             std::fs::rename(&temp, &backup)
         }
         other => other,
@@ -1632,6 +1634,20 @@ pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<Option<st
         }
         Err(err) => Err(anyhow::Error::from(err)).with_context(failed),
     }
+}
+
+/// `std::fs::hard_link`, which a test can make fail to exercise the fallback.
+fn hard_link_for_backup(original: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if tests::hard_links_fail_in(link) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "hard links are disabled for this test",
+            ));
+        }
+    }
+    std::fs::hard_link(original, link)
 }
 
 /// Whether a kept original is already at `backup`. Only a regular file counts:
@@ -2147,13 +2163,44 @@ mod tests {
     /// A test-only stand-in for a crash or a second writer inside
     /// `keep_version_backup`, once its file exists and before the copy is
     /// complete. Keyed by the config's directory so other tests are unaffected.
-    type BackupHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+    /// Where in `keep_version_backup` the hook runs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BackupStage {
+        /// The private copy exists and is not yet complete.
+        Copying,
+        /// The copy is complete, hard-linking failed, and the fallback is
+        /// about to publish it.
+        Publishing,
+    }
+
+    type BackupHook = std::sync::Arc<dyn Fn(BackupStage) + Send + Sync>;
     static VERSION_BACKUP_HOOK: std::sync::Mutex<Option<(std::path::PathBuf, BackupHook)>> =
         std::sync::Mutex::new(None);
     /// Serializes the tests that install the hook.
     static VERSION_BACKUP_HOOK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    pub(super) fn run_version_backup_hook(config_path: &Path) {
+    /// Config directories whose backups take the no-hard-link fallback.
+    static NO_HARD_LINKS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+        std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn hard_links_fail_in(link: &Path) -> bool {
+        let dirs = NO_HARD_LINKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        link.parent().is_some_and(|dir| dirs.iter().any(|d| d == dir))
+    }
+
+    fn set_no_hard_links(dir: &Path, on: bool) {
+        let mut dirs = NO_HARD_LINKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dirs.retain(|d| d != dir);
+        if on {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+
+    pub(super) fn run_version_backup_hook(config_path: &Path, stage: BackupStage) {
         let hook = VERSION_BACKUP_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2161,7 +2208,7 @@ mod tests {
             .filter(|(dir, _)| config_path.parent() == Some(dir.as_path()))
             .map(|(_, hook)| hook.clone());
         if let Some(hook) = hook {
-            hook();
+            hook(stage);
         }
     }
 
@@ -2186,8 +2233,10 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, V2_BACKUP_ORIGINAL).unwrap();
 
-        fn crash() {
-            panic!("simulated crash mid-backup");
+        fn crash(stage: BackupStage) {
+            if stage == BackupStage::Copying {
+                panic!("simulated crash mid-backup");
+            }
         }
         set_version_backup_hook(dir.path(), Some(std::sync::Arc::new(crash) as BackupHook));
         let crashed = std::panic::catch_unwind(|| migrate_file_in_place(&path));
@@ -2228,7 +2277,10 @@ mod tests {
         let go_rx = std::sync::Mutex::new(go_rx);
         set_version_backup_hook(
             dir.path(),
-            Some(std::sync::Arc::new(move || {
+            Some(std::sync::Arc::new(move |stage| {
+                if stage != BackupStage::Copying {
+                    return;
+                }
                 // Only the first writer pauses. Take the sender in its own
                 // statement so the lock is released before it blocks.
                 let first = reached_tx.lock().unwrap().take();
@@ -2265,6 +2317,87 @@ mod tests {
             std::fs::read_to_string(&backup).unwrap(),
             V2_BACKUP_ORIGINAL
         );
+    }
+
+    /// The copies of the config kept as `config.toml.v2…backup`, any numbering.
+    fn kept_v2_copies(dir: &Path) -> Vec<String> {
+        let mut copies: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("config.toml.v2") && name.ends_with(".backup")
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect();
+        copies.sort();
+        copies
+    }
+
+    /// Where hard links are missing, a writer publishing its copy must never
+    /// replace one another writer already published.
+    #[test]
+    fn v4_review_r2_backup_fallback_never_replaces_winner() {
+        const EARLIER: &str = "schema_version = 2\n\n[gateway]\nport = 1\n";
+        const LATER: &str = "schema_version = 2\n\n[gateway]\nport = 2\n";
+        let _serial = VERSION_BACKUP_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EARLIER).unwrap();
+        set_no_hard_links(dir.path(), true);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let reached_tx = std::sync::Mutex::new(Some(reached_tx));
+        let go_rx = std::sync::Mutex::new(go_rx);
+        set_version_backup_hook(
+            dir.path(),
+            Some(std::sync::Arc::new(move |stage| {
+                if stage != BackupStage::Publishing {
+                    return;
+                }
+                let first = reached_tx.lock().unwrap().take();
+                if let Some(tx) = first {
+                    tx.send(()).unwrap();
+                    let _ = go_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(30));
+                }
+            }) as BackupHook),
+        );
+        // The first writer copies EARLIER and pauses just before publishing.
+        let first = {
+            let path = path.clone();
+            std::thread::spawn(move || keep_version_backup(&path, 2))
+        };
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the first writer reaches the publish point");
+        // The file changes, and a second writer copies and publishes LATER.
+        std::fs::write(&path, LATER).unwrap();
+        let second = keep_version_backup(&path, 2);
+        go_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        set_version_backup_hook(dir.path(), None);
+        set_no_hard_links(dir.path(), false);
+
+        assert!(second.is_ok(), "{second:?}");
+        let base = version_backup_path(&path, 2).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&base).unwrap(),
+            LATER,
+            "the copy published first is never replaced"
+        );
+        if first.is_ok() {
+            assert!(
+                kept_v2_copies(dir.path()).contains(&EARLIER.to_string()),
+                "the other snapshot is kept too: {:?}",
+                kept_v2_copies(dir.path())
+            );
+        }
     }
 
     /// Unversioned files whose sections mix the V3 layout with older ones are

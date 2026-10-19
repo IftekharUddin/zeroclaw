@@ -43468,6 +43468,182 @@ channel = "notion"
         );
     }
 
+    /// One provider family, or one channel type, holding flat V2 fields and a
+    /// V3 alias at once.
+    const MIXED_PROVIDER_SECTION: &str = "[providers.models.ollama]\nmodel = \"legacy-model\"\n\n\
+        [providers.models.ollama.work]\nmodel = \"keep-work-model\"\n";
+    const MIXED_CHANNEL_SECTION: &str = "[channels.discord]\nbot_token = \"legacy-token\"\n\n\
+        [channels.discord.work]\nbot_token = \"keep-work-token\"\n";
+
+    /// Reading such a section as V1 nests the alias under `default`, so every
+    /// path refuses with the file and the dirty set unchanged.
+    #[test]
+    async fn v4_review_r2_mixed_fields_and_aliases_are_refused() {
+        // Positive control: a genuine flat V2 profile with a map-valued field.
+        let flat = "[providers.models.openai]\nmodel = \"gpt-4o\"\n\n\
+                    [providers.models.openai.extra_headers]\nX-Trace = \"keep\"\n";
+        assert_eq!(
+            crate::migration::detect_version(&toml::from_str(flat).unwrap()).unwrap(),
+            1
+        );
+
+        for raw in [MIXED_PROVIDER_SECTION, MIXED_CHANNEL_SECTION] {
+            assert!(
+                crate::migration::detect_version(&toml::from_str(raw).unwrap()).is_err(),
+                "{raw}"
+            );
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, raw).unwrap();
+            assert!(
+                crate::migration::migrate_file_in_place(&config_path).is_err(),
+                "{raw}"
+            );
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), raw);
+            for full in [false, true] {
+                let mut config = crate::migration::migrate_to_current_salvaged(raw).config;
+                config.config_path = config_path.clone();
+                config.loaded_from = Some(config_path.clone());
+                config.observability.backend = ObservabilityBackend::Otel;
+                config.mark_dirty("observability.backend");
+                let dirty = config.dirty_paths.clone();
+                let saved = if full {
+                    config.save().await
+                } else {
+                    config.save_dirty().await
+                };
+                assert!(saved.is_err(), "full={full}: {raw}");
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    raw,
+                    "full={full}"
+                );
+                assert_eq!(config.dirty_paths, dirty, "full={full}");
+            }
+        }
+    }
+
+    /// Every regular file kept as `config.toml.v2…backup`, any numbering.
+    fn kept_v2_copies(dir: &std::path::Path) -> Vec<String> {
+        let mut copies: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("config.toml.v2") && name.ends_with(".backup")
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect();
+        copies.sort();
+        copies
+    }
+
+    /// A regular file already at the backup path, left half-written by an
+    /// older build, is not a kept original: whatever rewrites the V2 file must
+    /// leave a complete copy of it, or refuse.
+    #[test]
+    async fn v4_review_r2_existing_partial_backup_cannot_authorize_save() {
+        for partial in ["", "schema_version = 2\n", "schema_version = 2\n\n[identity\n"] {
+            for route in ["save_dirty", "save", "migrate"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                std::fs::write(&config_path, V2_FILE_WITH_STRUCTURAL_INPUTS).unwrap();
+                std::fs::write(tmp.path().join("config.toml.v2.backup"), partial).unwrap();
+                let outcome = if route == "migrate" {
+                    crate::migration::migrate_file_in_place(&config_path).map(|_| ())
+                } else {
+                    let mut config =
+                        crate::migration::migrate_to_current(V2_FILE_WITH_STRUCTURAL_INPUTS)
+                            .unwrap();
+                    config.config_path = config_path.clone();
+                    config.loaded_from = Some(config_path.clone());
+                    config.observability.backend = ObservabilityBackend::Otel;
+                    config.mark_dirty("observability.backend");
+                    if route == "save" {
+                        config.save().await
+                    } else {
+                        config.save_dirty().await
+                    }
+                };
+                let copies = kept_v2_copies(tmp.path());
+                assert!(
+                    copies.contains(&partial.to_string()),
+                    "{route}: the existing file is kept as it was; got {copies:?}"
+                );
+                match outcome {
+                    Ok(()) => assert!(
+                        copies.contains(&V2_FILE_WITH_STRUCTURAL_INPUTS.to_string()),
+                        "{route} over {partial:?}: a complete original must be kept; got {copies:?}"
+                    ),
+                    Err(_) => assert_eq!(
+                        std::fs::read_to_string(&config_path).unwrap(),
+                        V2_FILE_WITH_STRUCTURAL_INPUTS,
+                        "{route}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// `V1Config` accepts `model_provider` and `model` for its provider keys,
+    /// so an unversioned file using them is still a V1 file: it loads, strict
+    /// and resilient, and migrates and saves exactly as the same file stated
+    /// as V1.
+    #[test]
+    async fn v4_review_r2_v1_provider_aliases_still_load() {
+        let as_value = |config: &Config| toml::Value::try_from(config).unwrap();
+        for raw in [
+            "model_provider = \"ollama\"\nmodel = \"llama3\"\n",
+            "default_provider = \"ollama\"\nmodel = \"llama3\"\n",
+        ] {
+            let control = crate::migration::migrate_to_current(&format!("schema_version = 1\n{raw}"))
+                .expect("the file stated as V1 loads");
+            let strict = crate::migration::migrate_to_current(raw)
+                .unwrap_or_else(|err| panic!("{raw}: strict load failed: {err:#}"));
+            assert_eq!(as_value(&strict), as_value(&control), "{raw}");
+            let resilient = crate::migration::migrate_to_current_salvaged(raw);
+            assert!(
+                resilient.dropped_security.is_empty(),
+                "{raw}: {:?}",
+                resilient.dropped_security
+            );
+            assert_eq!(as_value(&resilient.config), as_value(&control), "{raw}");
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, raw).unwrap();
+            crate::migration::migrate_file_in_place(&config_path)
+                .unwrap_or_else(|err| panic!("{raw}: migrate failed: {err:#}"));
+            let migrated =
+                crate::migration::migrate_to_current(&std::fs::read_to_string(&config_path).unwrap())
+                    .unwrap();
+            assert_eq!(as_value(&migrated), as_value(&control), "{raw}: migrate");
+
+            let mut expected = control.clone();
+            expected.observability.backend = ObservabilityBackend::Otel;
+            for full in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                std::fs::write(&config_path, raw).unwrap();
+                let mut config = crate::migration::migrate_to_current(raw).unwrap();
+                config.config_path = config_path.clone();
+                config.loaded_from = Some(config_path.clone());
+                config.observability.backend = ObservabilityBackend::Otel;
+                config.mark_dirty("observability.backend");
+                if full {
+                    config.save().await.unwrap();
+                } else {
+                    config.save_dirty().await.unwrap();
+                }
+                let reloaded = crate::migration::migrate_to_current(
+                    &std::fs::read_to_string(&config_path).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(as_value(&reloaded), as_value(&expected), "{raw}: full={full}");
+            }
+        }
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.
