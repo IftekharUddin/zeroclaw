@@ -384,8 +384,10 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                     "config has no schema_version and its shape is ambiguous"
                 );
                 anyhow::bail!(
-                    "config has no `schema_version`, and {detail}. Add `schema_version = 2` or \
-                     `schema_version = 3` as the first line of the file so it is not guessed"
+                    "config has no `schema_version`, and {detail}. Add `schema_version` as the \
+                     first line of the file with the version it was written for, so it is not \
+                     guessed: `schema_version = 1` or `schema_version = 2` for an older file, \
+                     `schema_version = 3` or `schema_version = 4` for the current layout"
                 )
             }
         },
@@ -413,6 +415,12 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
 /// version. Kept in step with the schema by
 /// `v1_keys_still_current_are_exactly_the_current_top_level_sections`.
 const V1_KEYS_STILL_CURRENT: &[&str] = &["model_routes", "embedding_routes", "cron"];
+
+/// Spellings `V1Config` accepts for its own keys (serde aliases):
+/// `model_provider` for `default_provider` and `model` for `default_model`.
+/// They mark a V1 file as surely as the keys do. Kept in step with the schema
+/// by `v1_key_aliases_are_not_current_top_level_sections`.
+const V1_KEY_ALIASES: &[&str] = &["model_provider", "model"];
 
 /// How a config with no `schema_version` key reads, by its shape.
 enum UnversionedShape {
@@ -449,7 +457,7 @@ const V2_CRON_KNOBS: &[&str] = &["enabled", "catch_up_on_startup", "max_run_hist
 ///
 /// Evidence of an older layout:
 /// - a V1-only top-level key ([`V1_LEGACY_KEYS`] minus the keys still
-///   current);
+///   current, or one of their [`V1_KEY_ALIASES`]);
 /// - a provider or channel section holding fields directly, the V2 shape
 ///   (`[providers.models.ollama] model = "..."`);
 /// - a V2-only setting (see [`v2_only_marker`]);
@@ -462,8 +470,8 @@ const V2_CRON_KNOBS: &[&str] = &["enabled", "catch_up_on_startup", "max_run_hist
 /// named `extra_headers`. A file with evidence of both layouts is refused, as
 /// either reading reshapes part of it. A file with only older evidence keeps
 /// the V1 reading. A file with neither is read as V1 only when that reading
-/// keeps every value it holds where it is (see [`v1_reading_drops`]), and is
-/// refused otherwise.
+/// keeps every value it holds, if possibly at another path (see
+/// [`v1_reading_drops`]), and is refused otherwise.
 ///
 /// A V4 file has the V3 shape, so an unversioned V4 file is read as V3 too;
 /// its V3 -> V4 step changes nothing it has not already done.
@@ -497,6 +505,7 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
     let mut legacy = V1_LEGACY_KEYS
         .iter()
         .filter(|key| !V1_KEYS_STILL_CURRENT.contains(key))
+        .chain(V1_KEY_ALIASES)
         .find(|key| table.contains_key(**key))
         .map(|key| format!("`{key}` is a pre-V3 setting"));
     let mut ambiguous = None;
@@ -574,24 +583,36 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
 }
 
 /// The first value an unversioned file holds that reading it as V1 would not
-/// keep at the same path, or `None` when that reading keeps everything. Retired
-/// keys, which the migration reports on its own, and the tool selector, which
-/// it carries across the chain, are not counted.
+/// keep anywhere, or `None` when that reading keeps every value. A value the
+/// V1 reading moves to another path counts as kept: older layouts relocate
+/// settings, and only a value that is gone is a loss. Each kept value accounts
+/// for one original value. Retired keys, which the migration reports on its
+/// own, and the tool selector, which it carries across the chain, are not
+/// counted.
 fn v1_reading_drops(table: &toml::Table) -> Option<String> {
     let mut original = table.clone();
     original.remove("tools");
     let migrated = run_chain(toml::Value::Table(original.clone()), 1, &mut Vec::new()).ok()?;
-    first_dropped_value(&original, migrated.as_table()?, &mut Vec::new())
+    let mut kept = Vec::new();
+    collect_values(&migrated, &mut kept);
+    first_dropped_value(&original, &mut kept, &mut Vec::new())
 }
 
-/// Depth-first, the first non-table value of `original` that `migrated` does
-/// not hold, equal, at the same path.
+/// Every non-table value under `value`, depth first.
+fn collect_values<'a>(value: &'a toml::Value, out: &mut Vec<&'a toml::Value>) {
+    match value {
+        toml::Value::Table(table) => table.values().for_each(|child| collect_values(child, out)),
+        leaf => out.push(leaf),
+    }
+}
+
+/// Depth-first, the path of the first non-table value of `original` with no
+/// equal value left in `kept`; each match is removed from `kept`.
 fn first_dropped_value(
     original: &toml::Table,
-    migrated: &toml::Table,
+    kept: &mut Vec<&toml::Value>,
     path: &mut Vec<String>,
 ) -> Option<String> {
-    let empty = toml::Table::new();
     for (key, value) in original {
         path.push(key.clone());
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -599,14 +620,14 @@ fn first_dropped_value(
             None
         } else {
             match value {
-                toml::Value::Table(child) => {
-                    let kept = migrated
-                        .get(key)
-                        .and_then(toml::Value::as_table)
-                        .unwrap_or(&empty);
-                    first_dropped_value(child, kept, path)
-                }
-                leaf => (migrated.get(key) != Some(leaf)).then(|| path.join(".")),
+                toml::Value::Table(child) => first_dropped_value(child, kept, path),
+                leaf => match kept.iter().position(|candidate| *candidate == leaf) {
+                    Some(at) => {
+                        kept.swap_remove(at);
+                        None
+                    }
+                    None => Some(path.join(".")),
+                },
             }
         };
         path.pop();
@@ -5430,6 +5451,20 @@ mention_only = false
             .filter(|key| current.contains(*key))
             .collect();
         assert_eq!(shared, V1_KEYS_STILL_CURRENT);
+    }
+
+    #[test]
+    fn v1_key_aliases_are_not_current_top_level_sections() {
+        let current = current_top_level_sections();
+        for alias in V1_KEY_ALIASES {
+            assert!(!current.contains(*alias), "`{alias}` is a current section");
+        }
+        // Each is a serde alias `V1Config` accepts: as the only key, it is read.
+        for alias in V1_KEY_ALIASES {
+            let value: toml::Value = toml::from_str(&format!("{alias} = \"x\"\n")).unwrap();
+            let v1: V1Config = value.try_into().unwrap();
+            assert!(v1.passthrough.is_empty(), "`{alias}` is not a V1Config key");
+        }
     }
 
     // ── V4 retirements of keys no schema field reads ────────────────
