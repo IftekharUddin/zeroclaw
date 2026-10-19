@@ -44584,8 +44584,7 @@ channel = "notion"
                 let loaded = crate::migration::migrate_to_current(raw).unwrap();
                 let profile = loaded.agents["x"].runtime_profile.to_string();
                 assert_eq!(
-                    loaded.runtime_profiles[&profile].max_tool_iterations,
-                    5,
+                    loaded.runtime_profiles[&profile].max_tool_iterations, 5,
                     "{raw}"
                 );
             }

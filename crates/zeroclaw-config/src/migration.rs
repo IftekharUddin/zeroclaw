@@ -903,9 +903,7 @@ fn holds_a_value(value: &toml::Value) -> bool {
 /// provider `provider`, or a V2-only setting (see [`v2_only_marker`]). A
 /// provider or channel section holding fields directly is found by
 /// [`unversioned_shape`], which reads those sections.
-fn legacy_layout_evidence(
-    table: &toml::Table,
-) -> Option<(String, Option<(String, &'static str)>)> {
+fn legacy_layout_evidence(table: &toml::Table) -> Option<(String, Option<(String, &'static str)>)> {
     if let Some(path) = LEGACY_LAYOUT_PATHS
         .iter()
         .flat_map(|pattern| spellings_of(pattern))
@@ -7434,9 +7432,13 @@ mention_only = false
                     let differ = readings_differ(&file);
                     if path.starts_with("agents.") {
                         assert!(
-                            differ.iter().all(|at| ["agents.x", "risk_profiles", "runtime_profiles"]
-                                .iter()
-                                .any(|within| at.starts_with(within))),
+                            differ.iter().all(|at| [
+                                "agents.x",
+                                "risk_profiles",
+                                "runtime_profiles"
+                            ]
+                            .iter()
+                            .any(|within| at.starts_with(within))),
                             "{path}: read as V1 it configures more than its agent, at {differ:?}"
                         );
                     } else {
