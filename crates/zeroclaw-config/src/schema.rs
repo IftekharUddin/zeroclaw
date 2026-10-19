@@ -43104,7 +43104,14 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         let test_case = "nevis-atomic-save-boundary";
         let retirement_events = |rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>| {
             let mut events = Vec::new();
-            while let Ok(event) = rx.try_recv() {
+            loop {
+                // Other tests log into the same capture; a lagged receiver
+                // has only dropped older events, so keep reading.
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
                 if event
                     .pointer("/attributes/test_case")
                     .and_then(|v| v.as_str())
@@ -43448,7 +43455,14 @@ channel = "notion"
         let test_case = "v4-review-full-save-retirement";
         let retirement_events = |rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>| {
             let mut events = Vec::new();
-            while let Ok(event) = rx.try_recv() {
+            loop {
+                // Other tests log into the same capture; a lagged receiver
+                // has only dropped older events, so keep reading.
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
                 if event
                     .pointer("/attributes/test_case")
                     .and_then(|v| v.as_str())
@@ -44230,7 +44244,14 @@ channel = "notion"
         let test_case = "v4-review-r4-save-dirty-migration";
         let assumed_v1 = |rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>| {
             let mut events = 0;
-            while let Ok(event) = rx.try_recv() {
+            loop {
+                // Other tests log into the same capture; a lagged receiver
+                // has only dropped older events, so keep reading.
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
                 if event
                     .pointer("/attributes/test_case")
                     .and_then(|v| v.as_str())
