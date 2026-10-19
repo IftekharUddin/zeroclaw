@@ -827,8 +827,10 @@ impl RenameableTable for toml_edit::Table {
     }
     fn rebuild(&mut self, rename: &dyn Fn(toml_edit::Key) -> toml_edit::Key) {
         let keys = self.entry_keys();
-        let entries: Vec<(toml_edit::Key, toml_edit::Item)> =
-            keys.iter().filter_map(|key| self.remove_entry(key)).collect();
+        let entries: Vec<(toml_edit::Key, toml_edit::Item)> = keys
+            .iter()
+            .filter_map(|key| self.remove_entry(key))
+            .collect();
         for (key, item) in entries {
             self.insert_formatted(&rename(key), item);
         }
@@ -844,8 +846,10 @@ impl RenameableTable for toml_edit::InlineTable {
     }
     fn rebuild(&mut self, rename: &dyn Fn(toml_edit::Key) -> toml_edit::Key) {
         let keys = self.entry_keys();
-        let entries: Vec<(toml_edit::Key, toml_edit::Value)> =
-            keys.iter().filter_map(|key| self.remove_entry(key)).collect();
+        let entries: Vec<(toml_edit::Key, toml_edit::Value)> = keys
+            .iter()
+            .filter_map(|key| self.remove_entry(key))
+            .collect();
         for (key, value) in entries {
             self.insert_formatted(&rename(key), value);
         }
@@ -2500,7 +2504,6 @@ fn apply_retired_keys_to_doc_table(
         }
     }
 }
-
 
 /// [`expand_path`] over a document: every concrete path `pattern` matches,
 /// descending through header, dotted and inline tables alike.
@@ -7620,8 +7623,14 @@ mention_only = false
                 _ => None,
             })
             .collect();
-        assert!(paths.contains(&"channels_config.notion".to_string()), "{paths:?}");
-        assert!(paths.contains(&"channels_config.wati".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"channels_config.notion".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&"channels_config.wati".to_string()),
+            "{paths:?}"
+        );
         assert!(retired_key_covering(&["channels_config", "notion", "main"]).is_some());
     }
 
@@ -7796,10 +7805,11 @@ mention_only = false
         );
 
         // A comment above a renamed key and the key's place survive too.
-        let mut scalars: toml_edit::DocumentMut = "[heartbeat]\n# Route heartbeat to the team room.\n\
+        let mut scalars: toml_edit::DocumentMut =
+            "[heartbeat]\n# Route heartbeat to the team room.\n\
             channel = \"telegram\" # delivery channel\nmessage = \"keep\"\n"
-            .parse()
-            .unwrap();
+                .parse()
+                .unwrap();
         use_written_spellings(scalars.as_table_mut()).unwrap();
         let written = scalars.to_string();
         assert!(

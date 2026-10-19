@@ -44608,7 +44608,9 @@ channel = "notion"
         const LIVE_UNDER_CHANNELS: &str =
             "[channels.discord.work]\nenabled = true\nbot_token = \"KEEP-DISCORD-TOKEN\"\n";
         let arrangements = [
-            format!("[channels.wati.old]\napi_token = \"RETIRED-WATI-TOKEN\"\n\n{LIVE_UNDER_ALIAS}"),
+            format!(
+                "[channels.wati.old]\napi_token = \"RETIRED-WATI-TOKEN\"\n\n{LIVE_UNDER_ALIAS}"
+            ),
             format!(
                 "[channels_config.wati.old]\napi_token = \"RETIRED-WATI-TOKEN\"\n\n{LIVE_UNDER_CHANNELS}"
             ),
@@ -44658,8 +44660,7 @@ channel = "notion"
                     );
                     if body.contains("discord") {
                         assert_eq!(
-                            reloaded.channels.discord["work"].bot_token,
-                            "KEEP-DISCORD-TOKEN",
+                            reloaded.channels.discord["work"].bot_token, "KEEP-DISCORD-TOKEN",
                             "{raw}: full={full}\n{written}"
                         );
                     } else {
@@ -44687,12 +44688,18 @@ channel = "notion"
                             .pointer("/attributes/test_case")
                             .and_then(|v| v.as_str())
                             == Some(test_case.as_str())
-                            && ["/attributes/retired_config", "/attributes/saved_notice/path"]
-                                .iter()
-                                .filter_map(|at| event.pointer(at).and_then(|v| v.as_str()))
-                                .any(|path| path.contains("wati"));
+                            && [
+                                "/attributes/retired_config",
+                                "/attributes/saved_notice/path",
+                            ]
+                            .iter()
+                            .filter_map(|at| event.pointer(at).and_then(|v| v.as_str()))
+                            .any(|path| path.contains("wati"));
                     }
-                    assert!(reported, "{raw}: full={full}: the retirement is not reported");
+                    assert!(
+                        reported,
+                        "{raw}: full={full}: the retirement is not reported"
+                    );
                 }
             }
         }
@@ -44740,7 +44747,10 @@ channel = "notion"
                 config.save_dirty().await.unwrap();
             }
             let written = std::fs::read_to_string(&config_path).unwrap();
-            assert!(!written.contains("RETIRED-NOTION-SENTINEL"), "full={full}\n{written}");
+            assert!(
+                !written.contains("RETIRED-NOTION-SENTINEL"),
+                "full={full}\n{written}"
+            );
             let reloaded = crate::migration::migrate_to_current(&written).unwrap();
             assert_eq!(reloaded.notion.database_id, "keep-db", "full={full}");
         }
@@ -44798,8 +44808,7 @@ channel = "notion"
             let store = crate::secrets::SecretStore::new(tmp.path(), reloaded.secrets.encrypt);
             reloaded.decrypt_secrets(&store).unwrap();
             assert_eq!(
-                reloaded.channels.telegram["default"].bot_token,
-                "keep-telegram",
+                reloaded.channels.telegram["default"].bot_token, "keep-telegram",
                 "full={full}\n{written}"
             );
             let table: toml::Table = toml::from_str(&written).unwrap();
