@@ -508,7 +508,8 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         let path = format!("{}.{name}", entry_kind.path());
         if !section.values().all(toml::Value::is_table) {
             // A field held directly on the section: the V2 shape.
-            legacy.get_or_insert_with(|| format!("`[{path}]` holds fields directly, the V2 layout"));
+            legacy
+                .get_or_insert_with(|| format!("`[{path}]` holds fields directly, the V2 layout"));
             continue;
         }
         current.get_or_insert_with(|| format!("`[{path}]` is in the V3 layout"));
@@ -553,9 +554,7 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         (None, Some(_)) => UnversionedShape::NotV3,
         (None, None) => match v1_reading_drops(table) {
             Some(path) => UnversionedShape::Ambiguous {
-                detail: format!(
-                    "reading it as V1 would drop `{path}`, which the V3 layout keeps"
-                ),
+                detail: format!("reading it as V1 would drop `{path}`, which the V3 layout keeps"),
             },
             None => UnversionedShape::NotV3,
         },
@@ -2262,7 +2261,10 @@ mod tests {
             "when the second writer returns, the kept original must be complete"
         );
         assert!(first.is_ok(), "{first:?}");
-        assert_eq!(std::fs::read_to_string(&backup).unwrap(), V2_BACKUP_ORIGINAL);
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            V2_BACKUP_ORIGINAL
+        );
     }
 
     /// Unversioned files whose sections mix the V3 layout with older ones are

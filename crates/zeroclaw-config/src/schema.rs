@@ -43343,9 +43343,11 @@ channel = "notion"
         .expect("with its version stated the job loads");
         assert_eq!(stated.cron["nightly"].command.as_deref(), Some("echo keep"));
 
-        match crate::migration::migrate_file_with_notices(UNVERSIONED_CRON) {
-            Ok(Some((migrated, _))) => assert!(keeps_the_nightly_job(&migrated), "{migrated}"),
-            Ok(None) | Err(_) => {}
+        // Refusing, or leaving the file alone, also keeps the job.
+        if let Ok(Some((migrated, _))) =
+            crate::migration::migrate_file_with_notices(UNVERSIONED_CRON)
+        {
+            assert!(keeps_the_nightly_job(&migrated), "{migrated}");
         }
 
         for full in [false, true] {
