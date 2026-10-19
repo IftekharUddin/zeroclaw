@@ -182,7 +182,10 @@ migration replaces. The first rewrite of a file at an older schema version,
 whether a migration or a save from any surface, also copies it to
 `config.toml.v<version>.backup` (for example `config.toml.v3.backup`). That
 copy is owner-only, is written once and never replaced, and is the downgrade
-path: an older binary reads it as is. It still holds every key the upgrade
+path: an older binary reads it as is. A file already at that name counts only
+when it holds exactly the bytes about to be rewritten; anything else there is
+left alone and the copy goes to the first free numbered name
+(`config.toml.v3-1.backup`, and so on). It still holds every key the upgrade
 retired, including plaintext secrets, so delete it once a downgrade is no
 longer needed.
 
