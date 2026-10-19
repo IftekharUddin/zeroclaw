@@ -711,7 +711,9 @@ fn v3_only_destination(table: &toml::Table) -> Option<String> {
 fn value_at_path<'a>(table: &'a toml::Table, path: &[String]) -> Option<&'a toml::Value> {
     let (first, rest) = path.split_first()?;
     rest.iter()
-        .try_fold(table.get(first.as_str())?, |value, key| value.get(key.as_str()))
+        .try_fold(table.get(first.as_str())?, |value, key| {
+            value.get(key.as_str())
+        })
 }
 
 /// Whether `value` holds anything: a scalar, a non-empty array, or a table
@@ -5955,7 +5957,8 @@ mention_only = false
         for key in written.as_table().unwrap().keys() {
             assert!(
                 top_level.contains(&key.as_str())
-                    || ["model_routes", "embedding_routes", "channels_config"].contains(&key.as_str()),
+                    || ["model_routes", "embedding_routes", "channels_config"]
+                        .contains(&key.as_str()),
                 "`{key}` is a V1 setting the catalog does not name"
             );
         }
@@ -6391,20 +6394,21 @@ mention_only = false
             toml::Value::Table(table) => table,
             other => panic!("the default config is not a table: {other}"),
         };
-        let mut sections: Vec<(String, toml::Table)> = [("fixture", fixture), ("default", defaults)]
-            .into_iter()
-            .flat_map(|(source, table)| {
-                table
-                    .into_iter()
-                    .filter(|(key, _)| key != "schema_version" && key != "tools")
-                    .map(move |(key, section)| {
-                        (
-                            format!("{source}: {key}"),
-                            toml::Table::from_iter([(key, section)]),
-                        )
-                    })
-            })
-            .collect();
+        let mut sections: Vec<(String, toml::Table)> =
+            [("fixture", fixture), ("default", defaults)]
+                .into_iter()
+                .flat_map(|(source, table)| {
+                    table
+                        .into_iter()
+                        .filter(|(key, _)| key != "schema_version" && key != "tools")
+                        .map(move |(key, section)| {
+                            (
+                                format!("{source}: {key}"),
+                                toml::Table::from_iter([(key, section)]),
+                            )
+                        })
+                })
+                .collect();
         // The same sections under every other spelling the schema accepts.
         for (alias, spelled) in top_level_aliases() {
             let respelled: Vec<(String, toml::Table)> = sections
@@ -6499,7 +6503,9 @@ mention_only = false
                         both.try_into::<Config>()
                             .is_err_and(|err| err.to_string().contains("duplicate field"))
                     })
-                    .unwrap_or_else(|| panic!("`{alias}` is accepted by `Config` but spells no section"));
+                    .unwrap_or_else(|| {
+                        panic!("`{alias}` is accepted by `Config` but spells no section")
+                    });
                 (alias, spelled.clone())
             })
             .collect()
@@ -6693,7 +6699,10 @@ mention_only = false
                 "transcription.local_whisper.url",
                 "http://127.0.0.1:8001/v1/transcribe",
             ),
-            ("transcription.local_whisper.bearer_token", "KEEP-LOCAL-TOKEN"),
+            (
+                "transcription.local_whisper.bearer_token",
+                "KEEP-LOCAL-TOKEN",
+            ),
         ] {
             assert_eq!(
                 value_at(&typed_v1, path).and_then(toml::Value::as_str),
@@ -6819,12 +6828,18 @@ mention_only = false
     #[test]
     fn spellings_shared_with_older_layouts_are_told_apart() {
         const TOLD_APART: &[(&str, &str)] = &[
-            ("agents", "V2-only agent keys are older; current agent keys are V3"),
+            (
+                "agents",
+                "V2-only agent keys are older; current agent keys are V3",
+            ),
             (
                 "channels",
                 "a channel type holding fields directly is older; alias-keyed is V3",
             ),
-            ("channels_config", "an alias of `channels`, read the same way"),
+            (
+                "channels_config",
+                "an alias of `channels`, read the same way",
+            ),
             ("cost", "`cost.prices` is older"),
             (
                 "cron",
@@ -6876,7 +6891,11 @@ mention_only = false
     #[test]
     fn v3_only_destinations_are_current_spellings() {
         for pattern in V3_ONLY_DESTINATIONS {
-            let named: Vec<&str> = pattern.iter().copied().filter(|key| *key != ANY_KEY).collect();
+            let named: Vec<&str> = pattern
+                .iter()
+                .copied()
+                .filter(|key| *key != ANY_KEY)
+                .collect();
             let (key, parent) = named.split_last().unwrap();
             assert!(
                 accepted_at(&parent.join(".")).contains(key),
@@ -6911,7 +6930,8 @@ mention_only = false
     /// Destinations the chain writes into that V2 had as well, or whose only
     /// older source is retired under either reading, so holding one beside
     /// that source tells nothing about the layout.
-    const DESTINATIONS_SHARED_WITH_V2: &[&str] = &["schema_version", "scheduler", "gateway.pairing_code"];
+    const DESTINATIONS_SHARED_WITH_V2: &[&str] =
+        &["schema_version", "scheduler", "gateway.pairing_code"];
 
     /// `value` with every leaf changed: a value no migration would write.
     fn changed(value: &toml::Value) -> toml::Value {
@@ -6970,7 +6990,11 @@ mention_only = false
                     continue;
                 }
                 let mut file = legacy.clone();
-                set_at(&mut file, &leaf, changed(value_at(&migrated, &leaf).unwrap()));
+                set_at(
+                    &mut file,
+                    &leaf,
+                    changed(value_at(&migrated, &leaf).unwrap()),
+                );
                 assert!(
                     detect_version(&file).is_err(),
                     "{path} beside a V3 value at `{leaf}`, which its migration writes, \

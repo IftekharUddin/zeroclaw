@@ -2585,7 +2585,8 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
                 let family = existing
                     .entry(ty)
                     .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-                if let (Some(family), toml::Value::Table(wrapped)) = (family.as_table_mut(), wrapped)
+                if let (Some(family), toml::Value::Table(wrapped)) =
+                    (family.as_table_mut(), wrapped)
                 {
                     for (alias, value) in wrapped {
                         let alias = ensure_unique_key(family, alias);

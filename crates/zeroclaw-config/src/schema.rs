@@ -44011,9 +44011,10 @@ channel = "notion"
                 config.save_dirty().await.unwrap();
             }
             let written = std::fs::read_to_string(&config_path).unwrap();
-            let mut reloaded = crate::migration::migrate_to_current(&written).unwrap_or_else(|err| {
-                panic!("{raw}: full={full}: reload failed: {err:#}\n{written}")
-            });
+            let mut reloaded =
+                crate::migration::migrate_to_current(&written).unwrap_or_else(|err| {
+                    panic!("{raw}: full={full}: reload failed: {err:#}\n{written}")
+                });
             // A full save encrypts secrets; read them back as a load does.
             let store = crate::secrets::SecretStore::new(tmp.path(), reloaded.secrets.encrypt);
             reloaded.decrypt_secrets(&store).unwrap();
@@ -44098,11 +44099,9 @@ channel = "notion"
         for (raw, paths, kept) in cases {
             let control = format!("schema_version = 3\n{raw}");
             reads_like(raw, &control, paths).await;
-            let loaded = toml::Value::try_from(
-                crate::migration::migrate_to_current(raw).unwrap(),
-            )
-            .unwrap()
-            .to_string();
+            let loaded = toml::Value::try_from(crate::migration::migrate_to_current(raw).unwrap())
+                .unwrap()
+                .to_string();
             for value in kept {
                 assert!(loaded.contains(value), "{raw}: `{value}` was lost");
             }
