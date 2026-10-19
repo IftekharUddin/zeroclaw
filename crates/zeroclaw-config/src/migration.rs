@@ -580,8 +580,9 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         });
     // `channels_config`, V1's name for the section, is also a spelling the
     // current schema accepts, so both are read by their shape.
-    let channel_types = ["channels", "channels_config"]
+    let channel_types = spellings_of(&["channels"])
         .into_iter()
+        .map(|spelling| spelling[0])
         .filter_map(|root| {
             table
                 .get(root)
@@ -688,6 +689,130 @@ fn agent_read_differently_by_each_layout(table: &toml::Table) -> Option<&str> {
         .map(|(alias, _)| alias.as_str())
 }
 
+/// Keys the current schema reads under a second spelling (its serde
+/// aliases), as `(parent, alias, written)`: `written` is the spelling the
+/// schema writes, and [`ANY_KEY`] in `parent` matches any key. An incremental
+/// save writes a setting under its written spelling, so a file spelling it
+/// the other way would end up holding both, which the schema refuses to read
+/// (`duplicate field`); saves rewrite those keys first (see
+/// [`use_written_spellings`]), and the detector reads older-layout settings
+/// under every spelling (see [`spellings_of`]). Aliases of enum values
+/// (`otlp`), `V1Config`'s spellings and types that are not config are not
+/// keys of the file. Kept in step with the types by
+/// `every_serde_alias_is_listed_with_its_field`.
+pub(crate) const ALIASED_KEYS: &[(&[&str], &str, &str)] = &[
+    (&[], "channels_config", "channels"),
+    (&[], "mcpServers", "mcp"),
+    (&["mcp"], "mcpServers", "servers"),
+    (
+        &["providers", "models", "azure", ANY_KEY],
+        "azure_openai_resource",
+        "resource",
+    ),
+    (
+        &["providers", "models", "azure", ANY_KEY],
+        "azure_openai_deployment",
+        "deployment",
+    ),
+    (
+        &["providers", "models", "azure", ANY_KEY],
+        "azure_openai_api_version",
+        "api_version",
+    ),
+    (&["providers", "tts", "openai", ANY_KEY], "api_url", "uri"),
+    (&["providers", "tts", "elevenlabs", ANY_KEY], "api_url", "uri"),
+    (&["providers", "tts", "google", ANY_KEY], "api_url", "uri"),
+    (&["providers", "tts", "edge", ANY_KEY], "api_url", "uri"),
+    (&["providers", "tts", "piper", ANY_KEY], "api_url", "uri"),
+    (&["skills"], "install-suggestions", "install_suggestions"),
+    (&["composio"], "enable", "enabled"),
+    (&["microsoft365"], "enable", "enabled"),
+    (&["storage", "postgres", ANY_KEY], "dbURL", "db_url"),
+    (&["storage", "postgres", ANY_KEY], "database_url", "db_url"),
+    (&["storage", "postgres", ANY_KEY], "databaseUrl", "db_url"),
+    (&["observability"], "runtime_trace_mode", "log_persistence"),
+    (&["observability"], "runtime_trace_path", "log_persistence_path"),
+    (
+        &["observability"],
+        "runtime_trace_max_entries",
+        "log_persistence_max_entries",
+    ),
+    (&["risk_profiles", ANY_KEY], "allowed_path", "allowed_roots"),
+    (&["risk_profiles", ANY_KEY], "allowed_paths", "allowed_roots"),
+    (&["heartbeat"], "channel", "target"),
+    (&["heartbeat"], "recipient", "to"),
+];
+
+/// `pattern` under every spelling the schema accepts for its keys (see
+/// [`ALIASED_KEYS`]): `channels.feishu` is also `channels_config.feishu`.
+fn spellings_of(pattern: &[&'static str]) -> Vec<Vec<&'static str>> {
+    let mut spellings: Vec<Vec<&'static str>> = vec![Vec::new()];
+    for (at, segment) in pattern.iter().enumerate() {
+        let parent = &pattern[..at];
+        let mut longer = Vec::new();
+        for prefix in &spellings {
+            longer.push([prefix.as_slice(), &[*segment]].concat());
+            for (alias_parent, alias, written) in ALIASED_KEYS {
+                if written == segment && *alias_parent == parent {
+                    longer.push([prefix.as_slice(), &[*alias]].concat());
+                }
+            }
+        }
+        spellings = longer;
+    }
+    spellings
+}
+
+/// Rewrite every key of `root` spelled as one of [`ALIASED_KEYS`]' aliases to
+/// the spelling the schema writes, keeping its value, comments and position,
+/// so an incremental edit of that setting lands on it rather than beside it.
+/// A table holding two spellings of one setting is refused: the schema
+/// cannot read it, so no save may write over it.
+pub(crate) fn use_written_spellings(root: &mut toml_edit::Table) -> Result<()> {
+    for (parent, alias, written) in ALIASED_KEYS {
+        let parents = if parent.is_empty() {
+            vec![Vec::new()]
+        } else {
+            expand_doc_path(root, parent)
+        };
+        for path in parents {
+            let Some(table) = table_like_at(root, &path) else {
+                continue;
+            };
+            if !table.contains_key(alias) {
+                continue;
+            }
+            if table.contains_key(written) {
+                let at = if path.is_empty() {
+                    "the top level".to_string()
+                } else {
+                    format!("`[{}]`", path.join("."))
+                };
+                anyhow::bail!(
+                    "{at} holds both `{written}` and `{alias}`, two spellings of one setting, \
+                     which the schema cannot read together; keep one before saving"
+                );
+            }
+            if let Some(item) = table.remove(alias) {
+                table.insert(written, item);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The table or inline table at `path` under `root`, or `None`.
+fn table_like_at<'a>(
+    root: &'a mut toml_edit::Table,
+    path: &[String],
+) -> Option<&'a mut dyn toml_edit::TableLike> {
+    let mut table: &mut dyn toml_edit::TableLike = root;
+    for key in path {
+        table = table.get_mut(key)?.as_table_like_mut()?;
+    }
+    Some(table)
+}
+
 /// Settings only the V3 layout has that the V1 -> V3 chain also writes into:
 /// beside the older setting it comes from, a migration would merge the two
 /// and keep only one, so each is evidence of the V3 layout. None of them
@@ -744,7 +869,8 @@ const V3_AGENT_FIELDS: &[&str] = &[
 fn v3_only_destination(table: &toml::Table) -> Option<String> {
     if let Some(path) = V3_ONLY_DESTINATIONS
         .iter()
-        .flat_map(|pattern| expand_path(table, pattern))
+        .flat_map(|pattern| spellings_of(pattern))
+        .flat_map(|pattern| expand_path(table, &pattern))
         .find(|path| value_at_path(table, path).is_some_and(holds_a_value))
     {
         return Some(format!("`{}` is a V3 setting", path.join(".")));
@@ -787,7 +913,8 @@ fn holds_a_value(value: &toml::Value) -> bool {
 fn legacy_layout_evidence(table: &toml::Table) -> Option<(String, Option<String>)> {
     if let Some(path) = LEGACY_LAYOUT_PATHS
         .iter()
-        .find_map(|pattern| expand_path(table, pattern).into_iter().next())
+        .flat_map(|pattern| spellings_of(pattern))
+        .find_map(|pattern| expand_path(table, &pattern).into_iter().next())
     {
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
         let dotted = path.join(".");
@@ -7387,6 +7514,161 @@ mention_only = false
             .unwrap_err()
             .to_string();
         assert!(!err.contains("is retired"), "{err}");
+    }
+
+    /// Serde aliases in this crate that are not keys of the file, with why.
+    const ALIASES_THAT_ARE_NOT_FILE_KEYS: &[(&str, &str)] = &[
+        ("model_provider", "`V1Config`'s spelling, in the legacy catalog"),
+        ("model", "`V1Config`'s spelling, in the legacy catalog"),
+        ("noop", "a value of `ObservabilityBackend`"),
+        ("opentelemetry", "a value of `ObservabilityBackend`"),
+        ("otlp", "a value of `ObservabilityBackend`"),
+        ("sandbox-exec", "a value of `SandboxBackend`"),
+        ("task_id", "a field of `CostRecord`, which is not config"),
+    ];
+
+    /// Every `alias = "..."` inside a `#[serde(...)]` attribute in this
+    /// crate's source.
+    fn serde_aliases_in_source() -> std::collections::BTreeSet<String> {
+        fn visit(dir: &Path, out: &mut std::collections::BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, out);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let mut in_serde = false;
+                for line in source.lines() {
+                    let line = line.trim();
+                    if line.starts_with("#[serde(") {
+                        in_serde = true;
+                    }
+                    if in_serde {
+                        let mut rest = line;
+                        while let Some(at) = rest.find("alias") {
+                            rest = &rest[at + "alias".len()..];
+                            let Some(value) = rest.trim_start().strip_prefix('=') else {
+                                continue;
+                            };
+                            let Some(value) = value.trim_start().strip_prefix('"') else {
+                                continue;
+                            };
+                            if let Some(end) = value.find('"') {
+                                out.insert(value[..end].to_string());
+                            }
+                        }
+                        if line.ends_with(")]") {
+                            in_serde = false;
+                        }
+                    }
+                }
+            }
+        }
+        let mut aliases = std::collections::BTreeSet::new();
+        visit(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut aliases,
+        );
+        aliases
+    }
+
+    /// `ALIASED_KEYS` lists every serde alias of a file key in this crate,
+    /// and each pair is real: a table holding both spellings is refused by
+    /// serde as a duplicate of the written one.
+    #[test]
+    fn every_serde_alias_is_listed_with_its_field() {
+        let listed: std::collections::BTreeSet<String> = ALIASED_KEYS
+            .iter()
+            .map(|(_, alias, _)| (*alias).to_string())
+            .chain(
+                ALIASES_THAT_ARE_NOT_FILE_KEYS
+                    .iter()
+                    .map(|(alias, _)| (*alias).to_string()),
+            )
+            .collect();
+        assert_eq!(serde_aliases_in_source(), listed);
+
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        for (parent, alias, written) in ALIASED_KEYS {
+            let parent: Vec<&str> = parent
+                .iter()
+                .map(|key| if *key == ANY_KEY { "probe" } else { *key })
+                .collect();
+            // The default value where the default config writes one (an enum
+            // takes only its variants), else a value of each shape.
+            let default = value_at(
+                &defaults,
+                &parent.iter().copied().chain([*written]).collect::<Vec<_>>().join("."),
+            )
+            .cloned();
+            let duplicate = default
+                .into_iter()
+                .chain([
+                toml::Value::Table(toml::Table::new()),
+                toml::Value::String("probe".into()),
+                toml::Value::Array(Vec::new()),
+                toml::Value::Boolean(true),
+                toml::Value::Integer(1),
+            ])
+            .any(|value| {
+                let mut file = toml::Value::Table(toml::Table::new());
+                for key in [*written, *alias] {
+                    let path = parent.iter().copied().chain([key]).collect::<Vec<_>>().join(".");
+                    set_at(&mut file, &path, value.clone());
+                }
+                file.try_into::<Config>().is_err_and(|err| {
+                    err.to_string()
+                        .contains(&format!("duplicate field `{written}`"))
+                })
+            });
+            assert!(
+                duplicate,
+                "`{alias}` is not read as `{written}` at `{}`",
+                parent.join(".")
+            );
+        }
+
+        // The top-level ones are exactly the ones `Config` accepts.
+        let mut top: Vec<(&str, String)> = ALIASED_KEYS
+            .iter()
+            .filter(|(parent, _, _)| parent.is_empty())
+            .map(|(_, alias, written)| (*alias, (*written).to_string()))
+            .collect();
+        top.sort();
+        let mut generated = top_level_aliases();
+        generated.sort();
+        assert_eq!(top, generated);
+    }
+
+    /// A save rewrites every aliased key to its written spelling, keeping its
+    /// value and comments, and refuses a table holding both spellings.
+    #[test]
+    fn saves_rewrite_aliased_keys_to_the_written_spelling() {
+        let mut doc: toml_edit::DocumentMut = "# the channels\n\
+            [channels_config.discord.work]\nbot_token = \"keep\"\n\n\
+            [heartbeat]\nchannel = \"telegram\" # where to post\n\n\
+            [storage.postgres.main]\ndbURL = \"postgres://keep\"\n"
+            .parse()
+            .unwrap();
+        use_written_spellings(doc.as_table_mut()).unwrap();
+        let written = doc.to_string();
+        assert!(written.contains("# the channels\n[channels.discord.work]"), "{written}");
+        assert!(written.contains("target = \"telegram\" # where to post"), "{written}");
+        assert!(written.contains("db_url = \"postgres://keep\""), "{written}");
+        assert!(!written.contains("channels_config") && !written.contains("dbURL"), "{written}");
+
+        let mut both: toml_edit::DocumentMut =
+            "[heartbeat]\nchannel = \"telegram\"\ntarget = \"discord\"\n"
+                .parse()
+                .unwrap();
+        let err = use_written_spellings(both.as_table_mut())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`target` and `channel`"), "{err}");
     }
 
     // ── V4 retirements of keys no schema field reads ────────────────

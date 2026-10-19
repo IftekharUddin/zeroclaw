@@ -26317,6 +26317,10 @@ impl Config {
             let mut doc: toml_edit::DocumentMut = existing
                 .parse()
                 .context("Failed to parse existing config for comment preservation")?;
+            // Sync onto the spelling the snapshot is written in, keeping the
+            // comments of a section spelled another way; a file holding both
+            // spellings of one setting is refused.
+            crate::migration::use_written_spellings(doc.as_table_mut())?;
             // Apply the `RETIRED_KEYS` policy to the file on disk before
             // syncing, as the load path and `save_dirty` do. The sync would
             // drop a retired key anyway, since the typed config has no field
@@ -26421,6 +26425,10 @@ impl Config {
         let mut doc: toml_edit::DocumentMut = existing
             .parse()
             .context("Failed to parse existing config for incremental save")?;
+        // A setting the file spells another way the schema accepts
+        // (`channels_config` for `channels`) is renamed to the spelling the
+        // dirty paths use, so an edit lands on it rather than beside it.
+        crate::migration::use_written_spellings(doc.as_table_mut())?;
 
         for path in &self.dirty_paths {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
