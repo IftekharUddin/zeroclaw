@@ -191,7 +191,7 @@ pub struct Config {
     #[serde(skip)]
     pub degraded_sections: Vec<String>,
     /// What migrating this config to the current schema changed or assumed
-    /// (retired keys removed or moved, a missing `schema_version` read as V1).
+    /// (retired keys removed, a missing `schema_version` read as V1 or V3).
     /// Never serialized; the CLI surfaces each on stderr, since the matching
     /// WARN records are hidden without `-v`.
     #[serde(skip)]

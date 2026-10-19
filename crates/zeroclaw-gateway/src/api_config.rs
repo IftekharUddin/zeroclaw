@@ -2975,9 +2975,9 @@ pub struct MigrateResponse {
     pub backup_path: Option<String>,
     pub schema_version: u32,
     /// What the migration changed or assumed, one line each, as
-    /// `zeroclaw config migrate` reports them: a retired key removed or
-    /// moved, a reference kept for the operator to fix. Key paths and
-    /// reasons only, never values.
+    /// `zeroclaw config migrate` reports them: a retired key removed, or a
+    /// missing `schema_version` read as V1 or V3. Key paths and reasons only,
+    /// never values.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<String>,
 }
