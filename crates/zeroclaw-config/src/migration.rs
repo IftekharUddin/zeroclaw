@@ -6219,14 +6219,23 @@ mention_only = false
                 value_at(&value, path),
                 "{path}: the V1 -> V3 chain leaves it where it is"
             );
-            if let Ok(current) = migrate_to_current(&format!("schema_version = 3\n{raw}")) {
-                let current = toml::Value::try_from(current).unwrap();
-                assert_ne!(
-                    value_at(&current, path),
-                    value_at(&value, path),
-                    "{path}: the current schema reads it where it is, so it is not legacy only"
-                );
-            }
+            // Strictly the current schema either refuses the file or loads
+            // it without the setting in place; salvaged, it keeps it nowhere
+            // either.
+            let stated = format!("schema_version = 3\n{raw}");
+            let (current, how) = match migrate_to_current(&stated) {
+                Ok(current) => (current, "loaded strictly"),
+                Err(_) => (
+                    migrate_to_current_salvaged(&stated).config,
+                    "refused strictly, then salvaged",
+                ),
+            };
+            let current = toml::Value::try_from(current).unwrap();
+            assert_ne!(
+                value_at(&current, path),
+                value_at(&value, path),
+                "{path}: the current schema reads it where it is ({how}), so it is not legacy only"
+            );
         }
     }
 
@@ -6409,6 +6418,22 @@ mention_only = false
                         })
                 })
                 .collect();
+        // Every property the schema exposes, set, in every keyed section.
+        let every = match toml::Value::try_from(config_with_every_property_set()).unwrap() {
+            toml::Value::Table(table) => table,
+            other => panic!("the config is not a table: {other}"),
+        };
+        sections.extend(
+            every
+                .into_iter()
+                .filter(|(key, _)| key != "schema_version" && key != "tools")
+                .map(|(key, section)| {
+                    (
+                        format!("every property: {key}"),
+                        toml::Table::from_iter([(key, section)]),
+                    )
+                }),
+        );
         // The same sections under every other spelling the schema accepts.
         for (alias, spelled) in top_level_aliases() {
             let respelled: Vec<(String, toml::Table)> = sections
@@ -6425,6 +6450,102 @@ mention_only = false
             sections.extend(respelled);
         }
         sections
+    }
+
+    /// Every property the schema exposes on `config` set to a value other
+    /// than its current one, where the setter takes it. References to other
+    /// aliases and nested lists are left as they are.
+    fn set_every_property(config: &mut Config) {
+        use crate::traits::PropKind;
+        for field in config.prop_fields() {
+            let current = field.display_value.clone();
+            let value = match field.kind {
+                PropKind::Bool => (current != "true").to_string(),
+                PropKind::Integer => current
+                    .parse::<i64>()
+                    .map_or_else(|_| "7".to_string(), |n| (n + 1).to_string()),
+                PropKind::Float => current
+                    .parse::<f64>()
+                    .map_or_else(|_| "1.5".to_string(), |x| (x + 0.5).to_string()),
+                PropKind::String if current.is_empty() => "probe".to_string(),
+                PropKind::String => format!("{current}-probe"),
+                PropKind::Enum => {
+                    let Some(other) = field
+                        .enum_variants
+                        .and_then(|variants| variants().into_iter().find(|v| *v != current))
+                    else {
+                        continue;
+                    };
+                    other
+                }
+                PropKind::StringArray => "probe-a,probe-b".to_string(),
+                _ => continue,
+            };
+            let _ = config.set_prop(&field.name, &value);
+        }
+    }
+
+    /// A config with an alias, `probe`, in every keyed section the schema
+    /// exposes, each optional table the parent types accept materialized,
+    /// and every property set: every current path, rather than the
+    /// fixture's and the defaults' selection.
+    fn config_with_every_property_set() -> Config {
+        let mut config = Config::default();
+        // Keyed sections nest (`providers.models.<family>`), so repeat until
+        // nothing new is created.
+        for _ in 0..4 {
+            let mut created = false;
+            for section in Config::map_key_sections() {
+                if config.create_map_key(section.path, "probe") == Ok(true) {
+                    created = true;
+                }
+            }
+            if !created {
+                break;
+            }
+        }
+        set_every_property(&mut config);
+        // An optional table appears in neither the properties nor the
+        // serialized config while unset: give each one a parent type accepts
+        // an empty table, where its defaults read, then set its properties.
+        let mut value = toml::Value::try_from(&config).unwrap();
+        for parent in [
+            "security",
+            "reliability",
+            "memory",
+            "storage",
+            "cost",
+            "tts",
+            "transcription",
+            "tunnel",
+            "web_search",
+            "channels",
+            "gateway.pairing_dashboard",
+        ] {
+            for key in accepted_at(parent) {
+                let mut candidate = value.clone();
+                let Some(section) = parent
+                    .split('.')
+                    .try_fold(&mut candidate, |value, key| value.get_mut(key))
+                    .and_then(toml::Value::as_table_mut)
+                else {
+                    continue;
+                };
+                if section.contains_key(*key) {
+                    continue;
+                }
+                section.insert((*key).to_string(), toml::Value::Table(toml::Table::new()));
+                if let Ok(parsed) = candidate.try_into::<Config>() {
+                    let written = toml::Value::try_from(&parsed).unwrap();
+                    if value_at(&written, &format!("{parent}.{key}")).is_some() {
+                        value = written;
+                    }
+                }
+            }
+        }
+        let mut config: Config = value.try_into().unwrap();
+        set_every_property(&mut config);
+        config
     }
 
     /// The keys `T` accepts, its serde aliases included: the field list
@@ -7003,6 +7124,122 @@ mention_only = false
                 );
             }
         }
+    }
+
+    /// One file per key retired at V4, which a V3 file may still hold.
+    const KEYS_RETIRED_AT_V4: &[(&str, &str)] = &[
+        ("security.nevis", "[security.nevis]\nclient_secret = \"x\"\n"),
+        ("agents.x.compact_context", "[agents.x]\ncompact_context = true\n"),
+        ("agents.x.max_tool_iterations", "[agents.x]\nmax_tool_iterations = 40\n"),
+        ("agents.x.max_history_messages", "[agents.x]\nmax_history_messages = 10\n"),
+        ("agents.x.max_context_tokens", "[agents.x]\nmax_context_tokens = 1000\n"),
+        ("agents.x.memory_recall_limit", "[agents.x]\nmemory_recall_limit = 5\n"),
+        ("agents.x.parallel_tools", "[agents.x]\nparallel_tools = true\n"),
+        ("agents.x.tool_dispatcher", "[agents.x]\ntool_dispatcher = \"native\"\n"),
+        ("agents.x.strict_tool_parsing", "[agents.x]\nstrict_tool_parsing = true\n"),
+        (
+            "runtime_profiles.x.context_compression.summary_model",
+            "[runtime_profiles.x.context_compression]\nsummary_model = \"haiku\"\n",
+        ),
+        ("channels.wati", "[channels.wati]\napi_token = \"x\"\n"),
+        ("channels_config.wati", "[channels_config.wati]\napi_token = \"x\"\n"),
+        ("twitter", "[twitter]\nbearer_token = \"x\"\n"),
+        ("reddit", "[reddit]\nclient_id = \"x\"\n"),
+        ("channels.notion", "[channels.notion]\ntoken = \"x\"\n"),
+    ];
+
+    /// A key retired at V4 means the same under either reading of a file
+    /// with nothing else to decide by, or, where the V1 chain still reads it
+    /// (an agent's `max_tool_iterations` is its V2 iteration limit, the V3
+    /// layout's an inert key), that file is refused rather than read either
+    /// way. Generated from `RETIRED_KEYS`.
+    #[test]
+    fn keys_retired_at_v4_read_the_same_or_require_the_version() {
+        for key in RETIRED_KEYS.iter().filter(|key| key.retired_in >= 4) {
+            let path = key.path.join(".").replace(ANY_KEY, "x");
+            assert!(
+                KEYS_RETIRED_AT_V4.iter().any(|(sample, _)| *sample == path),
+                "`{path}` has no sample"
+            );
+        }
+        for (path, raw) in KEYS_RETIRED_AT_V4 {
+            let file: toml::Table = toml::from_str(raw).unwrap();
+            match detect_version(&toml::Value::Table(file.clone())) {
+                // Beside a V3 setting it is retired with a notice.
+                Ok(INFERRED_SCHEMA_VERSION) => {}
+                Ok(1) => {
+                    let differ = readings_differ(&file);
+                    assert!(
+                        differ.is_empty(),
+                        "{path}: read as V1 it configures something else, at {differ:?}"
+                    );
+                }
+                Ok(other) => panic!("{path}: read as V{other}"),
+                Err(err) => {
+                    assert!(
+                        !readings_differ(&file).is_empty(),
+                        "{path} is refused although both readings agree: {err}"
+                    );
+                    assert!(err.to_string().contains(path), "{path}: {err}");
+                }
+            }
+        }
+    }
+
+    /// The content check in `holds_a_v2_field` compares a child with what
+    /// the entry writes back, which is exact while no nested field of a
+    /// provider or channel entry leaves out a sub-field at its default. The
+    /// default-skipping fields of the entry types are all scalars on the
+    /// entry itself, and the nested children are maps (`extra_headers`,
+    /// `pricing`, `chat_template_kwargs`, `provider_extra`, the git channel's
+    /// `events`, whose routes write every field they hold), so a V2 child
+    /// holding a default value still reads as that child.
+    #[test]
+    fn a_v2_child_holding_default_values_is_still_a_field() {
+        for raw in [
+            "[channels.git]\nrepos = [\"zeroclaw-labs/zeroclaw\"]\n\n\
+             [channels.git.events.push]\nmessage = false\n",
+            "[providers.models.openai]\nmodel = \"gpt-4o\"\n\n\
+             [providers.models.openai.pricing]\ninput = 0.0\n",
+        ] {
+            assert_eq!(
+                detect_version(&toml::from_str(raw).unwrap()).ok(),
+                Some(1),
+                "{raw}"
+            );
+        }
+        // A key no route has is not a field of the entry: an alias beside
+        // its fields.
+        let raw = "[channels.git]\nrepos = [\"zeroclaw-labs/zeroclaw\"]\n\n\
+                   [channels.git.events.push]\nbogus = 1\n";
+        assert!(detect_version(&toml::from_str(raw).unwrap()).is_err(), "{raw}");
+    }
+
+    /// When the older part of a mixed file is a key the current layout
+    /// retires anyway, adding the version is the whole fix, so the refusal
+    /// says that first; otherwise it does not claim it.
+    #[test]
+    fn a_mixed_file_whose_older_part_is_retired_says_the_one_line_fix() {
+        for retired in [
+            "[identity]\nformat = \"openclaw\"\n",
+            "[swarms.old]\nstrategy = \"sequential\"\n",
+            "[reliability]\nfallback_providers = [\"openai\"]\n",
+        ] {
+            let raw = format!("{HAND_WRITTEN_V3_WITHOUT_VERSION}\n{retired}");
+            let err = detect_version(&toml::from_str(&raw).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("is retired, so if the rest of the file is current, adding \
+                     `schema_version = 4` as its first line is the whole fix"),
+                "{err}"
+            );
+        }
+        let raw = format!("default_model = \"legacy\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
+        let err = detect_version(&toml::from_str(&raw).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("is retired"), "{err}");
     }
 
     // ── V4 retirements of keys no schema field reads ────────────────

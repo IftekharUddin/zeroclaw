@@ -44148,6 +44148,101 @@ channel = "notion"
         .await;
     }
 
+    /// The shared `[transcription]` table beside a V3 alias of the family its
+    /// fields would move to: both are kept, on every path, with or without
+    /// other V3 sections in the file.
+    #[test]
+    async fn v4_review_r4_transcription_alias_collision_is_not_lost() {
+        let transcription_only = "[transcription]\napi_key = \"groq-key-global\"\n\
+            model = \"whisper-large-v3\"\n\n\
+            [providers.transcription.groq.default]\napi_key = \"groq-key-alias\"\n";
+        let with_an_agent = format!(
+            "{transcription_only}\n[agents.helper]\nmodel_provider = \"openai.main\"\n\
+             transcription_provider = \"groq.default\"\n\n\
+             [providers.models.openai.main]\nmodel = \"gpt-4o\"\n"
+        );
+        for raw in [transcription_only.to_string(), with_an_agent] {
+            assert_eq!(
+                crate::migration::detect_version(&toml::from_str(&raw).unwrap()).ok(),
+                Some(crate::migration::INFERRED_SCHEMA_VERSION),
+                "{raw}"
+            );
+            reads_like(
+                &raw,
+                &format!("schema_version = 3\n{raw}"),
+                &["transcription", "providers.transcription"],
+            )
+            .await;
+            let loaded = crate::migration::migrate_to_current(&raw).unwrap();
+            assert_eq!(
+                loaded.transcription.api_key.as_deref(),
+                Some("groq-key-global")
+            );
+            let alias = toml::Value::try_from(&loaded).unwrap();
+            assert_eq!(
+                alias["providers"]["transcription"]["groq"]["default"]["api_key"].as_str(),
+                Some("groq-key-alias")
+            );
+        }
+        // A V2 TTS block beside a V3 TTS alias of another type is a mix.
+        refused_on_every_path(
+            "[tts.openai]\nvoice = \"alloy\"\n\n\
+             [providers.tts.elevenlabs.main]\napi_key = \"KEEP-ELEVEN-KEY\"\n",
+        )
+        .await;
+    }
+
+    /// An incremental save that carries an older file through the structural
+    /// migration reports what that migration did, once the file is replaced,
+    /// and nothing when the replace fails.
+    #[test]
+    async fn v4_review_r4_save_dirty_reports_its_structural_migration() {
+        const V1_FILE: &str = "default_provider = \"openrouter\"\n\
+            default_model = \"anthropic/claude-sonnet-4\"\n";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, V1_FILE).unwrap();
+        let mut config = crate::migration::migrate_to_current(V1_FILE).unwrap();
+        config.config_path = config_path.clone();
+        config.loaded_from = Some(config_path.clone());
+
+        let mut rx = capture_log_events();
+        let test_case = "v4-review-r4-save-dirty-migration";
+        let assumed_v1 = |rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>| {
+            let mut events = 0;
+            while let Ok(event) = rx.try_recv() {
+                if event
+                    .pointer("/attributes/test_case")
+                    .and_then(|v| v.as_str())
+                    == Some(test_case)
+                    && event
+                        .pointer("/attributes/notice/kind")
+                        .and_then(|v| v.as_str())
+                        == Some("assumed_v1")
+                {
+                    events += 1;
+                }
+            }
+            events
+        };
+
+        // A directory blocks the pre-commit backup copy, so the replace fails.
+        let backup_path = tmp.path().join("config.toml.bak");
+        std::fs::create_dir(&backup_path).unwrap();
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        let blocked = ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty()).await;
+        assert!(blocked.is_err());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), V1_FILE);
+        assert_eq!(assumed_v1(&mut rx), 0, "a failed save reports nothing");
+
+        std::fs::remove_dir(backup_path).unwrap();
+        ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty())
+            .await
+            .unwrap();
+        assert_eq!(assumed_v1(&mut rx), 1, "the migration is reported once");
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.
