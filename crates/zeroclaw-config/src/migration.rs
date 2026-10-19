@@ -1878,8 +1878,12 @@ fn expand_doc_path(root: &toml_edit::Table, pattern: &[&str]) -> Vec<Vec<String>
         let Some((segment, rest)) = pattern.split_first() else {
             return;
         };
+        // Sorted, as `expand_path` walks a sorted table, so both appliers
+        // retire wildcard matches, and report them, in the same order.
         let keys: Vec<String> = if *segment == ANY_KEY {
-            table.iter().map(|(key, _)| key.to_string()).collect()
+            let mut keys: Vec<String> = table.iter().map(|(key, _)| key.to_string()).collect();
+            keys.sort();
+            keys
         } else if table.contains_key(segment) {
             vec![(*segment).to_string()]
         } else {
@@ -2028,7 +2032,10 @@ fn expand_path(root: &toml::Table, pattern: &[&str]) -> Vec<Vec<String>> {
             return;
         };
         let keys: Vec<&String> = if *segment == ANY_KEY {
-            table.keys().collect()
+            // Sorted whatever the map's own order, as `expand_doc_path` sorts.
+            let mut keys: Vec<&String> = table.keys().collect();
+            keys.sort();
+            keys
         } else {
             table
                 .get_key_value(*segment)
