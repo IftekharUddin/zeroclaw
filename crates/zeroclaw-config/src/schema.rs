@@ -44283,6 +44283,248 @@ channel = "notion"
         assert_eq!(assumed_v1(&mut rx), 1, "the migration is reported once");
     }
 
+    /// V2 channel sections under `channels_config`, the spelling V1 files
+    /// used and the current schema still accepts for `channels`: beside a V3
+    /// section they are a mix, refused on every path; alone they migrate as
+    /// the same file stated as V1 does, keeping their credentials.
+    #[test]
+    async fn v4_review_r5_legacy_channels_under_channels_config() {
+        const PROVIDER_ALIAS: &str = "[providers.models.ollama.work]\nmodel = \"llama3\"\n\n";
+        for (legacy, kept) in [
+            (
+                "[channels_config.feishu]\nenabled = true\napp_id = \"keep-app\"\n\
+                 app_secret = \"KEEP-FEISHU-SECRET\"\nmention_only = true\n",
+                "KEEP-FEISHU-SECRET",
+            ),
+            (
+                "[channels_config.discord_history]\nenabled = true\n\
+                 bot_token = \"KEEP-HISTORY-TOKEN\"\n",
+                "KEEP-HISTORY-TOKEN",
+            ),
+        ] {
+            refused_on_every_path(&format!("{PROVIDER_ALIAS}{legacy}")).await;
+
+            assert_eq!(
+                crate::migration::detect_version(&toml::from_str(legacy).unwrap()).ok(),
+                Some(1),
+                "{legacy}"
+            );
+            reads_like(
+                legacy,
+                &format!("schema_version = 1\n{legacy}"),
+                &["channels", "peer_groups"],
+            )
+            .await;
+            let loaded =
+                toml::Value::try_from(crate::migration::migrate_to_current(legacy).unwrap())
+                    .unwrap()
+                    .to_string();
+            assert!(loaded.contains(kept), "{legacy}: `{kept}` was lost:\n{loaded}");
+        }
+    }
+
+    /// One alias of `channels.discord`, spelled under `channels_config`, and
+    /// a sibling.
+    const DISCORD_UNDER_CHANNELS_CONFIG: &str = "[channels_config.discord.work]\nenabled = true\n\
+        bot_token = \"KEEP-DISCORD-TOKEN\"\n\n\
+        [channels_config.discord.home]\nenabled = true\nbot_token = \"KEEP-HOME-TOKEN\"\n";
+
+    /// `raw` written to a fresh config path, loaded strictly, changed by
+    /// `edit`, which names the paths it changed, and saved incrementally.
+    /// Returns the file written and its strict reload.
+    async fn edit_incrementally(raw: &str, edit: impl FnOnce(&mut Config) -> Vec<&'static str>) -> (String, Config) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, raw).unwrap();
+        let mut config = crate::migration::migrate_to_current(raw)
+            .unwrap_or_else(|err| panic!("{raw}: load failed: {err:#}"));
+        config.config_path = config_path.clone();
+        config.loaded_from = Some(config_path.clone());
+        for path in edit(&mut config) {
+            config.mark_dirty(path);
+        }
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let mut reloaded = crate::migration::migrate_to_current(&written)
+            .unwrap_or_else(|err| panic!("{raw}: strict reload failed: {err:#}\n{written}"));
+        let store = crate::secrets::SecretStore::new(tmp.path(), reloaded.secrets.encrypt);
+        reloaded.decrypt_secrets(&store).unwrap();
+        (written, reloaded)
+    }
+
+    /// An incremental edit under a section the file spells `channels_config`
+    /// writes into that section, not into a second `channels` root the schema
+    /// would refuse to read beside it: an edit, a removal and a rename each
+    /// reload strictly with every other alias kept, whether the file states
+    /// no version, V3 or V4, or went through `config migrate` first.
+    #[test]
+    async fn v4_review_r5_incremental_edits_keep_one_spelling_of_channels() {
+        let migrated = {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, DISCORD_UNDER_CHANNELS_CONFIG).unwrap();
+            crate::migration::migrate_file_in_place(&config_path).unwrap();
+            std::fs::read_to_string(&config_path).unwrap()
+        };
+        for raw in [
+            DISCORD_UNDER_CHANNELS_CONFIG.to_string(),
+            format!("schema_version = 3\n{DISCORD_UNDER_CHANNELS_CONFIG}"),
+            format!("schema_version = 4\n{DISCORD_UNDER_CHANNELS_CONFIG}"),
+            migrated.clone(),
+        ] {
+            let one_spelling = |written: &str| {
+                let value: toml::Table = toml::from_str(written).unwrap();
+                assert!(
+                    !(value.contains_key("channels") && value.contains_key("channels_config")),
+                    "both spellings of the channels section:\n{written}"
+                );
+            };
+
+            let (written, reloaded) = edit_incrementally(&raw, |config| {
+                config.channels.discord.get_mut("work").unwrap().mention_only = true;
+                vec!["channels.discord.work.mention_only"]
+            })
+            .await;
+            one_spelling(&written);
+            let work = &reloaded.channels.discord["work"];
+            assert!(work.mention_only, "the edit is saved:\n{written}");
+            assert_eq!(work.bot_token, "KEEP-DISCORD-TOKEN", "{written}");
+            assert_eq!(
+                reloaded.channels.discord["home"].bot_token,
+                "KEEP-HOME-TOKEN",
+                "{written}"
+            );
+
+            let (written, reloaded) = edit_incrementally(&raw, |config| {
+                config.channels.discord.remove("home");
+                vec!["channels.discord.home"]
+            })
+            .await;
+            one_spelling(&written);
+            assert!(!reloaded.channels.discord.contains_key("home"), "{written}");
+            assert_eq!(
+                reloaded.channels.discord["work"].bot_token,
+                "KEEP-DISCORD-TOKEN",
+                "{written}"
+            );
+
+            let (written, reloaded) = edit_incrementally(&raw, |config| {
+                let home = config.channels.discord.remove("home").unwrap();
+                config.channels.discord.insert("office".to_string(), home);
+                vec!["channels.discord.home", "channels.discord.office"]
+            })
+            .await;
+            one_spelling(&written);
+            assert!(!reloaded.channels.discord.contains_key("home"), "{written}");
+            assert_eq!(
+                reloaded.channels.discord["office"].bot_token,
+                "KEEP-HOME-TOKEN",
+                "{written}"
+            );
+            assert_eq!(
+                reloaded.channels.discord["work"].bot_token,
+                "KEEP-DISCORD-TOKEN",
+                "{written}"
+            );
+        }
+    }
+
+    /// The same for every other key the schema reads under a second
+    /// spelling: an incremental edit of the setting leaves the file holding
+    /// one spelling of it, which reloads strictly with the edit.
+    #[test]
+    async fn v4_review_r5_incremental_edits_keep_one_spelling_of_any_aliased_key() {
+        let current = format!("schema_version = {}\n", crate::migration::CURRENT_SCHEMA_VERSION);
+
+        // `mcpServers` for `[mcp]`.
+        let (written, reloaded) = edit_incrementally(
+            &format!("{current}\n[mcpServers]\nenabled = true\ndeferred_loading = true\n"),
+            |config| {
+                config.mcp.deferred_loading = false;
+                vec!["mcp.deferred_loading"]
+            },
+        )
+        .await;
+        assert!(!reloaded.mcp.deferred_loading, "{written}");
+        assert!(reloaded.mcp.enabled, "{written}");
+
+        // `channel` and `recipient` for `heartbeat.target` and `.to`.
+        let (written, reloaded) = edit_incrementally(
+            &format!("{current}\n[heartbeat]\nchannel = \"telegram\"\nrecipient = \"keep-to\"\n"),
+            |config| {
+                config.heartbeat.target = Some("discord".to_string());
+                vec!["heartbeat.target"]
+            },
+        )
+        .await;
+        assert_eq!(reloaded.heartbeat.target.as_deref(), Some("discord"), "{written}");
+        assert_eq!(reloaded.heartbeat.to.as_deref(), Some("keep-to"), "{written}");
+
+        // `dbURL` for a Postgres store's `db_url`, under a keyed alias.
+        let (written, reloaded) = edit_incrementally(
+            &format!(
+                "{current}\n[storage.postgres.main]\ndbURL = \"postgres://keep\"\nschema = \"public\"\n"
+            ),
+            |config| {
+                config.storage.postgres.get_mut("main").unwrap().db_url =
+                    Some("postgres://edited".to_string());
+                vec!["storage.postgres.main.db_url"]
+            },
+        )
+        .await;
+        assert_eq!(
+            reloaded.storage.postgres["main"].db_url.as_deref(),
+            Some("postgres://edited"),
+            "{written}"
+        );
+
+        // `allowed_paths` for a risk profile's `allowed_roots`.
+        let (written, reloaded) = edit_incrementally(
+            &format!("{current}\n[risk_profiles.default]\nallowed_paths = [\"/srv/keep\"]\n"),
+            |config| {
+                config.risk_profiles.get_mut("default").unwrap().allowed_roots =
+                    vec!["/srv/edited".to_string()];
+                vec!["risk_profiles.default.allowed_roots"]
+            },
+        )
+        .await;
+        assert_eq!(
+            reloaded.risk_profiles["default"].allowed_roots,
+            vec!["/srv/edited".to_string()],
+            "{written}"
+        );
+    }
+
+    /// A file holding both spellings of one setting is one the schema cannot
+    /// read; no save writes over it.
+    #[test]
+    async fn v4_review_r5_both_spellings_of_one_setting_block_every_save() {
+        let raw = format!(
+            "schema_version = {}\n\n[channels.discord.a]\nbot_token = \"keep-a\"\n\n\
+             [channels_config.discord.b]\nbot_token = \"keep-b\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, &raw).unwrap();
+            let mut config = crate::migration::migrate_to_current_salvaged(&raw).config;
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            let dirty = config.dirty_paths.clone();
+            let saved = if full {
+                config.save().await
+            } else {
+                config.save_dirty().await
+            };
+            assert!(saved.is_err(), "full={full}");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), raw, "full={full}");
+            assert_eq!(config.dirty_paths, dirty, "full={full}");
+        }
+    }
+
     /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
     /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
     /// step moves; an incremental save must not delete them as retired keys.

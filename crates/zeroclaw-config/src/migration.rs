@@ -6239,6 +6239,36 @@ mention_only = false
         ),
     ];
 
+    /// [`LEGACY_LAYOUT_EXAMPLES`], and each again under every other spelling
+    /// the schema accepts for its top-level section (`channels_config` for
+    /// `channels`), generated from the schema's aliases.
+    fn legacy_layout_examples() -> Vec<(String, String)> {
+        let aliases = top_level_aliases();
+        let mut examples: Vec<(String, String)> = LEGACY_LAYOUT_EXAMPLES
+            .iter()
+            .map(|(path, raw)| ((*path).to_string(), (*raw).to_string()))
+            .collect();
+        for (path, raw) in LEGACY_LAYOUT_EXAMPLES {
+            let (path, raw): (&str, &str) = (path, raw);
+            let (top, rest) = path.split_once('.').unwrap_or((path, ""));
+            for (alias, spelled) in &aliases {
+                if spelled != top {
+                    continue;
+                }
+                let mut file: toml::Table = toml::from_str(raw).unwrap();
+                let section = file.remove(top).unwrap();
+                file.insert((*alias).to_string(), section);
+                let path = if rest.is_empty() {
+                    (*alias).to_string()
+                } else {
+                    format!("{alias}.{rest}")
+                };
+                examples.push((path, toml::to_string(&file).unwrap()));
+            }
+        }
+        examples
+    }
+
     /// A declarative cron job, the V3 layout, appended to a file.
     const V3_LAYOUT_PROBE: &str = "\n[cron.zz_layout_probe]\ncommand = \"echo keep\"\n\
         schedule = { kind = \"cron\", expr = \"0 0 * * *\" }\n";
@@ -6249,7 +6279,8 @@ mention_only = false
     /// naming it, as either reading would reshape part of the file.
     #[test]
     fn every_legacy_layout_example_is_read_as_v1_and_refused_beside_v3() {
-        for (path, raw) in LEGACY_LAYOUT_EXAMPLES {
+        for (path, raw) in &legacy_layout_examples() {
+            let (path, raw) = (path.as_str(), raw.as_str());
             let value: toml::Value =
                 toml::from_str(raw).unwrap_or_else(|err| panic!("{path}: {err}"));
             assert!(
@@ -6414,6 +6445,22 @@ mention_only = false
                  [providers.models.grok.extra_headers]\nX-Trace = \"keep-header\"\n"
                     .to_string(),
                 Reading::V1,
+            ),
+            (
+                "r5: a V2 Feishu channel under channels_config beside a provider alias",
+                "[providers.models.ollama.work]\nmodel = \"llama3\"\n\n\
+                 [channels_config.feishu]\nenabled = true\napp_id = \"keep-app\"\n\
+                 app_secret = \"KEEP-FEISHU-SECRET\"\nmention_only = true\n"
+                    .to_string(),
+                Reading::Refused,
+            ),
+            (
+                "r5: V2 Discord history under channels_config beside a provider alias",
+                "[providers.models.ollama.work]\nmodel = \"llama3\"\n\n\
+                 [channels_config.discord_history]\nenabled = true\n\
+                 bot_token = \"KEEP-HISTORY-TOKEN\"\n"
+                    .to_string(),
+                Reading::Refused,
             ),
             (
                 "control: a V2 profile with its header map",
@@ -7158,7 +7205,8 @@ mention_only = false
     /// older-layout example is tried.
     #[test]
     fn a_legacy_setting_beside_what_its_migration_writes_is_refused() {
-        for (path, raw) in LEGACY_LAYOUT_EXAMPLES {
+        for (path, raw) in &legacy_layout_examples() {
+            let (path, raw) = (path.as_str(), raw.as_str());
             let legacy: toml::Value = toml::from_str(raw).unwrap();
             let migrated = run_chain(legacy.clone(), 1, &mut Vec::new())
                 .unwrap_or_else(|err| panic!("{path}: {err:#}"));
