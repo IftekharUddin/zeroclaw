@@ -374,7 +374,11 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
         None => match unversioned_shape(table) {
             UnversionedShape::V3 => Ok(INFERRED_SCHEMA_VERSION),
             UnversionedShape::NotV3 => Ok(1),
-            UnversionedShape::Mixed { current, legacy } => {
+            UnversionedShape::Mixed {
+                current,
+                legacy,
+                retired,
+            } => {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -382,13 +386,22 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                         .with_attrs(::serde_json::json!({ "current": current, "legacy": legacy })),
                     "config has no schema_version and mixes the V3 layout with an older one"
                 );
+                let fix = match retired {
+                    Some(path) => format!(
+                        "`{path}` is retired, so if the rest of the file is current, adding \
+                         `schema_version = 4` as its first line is the whole fix: the current \
+                         layout then drops it with a notice. If the whole file is older, add \
+                         `schema_version = 1` or `schema_version = 2` instead"
+                    ),
+                    None => "Rewrite the older settings in the current layout and add \
+                             `schema_version = 4` as the first line, or, if the whole file is \
+                             older, add `schema_version = 1` or `schema_version = 2` instead; \
+                             `zeroclaw config migrate` then rewrites it in the current layout"
+                        .to_string(),
+                };
                 anyhow::bail!(
                     "config has no `schema_version` and mixes layouts: {current}, but {legacy}. \
-                     Read either way, part of it would be lost, so it is not guessed. Rewrite \
-                     the older settings in the current layout and add `schema_version = 4` as \
-                     the first line, or, if the whole file is older, add `schema_version = 1` \
-                     or `schema_version = 2` instead; `zeroclaw config migrate` then rewrites \
-                     it in the current layout"
+                     Read either way, part of it would be lost, so it is not guessed. {fix}"
                 )
             }
             UnversionedShape::Ambiguous { detail } => {
@@ -434,8 +447,13 @@ enum UnversionedShape {
     NotV3,
     /// A section only the V3 layout has beside a setting only an older one
     /// has. Either reading reshapes or drops part of the file, so neither is
-    /// chosen.
-    Mixed { current: String, legacy: String },
+    /// chosen. `retired` names the older setting when the current layout
+    /// retires it anyway, so stating the current version is the whole fix.
+    Mixed {
+        current: String,
+        legacy: String,
+        retired: Option<String>,
+    },
     /// A child table of an alias-keyed section reads both as a field of a V2
     /// entry and as a V3 alias, so the operator must state the version.
     /// `detail` says which.
@@ -593,8 +611,12 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         let path = format!("{root}.{name}");
         if !section.values().all(toml::Value::is_table) {
             // A field held directly on the section: the V2 shape.
-            legacy
-                .get_or_insert_with(|| format!("`[{path}]` holds fields directly, the V2 layout"));
+            legacy.get_or_insert_with(|| {
+                (
+                    format!("`[{path}]` holds fields directly, the V2 layout"),
+                    None,
+                )
+            });
             // A child table that is not a field of the V2 entry, with what it
             // holds, is a V3 alias beside those fields: both layouts in one
             // section.
@@ -627,13 +649,43 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
     }
 
     match (current, legacy) {
-        (Some(current), Some(legacy)) => UnversionedShape::Mixed { current, legacy },
+        (Some(current), Some((legacy, retired))) => UnversionedShape::Mixed {
+            current,
+            legacy,
+            retired,
+        },
         (Some(_), None) => match ambiguous {
             Some(detail) => UnversionedShape::Ambiguous { detail },
             None => UnversionedShape::V3,
         },
-        (None, _) => UnversionedShape::NotV3,
+        (None, Some(_)) => UnversionedShape::NotV3,
+        (None, None) => match agent_read_differently_by_each_layout(table) {
+            Some(alias) => UnversionedShape::Ambiguous {
+                detail: format!(
+                    "`[agents.{alias}]` holds none of a current agent's settings, so the older \
+                     layouts' migration rewrites it (profile references, `max_tool_iterations` \
+                     as its iteration limit) where the current layout leaves it, and nothing \
+                     else in the file tells the layouts apart"
+                ),
+            },
+            None => UnversionedShape::NotV3,
+        },
     }
+}
+
+/// An agent the V1 -> V3 chain rewrites although no key of it marks either
+/// layout: one holding no current agent setting (see [`V3_AGENT_FIELDS`]) and
+/// no V2-only one. The chain gives every such agent `default` profile
+/// references and reads its `max_tool_iterations`, which the current layout
+/// retires, as its V2 iteration limit, so in a file holding nothing else
+/// that tells the layouts apart it reads differently each way. Pinned by
+/// `keys_retired_at_v4_read_the_same_or_require_the_version`.
+fn agent_read_differently_by_each_layout(table: &toml::Table) -> Option<&str> {
+    let agents = table.get("agents").and_then(toml::Value::as_table)?;
+    agents
+        .iter()
+        .find(|(_, agent)| agent.is_table())
+        .map(|(alias, _)| alias.as_str())
 }
 
 /// Settings only the V3 layout has that the V1 -> V3 chain also writes into:
@@ -726,18 +778,21 @@ fn holds_a_value(value: &toml::Value) -> bool {
     }
 }
 
-/// The first setting in `table` that only a layout before V3 has, described,
-/// or `None`: a path in [`LEGACY_LAYOUT_PATHS`], the V2 cron layout
+/// The first setting in `table` that only a layout before V3 has, described
+/// with its path when the current layout retires it, or `None`: a path in [`LEGACY_LAYOUT_PATHS`], the V2 cron layout
 /// (`[[cron.jobs]]`, or a subsystem knob on `[cron]`), a route naming its
 /// provider `provider`, or a V2-only setting (see [`v2_only_marker`]). A
 /// provider or channel section holding fields directly is found by
 /// [`unversioned_shape`], which reads those sections.
-fn legacy_layout_evidence(table: &toml::Table) -> Option<String> {
+fn legacy_layout_evidence(table: &toml::Table) -> Option<(String, Option<String>)> {
     if let Some(path) = LEGACY_LAYOUT_PATHS
         .iter()
         .find_map(|pattern| expand_path(table, pattern).into_iter().next())
     {
-        return Some(format!("`{}` is a pre-V3 setting", path.join(".")));
+        let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+        let dotted = path.join(".");
+        let retired = retired_key_covering(&segments).map(|_| dotted.clone());
+        return Some((format!("`{dotted}` is a pre-V3 setting"), retired));
     }
     if let Some(cron) = table.get("cron").and_then(toml::Value::as_table)
         && let Some((key, _)) = cron.iter().find(|(key, value)| {
@@ -745,7 +800,7 @@ fn legacy_layout_evidence(table: &toml::Table) -> Option<String> {
                 || (V2_CRON_KNOBS.contains(&key.as_str()) && !value.is_table())
         })
     {
-        return Some(format!("`cron.{key}` is the V2 cron layout"));
+        return Some((format!("`cron.{key}` is the V2 cron layout"), None));
     }
     if let Some(routes) = ["model_routes", "embedding_routes"]
         .into_iter()
@@ -756,12 +811,15 @@ fn legacy_layout_evidence(table: &toml::Table) -> Option<String> {
                 .is_some_and(|entries| entries.iter().any(|entry| entry.get("provider").is_some()))
         })
     {
-        return Some(format!(
-            "`{routes}` entries name their provider `provider`, the V2 spelling of \
-             `model_provider`"
+        return Some((
+            format!(
+                "`{routes}` entries name their provider `provider`, the V2 spelling of \
+                 `model_provider`"
+            ),
+            None,
         ));
     }
-    v2_only_marker(table)
+    v2_only_marker(table).map(|detail| (detail, None))
 }
 
 /// Keys the V2 -> V3 step moves off `[agents.<alias>]` (see
