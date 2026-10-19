@@ -5730,6 +5730,7 @@ summary_model = "opus"
 
     // ── F3: `config migrate` from V3 or later edits the file in place ──
 
+    /// Its tool selector is explicit, so a migration has none to add.
     const UNTOUCHED_V3_BODY: &str = "locale = 'en'  # operator note: keep this explanation\n\
          \n\
          [gateway]\n\
@@ -5739,7 +5740,10 @@ summary_model = "opus"
          # A comment block before a section.\n\
          [cost]\n\
          daily_limit_usd = 1e1\n\
-         warn_at_percent = 0x50\n";
+         warn_at_percent = 0x50\n\
+         \n\
+         [tools]\n\
+         optional = [\"*\"]\n";
 
     #[test]
     fn v3_migration_changes_only_the_version_line() {
@@ -5777,7 +5781,9 @@ summary_model = "opus"
          code_ttl_secs = 3600\n\n\
          [gateway.pairing_code]\n\
          length = 20\n\
-         charset = \"unambiguous\"\n";
+         charset = \"unambiguous\"\n\n\
+         [tools]\n\
+         optional = [\"*\"]\n";
 
     #[test]
     fn retired_dashboard_code_length_is_removed_on_every_path() {
