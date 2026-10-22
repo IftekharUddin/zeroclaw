@@ -85,7 +85,7 @@ pub struct RetiredKey {
     pub retired_in: u32,
     /// Path from the config root, one segment per table key. [`ANY_KEY`]
     /// matches every key at its level. It covers every spelling the schema
-    /// accepts for its keys too (see [`ALIASED_KEYS`]): `channels.wati` also
+    /// accepts for its keys too (see `ALIASED_KEYS`): `channels.wati` also
     /// retires `channels_config.wati`.
     pub path: &'static [&'static str],
     /// Why it was retired and what to use instead, in English: logs and
@@ -356,7 +356,7 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
 
 /// The version a config with no `schema_version` key is read as when its
 /// layout is plainly V3: it holds a section only the V3 layout has, and
-/// nothing only an older layout has (see [`unversioned_shape`]).
+/// nothing only an older layout has (see `unversioned_shape`).
 ///
 /// Fixed at 3, not [`CURRENT_SCHEMA_VERSION`]: V3 is the newest shape such a
 /// file can be recognized by, and reading it as V3 runs every later migration
