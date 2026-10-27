@@ -22,15 +22,29 @@ cargo web install       # npm install in web/
 
 ## Workspace navigation
 
-Home (`/`) summarizes ready agents, active work, recorded daily model spend,
+**Classic** is the default layout, including when the browser has no saved
+layout or cannot read it. It keeps Dashboard at `/`, the full desktop navigation
+rail and mobile drawer, chat tabs, and the SOP collection, read-only view, and
+editor routes. Existing `/system`, `/memory`, and configuration bookmarks remain
+available.
+
+Choose **Focused** explicitly in **Appearance > Workspace layout** or the optional
+layout choice in Quickstart. The same choice is reversible and local to this
+browser, independent of color themes. Missing layout storage never triggers
+setup: the gateway's Quickstart state and agents still determine first run.
+Switching layouts preserves mounted conversations, approvals, helpers, and SOP
+drafts. A Classic SOP view displays the saved definition; choose Edit to return
+to an unsaved draft. Sessions and runtime configuration keep their existing owners.
+
+In Focused, Home (`/`) summarizes ready agents, active work, recorded daily model spend,
 and system health, followed by recent sessions and SOP activity. The main
 workspaces have short descriptions, and an expandable feature directory keeps
 supporting tools discoverable. These read-only views use existing gateway and
 runtime APIs; unavailable data is shown as unknown rather than zero.
 
 **Agent**, **Code**, **S.O.P**, and **Admin** form a centered switcher in the persistent
-header, including on Home. The page scrolls below it. There is no global
-navigation rail. Search, appearance, language, and sign-out remain available
+header, including on Home. The page scrolls below it. Focused has no global
+navigation rail; Classic retains the full rail and mobile drawer. Search, appearance, language, and sign-out remain available
 from the header. **Operator Dark/Light** use the same default palette and cyan
 accent behavior as `master`. They apply when no appearance preference is saved.
 The softer graphite/teal and ivory/green palettes remain available as
@@ -190,6 +204,28 @@ cargo build --release --features gateway
 </div>
 
 The gateway loads `web/dist/` from the filesystem at runtime via `static_files.rs`, so the Rust compile and the web build are decoupled. Ship the populated `web/dist/` alongside the binary for installs that should serve the dashboard.
+
+## Nix builds
+
+`nix/web.nix` exposes `packages.zeroclaw-web` (the `dist/` bundle at
+`$out/share/zeroclaw-web/`) and `packages.zeroclaw-openapi-spec` (the
+hermetic spec dump). The chain is split so each sandbox stays single-language:
+
+1. `zeroclaw-openapi-spec` builds `cargo xtask web` and runs
+   `web spec-dump --out $out`: pure Rust, no npm. `api-generated.ts` is
+   deliberately *not* produced here.
+2. `zeroclaw-web` (`buildNpmPackage`, Node 24 per `.nvmrc`) copies the dumped
+   helpers into `src/lib/`, derives `api-generated.ts` from `openapi.json`
+   with the vendored `openapi-typescript`, then runs the standard
+   `npm run build`.
+
+```sh
+nix build .#zeroclaw-web
+nix build .#zeroclaw-openapi-spec
+```
+
+The NixOS module (`nix/module.nix`, `webUiPackage` option) points
+`gateway.web_dist_dir` at the bundle; see `nix/README.md`.
 
 ## Required tools
 

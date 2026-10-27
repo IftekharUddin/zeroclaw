@@ -5,6 +5,13 @@ const fs = require('node:fs');
 const out = process.env.WEB_SMOKE_OUTPUT || '/tmp/zeroclaw-sop-evidence';
 const appUrl = process.env.WEB_SMOKE_URL || 'http://127.0.0.1:5179';
 fs.mkdirSync(out, { recursive: true });
+async function chooseLayout(page, name) {
+  await page.getByRole('button', { name: 'More options', exact: true }).click();
+  await page.getByRole('button', { name: 'Appearance', exact: true }).click();
+  await page.getByRole('radio', { name: new RegExp('^' + name) }).check();
+  await page.keyboard.press('Escape');
+}
+
 const step = (number, title, extra = {}) => ({
   number,
   title,
@@ -314,7 +321,17 @@ let page;
     console.error('Browser error:', e.message);
   });
   page.on('dialog', (dialog) => dialog.accept());
-  await page.goto(appUrl + '/sops/PR%20review');
+  await page.goto(appUrl + '/sops');
+  await page.getByRole('link', { name: /^PR review Review changes/ }).waitFor();
+  await page.screenshot({ path: out + '/classic-sop-list.png', fullPage: true });
+  await page.getByRole('link', { name: /^PR review Review changes/ }).click();
+  await page.getByRole('link', { name: 'Edit', exact: true }).click();
+  await page.getByRole('complementary').filter({ has: page.getByText('Name', { exact: true }) }).waitFor();
+  await page.locator('svg text').filter({ hasText: /^Review changes$/ }).waitFor();
+  await page.getByRole('button', { name: 'Fit view', exact: true }).click();
+  await page.screenshot({ path: out + '/classic-sop-editor.png', fullPage: true });
+  await chooseLayout(page, 'Focused');
+
   await page.getByRole('heading', { name: 'PR review', exact: true }).waitFor();
   await page
     .locator('svg text')
@@ -335,6 +352,11 @@ let page;
   await page.getByRole('button', { name: /^PR review Review changes/ }).click();
   assert.equal(await page.getByPlaceholder('Step title').inputValue(), 'Inspect pull request');
   assert.equal(saves, 0);
+  const socketsBeforeLayout = sockets;
+  await chooseLayout(page, 'Classic');
+  await chooseLayout(page, 'Focused');
+  assert.equal(sockets, socketsBeforeLayout);
+  assert.equal(await page.getByPlaceholder('Step title').inputValue(), 'Inspect pull request');
   await page.reload();
   await page.getByRole('button', { name: 'SOP settings', exact: true }).click();
   await page.getByRole('combobox', { name: 'Inspect', exact: true }).selectOption('step:1');
@@ -470,6 +492,33 @@ let page;
     await page.screenshot({ path: out + `/sop-mobile-${width}.png`, fullPage: true });
     await page.getByRole('button', { name: 'Close SOP panel', exact: true }).last().click();
   }
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await chooseLayout(page, 'Classic');
+  await page.getByRole('link', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: 'Toggle SOP panel', exact: true }).click();
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  const helper = page.getByRole('textbox', { name: 'Describe your SOP or ask for a change…' });
+  await helper.fill('Keep this unsent helper draft');
+  const helperSockets = sockets;
+  await chooseLayout(page, 'Focused');
+  assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
+  await chooseLayout(page, 'Classic');
+  assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
+  assert.equal(sockets, helperSockets);
+  await page.getByRole('button', { name: 'Back to SOPs', exact: true }).click();
+  await page.getByRole('link', { name: 'New SOP', exact: true }).click();
+  const classicForm = page.getByRole('complementary').filter({ has: page.getByText('Name', { exact: true }) }).first();
+  await classicForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Classic workflow');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('link', { name: 'Edit', exact: true }).waitFor();
+  assert.equal(definitions['Classic workflow'].name, 'Classic workflow');
+  await page.screenshot({ path: out + '/classic-sop-view.png', fullPage: true });
+  await page.getByRole('link', { name: 'Edit', exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: 'Close SOP panel', exact: true }).last().click();
+  await page.getByRole('button', { name: 'Fit view', exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.screenshot({ path: out + '/classic-sop-mobile.png', fullPage: true });
   assert.deepEqual(errors, []);
   await browser.close();
   console.log(JSON.stringify({ passed: true, saves, prompts, decisions, sockets, evidence: out }));

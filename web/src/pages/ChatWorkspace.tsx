@@ -1,7 +1,8 @@
+import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
-import { type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
+import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
 import { useWorkspaceVisible } from '@/components/layout/WorkspaceOutlet';
 import { useNavigate } from 'react-router-dom';
 import AgentSidebar from '@/components/AgentSidebar';
@@ -46,6 +47,7 @@ export interface ChatWorkspaceProps {
  * and its socket only closes — when its tab is explicitly closed.
  */
 export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWorkspaceProps) {
+  const { layout: presentation } = useLayoutPreference();
   const visible = useWorkspaceVisible();
   const navigate = useNavigate();
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
@@ -317,9 +319,10 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
     });
   }, [tabs]);
 
+  const Navigation = presentation === 'classic' ? ChatTabBar : AgentSidebar;
   return (
-    <div translate="no" className="notranslate relative flex h-full min-h-0">
-      <AgentSidebar
+    <div translate="no" className={`notranslate relative flex h-full min-h-0 ${presentation === 'classic' ? 'flex-col' : ''}`}>
+      <Navigation
         tabs={labelledTabs}
         activeKey={activeTab?.key ?? ''}
         indicators={indicators}

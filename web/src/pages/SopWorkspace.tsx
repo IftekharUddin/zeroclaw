@@ -1,12 +1,15 @@
+import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { PanelLeft, Plus, Search, Workflow, X } from 'lucide-react';
 import { listRuns, listSops, type SopRunSummary, type SopSummary } from '@/lib/sops';
 import { useWorkspaceVisible, VisibleWorkspace } from '@/components/layout/WorkspaceOutlet';
-import { SopEditor } from '@/pages/Sops';
+import { SopEditor, SopsList, SopView } from '@/pages/Sops';
 import { t } from '@/lib/i18n';
 
 export default function SopWorkspace() {
+  const { layout } = useLayoutPreference();
+  const classic = layout === 'classic';
   const { name } = useParams();
   const location = useLocation();
   const visible = useWorkspaceVisible();
@@ -37,6 +40,9 @@ export default function SopWorkspace() {
   const selected = lastSelection.current !== undefined ? lastSelection.current : sops[0]?.name;
   const selectedKey = selected ?? '@new';
   const runId = new URLSearchParams(search).get('run');
+  const classicList = classic && pathname === '/sops';
+  const classicView = classic && !!name && !pathname.endsWith('/edit') && !runId;
+  const editorVisible = !classicList && !classicView;
 
   useEffect(() => {
     let cancelled = false;
@@ -88,7 +94,7 @@ export default function SopWorkspace() {
     );
     if (!window.matchMedia('(min-width: 1280px)').matches) setLibraryOpen(false);
   };
-  if (selected !== undefined) {
+  if (selected !== undefined && (editorVisible || editors.current[selectedKey])) {
     const id = editors.current[selectedKey]?.id ?? crypto.randomUUID();
     editors.current[selectedKey] = {
       id,
@@ -99,7 +105,7 @@ export default function SopWorkspace() {
           runs={runs}
           runError={runError}
           onSelectRun={(sop, run) => selectSop(sop, run)}
-          onEdit={() => selectSop(selected)}
+          onEdit={() => { void navigate(selected ? `/sops/${encodeURIComponent(selected)}${classic ? '/edit' : ''}` : '/sops/new'); }}
           libraryOpen={libraryOpen}
           onToggleLibrary={() => setLibraryOpen((open) => !open)}
           onSaved={(savedName) => {
@@ -124,7 +130,9 @@ export default function SopWorkspace() {
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 overflow-hidden">
-      {libraryOpen && (
+      {classicList && <div className="w-full overflow-auto"><SopsList key={revision} /></div>}
+      {classicView && <div className="w-full overflow-auto"><SopView key={`${name}:${revision}`} /></div>}
+      {!classic && libraryOpen && (
         <>
           <button
             type="button"
@@ -209,10 +217,10 @@ export default function SopWorkspace() {
           </aside>
         </>
       )}
-      <div className="min-w-0 flex-1">
+      <div hidden={!editorVisible} className="min-w-0 flex-1">
         {Object.entries(editors.current).map(([key, entry]) => (
           <div key={entry.id} hidden={key !== selectedKey} className="h-full">
-            <VisibleWorkspace.Provider value={visible && key === selectedKey}>
+            <VisibleWorkspace.Provider value={visible && editorVisible && key === selectedKey}>
               {entry.element}
             </VisibleWorkspace.Provider>
           </div>

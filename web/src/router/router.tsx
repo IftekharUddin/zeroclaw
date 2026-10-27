@@ -1,3 +1,4 @@
+import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { Suspense } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import AgentLanding from '../pages/AgentLanding';
@@ -19,6 +20,7 @@ import {
   Integrations,
   Logs,
   Pairing,
+  Plugins,
   Quickstart,
   RunDetail,
   Runs,
@@ -38,11 +40,17 @@ function RouteFallback() {
   );
 }
 
+function Landing() {
+  const { layout } = useLayoutPreference();
+  // Loading the other landing page must not suspend the shell or its open Appearance dialog.
+  return <Suspense fallback={<RouteFallback />}>{layout === 'classic' ? <Dashboard /> : <Home />}</Suspense>;
+}
+
 export const Router = () => (
   <Suspense fallback={<RouteFallback />}>
     <Routes>
       <Route element={<Layout />}>
-        <Route path="/" element={<Home />} />
+        <Route path="/" element={<Landing />} />
         <Route path="/admin" element={<Admin />} />
         <Route path="/system" element={<Dashboard />} />
         <Route path="/sessions" element={<Sessions />} />
@@ -61,7 +69,8 @@ export const Router = () => (
         <Route path="/runs" element={<Runs />} />
         <Route path="/runs/:sop/:runId" element={<RunDetail />} />
         <Route path="/integrations" element={<Integrations />} />
-        <Route path="/memory" element={<Navigate to="/?tab=memories" replace />} />
+        <Route path="/plugins" element={<Plugins />} />
+        <Route path="/memory" element={<Navigate to="/system?tab=memories" replace />} />
         <Route path="/config" element={<Config />} />
         <Route path="/config/:section" element={<Config />} />
         <Route path="/config/:section/:type" element={<Config />} />

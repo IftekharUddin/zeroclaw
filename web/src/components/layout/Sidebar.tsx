@@ -266,11 +266,6 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
   useEffect(() => {
     if (drawerOpen) drawerRef.current?.querySelector<HTMLElement>('button, a')?.focus();
   }, [drawerOpen]);
-  // Daily work stays visible. Every destination is still available from More
-  // and from keyboard search, without a screen-height wall of icons.
-  const railGroups = navGroups.map((group, index) => ({ ...group,
-    items: index === 0 ? group.items : group.items.filter((item) => item.to === '/config' || item.to === '/system'),
-  }));
   const { pathname } = useLocation();
   const activePath = findActiveNavPath(pathname, navPaths);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -311,7 +306,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       >
         <RailLogo />
         <nav className={railNavClassName} aria-label={t('nav.aria.primary')}>
-          {railGroups.map((group, index) => (
+          {navGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}
               {index > 0 && (

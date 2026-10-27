@@ -341,11 +341,13 @@ mod tests {
             port,
             config,
             None,
-            Some(zeroclaw_runtime::daemon::GatewayReloadControls {
-                shutdown_tx: gateway_shutdown,
+            Some(zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+                gateway_shutdown,
                 reload_tx
-            }),
+            )),
             Some(context.tui_registry.clone()),
+            None,
+            None,
             None,
             None,
             None,
@@ -448,7 +450,7 @@ mod tests {
         assert!(created.get("error").is_none(), "{created}");
         assert_eq!(
             created["result"]["workspace_dir"],
-            expected.to_string_lossy().as_ref()
+            expected.canonicalize().unwrap().to_string_lossy().as_ref()
         );
         let sid = created["result"]["session_id"].as_str().unwrap();
         let turn = tokio_util::sync::CancellationToken::new();

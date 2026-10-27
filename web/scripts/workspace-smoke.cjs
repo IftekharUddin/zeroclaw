@@ -5,6 +5,13 @@ const assert = require("node:assert/strict");
 const out = process.env.WEB_SMOKE_OUTPUT || "/tmp/zeroclaw-workspace-evidence";
 const appUrl = process.env.WEB_SMOKE_URL || "http://127.0.0.1:5178/";
 fs.mkdirSync(out, { recursive: true });
+async function chooseLayout(page, name) {
+  await page.getByRole('button', { name: 'More options', exact: true }).click();
+  await page.getByRole('button', { name: 'Appearance', exact: true }).click();
+  await page.getByRole('radio', { name: new RegExp('^' + name) }).check();
+  await page.keyboard.press('Escape');
+}
+
 (async () => {
   const browser = await chromium.launch({ channel: "chrome", headless: true });
   const context = await browser.newContext({
@@ -16,6 +23,7 @@ fs.mkdirSync(out, { recursive: true });
   });
   let codeRunning = false;
   let capabilities = true;
+  let freshInstall = false;
   const sessions = [
     {
       session_id: "release-plan",
@@ -112,6 +120,8 @@ fs.mkdirSync(out, { recursive: true });
     if (u.pathname === "/api/status")
       body = {
         version: "0.8.5",
+        uptime_seconds: 3600,
+        gateway_port: 3000,
         locale: "en",
         check_updates: false,
         health: { components: {} },
@@ -129,7 +139,7 @@ fs.mkdirSync(out, { recursive: true });
         session_persistence: true,
       };
     else if (u.pathname === "/api/quickstart/state")
-      body = { quickstart_completed: true, agents: ["builder", "reviewer"] };
+      body = { quickstart_completed: !freshInstall, agents: freshInstall ? [] : ["builder", "reviewer"], model_provider_types: [], risk_presets: [], runtime_presets: [], memory_kinds: [], channels: [], unassigned_channels: [], channel_types: [], personality_files: [] };
     else if (u.pathname === "/api/sessions") body = { sessions };
     else if (u.pathname === "/api/sessions/running")
       body = { sessions: [{ session_id: "review-api" }] };
@@ -218,6 +228,25 @@ fs.mkdirSync(out, { recursive: true });
       body: JSON.stringify(body),
     });
   });
+  let chatSockets = 0;
+  let chatApprovals = 0;
+  await context.routeWebSocket('**/ws/chat?*', (ws) => {
+    chatSockets++;
+    let pendingApproval = false;
+    ws.onMessage((raw) => {
+      const frame = JSON.parse(raw);
+      if (frame.type === 'message') {
+        pendingApproval = true;
+        ws.send(JSON.stringify({ type: 'chunk', content: 'Checking the task.' }));
+        ws.send(JSON.stringify({ type: 'approval_request', request_id: 'chat-approval', tool: 'shell', arguments_summary: 'Run harmless fixture', timeout_secs: 120 }));
+      } else if (frame.type === 'approval_response' && pendingApproval) {
+        // The gateway resolves each parked approval once, including duplicate replies.
+        pendingApproval = false;
+        chatApprovals++;
+        ws.send(JSON.stringify({ type: 'done', full_response: 'Chat task complete.' }));
+      }
+    });
+  });
   let codeSockets = 0;
   await context.routeWebSocket("**/ws/code", (ws) => {
     codeSockets++;
@@ -302,10 +331,51 @@ fs.mkdirSync(out, { recursive: true });
     console.error("PAGE ERROR:", e.message);
   });
   await page.goto(appUrl);
+  await page.getByRole('navigation', { name: 'Primary navigation', exact: true }).waitFor();
+  assert.equal(new URL(page.url()).pathname, '/');
+  await page.getByRole('link', { name: 'Plugins', exact: true }).waitFor();
+  await page.getByText(':3000', { exact: true }).waitFor();
+  await page.waitForTimeout(500); // Let Dashboard's entrance animation settle for visual evidence.
+  await page.screenshot({ path: out + '/classic-desktop.png', fullPage: true });
+  for (const invalid of ['unknown', '{broken', 'null']) {
+    await page.evaluate((value) => localStorage.setItem('zeroclaw-layout', value), invalid);
+    await page.reload();
+    await page.getByRole('navigation', { name: 'Primary navigation', exact: true }).waitFor();
+  }
+  await page.addInitScript(() => {
+    const get = Storage.prototype.getItem;
+    Storage.prototype.getItem = function(key) {
+      if (key === 'zeroclaw-layout' && sessionStorage.getItem('block-layout') === 'yes') throw new DOMException('Fixture storage denied', 'SecurityError');
+      return get.call(this, key);
+    };
+  });
+  await page.evaluate(() => sessionStorage.setItem('block-layout', 'yes'));
+  await page.reload();
+  await page.getByRole('navigation', { name: 'Primary navigation', exact: true }).waitFor();
+  await page.evaluate(() => sessionStorage.removeItem('block-layout'));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: 'Primary navigation', exact: true }).click();
+  await page.getByRole('dialog').getByRole('link', { name: 'Plugins', exact: true }).waitFor();
+  await page.screenshot({ path: out + '/classic-mobile-drawer.png', fullPage: true });
+  await page.keyboard.press('Escape');
+  await page.setViewportSize({ width: 1440, height: 980 });
+  freshInstall = true;
+  await page.goto(appUrl);
+  await page.waitForURL('**/quickstart');
+  assert.equal(await page.getByRole('radio', { name: /^Classic/ }).isChecked(), true);
+  freshInstall = false;
+  await page.getByRole('radio', { name: /^Focused/ }).check();
+  assert.equal(await page.evaluate(() => localStorage.getItem('zeroclaw-layout')), 'focused');
+  await page.screenshot({ path: out + '/setup-focused-choice.png', fullPage: true });
+  await page.goto(appUrl);
+  await page.reload();
+
   for (const name of ["Agent", "Code", "S.O.P", "Admin"]) {
     await page.getByRole("link", { name, exact: true }).waitFor();
   }
   assert.equal(await page.getByRole("navigation", { name: "Primary" }).count(), 0);
+  await page.getByRole("heading", { name: "Your workspace", exact: true }).waitFor();
+  await page.getByText("Plan the next release", { exact: true }).waitFor();
   await page.screenshot({ path: out + "/home-desktop.png", fullPage: true });
   await page.keyboard.press("Control+k");
   await page
@@ -332,6 +402,7 @@ fs.mkdirSync(out, { recursive: true });
   await page
     .getByRole("textbox", { name: "Describe a code change or ask a question…" })
     .waitFor();
+  await page.getByText("This workspace contains a README and a source directory.", { exact: true }).waitFor();
   await page
     .getByRole("textbox", { name: "Describe a code change or ask a question…" })
     .fill("Run the project tests");
@@ -343,6 +414,14 @@ fs.mkdirSync(out, { recursive: true });
     .waitFor();
   await page.waitForTimeout(250);
   await page.screenshot({ path: out + "/code-approval.png", fullPage: true });
+  const socketsBeforeLayout = codeSockets;
+  await chooseLayout(page, 'Classic');
+  await page.getByText('Run project tests', { exact: true }).waitFor();
+  assert.equal(codeSockets, socketsBeforeLayout);
+  assert.equal(codeRunning, true);
+  await chooseLayout(page, 'Focused');
+  assert.equal(codeSockets, socketsBeforeLayout);
+
   await page.getByRole("link", { name: "Home", exact: true }).first().click();
   await page.getByRole("link", { name: "Agent", exact: true }).waitFor();
   assert.equal(codeRunning, true);
@@ -365,6 +444,7 @@ fs.mkdirSync(out, { recursive: true });
   await page.screenshot({ path: out + "/code-mobile.png", fullPage: true });
   await page.getByRole("link", { name: "Home", exact: true }).last().click();
   await page.getByRole("link", { name: "Agent", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "Your workspace", exact: true }).waitFor();
   await page.screenshot({ path: out + "/home-mobile.png", fullPage: true });
   assert.equal(
     await page.evaluate(
@@ -372,6 +452,27 @@ fs.mkdirSync(out, { recursive: true });
     ),
     true,
   );
+  // Chat sockets, an unsent composer, and pending approval survive presentation changes.
+  await page.setViewportSize({ width: 1440, height: 980 });
+  await page.getByRole('link', { name: 'Agent', exact: true }).click();
+  const chatInput = page.getByPlaceholder('Type a message...');
+  await chatInput.fill('Keep my chat draft');
+  const openedChats = chatSockets;
+  await chooseLayout(page, 'Classic');
+  assert.equal(await chatInput.inputValue(), 'Keep my chat draft');
+  await chooseLayout(page, 'Focused');
+  assert.equal(await chatInput.inputValue(), 'Keep my chat draft');
+  await chatInput.press('Enter');
+  await page.getByText('Run harmless fixture', { exact: true }).waitFor();
+  await chooseLayout(page, 'Classic');
+  await page.getByRole('link', { name: 'Dashboard', exact: true }).first().click();
+  await page.getByRole('link', { name: /Needs your attention · builder/ }).click();
+  await page.getByRole('button', { name: 'Approve', exact: true }).click();
+  await page.getByText('Chat task complete.', { exact: true }).waitFor();
+  assert.equal(chatSockets, openedChats);
+  assert.equal(chatApprovals, 1);
+  await chooseLayout(page, 'Focused');
+  await page.getByRole('link', { name: 'Home', exact: true }).first().click();
   // Home keeps the workspace entry points; unavailable workspaces offer setup.
   capabilities = false;
   await page.getByRole("link", { name: "Code", exact: true }).click();
@@ -383,7 +484,23 @@ fs.mkdirSync(out, { recursive: true });
   await page.setViewportSize({ width: 1440, height: 980 });
   await page.reload();
   await page.getByRole('link', { name: 'Code', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Your workspace', exact: true }).waitFor();
+  await page.getByText('Plan the next release', { exact: true }).waitFor();
   await page.screenshot({ path: out + '/home-light.png', fullPage: true });
+  await page.getByRole('button', { name: 'More options', exact: true }).click();
+  await page.getByRole('button', { name: 'Appearance', exact: true }).click();
+  assert.equal(await page.getByRole('radio', { name: /^Focused/ }).isChecked(), true);
+  await page.waitForTimeout(350); // Wait for the Appearance entrance animation before visual proof.
+  await page.screenshot({ path: out + '/appearance-focused-choice.png', fullPage: true });
+  await page.getByRole('radio', { name: /^Classic/ }).check();
+  await page.waitForTimeout(350);
+  await page.screenshot({ path: out + '/appearance-classic-choice.png', fullPage: true });
+  await page.keyboard.press('Escape');
+  await page.reload();
+  await page.getByRole('navigation', { name: 'Primary navigation', exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('zeroclaw-theme')).theme), 'light');
+  await page.getByText(':3000', { exact: true }).waitFor();
+  await page.screenshot({ path: out + '/classic-light.png', fullPage: true });
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ passed: true, codeSockets, evidence: out }));
   await browser.close();

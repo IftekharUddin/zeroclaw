@@ -1,6 +1,7 @@
+import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Home, MoreHorizontal, Search } from 'lucide-react';
+import { Home, Menu, MoreHorizontal, Search } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
@@ -10,9 +11,12 @@ import { activeWorkspace } from '@/lib/navigation';
 
 export default function Header({
   onOpenPalette,
+  onOpenSidebar,
 }: {
   onOpenPalette: () => void;
+  onOpenSidebar: () => void;
 }) {
+  const { layout } = useLayoutPreference();
   const { pathname } = useLocation();
   const workspace = activeWorkspace(pathname);
   const { logout } = useAuth();
@@ -23,14 +27,16 @@ export default function Header({
   return (
     <>
       <header className="relative z-40 grid min-h-16 shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-y-2 border-b border-pc-border bg-pc-surface px-2 py-2 sm:px-6 lg:py-0">
+        <div className="flex items-center gap-1">
+          {layout === 'classic' && <button type="button" onClick={onOpenSidebar} aria-label={t('nav.aria.primary')} className="rounded-lg p-2 md:hidden"><Menu className="h-5 w-5" /></button>}
         <Link
           to="/"
-          aria-label={t('home.title')}
+          aria-label={t(layout === 'classic' ? 'nav.dashboard' : 'home.title')}
           className="flex w-fit items-center gap-2 rounded-lg p-1.5 text-sm font-semibold tracking-tight text-pc-text-secondary hover:text-pc-text"
         >
           <Home className="h-4 w-4 sm:hidden" />
           <span className="hidden sm:inline">ZeroClaw</span>
-        </Link>
+        </Link></div>
         <nav
           aria-label={t('workspace.choose')}
           className="flex items-center gap-1 rounded-xl border border-pc-border bg-pc-base p-1 text-sm"

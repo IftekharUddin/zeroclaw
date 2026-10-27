@@ -22,6 +22,7 @@ import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 import WorkspaceAttention from '@/components/layout/WorkspaceAttention';
 import { useWorkspaceSettings } from '@/components/WorkspaceSettings';
+import { resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
@@ -43,21 +44,19 @@ function fmtTokens(n: number): string {
 }
 
 /** Context bar component showing context window usage. */
-function ContextBar({ contextMaxTokens, contextInputTokens }: { 
-  contextMaxTokens: number | null; 
-  contextInputTokens: number | null; 
+function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }: {
+  contextMaxTokens: number | null;
+  contextModelWindow: number | null;
+  contextInputTokens: number | null;
 }) {
-  if (!contextMaxTokens) return null;
+  const state = resolveContextBarState(
+    contextMaxTokens,
+    contextModelWindow,
+    contextInputTokens,
+  );
+  if (!state) return null;
 
-  const used = contextInputTokens ?? 0;
-  const max = contextMaxTokens;
-  const pct = max > 0 ? Math.min((used / max) * 100, 100) : 0;
-  const barWidth = 16;
-  const filled = Math.round((pct / 100) * barWidth);
-  const empty = Math.max(0, barWidth - filled);
-  const bar = '█'.repeat(filled) + '░'.repeat(empty);
-
-  const label = `ctx: ${fmtTokens(used).padStart(7)} / ${fmtTokens(max).padStart(7)}  [${bar}]  ${pct.toFixed(0)}%`;
+  const label = `${t('agent.context_usage')}: ${fmtTokens(state.used).padStart(7)} / ${fmtTokens(state.denominator).padStart(7)}  [${state.cells}]  ${state.percent.toFixed(0)}%`;
 
   return (
     <div className="px-4 py-1.5 border-b text-[11px] font-mono flex items-center gap-2" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
@@ -130,6 +129,7 @@ export function AgentChatInner({
     pendingApproval,
     respondToApproval,
     contextMaxTokens,
+    contextModelWindow,
     contextInputTokens,
   } = useAgent();
 
@@ -855,7 +855,7 @@ export function AgentChatInner({
                   : t('agent.disconnected_status')}
             </span>
           </div>
-          <ContextBar contextMaxTokens={contextMaxTokens} contextInputTokens={contextInputTokens} />
+          <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} />
         </div>
       </div>
     </div>

@@ -1,3 +1,4 @@
+import LayoutChoice from '@/components/LayoutChoice';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { X, Settings, Sun, Moon, Monitor, Laptop, Check, Type, CaseSensitive, Palette } from 'lucide-react';
 import { useTheme } from '@/hooks/useTheme';
@@ -263,6 +264,7 @@ export function SettingsModal({ open, onClose }: Props) {
           {tab === 'appearance' && (
             <>
               <SectionTitle>{t('settings.appearance')}</SectionTitle>
+              <LayoutChoice />
 
               {/* Theme Mode */}
               <div className="mb-3">

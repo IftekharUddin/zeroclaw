@@ -1,4 +1,6 @@
-import { useEffect } from 'react';
+import { useLayoutPreference } from '@/contexts/LayoutPreference';
+import Sidebar from './Sidebar';
+import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import WorkspaceSettings from '@/components/WorkspaceSettings';
 import Header from '@/components/layout/Header';
@@ -11,6 +13,8 @@ import { t } from '@/lib/i18n';
 import { routeTitleKey } from '@/lib/navigation';
 
 export default function Layout() {
+  const { layout } = useLayoutPreference();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const { pathname } = useLocation();
   const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
   // Per-route browser tab title.
@@ -19,7 +23,7 @@ export default function Layout() {
     const first = seg[0];
     let name: string | null;
     if (!first) {
-      name = t('home.title');
+      name = t(layout === 'classic' ? 'nav.dashboard' : 'home.title');
     } else if (first === 'agent' && seg[1]) {
       name = `${decodeURIComponent(seg[1])} · ${t('nav.group.chat')}`;
     } else {
@@ -27,12 +31,13 @@ export default function Layout() {
       name = key ? t(key) : null;
     }
     document.title = name ? `${name} — ZeroClaw` : 'ZeroClaw';
-  }, [pathname]);
+  }, [pathname, layout]);
 
   return (
     <WorkspaceSettings><div className="min-h-screen bg-pc-base text-pc-text">
-      <div className="flex h-dvh min-w-0 flex-col">
-        <Header onOpenPalette={openPalette} />
+      {layout === 'classic' && <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />}
+      <div className={`flex h-dvh min-w-0 flex-col ${layout === 'classic' ? 'md:ml-14' : ''}`}>
+        <Header onOpenPalette={openPalette} onOpenSidebar={() => setSidebarOpen(true)} />
         <ReloadBanner />
         <UnsavedChangesBanner />
         <div id="workspace-attention" />
