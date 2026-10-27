@@ -716,12 +716,25 @@ fn safe_return_path(raw: Option<&str>) -> String {
                 && path.len() <= MAX_RETURN_PATH_BYTES
                 && path
                     .bytes()
-                    .all(|b| (0x21..=0x7e).contains(&b) && b != b'\\') =>
+                    .all(|b| (0x21..=0x7e).contains(&b) && b != b'\\')
+                && !has_dot_segment(path) =>
         {
             path.to_string()
         }
         _ => "/".to_string(),
     }
+}
+
+/// Whether the path part of `path` has a `.` or `..` segment, literal or
+/// percent-encoded. The browser resolves those away, so `/zc/../x` would
+/// leave the dashboard's path prefix and `/.//evil.example` would land on
+/// the path `//evil.example`.
+fn has_dot_segment(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    path.split('/').any(|segment| {
+        let segment = segment.to_ascii_lowercase().replace("%2e", ".");
+        segment == "." || segment == ".."
+    })
 }
 
 /// Whether the request reached this gateway on the machine it runs on: a
@@ -3050,6 +3063,16 @@ mod tests {
             (Some("/a b"), "/"),
             (Some("/a\r\nSet-Cookie: x=y"), "/"),
             (Some("/\u{e9}"), "/"),
+            // Dot segments, which the browser resolves away: they could land
+            // outside the path prefix or on a `//host`-looking path.
+            (Some("/.//evil.example"), "/"),
+            (Some("/a/..//evil.example"), "/"),
+            (Some("/%2e//evil.example"), "/"),
+            (Some("/../x"), "/"),
+            (Some("/%2E%2e/x"), "/"),
+            (Some("/chat/."), "/"),
+            (Some("/a.b/c..d"), "/a.b/c..d"),
+            (Some("/chat?next=../x"), "/chat?next=../x"),
         ] {
             assert_eq!(safe_return_path(raw), landing, "{raw:?}");
         }
