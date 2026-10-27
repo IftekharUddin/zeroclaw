@@ -83,6 +83,7 @@ async function chooseLayout(page, name) {
     },
   ];
   const fields = [
+    { path: "agents.builder.env", kind: "secret-map", value: "{}", populated: true, is_secret: true, type_hint: "Map", category: "Agent", tab: "Advanced" },
     {
       path: "agents.builder.max_tool_iterations",
       kind: "integer",
@@ -396,6 +397,15 @@ async function chooseLayout(page, name) {
     fullPage: true,
   });
   assert.equal(new URL(page.url()).pathname, "/");
+  await page.keyboard.press("Escape");
+  await page.getByRole("dialog", { name: "Settings", exact: true }).waitFor({ state: "hidden" });
+  await page.keyboard.press("Control+k");
+  await page.getByRole("textbox", { name: "Search features, sessions, settings…" }).fill("builder env");
+  await page.getByRole("option").filter({ hasText: "env" }).click();
+  const secretMap = page.locator('[data-config-field="agents.builder.env"]');
+  await secretMap.waitFor();
+  await page.waitForTimeout(300);
+  assert.equal(await secretMap.locator('input').first().evaluate(el => el === document.activeElement), true, 'search focuses the new grouped secret map');
   await page.keyboard.press("Escape");
   await page.getByRole("dialog", { name: "Settings", exact: true }).waitFor({ state: "hidden" });
   await page.getByRole("link", { name: "Code", exact: true }).click();
