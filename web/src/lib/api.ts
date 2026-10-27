@@ -20,6 +20,7 @@ import {
   authHeaders,
   clearToken,
   getAuthMode,
+  getOidcSession,
   getToken,
   setToken,
   type AuthMode,
@@ -200,11 +201,12 @@ async function apiFetchOnce<T>(
   // AbortSignal — the cached entry closes over the FIRST caller's options, so a
   // later caller would silently get the wrong response and have its signal
   // ignored. Plain header-less, signal-less GETs still share one request.
-  // The key carries the credential: the pairing token, or the OIDC mode, whose
-  // cookie the page can't read.
+  // The key carries the credential: the pairing token, or the signed-in
+  // account (the page can't read its cookie), so one account never receives
+  // a response fetched for another.
   const coalesceKey =
     method === "GET" && !options.body && !options.headers && !options.signal
-      ? `${mode === "oidc" ? "oidc" : (token ?? "")} ${url}`
+      ? `${mode === "oidc" ? `oidc:${getOidcSession()?.principal_id ?? ""}` : (token ?? "")} ${url}`
       : null;
 
   const doFetch = async (): Promise<RawResult> => {

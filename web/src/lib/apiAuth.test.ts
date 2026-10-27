@@ -157,6 +157,24 @@ test("signed in: concurrent GETs still share one request", async () => {
   assert.equal(requests.length, 1);
 });
 
+test("signed in: GETs made under different accounts never share one request", async () => {
+  auth.setOidcSession(session());
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  responder = async () => {
+    await gate;
+    return json(200, { ok: true });
+  };
+  const first = api.apiFetch("/api/status");
+  auth.setOidcSession(session({ principal_id: "principal-b", csrf_token: "csrf-b" }));
+  const second = api.apiFetch("/api/status");
+  release();
+  await Promise.all([first, second]);
+  assert.equal(requests.length, 2);
+});
+
 // ---------------------------------------------------------------------------
 // OIDC mode: 401 / 403 routing
 // ---------------------------------------------------------------------------
