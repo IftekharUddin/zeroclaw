@@ -76,12 +76,14 @@ export default function Code({
   sopAssistant,
   onBusyChange,
   attentionTarget,
+  draftScope,
   onAttentionOpen,
 }: {
   embedded?: boolean;
   contextText?: string;
   sopAssistant?: { onApply: (source: string) => Promise<void> };
   attentionTarget?: string;
+  draftScope?: string;
   onAttentionOpen?: () => void;
   onBusyChange?: (busy: boolean) => void;
 }) {
@@ -117,7 +119,7 @@ export default function Code({
   >([]);
   const [messages, setMessages] = useState<CodeMessage[]>([]);
   const [stream, setStream] = useState("");
-  const draftKey = `code.${attentionTarget ?? "workspace"}.${alias}.${session?.session_id ?? "new"}`;
+  const draftKey = `code.${draftScope ?? attentionTarget ?? "workspace"}.${alias}.${session?.session_id ?? "new"}`;
   const { draft, saveDraft, clearDraft } = useDraft(draftKey);
   const [prompt, setPromptValue] = useState(draft);
   const setPrompt = (value: string) => {

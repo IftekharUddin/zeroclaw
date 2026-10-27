@@ -2731,6 +2731,7 @@ export function SopEditor({
                 sopAssistant={{ onApply: applyProposal }}
                 onBusyChange={setAssistantBusy}
                 onAttentionOpen={() => openDock('agent')}
+                draftScope={`sop-helper:${panelId}`}
                 attentionTarget={editing ? `/sops/${encodeURIComponent(editing)}/edit` : '/sops/new'}
               />
             )}

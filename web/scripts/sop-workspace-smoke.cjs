@@ -136,9 +136,14 @@ let prompts = 0;
 let projectedDraft;
 let rejectGraph = false;
 let rejectSave = false;
+let rejectRename = false;
+const renames = [];
+const savedNames = [];
 let rejectOverlay = false;
 let decisions = 0;
 let sockets = 0;
+let helperSessions = 0;
+let requestHelperApproval;
 let browser;
 let page;
 (async () => {
@@ -229,8 +234,21 @@ let page;
       }
       const value = route.request().postDataJSON();
       definitions[value.name] = value;
+      savedNames.push(value.name);
       saves++;
       body = { saved: value.name };
+    } else if (path.endsWith('/rename') && method === 'POST') {
+      const from = path.split('/')[3];
+      const { to } = route.request().postDataJSON();
+      if (rejectRename) {
+        rejectRename = false;
+        await route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture rename conflict' }) });
+        return;
+      }
+      definitions[to] = { ...definitions[from], name: to };
+      delete definitions[from];
+      renames.push({ from, to });
+      body = { renamed: to, from };
     } else if (path.endsWith('/full')) body = definitions[path.split('/')[3]];
     else if (path.endsWith('/graph')) body = graph(definitions[path.split('/')[3]]);
     else if (path.endsWith('/overlay')) {
@@ -279,13 +297,16 @@ let page;
   await context.routeWebSocket('**/ws/code', (ws) => {
     sockets++;
     let sid = `helper-${sockets}`;
+    requestHelperApproval = () => ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { session_id: sid, type: 'approval_request', request_id: 'rename-proof', tool_name: 'shell', arguments_summary: 'Harmless rename fixture', timeout_secs: 120 } }));
     const reply = (id, result) => ws.send(JSON.stringify({ jsonrpc: '2.0', id, result }));
     ws.onMessage((raw) => {
       const frame = JSON.parse(raw);
       if (frame.method === 'initialize') reply(frame.id, { protocol_version: 1 });
       else if (frame.method === 'session/list-acp') reply(frame.id, { sessions: [] });
-      else if (frame.method === 'session/new')
+      else if (frame.method === 'session/new') {
+        helperSessions++;
         reply(frame.id, { session_id: sid, agent_alias: 'reviewer' });
+      }
       else if (frame.method === 'session/prompt') {
         prompts++;
         assert.ok(
@@ -500,13 +521,54 @@ let page;
   const helper = page.getByRole('textbox', { name: 'Describe your SOP or ask for a change…' });
   await helper.fill('Keep this unsent helper draft');
   const helperSockets = sockets;
+  const beforeRenameSessions = helperSessions;
   await chooseLayout(page, 'Focused');
   assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
   await chooseLayout(page, 'Classic');
   assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
   assert.equal(sockets, helperSockets);
+  const renameForm = page.getByRole('complementary').filter({ has: page.getByText('Name', { exact: true }) }).first();
+  await renameForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Renamed workflow');
+  rejectRename = true;
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('alert').filter({ hasText: 'Fixture rename conflict' }).waitFor();
+  assert.ok(page.url().includes('/New%20workflow/edit'));
+  assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
+  assert.equal(renames.length, 0);
+  assert.ok(definitions['New workflow']);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('link', { name: 'Edit', exact: true }).waitFor();
+  assert.equal(new URL(page.url()).pathname, '/sops/Renamed%20workflow');
+  await page.getByRole('link', { name: 'Edit', exact: true }).click();
+  assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
+  assert.equal(sockets, helperSockets, 'rename must retain the helper connection');
+  assert.deepEqual(renames, [{ from: 'New workflow', to: 'Renamed workflow' }]);
+  assert.equal(definitions['New workflow'], undefined);
+  await chooseLayout(page, 'Focused');
+  assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
+  await chooseLayout(page, 'Classic');
+  await renameForm.getByRole('textbox', { name: 'Description', exact: true }).fill('Saved under renamed identity');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('link', { name: 'Edit', exact: true }).waitFor();
+  assert.equal(savedNames.at(-1), 'Renamed workflow');
+  assert.equal(renames.length, 1, 'subsequent save must not rename the old identity again');
+  await page.getByRole('link', { name: 'Edit', exact: true }).click();
+  assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
+  assert.equal(sockets, helperSockets);
+  assert.equal(helperSessions, beforeRenameSessions, 'rename must retain the helper session');
+  requestHelperApproval();
+  const attention = page.getByRole('link', { name: /Needs your attention/ });
+  await attention.waitFor();
+  assert.equal(await attention.getAttribute('href'), '/sops/Renamed%20workflow/edit');
+  await chooseLayout(page, 'Focused');
+  await attention.click();
+  assert.equal(new URL(page.url()).pathname, '/sops/Renamed%20workflow/edit');
+  assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
+  await chooseLayout(page, 'Classic');
   await page.getByRole('button', { name: 'Back to SOPs', exact: true }).click();
   await page.getByRole('link', { name: 'New SOP', exact: true }).click();
+  await helper.waitFor();
+  assert.equal(await helper.inputValue(), '', 'another SOP must not inherit the renamed helper composer');
   const classicForm = page.getByRole('complementary').filter({ has: page.getByText('Name', { exact: true }) }).first();
   await classicForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Classic workflow');
   await page.getByRole('button', { name: 'Save', exact: true }).click();

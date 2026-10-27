@@ -30,7 +30,7 @@ export default function SopWorkspace() {
   const editors = useRef<Record<string, { id: string; element: ReactNode }>>({});
   const lastSelection = useRef<string | null | undefined>(undefined);
   const selectionLocation = useRef<string | null>(null);
-  // A saved new draft acquires its name before Router commits navigation.
+  // A saved or renamed draft acquires its name before Router commits navigation.
   // Only a new navigation may replace that selection, not an intervening poll.
   if (visible && selectionLocation.current !== location.key) {
     if (pathname === '/sops/new') lastSelection.current = null;
@@ -109,12 +109,14 @@ export default function SopWorkspace() {
           libraryOpen={libraryOpen}
           onToggleLibrary={() => setLibraryOpen((open) => !open)}
           onSaved={(savedName) => {
-            // Keep the new SOP's mounted helper when its draft acquires a saved name.
-            if (selected === null && editors.current['@new']) {
-              editors.current[savedName] = editors.current['@new'];
-              delete editors.current['@new'];
-              lastSelection.current = savedName;
+            // The successful save owns the destination, even if an older editor
+            // for that name was cached. Move its React identity, never duplicate it.
+            const owner = editors.current[selectedKey];
+            if (owner && selectedKey !== savedName) {
+              editors.current[savedName] = owner;
+              delete editors.current[selectedKey];
             }
+            lastSelection.current = savedName;
             setRevision((value) => value + 1);
             void navigate(`/sops/${encodeURIComponent(savedName)}`, {
               replace: true,
