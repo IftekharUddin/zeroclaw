@@ -332,6 +332,26 @@ test("a signed-out tab picks up a sign-in from another tab", async () => {
   assert.equal(reloads, 0);
 });
 
+test("a tab signed out of one account reloads when another account signs in elsewhere", async () => {
+  await mountSignedIn();
+  await broadcast({ type: "signed-out" });
+  assert.equal(state().isAuthenticated, false);
+  sessionResponse = () => json(200, session({ principal_id: "principal-b", csrf_token: "csrf-b" }));
+  await broadcast({ type: "signed-in" });
+  assert.equal(reloads, 1);
+  assert.equal(state().isAuthenticated, false);
+});
+
+test("a tab signed out of an account picks up that account's new sign-in without a reload", async () => {
+  await mountSignedIn();
+  await broadcast({ type: "signed-out" });
+  sessionResponse = () => json(200, session({ csrf_token: "csrf-2" }));
+  await broadcast({ type: "signed-in" });
+  assert.equal(reloads, 0);
+  assert.equal(state().isAuthenticated, true);
+  assert.equal(state().session?.csrf_token, "csrf-2");
+});
+
 test("lost access re-checks the session", async () => {
   await mountSignedIn();
   sessionResponse = () => json(401, { error: "gone", reason: "session_invalid" });

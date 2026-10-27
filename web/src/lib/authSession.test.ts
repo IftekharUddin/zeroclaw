@@ -265,6 +265,46 @@ test("decideSignedIn: adopt, resume for the same account, reload for another", (
   );
 });
 
+test("decideSignedIn: a tab whose session ended adopts only that account again", () => {
+  const other = session({ principal_id: "principal-b" });
+  assert.equal(authSession.decideSignedIn(null, other, "principal-a"), "reload");
+  assert.equal(authSession.decideSignedIn(null, session(), "principal-a"), "adopt");
+  assert.equal(authSession.decideSignedIn(null, other, null), "adopt");
+});
+
+test("a signed-out tab reloads for another account's sign-in instead of adopting it", async () => {
+  auth.setOidcSession(session());
+  auth.setOidcSession(null);
+  let reloads = 0;
+  const outcome = await authSession.refreshOidcSession({
+    probe: async () => ({
+      kind: "oidc",
+      session: session({ principal_id: "principal-b", csrf_token: "csrf-b" }),
+      clockOffsetMs: 0,
+    }),
+    reload: () => {
+      reloads += 1;
+    },
+  });
+  assert.equal(outcome, "reloading");
+  assert.equal(reloads, 1);
+  // The old account's page is about to go; the other account is not let in.
+  assert.equal(auth.getOidcSession(), null);
+});
+
+test("a signed-out tab adopts the same account's new sign-in in place", async () => {
+  auth.setOidcSession(session());
+  auth.setOidcSession(null);
+  const next = session({ csrf_token: "csrf-2" });
+  const outcome = await authSession.refreshOidcSession({
+    probe: async () => ({ kind: "oidc", session: next, clockOffsetMs: 0 }),
+    reload: () => assert.fail("the same account keeps its page"),
+  });
+  assert.equal(outcome, "resumed");
+  assert.deepEqual(auth.getOidcSession(), next);
+  auth.setOidcSession(null);
+});
+
 test("re-auth as the same account resumes in place with the new session", async () => {
   auth.setOidcSession(session());
   let resumed = 0;

@@ -60,6 +60,10 @@ let reauthPending = false;
 // Expiry is computed on the server's clock so a skewed browser clock can't
 // make a fresh session look expired.
 let clockOffsetMs = 0;
+// The principal of the last session this page held, kept after it ends: the
+// page behind the sign-in screen still holds that account's state (unsent
+// drafts, loaded data), so only the same account may be let back in place.
+let lastPrincipalId: string | null = null;
 const sessionListeners = new Set<(session: OidcSession | null) => void>();
 
 /** The current auth mode. */
@@ -70,6 +74,11 @@ export function getAuthMode(): AuthMode {
 /** The signed-in OIDC session, or null in pairing mode. */
 export function getOidcSession(): OidcSession | null {
   return oidcSession;
+}
+
+/** The principal of the last session this page held, or null if it held none. */
+export function getLastPrincipalId(): string | null {
+  return lastPrincipalId;
 }
 
 /** Server clock minus browser clock for the held session, in ms. */
@@ -89,6 +98,7 @@ export function markReauthPending(pending: boolean): void {
 /** Enter (or refresh) OIDC mode, or leave it with `null`. */
 export function setOidcSession(session: OidcSession | null, offsetMs = 0): void {
   oidcSession = session;
+  if (session) lastPrincipalId = session.principal_id;
   clockOffsetMs = session ? offsetMs : 0;
   reauthPending = false;
   for (const listener of [...sessionListeners]) listener(session);

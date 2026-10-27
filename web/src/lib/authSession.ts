@@ -9,6 +9,7 @@
 import {
   AUTH_EVENTS,
   CSRF_HEADER,
+  getLastPrincipalId,
   getOidcSession,
   setOidcSession,
   type OidcSession,
@@ -363,13 +364,18 @@ export type SignedInDecision = 'adopt' | 'resume' | 'reload';
  * What a tab does with a session it just read after a sign-in somewhere in the
  * browser: adopt it (this tab had none), resume (same principal: keep the
  * page), or reload (another account: the page's data belongs to the old one).
+ * A tab whose session already ended (`lastPrincipalId`) still holds that
+ * account's page, so it adopts only the same account again.
  */
 export function decideSignedIn(
   current: OidcSession | null,
   next: OidcSession,
+  lastPrincipalId: string | null = null,
 ): SignedInDecision {
-  if (!current) return 'adopt';
-  return current.principal_id === next.principal_id ? 'resume' : 'reload';
+  const held = current?.principal_id ?? lastPrincipalId;
+  if (held === null) return 'adopt';
+  if (held !== next.principal_id) return 'reload';
+  return current ? 'resume' : 'adopt';
 }
 
 export type RefreshOutcome = 'resumed' | 'reloading' | 'expired' | 'signed-out' | 'error';
@@ -389,7 +395,7 @@ export async function refreshOidcSession(
   const probe = await (deps.probe ?? (() => fetchAuthSession()))();
   switch (probe.kind) {
     case 'oidc': {
-      if (decideSignedIn(getOidcSession(), probe.session) === 'reload') {
+      if (decideSignedIn(getOidcSession(), probe.session, getLastPrincipalId()) === 'reload') {
         (deps.reload ?? (() => window.location.reload()))();
         return 'reloading';
       }
