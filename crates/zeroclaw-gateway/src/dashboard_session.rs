@@ -350,6 +350,22 @@ impl DashboardSessions {
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
+    /// End every session whose provider the dashboard no longer offers, or
+    /// whose alias now names another issuer or client, as a request naming
+    /// it would. Offering the provider again later must not bring it back.
+    fn end_unoffered(&self, offered: &[(String, ProviderPin)]) {
+        if !self.occupied.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.sessions.lock().retain(|_, session| {
+            let kept = provider_for(offered, &session.alias).as_ref() == Some(&session.provider);
+            if !kept {
+                session.ended.cancel();
+            }
+            kept
+        });
+    }
+
     fn remove_key(&self, key: &[u8; 32]) -> bool {
         match self.sessions.lock().remove(key) {
             Some(session) => {
@@ -571,10 +587,16 @@ impl SweeperGuard {
                 let Some(sessions) = sessions.upgrade() else {
                     break;
                 };
-                // Sign-in turned off with no request since still ends every
-                // session, so turning it back on cannot bring them back.
-                if !config.read().gateway.dashboard_sign_in.enabled() {
-                    sessions.end_all();
+                // Sign-in turned off, or a provider taken off it or repointed,
+                // with no request since still ends the sessions concerned, so
+                // offering it again cannot bring them back.
+                {
+                    let config = config.read();
+                    if config.gateway.dashboard_sign_in.enabled() {
+                        sessions.end_unoffered(&offered_in(&config));
+                    } else {
+                        sessions.end_all();
+                    }
                 }
                 sessions.sweep_now(now_unix());
             }
@@ -619,12 +641,18 @@ impl DashboardAuth {
     /// Bind this state to the gateway generation `state` belongs to, before
     /// that generation serves anything: its stop retires every session watch
     /// and refuses cookie requests from then on, a generation built with
-    /// sign-in off ends every session, and the generation's idle sweep runs
-    /// until this state is dropped.
+    /// sign-in off ends every session (and one that no longer offers a
+    /// provider, or repoints it, ends that provider's sessions), and the
+    /// generation's idle sweep runs until this state is dropped.
     pub fn for_generation(mut self, state: &AppState) -> Self {
         let stopping = state.shutdown_tx.subscribe();
-        if !state.config.read().gateway.dashboard_sign_in.enabled() {
-            self.sessions.end_all();
+        {
+            let config = state.config.read();
+            if config.gateway.dashboard_sign_in.enabled() {
+                self.sessions.end_unoffered(&offered_in(&config));
+            } else {
+                self.sessions.end_all();
+            }
         }
         self._sweeper = SweeperGuard::start(&self.sessions, state.config.clone(), stopping.clone());
         self.stopping = Some(stopping);
@@ -1066,7 +1094,12 @@ fn check_csrf(
 /// The providers the dashboard offers now that are still configured, with
 /// the issuer and client each alias names now.
 fn offered_providers(state: &AppState) -> Vec<(String, ProviderPin)> {
-    let config = state.config.read();
+    offered_in(&state.config.read())
+}
+
+/// The providers `config` offers for dashboard sign-in that are still
+/// configured, with the issuer and client each alias names.
+fn offered_in(config: &zeroclaw_config::schema::Config) -> Vec<(String, ProviderPin)> {
     config
         .gateway
         .dashboard_sign_in
@@ -4129,6 +4162,125 @@ mod tests {
         commit
             .publish(commit.next_revision().expect("revision"), config)
             .expect("publish");
+    }
+
+    /// Sign-in with two providers offered: `corp` at `issuer`, and `backup`
+    /// at `backup_issuer` with a client of its own.
+    fn two_provider_config(issuer: &str, backup_issuer: &str) -> Config {
+        let mut config = sign_in_config(issuer);
+        let mut backup = config.oidc["corp"].clone();
+        backup.issuer = backup_issuer.into();
+        backup.client_id = "gw2".into();
+        backup.interactive_clients = vec!["gw2".into()];
+        backup.service_clients = Vec::new();
+        config.oidc.insert("backup".into(), backup);
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into(), "backup".into()];
+        config
+    }
+
+    async fn set_offered(state: &AppState, aliases: &[&str]) {
+        let commit = state
+            .config_authority
+            .begin_config_commit()
+            .await
+            .expect("config commit");
+        let mut config = commit.current_config();
+        config.gateway.dashboard_sign_in.oidc =
+            aliases.iter().map(|alias| alias.to_string()).collect();
+        commit
+            .publish(commit.next_revision().expect("revision"), config)
+            .expect("publish");
+    }
+
+    /// A provider taken off the sign-in screen while another stays offered
+    /// ends its sessions even when no request arrives before it is offered
+    /// again: the next sweep sees it gone.
+    #[tokio::test]
+    async fn a_provider_taken_off_sign_in_ends_its_sessions_without_a_request() {
+        let server = idp(&["admins"], "gw").await;
+        let backup_server = idp(&["admins"], "gw2").await;
+        let fixture = fixture(two_provider_config(&server.uri(), &backup_server.uri()));
+        let (cookie, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        set_offered(&fixture.state, &["backup"]).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        set_offered(&fixture.state, &["corp", "backup"]).await;
+        assert!(
+            session.ended.is_cancelled(),
+            "a session outlived its provider being taken off sign-in"
+        );
+        let (status, body) = probe(&fixture, &[("cookie", &cookie_for(&cookie))]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_invalid");
+    }
+
+    /// A gateway generation built without a provider, or with it pointed at
+    /// another client (the reload that changed it), ends that provider's
+    /// sessions at once, before any request, while the other provider's
+    /// sessions stay.
+    #[tokio::test]
+    async fn a_generation_built_without_a_provider_ends_its_sessions() {
+        let server = idp(&["admins"], "gw").await;
+        let backup_server = idp(&["admins"], "gw2").await;
+        let config = two_provider_config(&server.uri(), &backup_server.uri());
+        let mut repointed = config.clone();
+        if let Some(corp) = repointed.oidc.get_mut("corp") {
+            corp.client_id = "gw-new".into();
+            corp.interactive_clients = vec!["gw-new".into()];
+        }
+        let mut without = config.clone();
+        without.gateway.dashboard_sign_in.oidc = vec!["backup".into()];
+        for (changed, what) in [(without, "no longer offers"), (repointed, "repointed")] {
+            let sessions = Arc::new(DashboardSessions::default());
+            let on = fixture_with(
+                config.clone(),
+                pairing_for(&config),
+                inbound_for(&config),
+                Arc::clone(&sessions),
+            );
+            let (cookie, session) = on
+                .auth
+                .sign_in("corp", pin_for(&on, "corp"), "at-alice".into(), 3600)
+                .await
+                .expect("alice signs in");
+            let (_, backup) = on
+                .auth
+                .sign_in("backup", pin_for(&on, "backup"), "at-bob".into(), 3600)
+                .await
+                .expect("bob signs in");
+            let _changed = fixture_with(
+                changed.clone(),
+                pairing_for(&changed),
+                inbound_for(&changed),
+                Arc::clone(&sessions),
+            );
+            assert!(
+                session.ended.is_cancelled(),
+                "a session outlived a generation that {what} its provider"
+            );
+            assert!(
+                !backup.ended.is_cancelled(),
+                "the other provider's session ended ({what})"
+            );
+            assert_eq!(sessions.len(), 1, "{what}");
+            let again = fixture_with(
+                config.clone(),
+                pairing_for(&config),
+                inbound_for(&config),
+                Arc::clone(&sessions),
+            );
+            let (status, body) = probe(&again, &[("cookie", &cookie_for(&cookie))]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
+            assert_eq!(body["reason"], "session_invalid", "{what}");
+        }
     }
 
     /// Sign-in turned off ends every session even when no request arrives
