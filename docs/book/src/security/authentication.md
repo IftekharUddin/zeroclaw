@@ -629,6 +629,9 @@ Things to know before turning it on:
   that minute with no request in between. If the `[oidc.<alias>]` entry is pointed at another issuer or
   client, its sessions end as well, without their tokens being sent to
   the new provider.
+- `session_lifetime_secs` caps sessions that start after it is set;
+  sessions already signed in keep the cap they started with. To end them
+  sooner, take the provider off `gateway.dashboard_sign_in.oidc`.
 - With introspection, an identity provider that cannot be reached when a
   session is due for revalidation ends that session (it fails closed);
   users sign in again once the provider is back.
