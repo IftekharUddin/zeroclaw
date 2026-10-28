@@ -1469,14 +1469,13 @@ pub async fn layer(
     if layer.auth.is_retired() {
         return crate::gateway_restarting(request.version());
     }
-    let host = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let own_origin = origin_of(https, &host);
-    let caller = match check_origin(request.method(), request.headers(), &own_origin) {
+    // A Host that isn't a plain authority leaves no own origin to check
+    // against, so the request is refused as coming from another origin.
+    let checked = match crate::api_oidc::request_authority(request.headers()) {
+        Some(host) => check_origin(request.method(), request.headers(), &origin_of(https, host)),
+        None => Err(SessionRejection::Origin),
+    };
+    let caller = match checked {
         Err(rejection) => DashboardCaller::Rejected(rejection),
         Ok(()) => {
             let offered = offered_providers(&layer.state);
@@ -4190,6 +4189,52 @@ mod tests {
         commit
             .publish(commit.next_revision().expect("revision"), config)
             .expect("publish");
+    }
+
+    /// A request whose `Host` isn't a plain host name or address, with an
+    /// optional port, starts no sign-in: the callback URI would be built
+    /// from it, and `localhost:1@evil.example` names another site.
+    #[tokio::test]
+    async fn a_sign_in_whose_host_is_not_a_plain_authority_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        for host in [
+            "localhost:1@evil.example",
+            "localhost/evil.example",
+            "zc.example@evil.example",
+        ] {
+            let mut sign_in = request("GET", "/auth/sign-in/corp", loopback(), &[]);
+            sign_in
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            let response = send(&fixture.router, sign_in).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{host}");
+            assert!(response.headers().get(header::LOCATION).is_none(), "{host}");
+            assert!(set_cookies(&response).is_empty(), "{host}");
+        }
+    }
+
+    /// A signed-in request whose `Host` isn't a plain authority can't be
+    /// checked against the dashboard's own origin, so it is refused.
+    #[tokio::test]
+    async fn a_cookie_request_whose_host_is_not_a_plain_authority_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        let cookie = signed_in.cookie_header();
+        let mut probe_request = request(
+            "GET",
+            "/api/operator-probe",
+            loopback(),
+            &[("cookie", &cookie)],
+        );
+        probe_request.headers_mut().insert(
+            header::HOST,
+            HeaderValue::from_static("localhost:1@evil.example"),
+        );
+        let response = send(&fixture.router, probe_request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json(response).await["reason"], "origin");
     }
 
     /// A provider taken off the sign-in screen while another stays offered

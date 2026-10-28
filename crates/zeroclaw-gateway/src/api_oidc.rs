@@ -584,15 +584,28 @@ async fn handle_device_poll(
 }
 
 /// The scheme the browser used to reach this gateway: a forwarded proto
-/// only where the deployment trusts its proxy, else the listener's own.
-fn request_scheme(state: &AppState, headers: &HeaderMap) -> String {
+/// only where the deployment trusts its proxy, else the listener's own. The
+/// forwarded value counts only as `http` or `https` (the first of a chained
+/// list); anything else is ignored rather than pasted into a URL.
+fn request_scheme(state: &AppState, headers: &HeaderMap) -> &'static str {
     let forwarded_proto = state
         .trust_forwarded_headers
         .then(|| headers.get("x-forwarded-proto"))
         .flatten()
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .and_then(|proto| {
+            if proto.eq_ignore_ascii_case("https") {
+                Some("https")
+            } else if proto.eq_ignore_ascii_case("http") {
+                Some("http")
+            } else {
+                None
+            }
+        });
     match forwarded_proto {
-        Some(proto) => proto.to_string(),
+        Some(proto) => proto,
         None => {
             // A `[gateway.tls]` block that is present but not enabled is
             // the schema default, and the server it configures listens in
@@ -606,11 +619,7 @@ fn request_scheme(state: &AppState, headers: &HeaderMap) -> String {
                 .tls
                 .as_ref()
                 .is_some_and(|tls| tls.enabled);
-            if tls_on {
-                "https".into()
-            } else {
-                "http".into()
-            }
+            if tls_on { "https" } else { "http" }
         }
     }
 }
@@ -619,19 +628,73 @@ fn request_scheme(state: &AppState, headers: &HeaderMap) -> String {
 /// the callback URI uses. Decides `Secure` cookies and the dashboard's
 /// own origin.
 pub(crate) fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
-    request_scheme(state, headers).eq_ignore_ascii_case("https")
+    request_scheme(state, headers) == "https"
+}
+
+/// The authority a request named in `Host`, if it is a plain one: a host
+/// name, an IPv4 address or a bracketed IPv6 address, with an optional
+/// numeric port, and nothing else. Sign-in builds its callback URI, its
+/// loopback decision and its own origin from it, so anything else (a
+/// userinfo `@`, a path, a query) is refused rather than guessed at.
+pub(crate) fn request_authority(headers: &HeaderMap) -> Option<&str> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    is_authority(host).then_some(host)
+}
+
+/// Whether `authority` is `host[:port]`, with a host name or an IPv4
+/// address, or `[ipv6][:port]`. A host name is dot-separated labels of
+/// letters, digits, `-` and `_`.
+fn is_authority(authority: &str) -> bool {
+    let (host_ok, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let Some((address, rest)) = bracketed.split_once(']') else {
+                return false;
+            };
+            let port = match rest {
+                "" => None,
+                rest => match rest.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None => return false,
+                },
+            };
+            (address.parse::<std::net::Ipv6Addr>().is_ok(), port)
+        }
+        None => match authority.split_once(':') {
+            Some((name, port)) => (is_host_name(name), Some(port)),
+            None => (is_host_name(authority), None),
+        },
+    };
+    host_ok
+        && port.is_none_or(|port| {
+            port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+        })
+}
+
+fn is_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
 }
 
 /// The callback URI this deployment's browser flow lands on, derived
-/// from the request the user's browser just made. A spoofed Host cannot
-/// redeem anything: the IdP only accepts registered redirect URIs, and
-/// the exchange later uses the exact URI stored at flow start.
+/// from the request the user's browser just made. Only a plain `Host`
+/// authority is used, so the URI can't name another site; past that, the
+/// IdP accepts only registered redirect URIs, and the exchange later uses
+/// the exact URI stored at flow start.
 fn callback_uri(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
     let scheme = request_scheme(state, headers);
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Box::new(error_json(StatusCode::BAD_REQUEST, "missing Host header")))?;
+    let host = request_authority(headers).ok_or_else(|| {
+        Box::new(error_json(
+            StatusCode::BAD_REQUEST,
+            "the Host header must be a plain host name or address, with an optional port",
+        ))
+    })?;
     Ok(format!(
         "{scheme}://{host}{}/oidc/callback",
         state.path_prefix
@@ -743,13 +806,12 @@ fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
     if !peer.ip().is_loopback() {
         return false;
     }
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+    let Some(host) = request_authority(headers) else {
         return false;
     };
-    let host = host.trim();
     let name = match host.strip_prefix('[') {
         Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
-        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+        None => host.split_once(':').map_or(host, |(name, _)| name),
     };
     name.eq_ignore_ascii_case("localhost")
         || name
@@ -800,6 +862,16 @@ async fn handle_dashboard_sign_in(
             StatusCode::NOT_FOUND,
             "This dashboard does not offer that sign-in. Go back and choose another, or pair \
              this browser.",
+        );
+    }
+    // The HTTPS rule's loopback exception, the callback URI and the cookies
+    // all build on the Host this browser named: one that isn't a plain host
+    // name or address is refused (400, as HTTP asks of an invalid Host).
+    if request_authority(&headers).is_none() {
+        return sign_in_unavailable_page(
+            StatusCode::BAD_REQUEST,
+            "This request's Host header isn't a plain host name or address, so sign-in can't \
+             build the address to come back to. Open the dashboard at its usual address.",
         );
     }
     let https = request_is_https(&state, &headers);
@@ -1824,6 +1896,22 @@ mod tests {
             https_uri,
             "trusted X-Forwarded-Proto"
         );
+
+        // A trusted proxy's value counts only as `http` or `https` (the
+        // first of a chained list); anything else is ignored rather than
+        // pasted into the redirect URI.
+        for (proto, expected) in [
+            ("HTTPS", &https_uri),
+            ("https, http", &https_uri),
+            ("https://evil.example/#", &http_uri),
+            ("javascript", &http_uri),
+        ] {
+            assert_eq!(
+                &login_redirect_uri(base.clone(), true, &[("x-forwarded-proto", proto)]).await,
+                expected,
+                "X-Forwarded-Proto: {proto}"
+            );
+        }
 
         // The same header from a hop the deployment does not trust says
         // nothing, and cannot talk the gateway into a foreign scheme.
@@ -3109,5 +3197,81 @@ mod tests {
             &with_host("localhost:42617")
         ));
         assert!(!is_loopback_request(loopback(), &HeaderMap::new()));
+        // A Host that only starts like a loopback name names another site.
+        for host in [
+            "localhost:1@evil.example",
+            "127.0.0.1:1@evil.example",
+            "localhost/evil.example",
+            "[::1]@evil.example",
+        ] {
+            assert!(!is_loopback_request(loopback(), &with_host(host)), "{host}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_authority_counts_as_a_host() {
+        for host in [
+            "zc.example.com",
+            "zc.example.com:8443",
+            "ZC.Example.com",
+            "localhost",
+            "127.0.0.1:42617",
+            "[::1]",
+            "[::1]:42617",
+            "my_gateway:42617",
+        ] {
+            assert!(is_authority(host), "{host}");
+        }
+        for host in [
+            "",
+            "zc.example.com@evil.example",
+            "localhost:1@evil.example",
+            "user@zc.example.com",
+            "zc.example.com/evil",
+            "zc.example.com?x",
+            "zc.example.com#x",
+            "zc.example.com:",
+            "zc.example.com:80x",
+            "zc.example.com:99999",
+            ":42617",
+            "zc..example.com",
+            "zc example.com",
+            "[::1",
+            "[evil.example]:80",
+            "[::1]x",
+            "zc.example.com:80:81",
+        ] {
+            assert!(!is_authority(host), "{host:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_whose_host_is_not_a_plain_authority_is_refused() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for host in [
+            "gw.local@evil.example",
+            "localhost:1@evil.example",
+            "gw.local/evil.example",
+            "gw.local:80x",
+        ] {
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                "/oidc/login/corp",
+                host,
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{host}");
+            assert!(header_value(&response, "location").is_empty(), "{host}");
+        }
+        assert_eq!(
+            total_requests(&server).await,
+            0,
+            "nothing reached the identity provider"
+        );
     }
 }
