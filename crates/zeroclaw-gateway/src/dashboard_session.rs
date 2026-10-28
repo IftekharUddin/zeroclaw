@@ -4191,6 +4191,84 @@ mod tests {
             .expect("publish");
     }
 
+    /// With sign-in on, a request with no session cookie, or with one that
+    /// names no session, reaches neither an operator route nor a config
+    /// route.
+    #[tokio::test]
+    async fn with_sign_in_on_a_missing_or_forged_cookie_reaches_no_route() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        for cookie in [None, Some("zc_session=forged")] {
+            let headers: Vec<(&str, &str)> = cookie.map(|c| ("cookie", c)).into_iter().collect();
+            let (status, _) = probe(&fixture, &headers).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "operator route, {cookie:?}"
+            );
+            let response = send(
+                &fixture.router,
+                request("GET", "/api/quickstart/state", loopback(), &headers),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "config route, {cookie:?}"
+            );
+        }
+    }
+
+    /// The access token never reaches the browser: not in the callback's
+    /// redirect or cookies, not in the popup page, and not in the session
+    /// read.
+    #[tokio::test]
+    async fn the_access_token_never_reaches_the_browser() {
+        for path in [
+            "/auth/sign-in/corp?return=/chat",
+            "/auth/sign-in/corp?popup=1",
+        ] {
+            let server = idp(&["admins"], "gw").await;
+            let fixture = fixture(sign_in_config(&server.uri()));
+            let started = start(&fixture, path).await;
+            mount_token(&server, &started.nonce, true).await;
+            let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
+            assert!(
+                [StatusCode::SEE_OTHER, StatusCode::OK].contains(&response.status()),
+                "{path}: {}",
+                response.status()
+            );
+            let cookie = cookie_from(&response, SESSION_COOKIE).expect("session cookie set");
+            let headers = format!("{:?}", response.headers());
+            let page = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(!headers.contains("at-alice"), "{path}: {headers}");
+            assert!(
+                !String::from_utf8_lossy(&page).contains("at-alice"),
+                "{path}"
+            );
+            let cookie_header = format!("{SESSION_COOKIE}={cookie}");
+            let response = send(
+                &fixture.router,
+                request(
+                    "GET",
+                    "/api/auth/session",
+                    loopback(),
+                    &[
+                        ("cookie", &cookie_header),
+                        ("sec-fetch-site", "same-origin"),
+                    ],
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let session = json(response).await;
+            assert!(
+                !session.to_string().contains("at-alice"),
+                "{path}: {session}"
+            );
+        }
+    }
+
     /// A request whose `Host` isn't a plain host name or address, with an
     /// optional port, starts no sign-in: the callback URI would be built
     /// from it, and `localhost:1@evil.example` names another site.
