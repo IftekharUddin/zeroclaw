@@ -197,13 +197,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, []);
 
   // A paired browser that lost its token never asked which providers exist.
+  // The answer marks them known: marking them before it would re-run this
+  // effect, and its cleanup would drop the answer.
   useEffect(() => {
     if (phase !== 'signed-out' || providersKnown || isTauri()) return;
     let cancelled = false;
-    setProvidersKnown(true);
     fetchAuthMethods()
       .then((methods) => {
-        if (!cancelled && methods) setProviders(methods.oidc);
+        if (cancelled) return;
+        if (methods) setProviders(methods.oidc);
+        setProvidersKnown(true);
       })
       .catch(() => {
         // No providers to offer; the pairing form stays.

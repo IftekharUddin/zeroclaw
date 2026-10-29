@@ -218,6 +218,27 @@ test("a paired browser starts authenticated without asking the gateway", async (
   assert.equal(requests.length, 0);
 });
 
+test("a paired browser whose token is refused offers the sign-in providers", async () => {
+  storage.setItem("zeroclaw_token", "tok");
+  providers = ["corp"];
+  await mount();
+  await fire("unauthorized");
+  assert.equal(state().isAuthenticated, false);
+  assert.deepEqual(state().providers, [{ alias: "corp", provider: "oidc.corp" }]);
+});
+
+test("a paired browser that logs out offers the sign-in providers", async () => {
+  storage.setItem("zeroclaw_token", "tok");
+  providers = ["corp"];
+  await mount();
+  await act(async () => {
+    state().logout();
+  });
+  await act(settle);
+  assert.equal(state().isAuthenticated, false);
+  assert.deepEqual(state().providers, [{ alias: "corp", provider: "oidc.corp" }]);
+});
+
 test("a gateway without pairing is open", async () => {
   health = { require_pairing: false, paired: false };
   await mount();
