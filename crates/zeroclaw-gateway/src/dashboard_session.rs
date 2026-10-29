@@ -129,8 +129,10 @@ struct Session {
     provider: ProviderPin,
     /// The access token the sign-in was issued. Memory only; never logged
     /// and never sent anywhere but the inbound authority that verifies it.
-    /// Wiped when the session leaves the store, as is every copy taken to
-    /// verify it.
+    /// Wiped when the session leaves the store, as are the copies this
+    /// module takes to verify it. The runtime's verification makes plain
+    /// copies of its own (its bearer credential and, with introspection,
+    /// the request body) that are not wiped yet.
     bearer: Zeroizing<String>,
     auth: ConnectionAuth,
     /// The authority `auth` was verified by. A reload builds a new one, and
