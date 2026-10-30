@@ -1552,8 +1552,8 @@ fn patch_testing_an_authorization_input() -> Value {
 
 /// A patch the running daemon would commit applies its writes to the
 /// daemon's live configuration, while the CLI checked its `test` ops against
-/// its own copy of config.toml. A `test` op on an authorization input then
-/// fails the whole patch before the daemon is contacted, and nothing is
+/// its own copy of config.toml. A `test` op, here on an authorization input,
+/// then fails the whole patch before the daemon is contacted, and nothing is
 /// saved.
 #[test]
 fn config_patch_testing_an_authorization_input_fails_while_a_daemon_runs() {
@@ -1590,6 +1590,53 @@ fn config_patch_testing_an_authorization_input_fails_while_a_daemon_runs() {
     );
 
     let mut probe = daemon.probe();
+    let live = live_profiles_of_me(&mut probe);
+    assert!(
+        live.contains("admin") && !live.contains("reader"),
+        "the daemon's live roster must be unchanged: {live}"
+    );
+}
+
+/// A `test` op outside the authorization inputs fails such a patch too:
+/// every write in it, not only the authorization edit, would land on the
+/// daemon's live configuration, so a `test` op guarding the `gateway.host`
+/// write is no more checkable there than one on an authorization input.
+#[test]
+fn config_patch_testing_any_property_fails_while_a_daemon_runs() {
+    let fixture = Fixture::new("admin");
+    let daemon = Daemon::start(&fixture);
+    let before = fixture.config_text();
+
+    let patch = json!([
+        {"op": "test", "path": "/gateway/host", "value": "127.0.0.1"},
+        {"op": "replace", "path": "/gateway/host", "value": "127.0.0.3"},
+        {"op": "replace", "path": "/users/me/permission_profiles", "value": ["reader"]}
+    ]);
+    let output = config_patch_json(&fixture, &patch);
+    assert!(
+        !output.status.success(),
+        "a patch whose `test` op cannot be checked where it applies must fail\n{}",
+        describe(&output)
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+        panic!("stderr is not a JSON error: {error}\n{}", describe(&output))
+    });
+    assert_eq!(error["code"], "op_not_supported", "{error}");
+    assert_eq!(error["path"], "gateway.host", "{error}");
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "a refused patch must leave config.toml untouched"
+    );
+
+    let mut probe = daemon.probe();
+    let host = probe
+        .config_get("gateway.host")
+        .unwrap_or_else(|error| panic!("an admin principal must be able to read config: {error}"));
+    assert_eq!(
+        host["value"], "127.0.0.1",
+        "the daemon's live config must be untouched: {host}"
+    );
     let live = live_profiles_of_me(&mut probe);
     assert!(
         live.contains("admin") && !live.contains("reader"),

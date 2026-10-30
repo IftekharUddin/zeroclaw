@@ -339,10 +339,10 @@ pub(crate) enum CommitFailure {
     #[cfg(unix)]
     Unknown { path: String },
     /// A `config patch` batch the running daemon would have committed
-    /// carries a `test` op on the authorization input `path`. The op was
-    /// checked against the CLI's copy of config.toml, while the batch's
-    /// writes would land on the daemon's live configuration, so the daemon
-    /// was not contacted and nothing was saved.
+    /// carries a `test` op on `path`. The op was checked against the CLI's
+    /// copy of config.toml, while the batch's writes would land on the
+    /// daemon's live configuration, so the daemon was not contacted and
+    /// nothing was saved.
     UncheckableTest { path: String },
 }
 
@@ -460,9 +460,8 @@ pub(crate) async fn commit_set(
 /// `{"sets":[{"prop","value"}...]}` (values are JSON strings). `tested` are
 /// the properties the patch's `test` ops checked on `staged`: a running
 /// daemon that would take the batch applies its writes to its live
-/// configuration instead, so a `test` op on an authorization input then
-/// fails the batch with `CommitFailure::UncheckableTest` before the daemon is
-/// contacted.
+/// configuration instead, so any `test` op then fails the batch with
+/// `CommitFailure::UncheckableTest` before the daemon is contacted.
 pub(crate) async fn commit_set_many(
     before: &AuthSnapshot,
     staged: &Config,
@@ -483,10 +482,10 @@ pub(crate) async fn commit_set_many(
             })
             .collect(),
     })?;
-    let uncheckable_test = tested
-        .iter()
-        .map(String::as_str)
-        .find(|path| is_auth_input_path(path));
+    // Every write in the batch lands on the daemon's live configuration, so
+    // a `test` op on any property, not only an authorization input, would
+    // have been checked against a different copy than the one it guards.
+    let uncheckable_test = tested.first().map(String::as_str);
     commit(
         before,
         staged,
@@ -707,8 +706,8 @@ fn nothing_listening(error: &DaemonCallError) -> bool {
 /// Send an authorization edit to the daemon and classify the outcome.
 /// `config` is the CLI's config with the edit staged; `check_path` is the
 /// property a caller should inspect when the outcome is unknown;
-/// `uncheckable_test` is the authorization input a batch's `test` op checked
-/// on `config`, if any.
+/// `uncheckable_test` is the property a batch's first `test` op checked on
+/// `config`, if any.
 async fn commit(
     before: &AuthSnapshot,
     config: &Config,
@@ -1694,13 +1693,14 @@ mod tests {
         drop(held);
     }
 
-    /// A batch a running daemon would commit applies its writes to the
-    /// daemon's live configuration, so a `test` op the CLI checked on its own
-    /// copy of an authorization input fails the batch before the daemon is
-    /// contacted. A `test` op elsewhere does not stop the batch.
+    /// A batch a running daemon would commit applies all of its writes to the
+    /// daemon's live configuration, so any `test` op the CLI checked on its
+    /// own copy fails the batch before the daemon is contacted, whether it
+    /// tests an authorization input or not. A batch without `test` ops is
+    /// still offered to the daemon.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_batch_testing_an_authorization_input_is_not_sent_to_a_running_daemon() {
+    async fn a_batch_with_a_test_op_is_not_sent_to_a_running_daemon() {
         let (_dir, config) = scratch_config();
         let before = AuthSnapshot::capture(&config).expect("encodes");
         record_running_daemon(&config);
@@ -1725,21 +1725,32 @@ mod tests {
         .expect_err("the batch is refused");
         match failure.downcast_ref::<CommitFailure>() {
             Some(CommitFailure::UncheckableTest { path }) => {
-                assert_eq!(path, "users.me.permission_profiles");
+                assert_eq!(path, "gateway.host", "the first `test` op is named");
             }
             other => panic!("expected UncheckableTest, got {other:?}"),
         }
         assert_nothing_connected(&listener);
 
-        // An endpoint that fails at once shows the batch was offered to the
-        // daemon when its only `test` op is outside the authorization inputs.
+        let failure = commit_set_many(&before, &staged, &sets, &["gateway.host".to_owned()], false)
+            .await
+            .expect_err("a `test` op outside the authorization inputs also refuses the batch");
+        assert!(
+            matches!(
+                failure.downcast_ref::<CommitFailure>(),
+                Some(CommitFailure::UncheckableTest { path }) if path == "gateway.host"
+            ),
+            "{failure:?}"
+        );
+        assert_nothing_connected(&listener);
+
+        // An endpoint that fails at once shows a batch without `test` ops is
+        // still offered to the daemon.
         let unconnectable = with_unconnectable_endpoint(&config);
         record_running_daemon(&unconnectable);
         let staged = with_trust_flipped(&unconnectable);
-        let publication =
-            commit_set_many(&before, &staged, &sets, &["gateway.host".to_owned()], false)
-                .await
-                .expect("classifies");
+        let publication = commit_set_many(&before, &staged, &sets, &[], false)
+            .await
+            .expect("classifies");
         assert!(
             matches!(
                 publication,

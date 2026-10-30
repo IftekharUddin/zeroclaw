@@ -96,10 +96,11 @@ the edit to it as `config/set`, or `config/set-many` for a patch. The
 daemon validates and saves the edit, swaps it into its live configuration
 and publishes the policy before the CLI reports it applied. It commits a
 patch that also writes other paths as one batch. A patch the daemon would
-commit fails whole if it has a `test` op on an authorization path, before
+commit fails whole if it has any `test` op, whatever path it checks, before
 the daemon is contacted and with nothing saved: the CLI would check that
-`test` against its on-disk copy while the writes land on the daemon's live
-configuration. With no daemon, `test` ops keep their usual meaning.
+`test` against its on-disk copy while every write in the patch lands on the
+daemon's live configuration. A patch the CLI saves itself, as with no
+daemon, keeps the usual meaning of its `test` ops.
 
 With the daemon running, the CLI instead saves `config.toml` itself and
 reports the edit as pending reload, naming the reason, when the daemon
@@ -160,9 +161,9 @@ these codes.
 A `config patch --json` that fails uses the command's JSON error envelope:
 `validation_failed` for an edit the daemon rejects as invalid, refuses for
 the principal it identified, or one that would break a compiling policy;
-`op_not_supported`, with `path` naming it, for a `test` op on an
-authorization path; and `internal_error` otherwise, with `path` naming the
-property to check when the outcome is unknown.
+`op_not_supported`, with `path` naming the tested property, for a `test` op
+in a patch the daemon would commit; and `internal_error` otherwise, with
+`path` naming the property to check when the outcome is unknown.
 
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
