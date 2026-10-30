@@ -202,9 +202,12 @@ certificate works without disabling verification):
 - `zeroclaw gateway restart` (graceful `/admin/shutdown` before relaunch)
 - `zeroclaw sop pending|logs|approve|deny`
 
-There is no silent fallback to plain HTTP. If `[gateway.tls.client_auth]` is
+These local admin clients connect directly to the configured gateway, ignoring
+proxy environment variables and refusing redirects. There is no silent fallback
+to plain HTTP. If `[gateway.tls.client_auth]` is
 enabled with `require_client_cert = true`, these commands refuse to run and
-name that cause — they do not yet present a client certificate. Bind addresses
-`0.0.0.0` / `::` are rewritten to `127.0.0.1` for the outbound URL so the
-hostname matches a typical localhost certificate.
-
+name that cause; they do not yet present a client certificate. Bind address
+`0.0.0.0` uses `127.0.0.1` for the outbound URL; `::` / `[::]` use `[::1]`.
+The certificate must cover that loopback address or the configured host.
+`gateway restart` stops on TLS setup, certificate verification, request timeout, or
+HTTP errors. Only a refused TCP connection is treated as no running gateway.

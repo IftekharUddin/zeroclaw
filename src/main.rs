@@ -10269,61 +10269,69 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     );
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(
+                    if shutdown_gateway(
                         &host,
                         port,
                         config.gateway.path_prefix.as_deref(),
                         config.gateway.tls.as_ref(),
                     )
-                    .await
+                    .await?
                     {
-                        Ok(()) => {
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(::serde_json::json!({"addr": addr})),
-                                "✓ Existing gateway on shut down gracefully"
-                            );
-                            // Poll until the port is free (connection refused) or timeout
-                            let deadline =
-                                tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-                            loop {
-                                match tokio::net::TcpStream::connect(&addr).await {
-                                    Err(_) => break, // port is free
-                                    Ok(_) if tokio::time::Instant::now() >= deadline => {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Note
-                                            )
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                            .with_attrs(::serde_json::json!({"port": port})),
-                                            "Timed out waiting for port to be released"
-                                        );
-                                        break;
-                                    }
-                                    Ok(_) => {
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(50))
-                                            .await;
-                                    }
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"addr": addr})),
+                            "✓ Existing gateway on shut down gracefully"
+                        );
+                        // Poll until the port is free (connection refused) or timeout
+                        let deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                        loop {
+                            match tokio::net::TcpStream::connect((
+                                gateway_admin_connect_host(&host).trim_matches(['[', ']']),
+                                port,
+                            ))
+                            .await
+                            {
+                                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                                    break;
+                                }
+                                Err(e) => {
+                                    return Err(e)
+                                        .context(qta("cli-gateway-admin-connect-failed", &[]));
+                                }
+                                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"port": port})),
+                                        "Timed out waiting for port to be released"
+                                    );
+                                    break;
+                                }
+                                Ok(_) => {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(50))
+                                        .await;
                                 }
                             }
                         }
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "   No existing gateway to shut down"
-                            );
-                        }
+                    } else {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"addr": addr})),
+                            "   No existing gateway to shut down"
+                        );
                     }
 
                     log_gateway_start(&host, port);
@@ -14357,14 +14365,15 @@ fn log_gateway_start(host: &str, port: u16) {
     }
 }
 
-/// Gracefully shutdown a running gateway via the admin endpoint.
+/// Gracefully shut down a running gateway via the admin endpoint.
+/// Returns false only when the TCP connection was refused (no listener).
 #[cfg(feature = "agent-runtime")]
 async fn shutdown_gateway(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
     tls: Option<&zeroclaw_config::schema::GatewayTlsConfig>,
-) -> Result<()> {
+) -> Result<bool> {
     let use_tls = tls.is_some_and(|tls| tls.enabled);
     let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown", use_tls);
     let client = gateway_admin_http_client(tls)?;
@@ -14375,7 +14384,7 @@ async fn shutdown_gateway(
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) if response.status().is_success() => Ok(true),
         Ok(response) => {
             let status = response.status();
             ::zeroclaw_log::record!(
@@ -14385,21 +14394,33 @@ async fn shutdown_gateway(
                     .with_attrs(::serde_json::json!({"endpoint": url, "status": status.as_u16()})),
                 "gateway admin shutdown returned non-success status"
             );
-            Err(anyhow::Error::msg(format!(
-                "Gateway responded with status: {status}"
+            Err(anyhow::Error::msg(qta(
+                "cli-gateway-admin-shutdown-status",
+                &[("status", &status.to_string())],
             )))
         }
         Err(e) => {
+            let connect_failed = e.is_connect();
+            let error = anyhow::Error::new(e);
+            // is_connect() also includes TLS failures. Only a causal TCP
+            // refusal proves that restart has no listener to shut down.
+            if connect_failed
+                && error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+                })
+            {
+                return Ok(false);
+            }
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"endpoint": url, "error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"endpoint": url, "error": error.to_string()})),
                 "gateway admin shutdown: connect failed"
             );
-            Err(anyhow::Error::msg(format!(
-                "Failed to connect to gateway: {e}"
-            )))
+            Err(error.context(qta("cli-gateway-admin-connect-failed", &[])))
         }
     }
 }
@@ -14810,12 +14831,13 @@ async fn fetch_paircode(
     }
 }
 
-/// Rewrite wildcard bind addresses to a loopback connect target so admin
-/// HTTPS clients can present a hostname that matches the gateway certificate.
+/// Rewrite wildcard bind addresses to loopback in the same address family.
+/// TLS still verifies that target against the gateway certificate.
 #[cfg(feature = "agent-runtime")]
 fn gateway_admin_connect_host(host: &str) -> &str {
     match host.trim() {
-        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
         other => other,
     }
 }
@@ -14849,8 +14871,15 @@ fn gateway_admin_url(
 fn gateway_admin_http_client(
     tls: Option<&zeroclaw_config::schema::GatewayTlsConfig>,
 ) -> Result<reqwest::Client> {
+    // Admin controls target this gateway directly: a proxy/redirect failure
+    // must not be mistaken for an absent gateway, or forward the admin token.
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
     let Some(tls) = tls.filter(|tls| tls.enabled) else {
-        return Ok(reqwest::Client::new());
+        return builder
+            .build()
+            .with_context(|| qta("cli-gateway-admin-client-build-failed", &[]));
     };
 
     if tls
@@ -14858,33 +14887,28 @@ fn gateway_admin_http_client(
         .as_ref()
         .is_some_and(|auth| auth.enabled && auth.require_client_cert)
     {
-        anyhow::bail!(
-            "gateway.tls.client_auth requires a client certificate, but CLI admin commands (get-paircode, sop *, gateway restart) do not present one. Disable [gateway.tls.client_auth] for local admin CLI access, or call the admin endpoints from a client that already carries mutual-TLS identity."
-        );
+        anyhow::bail!(qta("cli-gateway-admin-client-cert-required", &[]));
     }
 
     let cert_path = tls.cert_path.trim();
     if cert_path.is_empty() {
-        anyhow::bail!(
-            "gateway.tls.enabled is set but cert_path is empty; set [gateway.tls] cert_path so the CLI can trust the gateway certificate"
-        );
+        anyhow::bail!(qta("cli-gateway-admin-cert-path-empty", &[]));
     }
 
     let pem = std::fs::read(cert_path)
-        .with_context(|| format!("failed to read gateway TLS certificate at {cert_path}"))?;
+        .with_context(|| qta("cli-gateway-admin-cert-read-failed", &[("path", cert_path)]))?;
     let certificates = reqwest::Certificate::from_pem_bundle(&pem)
-        .with_context(|| format!("invalid PEM in gateway TLS certificate at {cert_path}"))?;
+        .with_context(|| qta("cli-gateway-admin-cert-invalid", &[("path", cert_path)]))?;
     if certificates.is_empty() {
-        anyhow::bail!("gateway TLS certificate at {cert_path} contained no certificates");
+        anyhow::bail!(qta("cli-gateway-admin-cert-empty", &[("path", cert_path)]));
     }
 
-    let mut builder = reqwest::Client::builder();
     for certificate in certificates {
         builder = builder.add_root_certificate(certificate);
     }
     builder
         .build()
-        .context("failed to build gateway admin HTTPS client")
+        .with_context(|| qta("cli-gateway-admin-client-build-failed", &[]))
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -18857,57 +18881,183 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(feature = "agent-runtime")]
-    async fn gateway_admin_shutdown_reaches_tls_listener() {
+    fn gateway_admin_url_preserves_ipv6_family_and_brackets() {
+        for host in ["::", "[::]", "::1", "[::1]"] {
+            for (tls, scheme) in [(false, "http"), (true, "https")] {
+                assert_eq!(
+                    gateway_admin_url(host, 42617, Some("/gw"), "/admin/shutdown", tls),
+                    format!("{scheme}://[::1]:42617/gw/admin/shutdown")
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_tls_shutdown_case(
+        bind: &str,
+        host: &str,
+        certificate_name: &str,
+        trust_server: bool,
+    ) -> Result<bool> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().expect("tempdir");
         let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
-
         let key = rcgen::KeyPair::generate().expect("key");
-        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).expect("params");
+        let mut params =
+            rcgen::CertificateParams::new(vec![certificate_name.into()]).expect("params");
         params
             .extended_key_usages
             .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
-        let cert = params.self_signed(&key).expect("self-sign");
+        let cert = params.clone().self_signed(&key).expect("self-sign");
         std::fs::write(&cert_path, cert.pem()).expect("write cert");
         std::fs::write(&key_path, key.serialize_pem()).expect("write key");
-
         let acceptor = zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: key_path.to_string_lossy().into_owned(),
             client_auth: None,
         })
         .expect("tls acceptor");
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        if !trust_server {
+            let other_key = rcgen::KeyPair::generate().expect("unrelated key");
+            let other_cert = params
+                .self_signed(&other_key)
+                .expect("unrelated certificate");
+            std::fs::write(&cert_path, other_cert.pem()).expect("write untrusted root");
+        }
+        let listener = tokio::net::TcpListener::bind(bind).await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-
-        let server = tokio::spawn(async move {
+        let server = ::zeroclaw_spawn::spawn!(async move {
             let (tcp, _) = listener.accept().await.expect("accept");
-            let mut tls = acceptor.accept(tcp).await.expect("handshake");
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return; // The certificate-rejection controls fail during TLS.
+            };
             let mut buf = vec![0u8; 1024];
-            let _ = tls.read(&mut buf).await;
+            let read = tls.read(&mut buf).await.expect("read request");
+            assert!(
+                String::from_utf8_lossy(&buf[..read])
+                    .starts_with("POST /gw/admin/shutdown HTTP/1.1\r\n")
+            );
             tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await
                 .expect("write response");
             let _ = tls.shutdown().await;
         });
-
         let tls = zeroclaw_config::schema::GatewayTlsConfig {
             enabled: true,
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: key_path.to_string_lossy().into_owned(),
             client_auth: None,
         };
-        shutdown_gateway("127.0.0.1", port, None, Some(&tls))
+        let result = shutdown_gateway(host, port, Some("/gw"), Some(&tls)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
             .await
-            .expect("shutdown over TLS");
-        server.await.expect("server task");
+            .expect("server completes")
+            .expect("server task");
+        result
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_reaches_tls_listener() {
+        assert!(
+            gateway_admin_tls_shutdown_case("127.0.0.1:0", "0.0.0.0", "127.0.0.1", true)
+                .await
+                .expect("shutdown over TLS")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_reaches_ipv6_tls_listener() {
+        // An IPv6 loopback listener cannot receive the old IPv4 rewrite.
+        assert!(
+            gateway_admin_tls_shutdown_case("[::1]:0", "[::]", "::1", true)
+                .await
+                .expect("shutdown over IPv6 TLS")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_certificate_failures_are_not_absence() {
+        for (name, trust_server) in [("wrong.invalid", true), ("127.0.0.1", false)] {
+            let error =
+                gateway_admin_tls_shutdown_case("127.0.0.1:0", "127.0.0.1", name, trust_server)
+                    .await
+                    .expect_err("invalid server identity must stop restart");
+            assert!(error.downcast_ref::<reqwest::Error>().is_some());
+            assert!(format!("{error:#}").contains("certificate"), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_connection_refused_is_absence() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(
+            !shutdown_gateway("127.0.0.1", port, None, None)
+                .await
+                .expect("no listener is a valid restart case")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_timeout_is_not_absence() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = shutdown_gateway("127.0.0.1", port, None, None)
+            .await
+            .expect_err("unresponsive listener must stop restart");
+        server.abort();
+        assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_http_error_and_redirect_are_not_absence() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in ["403 Forbidden", "307 Temporary Redirect"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_port = target.local_addr().unwrap().port();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nLocation: http://127.0.0.1:{target_port}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 1024];
+                let read = stream.read(&mut buf).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&buf[..read])
+                        .starts_with("POST /admin/shutdown HTTP/1.1\r\n")
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let error = shutdown_gateway("127.0.0.1", port, None, None)
+                .await
+                .expect_err("HTTP refusal must stop restart");
+            assert!(error.to_string().contains(status), "{error:#}");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), target.accept())
+                    .await
+                    .is_err(),
+                "admin redirects must not be followed"
+            );
+            server.await.unwrap();
+        }
     }
 
     #[test]
