@@ -10269,7 +10269,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     );
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
+                    match shutdown_gateway(
+                        &host,
+                        port,
+                        config.gateway.path_prefix.as_deref(),
+                        config.gateway.tls.as_ref(),
+                    )
+                    .await
                     {
                         Ok(()) => {
                             ::zeroclaw_log::record!(
@@ -10351,6 +10357,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         config.gateway.path_prefix.as_deref(),
                         &config.data_dir,
                         &action,
+                        config.gateway.tls.as_ref(),
                     )
                     .await;
                     if json {
@@ -14352,9 +14359,15 @@ fn log_gateway_start(host: &str, port: u16) {
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
 #[cfg(feature = "agent-runtime")]
-async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
-    let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown");
-    let client = reqwest::Client::new();
+async fn shutdown_gateway(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    tls: Option<&zeroclaw_config::schema::GatewayTlsConfig>,
+) -> Result<()> {
+    let use_tls = tls.is_some_and(|tls| tls.enabled);
+    let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown", use_tls);
+    let client = gateway_admin_http_client(tls)?;
 
     match client
         .post(&url)
@@ -14407,10 +14420,12 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
     let host = config.gateway.host.clone();
     let port = config.gateway.port;
     let prefix = config.gateway.path_prefix.as_deref();
-    let client = reqwest::Client::new();
+    let tls = config.gateway.tls.as_ref();
+    let use_tls = tls.is_some_and(|tls| tls.enabled);
+    let client = gateway_admin_http_client(tls)?;
     match cmd {
         SopCommands::Pending => {
-            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending");
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending", use_tls);
             let resp = client
                 .get(&url)
                 .timeout(std::time::Duration::from_secs(5))
@@ -14476,7 +14491,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             limit,
             json,
         } => {
-            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/logs");
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/logs", use_tls);
             let resp = client
                 .get(&url)
                 .query(&[("run_id", run_id.as_str()), ("limit", &limit.to_string())])
@@ -14585,11 +14600,11 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             Ok(())
         }
         SopCommands::Approve { run_id } => {
-            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve", use_tls);
             sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
         }
         SopCommands::Deny { run_id, reason } => {
-            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/deny");
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/deny", use_tls);
             sop_admin_post(
                 &client,
                 &url,
@@ -14694,6 +14709,7 @@ async fn fetch_paircode(
     path_prefix: Option<&str>,
     data_dir: &std::path::Path,
     action: &PaircodeAction,
+    tls: Option<&zeroclaw_config::schema::GatewayTlsConfig>,
 ) -> Result<PaircodeResult> {
     // The pairing-code admin routes accept only this run's admin token, which
     // the gateway writes owner-only into its data directory at startup.
@@ -14705,10 +14721,11 @@ async fn fetch_paircode(
                 zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display()
             ))
         })?;
-    let client = reqwest::Client::new();
+    let use_tls = tls.is_some_and(|tls| tls.enabled);
+    let client = gateway_admin_http_client(tls)?;
 
     let response = if action.mints_code() {
-        let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+        let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new", use_tls);
         if let Some(rotate) = action.rotate_query() {
             url.push_str("?rotate=");
             url.push_str(&urlencoding::encode(&rotate));
@@ -14723,7 +14740,7 @@ async fn fetch_paircode(
             .send()
             .await
     } else {
-        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
+        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode", use_tls);
         client
             .get(&url)
             .header(
@@ -14793,10 +14810,81 @@ async fn fetch_paircode(
     }
 }
 
+/// Rewrite wildcard bind addresses to a loopback connect target so admin
+/// HTTPS clients can present a hostname that matches the gateway certificate.
 #[cfg(feature = "agent-runtime")]
-fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_path: &str) -> String {
+fn gateway_admin_connect_host(host: &str) -> &str {
+    match host.trim() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn gateway_admin_url(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    admin_path: &str,
+    use_tls: bool,
+) -> String {
+    let host = gateway_admin_connect_host(host);
+    let host = if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let scheme = if use_tls { "https" } else { "http" };
     let prefix = path_prefix.unwrap_or("");
-    format!("http://{host}:{port}{prefix}{admin_path}")
+    format!("{scheme}://{host}:{port}{prefix}{admin_path}")
+}
+
+/// Build the HTTP(S) client used by CLI admin commands against a running gateway.
+///
+/// When `[gateway.tls]` is enabled, the client trusts `cert_path` as a PEM root
+/// (or leaf-as-trust-anchor) bundle so self-signed gateway certificates work.
+/// Required client-certificate auth is refused with an explicit error: the CLI
+/// does not yet present a client identity for these local admin routes.
+#[cfg(feature = "agent-runtime")]
+fn gateway_admin_http_client(
+    tls: Option<&zeroclaw_config::schema::GatewayTlsConfig>,
+) -> Result<reqwest::Client> {
+    let Some(tls) = tls.filter(|tls| tls.enabled) else {
+        return Ok(reqwest::Client::new());
+    };
+
+    if tls
+        .client_auth
+        .as_ref()
+        .is_some_and(|auth| auth.enabled && auth.require_client_cert)
+    {
+        anyhow::bail!(
+            "gateway.tls.client_auth requires a client certificate, but CLI admin commands (get-paircode, sop *, gateway restart) do not present one. Disable [gateway.tls.client_auth] for local admin CLI access, or call the admin endpoints from a client that already carries mutual-TLS identity."
+        );
+    }
+
+    let cert_path = tls.cert_path.trim();
+    if cert_path.is_empty() {
+        anyhow::bail!(
+            "gateway.tls.enabled is set but cert_path is empty; set [gateway.tls] cert_path so the CLI can trust the gateway certificate"
+        );
+    }
+
+    let pem = std::fs::read(cert_path)
+        .with_context(|| format!("failed to read gateway TLS certificate at {cert_path}"))?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+        .with_context(|| format!("invalid PEM in gateway TLS certificate at {cert_path}"))?;
+    if certificates.is_empty() {
+        anyhow::bail!("gateway TLS certificate at {cert_path} contained no certificates");
+    }
+
+    let mut builder = reqwest::Client::builder();
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .context("failed to build gateway admin HTTPS client")
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -18710,7 +18798,7 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
         assert_eq!(
-            gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode"),
+            gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode", false),
             "http://127.0.0.1:42617/admin/paircode"
         );
     }
@@ -18719,9 +18807,107 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn gateway_admin_url_prepends_configured_path_prefix() {
         assert_eq!(
-            gateway_admin_url("localhost", 42617, Some("/zeroclaw"), "/admin/paircode/new"),
+            gateway_admin_url(
+                "localhost",
+                42617,
+                Some("/zeroclaw"),
+                "/admin/paircode/new",
+                false
+            ),
             "http://localhost:42617/zeroclaw/admin/paircode/new"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_admin_url_uses_https_when_tls_enabled() {
+        assert_eq!(
+            gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode", true),
+            "https://127.0.0.1:42617/admin/paircode"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_admin_url_rewrites_wildcard_bind_to_loopback() {
+        assert_eq!(
+            gateway_admin_url("0.0.0.0", 42617, None, "/admin/shutdown", true),
+            "https://127.0.0.1:42617/admin/shutdown"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_admin_http_client_refuses_required_client_auth() {
+        let tls = zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: "/tmp/unused.pem".into(),
+            key_path: "/tmp/unused-key.pem".into(),
+            client_auth: Some(zeroclaw_config::schema::GatewayClientAuthConfig {
+                enabled: true,
+                require_client_cert: true,
+                ..Default::default()
+            }),
+        };
+        let err = gateway_admin_http_client(Some(&tls)).expect_err("client auth required");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("client certificate") || msg.contains("client_auth"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_reaches_tls_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).expect("params");
+        params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+        let cert = params.self_signed(&key).expect("self-sign");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+
+        let acceptor = zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            client_auth: None,
+        })
+        .expect("tls acceptor");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("handshake");
+            let mut buf = vec![0u8; 1024];
+            let _ = tls.read(&mut buf).await;
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+            let _ = tls.shutdown().await;
+        });
+
+        let tls = zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            client_auth: None,
+        };
+        shutdown_gateway("127.0.0.1", port, None, Some(&tls))
+            .await
+            .expect("shutdown over TLS");
+        server.await.expect("server task");
     }
 
     #[test]
@@ -19264,12 +19450,13 @@ mod tests {
                 "127.0.0.1",
                 9001,
                 Some("/agents/myagent"),
-                "/admin/paircode/new"
+                "/admin/paircode/new",
+                false,
             ),
             "http://127.0.0.1:9001/agents/myagent/admin/paircode/new",
         );
         assert_eq!(
-            gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode"),
+            gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode", false),
             "http://192.168.1.20:42617/gw/admin/paircode",
         );
     }

@@ -191,3 +191,20 @@ identifiers present on the event payload rather than assuming each
 `GET /api/events/history` replays the retained recent events from the same
 buffer, oldest first. It is a reconnect window for subscribers, not a separate
 canonical lifecycle store.
+
+## CLI admin commands and `[gateway.tls]`
+
+When `[gateway.tls] enabled = true`, the local CLI admin commands talk to the
+gateway over HTTPS and trust the PEM at `cert_path` (so a self-signed gateway
+certificate works without disabling verification):
+
+- `zeroclaw gateway get-paircode` (and `--new` / `--rotate` / `--rotate-device`)
+- `zeroclaw gateway restart` (graceful `/admin/shutdown` before relaunch)
+- `zeroclaw sop pending|logs|approve|deny`
+
+There is no silent fallback to plain HTTP. If `[gateway.tls.client_auth]` is
+enabled with `require_client_cert = true`, these commands refuse to run and
+name that cause — they do not yet present a client certificate. Bind addresses
+`0.0.0.0` / `::` are rewritten to `127.0.0.1` for the outbound URL so the
+hostname matches a typical localhost certificate.
+
