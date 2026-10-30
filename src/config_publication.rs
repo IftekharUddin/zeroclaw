@@ -1568,11 +1568,13 @@ mod tests {
         let listener = listen_at_the_endpoint(&config);
         let staged = with_trust_flipped(&config);
         let value = staged.security.trust_daemon_uid.to_string();
-        let lock = config
-            .data_dir
-            .join("config-lifecycle.lock")
-            .display()
-            .to_string();
+        // The lock reports where it lives when it is already held, which
+        // keeps this test independent of the lock's layout under the data
+        // directory.
+        let lock = match ConfigOwnershipGuard::acquire(&config.data_dir) {
+            Err(ConfigOwnershipError::AlreadyOwned { path }) => path.display().to_string(),
+            other => panic!("the test's own guard holds the lock: {other:?}"),
+        };
         let unconfirmed = |publication: &Publication| {
             matches!(
                 publication,

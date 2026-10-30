@@ -1695,7 +1695,9 @@ mod tests {
                 items.push("drift-guard".to_owned());
                 serde_json::to_string(&items).ok()
             }
-            PropKind::Object | PropKind::ObjectArray => None,
+            // A secret map's row is its container; its entries are separate
+            // secret rows, which the loop exercises on their own.
+            PropKind::Object | PropKind::ObjectArray | PropKind::SecretMap => None,
         }
     }
 
