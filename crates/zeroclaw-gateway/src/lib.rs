@@ -628,10 +628,16 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     // Skip loopback hops: a real client never arrives as loopback through a
     // proxy, and a same-host proxy chain can append 127.0.0.1 while the real
     // caller sits further left.
-    if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+    if let Some(xff) = headers.get("X-Forwarded-For") {
         let mut rightmost_loopback = None;
-        for candidate in xff.split(',').rev() {
-            if let Some(ip) = parse_client_ip(candidate) {
+        // A proxy can append a valid address to a caller's opaque header
+        // bytes. Decode each hop separately so that prefix cannot hide the
+        // proxy's suffix and restore the loopback peer's limiter exemption.
+        for candidate in xff.as_bytes().rsplit(|byte| *byte == b',') {
+            if let Some(ip) = std::str::from_utf8(candidate)
+                .ok()
+                .and_then(parse_client_ip)
+            {
                 if ip.is_loopback() {
                     if rightmost_loopback.is_none() {
                         rightmost_loopback = Some(ip);
@@ -9147,6 +9153,26 @@ path = "{trigger_path}"
 
         let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "203.0.113.11");
+    }
+
+    #[test]
+    fn client_key_preserves_proxy_suffix_after_opaque_xff_prefix() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        for value in [
+            &b"\x80, 198.51.100.10"[..],
+            &b"\x80, 198.51.100.10, 127.0.0.1"[..],
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", HeaderValue::from_bytes(value).unwrap());
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, true),
+                "198.51.100.10"
+            );
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, false),
+                "127.0.0.1"
+            );
+        }
     }
 
     #[test]
