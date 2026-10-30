@@ -468,28 +468,57 @@ pub(crate) struct CoreCredential {
     pub(crate) pin: zeroclaw_runtime::rpc::auth::OidcBinding,
 }
 
+/// The existing charge retained while the daemon verifies a handshake.
+#[derive(Clone, Copy)]
+enum HandshakeCharge<'a> {
+    Auxiliary(&'a Arc<Auxiliary>),
+    Opening(&'a Place),
+}
+
 /// One handshake through `connector`, presenting `credential` and, when there
 /// is one, the TUI identity, on a connection bound to the credential's
 /// provider, and what resolves once the core is done with that connection.
-/// The connection keeps `slot`, when there is one, until then.
+/// An auxiliary charge lasts until then. An opening charge hands back to
+/// its creation on success, but a cancelled or failed handshake keeps it
+/// until the daemon is done verifying the token.
 async fn handshake(
     connector: &zeroclaw_runtime::rpc::inproc::InprocConnector,
     provider: &str,
     credential: &CoreCredential,
     identity: Option<&TuiIdentity>,
-    slot: Option<&Arc<Auxiliary>>,
+    charge: Option<HandshakeCharge<'_>>,
 ) -> Result<(Result<RpcClient, ClientError>, Served), CoreFailure> {
     let (stream, served) = connector
         .connect_bound(credential.pin.clone())
         .await
         .ok_or(CoreFailure::Unavailable)?;
-    if let Some(slot) = slot {
-        let (slot, served) = (Arc::clone(slot), served.clone());
-        zeroclaw_spawn::spawn!(async move {
-            served.wait().await;
-            drop(slot);
-        });
-    }
+    let handoff = match charge {
+        Some(HandshakeCharge::Auxiliary(slot)) => {
+            let (slot, served) = (Arc::clone(slot), served.clone());
+            zeroclaw_spawn::spawn!(async move {
+                served.wait().await;
+                drop(slot);
+            });
+            None
+        }
+        Some(HandshakeCharge::Opening(place)) => {
+            let (place, served) = (Arc::clone(place), served.clone());
+            let (handoff, received) = tokio::sync::oneshot::channel();
+            zeroclaw_spawn::spawn!(async move {
+                tokio::select! {
+                    () = served.wait() => {}
+                    handed_over = received => {
+                        if handed_over.is_err() {
+                            served.wait().await;
+                        }
+                    }
+                }
+                drop(place);
+            });
+            Some(handoff)
+        }
+        None => None,
+    };
     let options = ConnectOptions {
         auth_token: Some(credential.bearer.to_string()),
         auth_provider: Some(format!("oidc.{provider}")),
@@ -497,7 +526,13 @@ async fn handshake(
         tui_sig: identity.map(|identity| identity.sig.clone()),
         ..ConnectOptions::default()
     };
-    Ok((RpcClient::connect_over(stream, options).await, served))
+    let outcome = RpcClient::connect_over(stream, options).await;
+    if outcome.is_ok()
+        && let Some(handoff) = handoff
+    {
+        let _ = handoff.send(());
+    }
+    Ok((outcome, served))
 }
 
 /// A refusal at the handshake: the core no longer takes this token.
@@ -1135,23 +1170,23 @@ impl CoreCaller {
     /// provider again, unless a policy was published during the handshake:
     /// that fails it closed, as it should, and is no reason to sign anybody
     /// out, so the token is presented once more, as the session's own
-    /// re-verification does. Each connection keeps `slot`, when there is
-    /// one, until the core is done with it.
+    /// re-verification does. Failed or cancelled handshakes keep their
+    /// existing charge until the core is done with them.
     async fn connect(
         &self,
         credential: &CoreCredential,
         identity: Option<&TuiIdentity>,
-        slot: Option<&Arc<Auxiliary>>,
+        charge: Option<HandshakeCharge<'_>>,
     ) -> Result<RpcClient, CoreFailure> {
         let connector = self.core.connector().ok_or(CoreFailure::Unavailable)?;
         let provider = self.session.alias.as_str();
         let published = self.auth.inbound.generation();
         let (mut outcome, served) =
-            handshake(connector, provider, credential, identity, slot).await?;
+            handshake(connector, provider, credential, identity, charge).await?;
         if refuses_token(&outcome) && self.auth.inbound.generation() != published {
             // One connection at a time: the refused one is over first.
             served.wait().await;
-            outcome = handshake(connector, provider, credential, identity, slot)
+            outcome = handshake(connector, provider, credential, identity, charge)
                 .await?
                 .0;
         }
@@ -1187,7 +1222,10 @@ impl CoreCaller {
             .auth
             .core_credential(&self.session)
             .ok_or(CoreFailure::SessionEnded)?;
-        let mut client = Arc::new(self.connect(&credential, None, None).await?);
+        let mut client = Arc::new(
+            self.connect(&credential, None, Some(HandshakeCharge::Opening(&place)))
+                .await?,
+        );
         let handshake = client.handshake();
         let identity = match (&handshake.tui_id, &handshake.tui_sig) {
             (Some(id), Some(sig)) => TuiIdentity {
@@ -1238,7 +1276,14 @@ impl CoreCaller {
                 {
                     renewed = true;
                     client.shutdown();
-                    client = Arc::new(self.connect(&credential, Some(&identity), None).await?);
+                    client = Arc::new(
+                        self.connect(
+                            &credential,
+                            Some(&identity),
+                            Some(HandshakeCharge::Opening(&place)),
+                        )
+                        .await?,
+                    );
                 }
                 Created::Failed(error) => {
                     client.shutdown();
@@ -1337,7 +1382,11 @@ impl CoreCaller {
                     Err(failure) => return failure.into_response(),
                 };
                 match self
-                    .connect(&credential, Some(&identity), Some(&slot))
+                    .connect(
+                        &credential,
+                        Some(&identity),
+                        Some(HandshakeCharge::Auxiliary(&slot)),
+                    )
                     .await
                 {
                     Ok(fresh) => {
@@ -1428,7 +1477,9 @@ impl CoreCaller {
             .auth
             .core_credential(&self.session)
             .ok_or(CoreFailure::SessionEnded)?;
-        let client = self.connect(&credential, None, Some(&slot)).await?;
+        let client = self
+            .connect(&credential, None, Some(HandshakeCharge::Auxiliary(&slot)))
+            .await?;
         let listed = client
             .call::<AgentsListResult>(Method::AgentsList, json!({}))
             .await;
@@ -1681,6 +1732,7 @@ mod tests {
         RiskProfileConfig, WireApi,
     };
     use zeroclaw_infra::session_backend::SessionBackend as _;
+    use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
     use zeroclaw_runtime::rpc::context::RpcContext;
     use zeroclaw_runtime::rpc::inproc::InprocConnector;
     use zeroclaw_runtime::rpc::session::SessionStore;
@@ -3967,6 +4019,88 @@ mod tests {
         assert_eq!(end["type"], "done", "alice's turn ran to its end: {end}");
     }
 
+    #[tokio::test]
+    async fn oversized_chat_frames_are_rejected_before_json_parsing() {
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let payload = json!({
+            "type": "message",
+            "content": "oversized-padded",
+            "padding": "x".repeat(MAX_FRAME_BYTES as usize),
+        })
+        .to_string();
+        for fragmented in [false, true] {
+            let mut socket = open_chat(addr, &cookie, "support", "web-1").await.unwrap();
+            let _ = await_frame(&mut socket, "session_start").await;
+            if fragmented {
+                let midpoint = payload.len() / 2;
+                for (bytes, kind, final_frame) in [
+                    (&payload.as_bytes()[..midpoint], Data::Text, false),
+                    (&payload.as_bytes()[midpoint..], Data::Continue, true),
+                ] {
+                    let _ = socket
+                        .send(ClientMessage::Frame(Frame::message(
+                            bytes.to_vec(),
+                            OpCode::Data(kind),
+                            final_frame,
+                        )))
+                        .await;
+                }
+            } else {
+                let _ = socket
+                    .send(ClientMessage::Text(payload.clone().into()))
+                    .await;
+            }
+            let (frames, _) = read_to_close(&mut socket).await;
+            assert!(
+                frames.is_empty(),
+                "the oversized input never starts a turn: {frames:?}"
+            );
+            fixture
+                .assert_nothing_live("oversized input closes its conversation")
+                .await;
+        }
+        assert!(fixture._model.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_chat_prompt_over_the_encoded_rpc_limit_keeps_its_connection() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &cookie, "support", "web-1").await.unwrap();
+        let start = await_frame(&mut socket, "session_start").await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        // Escapes count as wire bytes, as do the RPC envelope and newline.
+        // The browser message fits, but its larger RPC envelope does not.
+        let payload = json!({
+            "type": "message",
+            "content": "\n".repeat((MAX_FRAME_BYTES as usize - 64) / 2),
+        })
+        .to_string();
+        assert!(payload.len() as u64 <= MAX_FRAME_BYTES);
+        socket
+            .send(ClientMessage::Text(payload.into()))
+            .await
+            .unwrap();
+        let refused = turn_end(&mut socket).await;
+        assert_eq!(refused["code"], "CORE_REFUSED", "{refused}");
+        assert!(fixture._model.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            chat_once(&mut socket, "a small prompt").await["type"],
+            "done"
+        );
+        assert_eq!(introspections_of(&fixture._idp, "tok-alice").await, before);
+        assert_eq!(
+            fixture.store.list_ids().await,
+            vec![start["session_id"].as_str().unwrap()]
+        );
+    }
+
     /// Read text frames until the turn ends, and return the frame that ends
     /// it.
     async fn turn_end(socket: &mut ChatSocket) -> Value {
@@ -4650,6 +4784,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_final_reply_closes_the_conversation_without_pings() {
+        let fixture = Fixture::with_config(|config| {
+            config.gateway.websocket_ping_interval_secs = 0;
+        })
+        .await;
+        mount_flood(&fixture).await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &cookie, "support", "web-1").await.unwrap();
+        let tokio_tungstenite::MaybeTlsStream::Plain(stream) = socket.get_ref() else {
+            panic!("the fixture uses plain loopback TCP");
+        };
+        socket2::SockRef::from(stream)
+            .set_recv_buffer_size(64 * 1024)
+            .unwrap();
+        let _ = await_frame(&mut socket, "session_start").await;
+        socket
+            .send(ClientMessage::Text(
+                json!({ "type": "message", "content": "flood please" })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        // Consume the chunk completely, then stop reading before the equally
+        // large final reply. Only that final write may hit its deadline.
+        let chunk = await_frame(&mut socket, "chunk").await;
+        assert_eq!(chunk["content"].as_str().unwrap().len(), 7 * 1024 * 1024);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !fixture.store.list_ids().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a failed final write closes its conversation");
+        drop(socket);
+    }
+
+    #[tokio::test]
     async fn a_chat_whose_browser_stops_reading_still_ends_at_sign_out() {
         let fixture = Fixture::new().await;
         mount_flood(&fixture).await;
@@ -5026,6 +5199,83 @@ mod tests {
     /// connection, but the core may still be verifying its token.
     const PAST_THE_HANDSHAKE_DEADLINE: Duration =
         Duration::from_secs(zeroclaw_rpc_client::DEFAULT_HANDSHAKE_TIMEOUT.as_secs() + 2);
+
+    #[tokio::test]
+    async fn cancelled_chat_handshakes_keep_their_places_until_served() {
+        let fixture = Fixture::new().await;
+        let (_, session) = fixture.sign_in("alice").await;
+        let caller = core_caller_for(&fixture, &session);
+        slow_introspections(
+            &fixture,
+            "alice",
+            "chatters",
+            Duration::from_secs(3),
+            (MAX_LIVE_CONVERSATIONS as u64, 1),
+        )
+        .await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        for opened in 1..=MAX_LIVE_CONVERSATIONS {
+            let opening = {
+                let caller = caller.clone();
+                zeroclaw_spawn::spawn!(async move { caller.open_chat("support", None).await })
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while introspections_of(&fixture._idp, "tok-alice").await < before + opened {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the handshake reached token verification");
+            opening.abort();
+            let _ = opening.await;
+            assert_eq!(caller.binding.places_taken(), opened);
+        }
+        assert!(matches!(
+            caller.open_chat("support", None).await,
+            Err(CoreFailure::ConversationLimit)
+        ));
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while fixture.connector.connection_count() != 0 || caller.binding.places_taken() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed verifications release their places");
+        caller
+            .open_chat("support", None)
+            .await
+            .unwrap()
+            .close()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_chat_handshake_keeps_its_place_until_served() {
+        let fixture = Fixture::new().await;
+        let (_, session) = fixture.sign_in("alice").await;
+        let caller = core_caller_for(&fixture, &session);
+        slow_introspections(
+            &fixture,
+            "alice",
+            "chatters",
+            PAST_THE_HANDSHAKE_DEADLINE,
+            (1, 1),
+        )
+        .await;
+        assert!(matches!(
+            caller.open_chat("support", None).await,
+            Err(CoreFailure::Lost(_))
+        ));
+        assert_eq!(caller.binding.places_taken(), 1);
+        assert_eq!(fixture.connector.connection_count(), 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.connector.connection_count() != 0 || caller.binding.places_taken() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the timed-out handshake settles when the daemon is done");
+    }
 
     #[tokio::test]
     async fn an_accounts_connection_bound_holds_past_the_handshake_deadline() {
