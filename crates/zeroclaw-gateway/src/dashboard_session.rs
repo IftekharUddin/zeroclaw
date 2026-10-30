@@ -2893,6 +2893,9 @@ mod tests {
         for remove_agent in [false, true] {
             let server = idp(&["admins"], "gw").await;
             let mut config = sign_in_config(&server.uri());
+            for alias in ["support", "other"] {
+                config.agents.insert(alias.into(), Default::default());
+            }
             let profile = config.permission_profiles.get_mut("admin").unwrap();
             profile.admin = false;
             profile.allowed_agents = vec!["support".into()];
@@ -2900,6 +2903,7 @@ mod tests {
                 Resource::Sessions,
                 vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
             );
+            config.validate_auth().unwrap();
             let fixture = fixture(config.clone());
             let signed_in = sign_in(&fixture, &server).await;
             let DashboardCaller::Session(session) = fixture
