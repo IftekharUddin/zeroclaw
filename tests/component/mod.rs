@@ -37,6 +37,8 @@ mod relay_claim_cli;
 mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;
+#[cfg(unix)]
+mod sigpipe_cli;
 mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;

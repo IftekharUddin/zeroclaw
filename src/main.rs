@@ -8972,7 +8972,8 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
 /// this way while printing output that looked complete.
 ///
 /// For these commands the conventional Unix behaviour, terminating quietly on
-/// `SIGPIPE`, is the right one. Commands that stay resident or drive the agent
+/// `SIGPIPE`, is the right one. Commands that mutate configuration, stay resident,
+/// or drive the agent
 /// runtime (daemon, gateway, ACP, an interactive agent, eval) keep the ignored
 /// disposition on purpose: they write to child processes and stdio protocols,
 /// where a vanished peer must surface as an error they already handle rather
@@ -8982,12 +8983,15 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
 fn restores_default_sigpipe(command: &Commands) -> bool {
     match command {
         Commands::Status { .. }
-        | Commands::Doctor { .. }
         | Commands::Browse { .. }
         | Commands::Integrations { .. }
         | Commands::Completions { .. }
         | Commands::MarkdownHelp
         | Commands::MarkdownSchema => true,
+        Commands::Doctor { doctor_command } => matches!(
+            doctor_command,
+            None | Some(DoctorCommands::Models { .. } | DoctorCommands::Traces { .. })
+        ),
         Commands::Cron { cron_command } => matches!(cron_command, CronCommands::List),
         Commands::Channel { channel_command } => {
             matches!(channel_command, ChannelCommands::List)
@@ -17036,6 +17040,8 @@ mod tests {
             &["zeroclaw", "cron", "list"][..],
             &["zeroclaw", "status"],
             &["zeroclaw", "doctor"],
+            &["zeroclaw", "doctor", "models"],
+            &["zeroclaw", "doctor", "traces"],
             &["zeroclaw", "channel", "list"],
             &["zeroclaw", "agents", "list"],
             &["zeroclaw", "providers"],
@@ -17053,13 +17059,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resident_and_runtime_commands_keep_sigpipe_ignored() {
+    fn resident_runtime_and_mutating_commands_keep_sigpipe_ignored() {
         for args in [
             &["zeroclaw", "daemon"][..],
             &["zeroclaw", "gateway"],
             &["zeroclaw", "agent", "--agent", "fable", "--message", "hi"],
             &["zeroclaw", "channel", "start"],
             &["zeroclaw", "cron", "pause", "job-1"],
+            &["zeroclaw", "doctor", "update-context-windows"],
+            &["zeroclaw", "doctor", "update-context-windows", "--dry-run"],
             &["zeroclaw", "memory", "clear"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
