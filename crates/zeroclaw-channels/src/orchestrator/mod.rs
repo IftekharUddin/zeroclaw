@@ -15213,7 +15213,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if !config_arc.read().channels.wecom.is_empty() {
         println!(
-            "  ℹ️  WeCom     healthy = configuration check only (the webhook API has no message-free probe); delivery is validated on real sends"
+            "  ℹ️  WeCom     {}",
+            channel_runtime_cli_string("channel-doctor-wecom-configuration-only")
         );
     }
 

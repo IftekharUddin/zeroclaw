@@ -65,6 +65,7 @@ cli-service-logs-about = Tail daemon service logs
 cli-channel-list-about = List all configured channels
 cli-channel-start-about = Start all configured channels
 cli-channel-doctor-about = Run health checks for configured channels
+channel-doctor-wecom-configuration-only = healthy = configuration check only (the webhook API has no message-free probe); delivery is validated on real sends
 cli-channel-add-about = Add a new channel configuration
 cli-channel-remove-about = Remove a channel configuration
 cli-channel-send-about = Send a one-off message to a configured channel
