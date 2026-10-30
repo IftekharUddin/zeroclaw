@@ -3078,6 +3078,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_narrowed_chat_grant_closes_the_socket_before_acting() {
+        for remove_agent in [false, true] {
+            let fixture = Fixture::new().await;
+            let addr = serve(fixture.router()).await;
+            let (cookie, session) = fixture.sign_in("alice").await;
+            let (mut socket, _) = chat_in(addr, &cookie, "web-1").await;
+            let mut narrowed = fixture.config.clone();
+            let profile = narrowed.permission_profiles.get_mut("chat-user").unwrap();
+            if remove_agent {
+                profile.allowed_agents = vec!["other".into()];
+            } else {
+                profile
+                    .grants
+                    .get_mut(&Resource::Sessions)
+                    .unwrap()
+                    .retain(|verb| *verb != Verb::Read);
+            }
+            // Only the gateway loses access, so the core cannot mask a missing
+            // socket check. Other grants keep this account signed in.
+            fixture
+                .rpc_auth
+                .publish_accepted(&narrowed, fixture.rpc_auth.accepted_revision() + 1)
+                .unwrap();
+            assert!(!session.ended.is_cancelled());
+            socket
+                .send(ClientMessage::Text(
+                    json!({
+                        "type": "message", "content": "must not run after narrowing"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let (frames, code) = read_to_close(&mut socket).await;
+            assert_eq!(
+                code,
+                Some(crate::dashboard_session::WS_CLOSE_ACCESS_LOST),
+                "{frames:?}"
+            );
+            assert!(
+                !frames.iter().any(|frame| frame["type"] == "done"),
+                "{frames:?}"
+            );
+            assert!(
+                !fixture
+                    ._model
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|request| {
+                        String::from_utf8_lossy(&request.body)
+                            .contains("must not run after narrowing")
+                    })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn between_turns_a_frame_after_a_lost_grant_closes_the_socket_unacted() {
         let fixture = Fixture::new().await;
         let addr = serve(fixture.router()).await;

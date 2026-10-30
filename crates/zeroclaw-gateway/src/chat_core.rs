@@ -135,6 +135,7 @@ pub(crate) async fn ws_chat_through_core(
     if !crate::dashboard_core::may_chat(&caller.session.grants) {
         return chat_not_permitted();
     }
+    let watch = watch.map(|watch| watch.for_chat(agent_alias.clone()));
     if state.config.read().agent(&agent_alias).is_none() {
         return (
             StatusCode::BAD_REQUEST,

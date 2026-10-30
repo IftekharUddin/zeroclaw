@@ -1178,6 +1178,9 @@ pub(crate) struct SessionWatch {
     auth: Arc<DashboardAuth>,
     session: Arc<SessionAuth>,
     require_admin: bool,
+    /// The agent selected by a core chat socket. This is the socket's access
+    /// requirement; its grants are resolved live on each recheck.
+    chat_agent: Option<String>,
     recheck: tokio::time::Interval,
     /// A recheck in progress. Kept here, not in a `lost` future, because
     /// a socket's loop drops that future whenever another branch fires: a
@@ -1210,6 +1213,7 @@ impl SessionWatch {
             auth,
             session,
             require_admin,
+            chat_agent: None,
             recheck,
             pending: None,
             stopping,
@@ -1219,6 +1223,11 @@ impl SessionWatch {
 
     pub(crate) fn principal_id(&self) -> &str {
         self.session.principal().id.as_str()
+    }
+
+    pub(crate) fn for_chat(mut self, agent_alias: String) -> Self {
+        self.chat_agent = Some(agent_alias);
+        self
     }
 
     /// The ends a stream can see by itself, without waiting for the task
@@ -1253,7 +1262,13 @@ impl SessionWatch {
 
     fn judge(&mut self, outcome: DashboardCaller) -> Result<(), u16> {
         match outcome {
-            DashboardCaller::Session(session) if !self.require_admin || session.is_admin() => {
+            DashboardCaller::Session(session)
+                if (!self.require_admin || session.is_admin())
+                    && self.chat_agent.as_ref().is_none_or(|agent| {
+                        crate::dashboard_core::may_chat(&session.grants)
+                            && session.grants.may_use_agent(agent)
+                    }) =>
+            {
                 self.session = session;
                 Ok(())
             }
@@ -2870,6 +2885,58 @@ mod tests {
     }
 
     // ── Long-lived sockets ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_chat_watch_closes_on_narrowed_grants_without_input() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        for remove_agent in [false, true] {
+            let server = idp(&["admins"], "gw").await;
+            let mut config = sign_in_config(&server.uri());
+            let profile = config.permission_profiles.get_mut("admin").unwrap();
+            profile.admin = false;
+            profile.allowed_agents = vec!["support".into()];
+            profile.grants.insert(
+                Resource::Sessions,
+                vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+            );
+            let fixture = fixture(config.clone());
+            let signed_in = sign_in(&fixture, &server).await;
+            let DashboardCaller::Session(session) = fixture
+                .auth
+                .admit(|alias| Some(pin_for(&fixture, alias)), &signed_in.cookie)
+                .await
+            else {
+                panic!("signed in");
+            };
+            let mut watch =
+                SessionWatch::new(Arc::clone(&fixture.auth), session, false, &fixture.state)
+                    .for_chat("support".into());
+            assert_eq!(watch.admits_now(&fixture.state).await, Ok(()));
+            let profile = config.permission_profiles.get_mut("admin").unwrap();
+            if remove_agent {
+                profile.allowed_agents = vec!["other".into()];
+            } else {
+                profile
+                    .grants
+                    .get_mut(&Resource::Sessions)
+                    .unwrap()
+                    .retain(|verb| *verb != Verb::Read);
+            }
+            let authority = fixture.auth.inbound.authority_ref().upgrade().unwrap();
+            authority
+                .publish_accepted(&config, authority.accepted_revision() + 1)
+                .unwrap();
+            watch.recheck = tokio::time::interval(std::time::Duration::from_millis(1));
+            let code = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                watch.lost(&fixture.state),
+            )
+            .await
+            .expect("a narrowed chat closes without another incoming frame");
+            assert_eq!(code, WS_CLOSE_ACCESS_LOST);
+        }
+    }
 
     #[tokio::test]
     async fn a_socket_watch_fires_when_its_session_is_signed_out() {
