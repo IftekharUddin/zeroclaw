@@ -46,10 +46,11 @@
 use std::cell::OnceCell;
 use std::fmt;
 use std::path::PathBuf;
-#[cfg(unix)]
 use std::time::Duration;
 
+use chrono::Utc;
 use serde_json::Value;
+use zeroclaw_runtime::daemon::{STATUS_FLUSH_SECONDS, state_file_path};
 use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
 use zeroclaw_runtime::rpc::auth::{auth_inputs, is_auth_input_path, validate_accepted_auth_config};
 use zeroclaw_runtime::rpc::types::{ConfigSetManyParams, ConfigSetParams};
@@ -595,6 +596,75 @@ fn daemon_presence(config: &Config, holds_config_ownership: bool) -> DaemonPrese
     }
 }
 
+/// How many of the heartbeat writer's intervals may pass without a new stamp
+/// before the daemon that wrote the last one counts as gone.
+const HEARTBEAT_MISSED_WRITES: u64 = 3;
+
+/// How long a reader waits before it reads the heartbeat again when the file
+/// is there but did not parse.
+const HEARTBEAT_REREAD_DELAY: Duration = Duration::from_millis(20);
+
+/// What the daemon heartbeat at [`state_file_path`] last recorded. The daemon
+/// rewrites the file on a fixed interval while it runs and leaves the last
+/// one behind when it stops, so a record alone does not show that a daemon
+/// runs: [`RecordedDaemon::is_recent`] says whether it still may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedDaemon {
+    /// The daemon's process id, when the file records one.
+    pid: Option<u32>,
+    /// When the daemon wrote the file.
+    written_at: chrono::DateTime<Utc>,
+}
+
+impl RecordedDaemon {
+    /// Whether the heartbeat is recent as of `now`: written within three of
+    /// the writer's intervals, so the daemon that wrote it has not missed
+    /// three writes in a row. A stamp ahead of `now` by as much counts as
+    /// recent too: the daemon and its readers share a clock, so a stamp in
+    /// the future only means the clock was stepped.
+    fn is_recent(&self, now: chrono::DateTime<Utc>) -> bool {
+        let stale_after = Duration::from_secs(STATUS_FLUSH_SECONDS * HEARTBEAT_MISSED_WRITES);
+        now.signed_duration_since(self.written_at)
+            .abs()
+            .to_std()
+            .is_ok_and(|age| age <= stale_after)
+    }
+}
+
+/// The heartbeat the daemon serving `config`'s directory last wrote, or
+/// `None` when there is none or it does not parse.
+///
+/// The writer truncates the file before it writes the new stamp, so a read
+/// can land between the two and find it empty or partial. A file that is
+/// there but does not parse is read once more before it counts as
+/// unreadable. On such a torn read this blocks the calling thread for a
+/// short re-read delay, so a caller on an async runtime worker should call it
+/// through `tokio::task::spawn_blocking`.
+fn recorded_daemon(config: &Config) -> Option<RecordedDaemon> {
+    let path = state_file_path(config);
+    let raw = std::fs::read(&path).ok()?;
+    parse_recorded_daemon(&raw).or_else(|| {
+        std::thread::sleep(HEARTBEAT_REREAD_DELAY);
+        parse_recorded_daemon(&std::fs::read(&path).ok()?)
+    })
+}
+
+/// The pid and stamp in one heartbeat file's contents, as the writer records
+/// them: `pid` from the health snapshot and `written_at` in RFC 3339.
+fn parse_recorded_daemon(raw: &[u8]) -> Option<RecordedDaemon> {
+    let state: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let written_at =
+        chrono::DateTime::parse_from_rfc3339(state.get("written_at")?.as_str()?).ok()?;
+    let pid = state
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    Some(RecordedDaemon {
+        pid,
+        written_at: written_at.with_timezone(&Utc),
+    })
+}
+
 /// The pid of the daemon serving `config`'s directory, when one is running:
 /// the heartbeat beside config.toml is recent and the process it names is
 /// alive. A daemon that stops leaves its last heartbeat behind, so the stamp
@@ -605,7 +675,7 @@ fn daemon_presence(config: &Config, holds_config_ownership: bool) -> DaemonPrese
 /// on the thread that drives its runtime, not on a worker, so the wait holds
 /// up only the command itself.
 fn running_daemon(config: &Config) -> Option<u32> {
-    let recorded = zeroclaw_runtime::daemon::recorded_daemon(config)?;
+    let recorded = recorded_daemon(config)?;
     if !recorded.is_recent(chrono::Utc::now()) {
         return None;
     }
@@ -838,14 +908,91 @@ mod tests {
         (dir, config)
     }
 
+    /// Write `contents` where `spawn_state_writer` writes the heartbeat.
+    fn write_heartbeat_file(config: &Config, contents: &[u8]) {
+        let path = state_file_path(config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn recorded_daemon_reads_what_the_heartbeat_writer_records() {
+        let (_tmp, config) = scratch_config();
+        assert_eq!(recorded_daemon(&config), None, "no heartbeat yet");
+
+        // The writer's format: the health snapshot, which carries the pid,
+        // plus the stamp, pretty-printed.
+        let written_at = Utc::now();
+        let mut state = zeroclaw_runtime::health::snapshot_json();
+        state["written_at"] = serde_json::json!(written_at.to_rfc3339());
+        write_heartbeat_file(&config, &serde_json::to_vec_pretty(&state).unwrap());
+        assert_eq!(
+            recorded_daemon(&config),
+            Some(RecordedDaemon {
+                pid: Some(std::process::id()),
+                written_at,
+            })
+        );
+
+        let unstamped_pid = serde_json::json!({ "written_at": written_at.to_rfc3339() });
+        write_heartbeat_file(&config, unstamped_pid.to_string().as_bytes());
+        assert_eq!(
+            recorded_daemon(&config).map(|recorded| recorded.pid),
+            Some(None),
+            "a heartbeat without a pid still records its stamp"
+        );
+    }
+
+    /// The writer truncates before it writes, so a reader can find the file
+    /// empty or cut short; a file that never parses records nothing.
+    #[test]
+    fn recorded_daemon_records_nothing_for_a_torn_or_unstamped_heartbeat() {
+        let (_tmp, config) = scratch_config();
+        let stamp = Utc::now().to_rfc3339();
+        for torn in [
+            String::new(),
+            format!("{{\"pid\": 4321, \"written_at\": \"{stamp}"),
+            serde_json::json!({ "pid": 4321 }).to_string(),
+            serde_json::json!({ "pid": 4321, "written_at": "yesterday" }).to_string(),
+        ] {
+            write_heartbeat_file(&config, torn.as_bytes());
+            assert_eq!(recorded_daemon(&config), None, "{torn:?}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_is_recent_within_three_writer_intervals_either_way() {
+        let now = Utc::now();
+        let written = |seconds_ago: i64| RecordedDaemon {
+            pid: Some(4321),
+            written_at: now - chrono::TimeDelta::seconds(seconds_ago),
+        };
+        let bound = i64::try_from(STATUS_FLUSH_SECONDS * HEARTBEAT_MISSED_WRITES).unwrap();
+
+        assert!(written(0).is_recent(now), "written just now");
+        assert!(
+            written(bound).is_recent(now),
+            "three intervals is the bound"
+        );
+        assert!(
+            !written(bound + 1).is_recent(now),
+            "three missed writes and more mean the writer is gone"
+        );
+        assert!(
+            written(-2).is_recent(now),
+            "a stamp slightly ahead of this clock is still recent"
+        );
+        assert!(
+            !written(-(bound + 1)).is_recent(now),
+            "a stamp far ahead of this clock is not"
+        );
+    }
+
     /// Record `pid` as `config`'s daemon, stamped `written_at`, where the
     /// daemon's heartbeat goes.
     fn write_heartbeat_of(config: &Config, written_at: chrono::DateTime<chrono::Utc>, pid: u32) {
-        let path = zeroclaw_runtime::daemon::state_file_path(config);
-        std::fs::create_dir_all(path.parent().expect("the state file has a directory"))
-            .expect("the state directory is writable");
         let state = serde_json::json!({ "pid": pid, "written_at": written_at.to_rfc3339() });
-        std::fs::write(path, state.to_string()).expect("the state file is writable");
+        write_heartbeat_file(config, state.to_string().as_bytes());
     }
 
     /// Record this test process as `config`'s running daemon: a fresh stamp
