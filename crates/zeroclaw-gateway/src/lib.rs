@@ -623,8 +623,10 @@ fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    // Appending proxies add the connecting peer at the right-hand end. Prefer
+    // that hop so a client-supplied leading entry cannot pick the rate-limit key.
     if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        for candidate in xff.split(',') {
+        for candidate in xff.split(',').rev() {
             if let Some(ip) = parse_client_ip(candidate) {
                 return Some(ip);
             }
@@ -643,7 +645,12 @@ pub(crate) fn client_key_from_request(
     trust_forwarded_headers: bool,
 ) -> String {
     if trust_forwarded_headers && let Some(ip) = forwarded_client_ip(headers) {
-        return ip.to_string();
+        // A real loopback caller never arrives through a proxy with a
+        // forwarded header. Treat a loopback forwarded value as spoofed and
+        // fall back to the peer so limiter exemptions stay local-only.
+        if !ip.is_loopback() {
+            return ip.to_string();
+        }
     }
 
     peer_addr
@@ -9112,11 +9119,23 @@ path = "{trigger_path}"
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
+            // Client-supplied leftmost entry, then the address the immediate
+            // proxy appended (rightmost).
             HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
         );
 
         let key = client_key_from_request(Some(peer), &headers, true);
-        assert_eq!(key, "198.51.100.10");
+        assert_eq!(key, "203.0.113.11");
+    }
+
+    #[test]
+    fn client_key_ignores_spoofed_loopback_forwarded_header() {
+        let peer = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.50");
     }
 
     #[test]
