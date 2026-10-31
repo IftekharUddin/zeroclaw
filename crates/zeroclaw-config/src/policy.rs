@@ -2588,9 +2588,9 @@ fn rm_targets_filesystem_root(args: &[String]) -> bool {
 
 /// One shell word as the destructive-command matcher sees it.
 struct MatcherShellWord {
-    /// The word as written, quotes and escapes included. Assignment detection
-    /// reads this: a shell only treats `NAME=value` as an assignment when the
-    /// name itself is unquoted.
+    /// The word with line continuations removed, but quotes and other escapes
+    /// preserved. Assignment detection reads this: the name in `NAME=value`
+    /// must be unquoted.
     raw: String,
     /// The word after the shell removes its quoting and escapes.
     value: String,
@@ -2631,9 +2631,12 @@ fn shell_words_for_destructive_match(
                 }
             }
             '\\' if backslash_escapes => {
+                let escaped = chars.next()?;
+                if escaped == '\n' {
+                    continue;
+                }
                 in_word = true;
                 raw.push(ch);
-                let escaped = chars.next()?;
                 raw.push(escaped);
                 value.push(escaped);
             }
@@ -2654,20 +2657,29 @@ fn shell_words_for_destructive_match(
                 raw.push(ch);
                 loop {
                     let inner = chars.next()?;
-                    raw.push(inner);
                     match inner {
-                        '"' => break,
+                        '"' => {
+                            raw.push(inner);
+                            break;
+                        }
                         '\\' if backslash_escapes => {
+                            let next = chars.next()?;
+                            if next == '\n' {
+                                continue;
+                            }
+                            raw.push(inner);
+                            raw.push(next);
                             // Inside double quotes a backslash only escapes
                             // these; before anything else it stays literal.
-                            let next = chars.next()?;
-                            raw.push(next);
-                            if !matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                            if !matches!(next, '$' | '`' | '"' | '\\') {
                                 value.push('\\');
                             }
                             value.push(next);
                         }
-                        other => value.push(other),
+                        other => {
+                            raw.push(other);
+                            value.push(other);
+                        }
                     }
                 }
             }
@@ -6972,6 +6984,61 @@ mod tests {
             assert!(
                 err.contains("irreversible"),
                 "{command:?} should report the destructive-operation deny, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_line_continuations_do_not_hide_direct_spellings() {
+        let policy = most_permissive_policy();
+
+        for command in [
+            "m\\\nkfs.ext4 /dev/sda1",
+            "\"m\\\nkfs.ext4\" /dev/sda1",
+            "FO\\\nO=value rm -rf /",
+            "FOO=\"va\\\nlue\" rm -rf /",
+            "dd if=/dev/zero of=/dev/s\\\nda",
+            "dd if=/dev/zero \"of=/dev/s\\\nda\"",
+            "\\\n mkfs.ext4 /dev/sda1",
+            "\\\n \\\n rm -rf /",
+            "FOO=value \\\n rm -rf /",
+            "echo safe && m\\\nkfs.ext4 /dev/sda1",
+        ] {
+            assert!(
+                !policy.is_command_allowed_for_shell(command, ShellDialect::Posix),
+                "{command:?} must remain denied after removing POSIX line continuations"
+            );
+            for approved in [false, true] {
+                let error = policy
+                    .validate_command_execution_for_shell(command, approved, ShellDialect::Posix)
+                    .expect_err("a continued destructive spelling must not validate");
+                assert!(error.contains("irreversible"), "{command:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn line_continuation_matching_preserves_literal_and_ordinary_words() {
+        let policy = most_permissive_policy();
+
+        for (command, dialect) in [
+            ("FO\\\nO=value echo safe", ShellDialect::Posix),
+            ("\\\n echo safe", ShellDialect::Posix),
+            ("'m\\\nkfs.ext4' /dev/sda1", ShellDialect::Posix),
+            ("dd if=/dev/zero 'of=/dev/s\\\nda'", ShellDialect::Posix),
+            ("\"FO\\\nO=value\" rm -rf /", ShellDialect::Posix),
+            ("echo .\\notes.txt", ShellDialect::WindowsCmd),
+            ("m\\\nkfs.ext4 file", ShellDialect::WindowsCmd),
+        ] {
+            assert!(
+                policy.is_command_allowed_for_shell(command, dialect),
+                "{command:?} is not a covered destructive spelling under {dialect:?}"
+            );
+            assert!(
+                policy
+                    .validate_command_execution_for_shell(command, true, dialect)
+                    .is_ok(),
+                "{command:?} must still validate under {dialect:?}"
             );
         }
     }
