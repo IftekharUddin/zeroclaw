@@ -2753,6 +2753,9 @@ impl LarkChannel {
                     }
                     text.push_str(&marker);
                 }
+                if text.trim().is_empty() {
+                    return messages;
+                }
                 (text, mentioned)
             }
             "image" => {
@@ -4140,14 +4143,6 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
             parsed
                 .as_object()
                 .and_then(|m| m.values().find(|v| v.is_object()))
-        })
-        .or_else(|| {
-            // Flat post bodies (no `zh_cn`/`en_us` wrapper) carry `title` and
-            // `content` at the top level; use the body itself as the locale.
-            parsed
-                .get("content")
-                .and_then(|c| c.as_array())
-                .map(|_| &parsed)
         })?;
 
     let mut text = String::new();
@@ -5723,6 +5718,110 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "* 1\n* 2");
+    }
+
+    #[tokio::test]
+    async fn lark_parse_post_message_skips_empty_content() {
+        let ch = make_channel();
+        for content in [
+            "not json",
+            r#"{"title":"","content":[]}"#,
+            r#"{"zh_cn":{"title":"","content":[[{"tag":"emotion","emoji_type":"SMILE"}]]}}"#,
+            r#"{"title":" ","content_v2":[[{"tag":"text","text":" \n "},{"tag":"img"}]]}"#,
+        ] {
+            let payload = serde_json::json!({
+                "header": { "event_type": "im.message.receive_v1" },
+                "event": {
+                    "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                    "message": {
+                        "message_id": "om_empty_post",
+                        "message_type": "post",
+                        "chat_type": "p2p",
+                        "chat_id": "oc_chat",
+                        "mentions": [],
+                        "content": content
+                    }
+                }
+            });
+
+            assert!(
+                ch.parse_event_payload(&payload).await.is_empty(),
+                "post without text or an image must not dispatch: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lark_parse_post_message_preserves_image_only_content() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-token",
+                "expire": 7200
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+        for (image_key, response, expected) in [
+            (
+                "img_ok",
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(png)
+                            .unwrap(),
+                    ),
+                format!("[IMAGE:data:image/png;base64,{png}]"),
+            ),
+            (
+                "img_missing",
+                ResponseTemplate::new(404),
+                "[IMAGE:img_missing | download failed]".to_string(),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/im/v1/messages/om_post/resources/{image_key}"
+                )))
+                .and(query_param("type", "image"))
+                .and(header("authorization", "Bearer test-token"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let images = serde_json::json!([[{"tag": "img", "image_key": image_key}]]);
+            let payload = serde_json::json!({
+                "header": { "event_type": "im.message.receive_v1" },
+                "event": {
+                    "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                    "message": {
+                        "message_id": "om_post",
+                        "message_type": "post",
+                        "chat_type": "p2p",
+                        "chat_id": "oc_chat",
+                        "mentions": [],
+                        "content": serde_json::json!({
+                            "title": "", "content": images, "content_v2": images
+                        }).to_string()
+                    }
+                }
+            });
+
+            let messages = ch.parse_event_payload(&payload).await;
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, expected);
+            assert_eq!(messages[0].reply_target, "oc_chat");
+        }
     }
 
     /// Feishu delivers inbound rich-text (`post`) content in the flat
