@@ -347,20 +347,18 @@ async fn an_unusable_credential_is_refused_before_any_connection() {
 }
 
 #[tokio::test]
-async fn with_pairing_disabled_only_an_unselected_request_stays_in_process() {
+async fn with_pairing_disabled_only_an_absent_credential_stays_in_process() {
     let fake = FakeCore::accepting(&["zc_alice"]);
     let core = core_over(&fake, false, PoolLimits::default());
 
-    for headers in [
-        HeaderMap::new(),
-        headers(Some("zc_alice"), None),
-        headers(Some("not a token"), None),
-    ] {
-        assert!(matches!(
-            core.access(&headers).await,
-            Ok(CoreAccess::InProcess)
-        ));
-    }
+    assert!(matches!(
+        core.access(&HeaderMap::new()).await,
+        Ok(CoreAccess::InProcess)
+    ));
+    assert!(matches!(
+        core.access(&headers(Some("not a token"), None)).await,
+        Err(CoreError::AuthRequired(_))
+    ));
     // A provider selection is a request to authenticate: it is never waved
     // through, and a bad one is refused.
     assert!(matches!(
@@ -374,6 +372,10 @@ async fn with_pairing_disabled_only_an_unselected_request_stays_in_process() {
     ));
     assert_eq!(fake.dials(), 0);
 
+    assert!(matches!(
+        core.access(&headers(Some("zc_alice"), None)).await,
+        Ok(CoreAccess::Core(_))
+    ));
     let selected = core
         .access(&headers(Some("zc_alice"), Some("native")))
         .await;
@@ -813,14 +815,20 @@ async fn the_real_core_binds_each_bearer_and_revocation_ends_its_connection() {
 
 // ── Review regressions ───────────────────────────────────────────
 
-/// A real in-process core with two paired native bearers, counting dials.
-fn real_pool() -> (
+type RealPool = (
     tempfile::TempDir,
     Arc<zeroclaw_runtime::rpc::context::RpcContext>,
     tokio_util::sync::CancellationToken,
     CoreRpc,
     Arc<AtomicUsize>,
-) {
+);
+
+/// A real in-process core with two paired native bearers, counting dials.
+fn real_pool() -> RealPool {
+    real_pool_with(|_| {})
+}
+
+fn real_pool_with(configure: impl FnOnce(&mut zeroclaw_config::schema::Config)) -> RealPool {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut config = zeroclaw_config::schema::Config {
         data_dir: tmp.path().to_path_buf(),
@@ -829,6 +837,7 @@ fn real_pool() -> (
     };
     config.gateway.require_pairing = true;
     config.gateway.paired_tokens = vec!["zc_real_a".into(), "zc_real_b".into()];
+    configure(&mut config);
     with_daemon_signing_key(&config);
     let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
         16,
@@ -842,12 +851,13 @@ fn real_pool() -> (
     let connector = InprocConnector::new(cancel.clone());
     connector.bind(Arc::clone(&ctx));
     let dials = Arc::new(AtomicUsize::new(0));
+    let pairing = Arc::clone(ctx.auth.pairing());
     let core = CoreRpc::with_dialer(
         CountingDial {
             connector,
             dials: Arc::clone(&dials),
         },
-        || true,
+        move || pairing.require_pairing(),
         PoolLimits::default(),
     );
     (tmp, ctx, cancel, core, dials)
@@ -1276,4 +1286,225 @@ async fn an_unknown_oidc_alias_is_the_cores_call_and_is_never_pooled() {
     assert_eq!(pool_of(&core).pooled(), 0);
     assert_eq!(pool_of(&core).open_connections(), 0);
     cancel.cancel();
+}
+
+/// Exercises the production extractor and real core without activating a
+/// dashboard route. The counter makes every use of the legacy body observable.
+async fn policy_probe(
+    axum::extract::State((method, legacy_calls)): axum::extract::State<(Method, Arc<AtomicUsize>)>,
+    access: CoreAccess,
+) -> Response {
+    match access {
+        CoreAccess::InProcess => {
+            legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({ "legacy": true })).into_response()
+        }
+        CoreAccess::Core(call) => {
+            let principal = call.principal_id().map(str::to_owned);
+            match call.request(method, json!({})).await {
+                Ok(result) => {
+                    Json(json!({ "principal_id": principal, "result": result })).into_response()
+                }
+                Err(error) => error.into_response(),
+            }
+        }
+    }
+}
+
+fn policy_router(core: CoreRpc, method: Method, legacy_calls: &Arc<AtomicUsize>) -> Router {
+    Router::new()
+        .route("/probe", get(policy_probe))
+        .layer(axum::Extension(core))
+        .with_state((method, Arc::clone(legacy_calls)))
+}
+
+#[tokio::test]
+async fn pairing_disabled_router_authenticates_present_credentials() {
+    let (_tmp, _ctx, cancel, core, dials) = real_pool_with(|config| {
+        config.gateway.require_pairing = false;
+    });
+    let _cancel_guard = cancel.drop_guard();
+    let legacy_calls = Arc::new(AtomicUsize::new(0));
+    let router = policy_router(core, Method::Status, &legacy_calls);
+
+    let (status, body) = get_probe(router.clone(), HeaderMap::new()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["legacy"], true);
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+
+    let mut malformed = vec![
+        headers(Some(""), None),
+        headers(Some("not a token"), None),
+        headers(None, Some("native")),
+        headers(Some("zc_real_a"), Some("")),
+        headers(Some("zc_real_a"), Some("peercred")),
+        headers(Some("zc_real_a"), Some("oidc.")),
+    ];
+    for value in [
+        HeaderValue::from_static(""),
+        HeaderValue::from_static("Basic zc_real_a"),
+        HeaderValue::from_bytes(&[0xff]).expect("opaque header"),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, value);
+        malformed.push(headers);
+    }
+    for headers in malformed {
+        let (status, body) = get_probe(router.clone(), headers).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["code"], "auth_required");
+    }
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+
+    // A valid native token cannot escape the explicitly selected provider.
+    let (status, body) = get_probe(
+        router.clone(),
+        headers(Some("zc_real_a"), Some("oidc.not-configured")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "auth_required");
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+
+    let (status, body) = get_probe(router, headers(Some("zc_real_a"), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["principal_id"], "shared-operator");
+    assert!(body["result"]["server_version"].is_string(), "{body}");
+    assert!(body.get("legacy").is_none(), "{body}");
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pairing_disabled_router_does_not_downgrade_refusal_or_outage() {
+    let (_tmp, ctx, cancel, core, dials) = real_pool_with(|config| {
+        config.gateway.require_pairing = false;
+    });
+    let _cancel_guard = cancel.clone().drop_guard();
+    let legacy_calls = Arc::new(AtomicUsize::new(0));
+    let router = policy_router(core, Method::Status, &legacy_calls);
+
+    let (status, body) = get_probe(router.clone(), headers(Some("zc_forged"), None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "auth_required");
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+    let (status, body) = get_probe(router.clone(), headers(Some("zc_real_a"), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["principal_id"], "shared-operator");
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    assert!(ctx.auth.pairing().revoke_token("zc_real_a"));
+    let (status, body) = get_probe(router.clone(), headers(Some("zc_real_a"), None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "auth_required");
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        2,
+        "the live pool rechecks revocation"
+    );
+
+    // This valid token has no pooled connection. A cancelled real connector
+    // must refuse it, not retry without credentials or use the legacy body.
+    cancel.cancel();
+    let (status, body) = get_probe(router.clone(), headers(Some("zc_real_b"), None)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "core_unavailable");
+    assert_eq!(dials.load(Ordering::SeqCst), 3);
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+    // Intentional credential-free operation does not acquire a core dependency.
+    let (status, body) = get_probe(router, HeaderMap::new()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["legacy"], true);
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dials.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn pairing_disabled_router_preserves_core_permission_refusal() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{OidcConfig, OidcValidation, PermissionProfileConfig};
+
+    // Only the external IdP is scripted; verification, principal resolution,
+    // grants and RPC dispatch all use the core's existing production paths.
+    let idp = MockServer::start().await;
+    let issuer = idp.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "introspection_endpoint": format!("{issuer}/introspect"),
+        })))
+        .mount(&idp)
+        .await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "token_type": "Bearer",
+            "client_id": "gateway-test",
+            "iss": issuer,
+            "sub": "scoped-test-user",
+            "aud": "zeroclaw",
+            "exp": now + 600,
+            "groups": ["readers"],
+        })))
+        .mount(&idp)
+        .await;
+    let (_tmp, _ctx, cancel, core, dials) = real_pool_with(|config| {
+        config.gateway.require_pairing = false;
+        config.oidc.insert(
+            "test".into(),
+            OidcConfig {
+                issuer,
+                audience: "zeroclaw".into(),
+                client_id: "gateway-test".into(),
+                client_secret: Some("fixture-only-secret".into()),
+                validation: OidcValidation::Introspection,
+                claim_path: "groups".into(),
+                profile_map: HashMap::from([("readers".into(), "system-reader".into())]),
+                interactive_clients: vec!["gateway-test".into()],
+                ..OidcConfig::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "system-reader".into(),
+            PermissionProfileConfig {
+                grants: HashMap::from([(Resource::System, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+    });
+    let _cancel_guard = cancel.drop_guard();
+    let legacy_calls = Arc::new(AtomicUsize::new(0));
+    let scoped = headers(Some("opaque-scoped"), Some("oidc.test"));
+    let (status, body) = get_probe(
+        policy_router(core.clone(), Method::Status, &legacy_calls),
+        scoped.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["principal_id"].is_string(), "{body}");
+    assert_ne!(body["principal_id"], "shared-operator");
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+    let (status, body) = get_probe(
+        policy_router(core, Method::EventsHistory, &legacy_calls),
+        scoped,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden");
+    assert!(body.get("legacy").is_none(), "{body}");
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "no anonymous retry");
 }

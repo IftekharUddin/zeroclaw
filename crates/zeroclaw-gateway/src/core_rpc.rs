@@ -38,10 +38,14 @@
 //! no request holds is closed to make room; if every connection is in use,
 //! the request waits briefly and is then answered `503 core_busy`.
 //!
-//! Two cases stay in-process. With pairing disabled and no provider selected
-//! the caller presents no credential by design, so the request is served by
-//! the route's in-process body exactly as before. A gateway with no core
-//! attached (a standalone run) serves every request in-process.
+//! Two cases stay in-process. With pairing disabled and neither an
+//! Authorization header nor a provider selected, the request is served by the
+//! route's in-process body exactly as before. A supplied credential is always
+//! authenticated or refused, even when pairing is disabled; an empty or
+//! malformed header is not an absent credential. Clients must not remove a
+//! refused token and retry anonymously. A gateway with no core attached keeps
+//! its existing in-process authentication and is outside this core-access
+//! guarantee, as are routes that do not use the extractor.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -161,13 +165,16 @@ impl CoreRpc {
 
     /// Decide how the request carrying `headers` reaches the core.
     ///
-    /// Every refusal here happens before a connection is opened or reused.
+    /// Credential-shape refusals happen before a connection is opened or reused.
     pub async fn access(&self, headers: &HeaderMap) -> Result<CoreAccess, CoreError> {
         let Some(seam) = &self.seam else {
             return Ok(CoreAccess::InProcess);
         };
         let provider = provider_selection(headers)?;
-        if provider.is_none() && !(seam.pairing_required)() {
+        if provider.is_none()
+            && !headers.contains_key(axum::http::header::AUTHORIZATION)
+            && !(seam.pairing_required)()
+        {
             return Ok(CoreAccess::InProcess);
         }
         let provider = provider.unwrap_or(NATIVE_PROVIDER);
@@ -186,8 +193,8 @@ impl CoreRpc {
 pub enum CoreAccess {
     /// Through the core, on a connection bound to the caller's credential.
     Core(CoreCall),
-    /// Through the route's in-process body: pairing is disabled and the
-    /// caller selected no provider, or this gateway has no core attached.
+    /// Through the route's in-process body: pairing is disabled and neither
+    /// credential header is present, or this gateway has no core attached.
     InProcess,
 }
 
