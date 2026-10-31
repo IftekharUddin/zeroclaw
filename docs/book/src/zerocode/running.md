@@ -21,6 +21,25 @@ isn't running, zerocode spawns an ephemeral one. zerocode does not follow
 `ZEROCLAW_DATA_DIR`; if the daemon runs with it, set `ZEROCLAW_SOCKET` to the
 daemon's endpoint.
 
+### Upgrading on Windows
+
+Update zerocode and the core to the same version, then stop and restart the
+daemon or its service before reconnecting. New daemons use a stable pipe name;
+older clients use a different default name and cannot discover it.
+
+For one release, zerocode can try a computed legacy name when the stable pipe
+is missing. This is best effort across Rust toolchains. A discovered daemon
+still has to match zerocode's version; a version or handshake refusal is shown
+without starting another daemon. A nonblank `ZEROCLAW_SOCKET` selects only that
+endpoint and disables legacy discovery. If discovery misses a running older
+daemon, stop it and restart the updated core before retrying.
+
+Windows directory names that differ only in ASCII case can share a default
+pipe name even when the filesystem treats them as distinct directories. Use a
+distinct explicit `ZEROCLAW_SOCKET` consistently for each daemon and its clients
+in that setup. See [Windows migration and directory identity](../architecture/rpc-socket.md#windows-migration-and-directory-identity)
+for the precise naming limits and fallback-removal requirement.
+
 ## Session working directories
 
 On a local connection, fresh **Chat** and **Code** sessions start in the

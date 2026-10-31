@@ -7,8 +7,10 @@ webhooks, the web dashboard, and remote REST consumers.
 
 ## Endpoint resolution
 
-Each data directory gets its own endpoint, so multiple daemon instances on the
-same machine do not collide. The data dir is derived from the config dir
+The endpoint is derived from the data directory so clients can find the
+corresponding daemon. Windows uses the limited path-identity rules below;
+these do not guarantee a distinct endpoint for every filesystem directory.
+The data dir is derived from the config dir
 (`--config-dir` / `ZEROCLAW_CONFIG_DIR`, or `ZEROCLAW_DATA_DIR`).
 
 | OS | Default endpoint |
@@ -40,14 +42,45 @@ input is fixed, so the name is the same for every release and toolchain:
   folds them per volume and a directory can be case-sensitive.
 - Each unit hashed as two little-endian bytes.
 
-Releases before this named the pipe `\\.\pipe\zeroclaw-<hash>` from Rust's
-`DefaultHasher`, which is not stable across toolchains. For one release,
-clients also try that older name when nothing listens at the new one, so they
-find a daemon an earlier binary started that has not been restarted. Finding
-it does not make it usable: zerocode still requires the daemon's version to
-equal its own, so against an older daemon it reports the mismatch, which means
-restart the daemon, instead of starting a second daemon beside it. The daemon
-binds only the new name.
+### Windows migration and directory identity
+
+Update the client and core binaries together, then stop and restart the daemon
+or its service. New daemons bind only the stable `zeroclaw-daemon-<hash>` name;
+old clients cannot discover them through the old default name. For zerocode,
+the daemon's package version must still equal the client's. The generic RPC
+client retains its existing protocol-version check instead.
+
+The previous `\\.\pipe\zeroclaw-<hash>` name used Rust's `DefaultHasher`, whose
+output is not stable across toolchains. For one release, a client without an
+explicit endpoint tries its computed legacy name **only after `NotFound` at
+the stable name**. This is best-effort discovery: a new toolchain may not
+compute the name used by an old binary. Finding a legacy daemon does not waive
+version requirements. A version or handshake refusal is reported without
+trying another endpoint; zerocode must not start a second daemon in response
+to that refusal. Permission and other non-missing connection errors never
+trigger legacy discovery either.
+
+The release owner must name the introduction release and the following release
+that removes this fallback before shipping the migration. Those release
+identifiers are not yet assigned; this document does not select a release or
+extend the fallback beyond one release.
+
+ASCII case folding is a deliberate limitation. Distinct directories differing
+only in ASCII case under a case-sensitive Windows directory can share one pipe
+name. A collision may reach the wrong daemon or prevent another daemon from
+binding. Checking the server's account does not identify its data directory.
+Use distinct explicit `ZEROCLAW_SOCKET` values, configured consistently for each
+daemon and its clients, when managing such directories. Non-ASCII case
+equivalence, links, `..`, and full filesystem identity are outside this naming
+policy.
+
+Every attempted endpoint must retain the client's applicable server-identity
+checks before credentials are sent. The RPC client's endpoint-verification
+work is tracked in [#11274](https://github.com/zeroclaw-labs/zeroclaw/pull/11274)
+and its Windows integration in
+[#11393](https://github.com/zeroclaw-labs/zeroclaw/pull/11393); naming and fallback
+alone do not establish server trust. The latter does not add those checks to
+zerocode's independent client.
 
 Clients choose the data directory themselves. zerocode uses
 `<config_dir>/data`; it does not follow `ZEROCLAW_DATA_DIR`,
@@ -55,7 +88,9 @@ Clients choose the data directory themselves. zerocode uses
 those, set `ZEROCLAW_SOCKET` for zerocode.
 
 Override with the `ZEROCLAW_SOCKET` environment variable on either platform. A
-blank value is ignored, and surrounding whitespace is trimmed:
+blank value is ignored, and surrounding whitespace is trimmed. A nonblank
+override selects only that endpoint: neither default nor legacy names are
+attempted if it is missing or refuses the connection:
 
 <div class="os-tabs-src">
 

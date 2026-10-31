@@ -130,8 +130,10 @@ const DOT: u16 = b'.' as u16;
 const COLON: u16 = b':' as u16;
 const QUESTION: u16 = b'?' as u16;
 
-/// Steps 2 to 5 of [`pipe_name`]: one key per directory, and a different key
-/// for a different kind of path, by construction.
+/// Steps 2 to 5 of [`pipe_name`]: one key per normalized path spelling,
+/// separated by path kind. This is not filesystem identity: ASCII case
+/// folding can conflate distinct case-sensitive directories, while aliases
+/// such as links and `..` are not resolved.
 ///
 /// A plain path (relative, rooted, drive or UNC) is keyed by its canonical
 /// spelling: the prefix, a `\` when the path is rooted, and the components

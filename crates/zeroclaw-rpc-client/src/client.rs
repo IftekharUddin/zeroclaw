@@ -1071,7 +1071,10 @@ mod tests {
 
     /// Serve the scripted daemon on the named pipe `name`.
     #[cfg(windows)]
-    fn fake_daemon_on_pipe(name: &std::path::Path) {
+    fn fake_daemon_on_pipe(
+        name: &std::path::Path,
+        init_error: Option<JsonRpcError>,
+    ) -> tokio::task::JoinHandle<()> {
         let mut server = tokio::net::windows::named_pipe::ServerOptions::new()
             .first_pipe_instance(true)
             .create(name)
@@ -1079,9 +1082,9 @@ mod tests {
         tokio::spawn(async move {
             server.connect().await.expect("accept the client");
             let (mut client_half, server_half) = tokio::io::duplex(64 * 1024);
-            let _seen = fake_daemon(server_half, None);
+            let _seen = fake_daemon(server_half, init_error);
             let _ = tokio::io::copy_bidirectional(&mut server, &mut client_half).await;
-        });
+        })
     }
 
     #[cfg(windows)]
@@ -1096,11 +1099,18 @@ mod tests {
             .legacy
             .clone()
             .expect("a Windows client without an override carries the legacy pipe");
-        fake_daemon_on_pipe(&legacy);
+        let peer = fake_daemon_on_pipe(&legacy, None);
         let client = RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default())
             .await
             .expect("the legacy pipe answers when nothing serves the stable one");
         assert_eq!(client.handshake().server_version, "test");
+        let status = client
+            .request(Method::Status, json!({}))
+            .await
+            .expect("status reply");
+        assert_eq!(status["active_sessions"], json!(0));
+        drop(client);
+        peer.abort();
     }
 
     #[cfg(windows)]
@@ -1110,11 +1120,96 @@ mod tests {
             std::env::temp_dir().join(format!("zc-rpcc-{}-pipe-primary", std::process::id()));
         let endpoints = crate::endpoint::client_endpoints_with(None, &data_dir);
         assert!(endpoints.legacy.is_some());
-        fake_daemon_on_pipe(&endpoints.primary);
+        let peer = fake_daemon_on_pipe(&endpoints.primary, None);
         let client = RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default())
             .await
             .expect("the stable pipe answers");
         assert_eq!(client.handshake().server_version, "test");
+        let status = client
+            .request(Method::Status, json!({}))
+            .await
+            .expect("status reply");
+        assert_eq!(status["active_sessions"], json!(0));
+        drop(client);
+        peer.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_pipe_endpoints_do_not_fall_back_after_handshake_refusal() {
+        let data_dir =
+            std::env::temp_dir().join(format!("zc-rpcc-{}-pipe-refusal", std::process::id()));
+        let endpoints = crate::endpoint::client_endpoints_with(None, &data_dir);
+        let peer = fake_daemon_on_pipe(
+            &endpoints.primary,
+            Some(JsonRpcError {
+                code: zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED,
+                message: "fixture credential required".into(),
+                data: None,
+            }),
+        );
+        let legacy = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(endpoints.legacy.as_deref().unwrap())
+            .unwrap();
+        match RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default()).await {
+            Err(ClientError::Rpc(error)) => assert_eq!(
+                error.code,
+                zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+            ),
+            Err(error) => panic!("expected handshake refusal, got {error}"),
+            Ok(_) => panic!("the primary refused initialize"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), legacy.connect())
+                .await
+                .is_err(),
+            "a refused primary must not dial the legacy pipe"
+        );
+        peer.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_pipe_explicit_override_serves_only_the_selected_endpoint() {
+        let data_dir =
+            std::env::temp_dir().join(format!("zc-rpcc-{}-pipe-override", std::process::id()));
+        let defaults = crate::endpoint::client_endpoints_with(None, &data_dir);
+        let override_name = format!(r"\\.\pipe\zc-rpcc-{}-explicit", std::process::id());
+        let endpoints = crate::endpoint::client_endpoints_with(
+            Some(&format!("  {override_name}  ")),
+            &data_dir,
+        );
+        assert!(endpoints.legacy.is_none());
+        let primary = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&defaults.primary)
+            .unwrap();
+        let legacy = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(defaults.legacy.as_deref().unwrap())
+            .unwrap();
+        let peer = fake_daemon_on_pipe(&endpoints.primary, None);
+        let client = RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default())
+            .await
+            .unwrap();
+        let status = client
+            .request(Method::Status, json!({}))
+            .await
+            .expect("selected daemon replies");
+        assert_eq!(status["active_sessions"], json!(0));
+        drop(client);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), primary.connect())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), legacy.connect())
+                .await
+                .is_err()
+        );
+        peer.abort();
     }
 
     #[tokio::test]

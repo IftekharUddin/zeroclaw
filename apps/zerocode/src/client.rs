@@ -602,6 +602,21 @@ impl fmt::Display for DaemonInitializeTimeout {
 
 impl std::error::Error for DaemonInitializeTimeout {}
 
+/// The local transport opened, but initialization failed. Preserve the
+/// original error in anyhow's context chain (including typed version and
+/// timeout errors), while telling startup that a daemon was found. Starting
+/// another daemon cannot recover a refusal from the one already reached.
+#[derive(Debug)]
+pub struct DaemonHandshakeFailed;
+
+impl fmt::Display for DaemonHandshakeFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&crate::i18n::t("zc-error-daemon-handshake-failed"))
+    }
+}
+
+impl std::error::Error for DaemonHandshakeFailed {}
+
 /// A single RPC did not get a reply within its client-side deadline. The
 /// connection is still up; the daemon is busy or wedged on this method.
 /// Callers that own a UI surface should report this and stay alive — a
@@ -1842,7 +1857,7 @@ impl RpcClient {
             Err(e) => {
                 read_task.abort();
                 writer_task.abort();
-                return Err(e);
+                return Err(e.context(DaemonHandshakeFailed));
             }
         };
 
@@ -1851,7 +1866,7 @@ impl RpcClient {
             Err(e) => {
                 read_task.abort();
                 writer_task.abort();
-                return Err(e);
+                return Err(e.context(DaemonHandshakeFailed));
             }
         };
         let bcast_rx = notif_tx.subscribe();
@@ -3274,7 +3289,6 @@ pub struct ConfigMapKeyMutationResult {
 #[cfg(test)]
 mod endpoint_tests {
     use super::*;
-    #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -3308,19 +3322,103 @@ mod endpoint_tests {
         assert!(!is_missing_endpoint(&refused));
     }
 
+    fn test_endpoints() -> (tempfile::TempDir, rpc_endpoint::ClientEndpoints) {
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let dir = tempfile::tempdir().unwrap();
+        let endpoints = rpc_endpoint::client_endpoints_with(None, dir.path());
+        // Unix does not migrate names; use a second real socket to exercise
+        // the shared missing-only client control flow on this platform too.
+        #[cfg(unix)]
+        let endpoints = rpc_endpoint::ClientEndpoints {
+            legacy: Some(dir.path().join("legacy.sock")),
+            ..endpoints
+        };
+        (dir, endpoints)
+    }
+
+    #[tokio::test]
+    async fn a_stable_endpoint_serves_a_request_without_dialing_legacy() {
+        let (_dir, endpoints) = test_endpoints();
+        let (_, primary_peer) =
+            initialize_peer(&endpoints.primary, env!("CARGO_PKG_VERSION"), false);
+        let (legacy_reached, legacy_peer) = initialize_peer(
+            endpoints.legacy.as_deref().unwrap(),
+            env!("CARGO_PKG_VERSION"),
+            false,
+        );
+        let client = RpcClient::connect_endpoints(&endpoints, None, None)
+            .await
+            .unwrap();
+        let status = client
+            .rpc
+            .request("status", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            status["fixture_endpoint"],
+            endpoints.primary.to_string_lossy().as_ref()
+        );
+        assert!(!legacy_reached.load(Ordering::SeqCst));
+        client.shutdown();
+        primary_peer.abort();
+        legacy_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn an_explicit_endpoint_serves_the_selected_daemon() {
+        let (_dir, defaults) = test_endpoints();
+        let override_path = defaults.legacy.as_deref().unwrap();
+        let value = format!("  {}  ", override_path.display());
+        let endpoints = rpc_endpoint::client_endpoints_with(Some(&value), Path::new("unused"));
+        assert!(endpoints.legacy.is_none());
+        let (default_reached, default_peer) =
+            initialize_peer(&defaults.primary, env!("CARGO_PKG_VERSION"), false);
+        let (_, peer) = initialize_peer(override_path, env!("CARGO_PKG_VERSION"), false);
+        let client = RpcClient::connect_endpoints(&endpoints, None, None)
+            .await
+            .unwrap();
+        let status = client
+            .rpc
+            .request("status", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            status["fixture_endpoint"],
+            override_path.to_string_lossy().as_ref()
+        );
+        assert!(!default_reached.load(Ordering::SeqCst));
+        client.shutdown();
+        default_peer.abort();
+        peer.abort();
+    }
+
     /// A daemon at `path` that answers one `initialize`, as `server_version`
     /// or with a refusal, and records whether a client reached it.
-    #[cfg(unix)]
     fn initialize_peer(
         path: &Path,
         server_version: &'static str,
         refuse: bool,
     ) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        #[cfg(unix)]
         let listener = tokio::net::UnixListener::bind(path).unwrap();
+        #[cfg(windows)]
+        let listener = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(path)
+            .unwrap();
         let reached = Arc::new(AtomicBool::new(false));
         let peer_reached = Arc::clone(&reached);
+        let path_label = path.to_string_lossy().into_owned();
         let task = tokio::spawn(async move {
+            #[cfg(unix)]
             let (stream, _) = listener.accept().await.unwrap();
+            #[cfg(windows)]
+            let stream = {
+                listener.connect().await.unwrap();
+                listener
+            };
             peer_reached.store(true, Ordering::SeqCst);
             let (read_half, mut write_half) = tokio::io::split(stream);
             let mut lines = BufReader::new(read_half).lines();
@@ -3348,44 +3446,52 @@ mod endpoint_tests {
                 .write_all(format!("{response}\n").as_bytes())
                 .await
                 .unwrap();
-            // Hold the connection open until the client is done with it.
-            let _ = lines.next_line().await;
+            // A real post-handshake request identifies the selected peer.
+            while let Some(request) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(request["method"], "status");
+                let response = serde_json::json!({"jsonrpc": "2.0", "id": request["id"],
+                    "result": {"fixture_endpoint": path_label}});
+                write_half
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
         });
         (reached, task)
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_same_version_daemon_at_the_legacy_endpoint_connects() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = dir.path().join("legacy.sock");
+        let (_dir, endpoints) = test_endpoints();
+        let legacy = endpoints.legacy.clone().unwrap();
         let (reached, peer) = initialize_peer(&legacy, env!("CARGO_PKG_VERSION"), false);
-        let endpoints = rpc_endpoint::ClientEndpoints {
-            primary: dir.path().join("primary.sock"),
-            legacy: Some(legacy),
-        };
         let client = RpcClient::connect_endpoints(&endpoints, None, None)
             .await
             .expect("the legacy endpoint answers when nothing listens at the primary");
         assert!(reached.load(Ordering::SeqCst));
+        let status = client
+            .rpc
+            .request("status", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            status["fixture_endpoint"],
+            legacy.to_string_lossy().as_ref()
+        );
         client.shutdown();
         peer.abort();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_previous_release_daemon_at_the_legacy_endpoint_is_found_and_refused() {
         // The fallback finds an older daemon; zerocode's version gate then
         // refuses it as before. Finding it is still the point: zerocode
         // reports the mismatch, which is terminal, instead of missing the
         // daemon and starting a second one over the same data directory.
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = dir.path().join("legacy.sock");
+        let (_dir, endpoints) = test_endpoints();
+        let legacy = endpoints.legacy.clone().unwrap();
         let (reached, peer) = initialize_peer(&legacy, "0.0.0-previous", false);
-        let endpoints = rpc_endpoint::ClientEndpoints {
-            primary: dir.path().join("primary.sock"),
-            legacy: Some(legacy),
-        };
         let Err(error) = RpcClient::connect_endpoints(&endpoints, None, None).await else {
             panic!("a daemon from another release is refused");
         };
@@ -3397,19 +3503,14 @@ mod endpoint_tests {
         peer.abort();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_refusing_primary_is_reported_without_dialing_the_legacy_endpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let primary = dir.path().join("primary.sock");
-        let legacy = dir.path().join("legacy.sock");
+        let (_dir, endpoints) = test_endpoints();
+        let primary = endpoints.primary.clone();
+        let legacy = endpoints.legacy.clone().unwrap();
         let (_, primary_peer) = initialize_peer(&primary, env!("CARGO_PKG_VERSION"), true);
         let (legacy_reached, legacy_peer) =
             initialize_peer(&legacy, env!("CARGO_PKG_VERSION"), false);
-        let endpoints = rpc_endpoint::ClientEndpoints {
-            primary,
-            legacy: Some(legacy),
-        };
         let result = RpcClient::connect_endpoints(&endpoints, None, None).await;
         assert!(result.is_err(), "the primary refused the handshake");
         assert!(

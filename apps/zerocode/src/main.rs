@@ -1685,6 +1685,9 @@ fn is_daemon_version_mismatch(err: &anyhow::Error) -> bool {
 fn is_terminal_connection_error(err: &anyhow::Error) -> bool {
     is_daemon_version_mismatch(err)
         || err
+            .downcast_ref::<client::DaemonHandshakeFailed>()
+            .is_some()
+        || err
             .downcast_ref::<client::DaemonInitializeTimeout>()
             .is_some()
 }
