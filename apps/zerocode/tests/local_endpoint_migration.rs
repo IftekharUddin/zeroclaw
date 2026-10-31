@@ -4,7 +4,7 @@
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use zeroclaw_api::rpc_endpoint;
@@ -80,21 +80,25 @@ impl Listener {
     }
 }
 
-fn binaries() -> &'static Path {
-    static BINARIES: OnceLock<tempfile::TempDir> = OnceLock::new();
-    BINARIES
-        .get_or_init(|| {
-            let dir = tempfile::tempdir().expect("private executable directory");
-            let cli_name = format!("zerocode{}", std::env::consts::EXE_SUFFIX);
-            std::fs::copy(env!("CARGO_BIN_EXE_zerocode"), dir.path().join(cli_name))
-                .expect("copy shipped CLI beside harmless daemon sentinel");
-            // The production launcher locates a sibling zeroclaw executable.
-            // This tiny fixture records an attempted spawn, then exits. It cannot
-            // run a daemon or access the user's configuration.
-            let source = dir.path().join("sentinel.rs");
-            std::fs::write(
-                &source,
-                r#"
+fn binaries() -> Arc<tempfile::TempDir> {
+    // Share compilation while cases overlap, but let the final test owner
+    // remove the executables. A static TempDir itself would never be dropped.
+    static BINARIES: Mutex<Weak<tempfile::TempDir>> = Mutex::new(Weak::new());
+    let mut shared = BINARIES.lock().expect("shared fixture lock");
+    if let Some(dir) = shared.upgrade() {
+        return dir;
+    }
+    let dir = tempfile::tempdir().expect("private executable directory");
+    let cli_name = format!("zerocode{}", std::env::consts::EXE_SUFFIX);
+    std::fs::copy(env!("CARGO_BIN_EXE_zerocode"), dir.path().join(cli_name))
+        .expect("copy shipped CLI beside harmless daemon sentinel");
+    // The production launcher locates a sibling zeroclaw executable.
+    // This tiny fixture records an attempted spawn, then exits. It cannot
+    // run a daemon or access the user's configuration.
+    let source = dir.path().join("sentinel.rs");
+    std::fs::write(
+        &source,
+        r#"
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
     let index = args.iter().position(|arg| arg == "--config-dir").unwrap();
@@ -103,26 +107,26 @@ fn main() {
     std::process::exit(27);
 }
 "#,
-            )
-            .unwrap();
-            let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-            let output = std::process::Command::new(compiler)
-                .arg(&source)
-                .arg("-o")
-                .arg(
-                    dir.path()
-                        .join(format!("zeroclaw{}", std::env::consts::EXE_SUFFIX)),
-                )
-                .output()
-                .expect("compile harmless spawn sentinel with the test toolchain");
-            assert!(
-                output.status.success(),
-                "sentinel compile: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            dir
-        })
-        .path()
+    )
+    .unwrap();
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = std::process::Command::new(compiler)
+        .arg(&source)
+        .arg("-o")
+        .arg(
+            dir.path()
+                .join(format!("zeroclaw{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .output()
+        .expect("compile harmless spawn sentinel with the test toolchain");
+    assert!(
+        output.status.success(),
+        "sentinel compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir = Arc::new(dir);
+    *shared = Arc::downgrade(&dir);
+    dir
 }
 
 struct Fixture {
@@ -155,8 +159,11 @@ impl Fixture {
     }
 
     async fn run(&self, socket_override: Option<&Path>) -> String {
+        let executables = binaries();
         let mut command = tokio::process::Command::new(
-            binaries().join(format!("zerocode{}", std::env::consts::EXE_SUFFIX)),
+            executables
+                .path()
+                .join(format!("zerocode{}", std::env::consts::EXE_SUFFIX)),
         );
         command.env_clear();
         // Windows requires its system directory for normal process startup.
