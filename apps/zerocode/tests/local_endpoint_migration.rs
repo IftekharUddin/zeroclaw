@@ -43,6 +43,9 @@ impl Listener {
         );
     }
 
+    // Zerocode is the documented standalone-client exemption in clippy.toml;
+    // its transport fixture must not pull in the daemon attribution crate.
+    #[allow(clippy::disallowed_methods)]
     fn respond(self, refusal: bool) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             #[cfg(unix)]
