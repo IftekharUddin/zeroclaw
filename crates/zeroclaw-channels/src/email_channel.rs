@@ -502,15 +502,17 @@ impl EmailChannel {
         Ok(results)
     }
 
-    /// Fetch messages with UID >= uid_threshold. Returns parsed messages and the
-    /// new threshold (max fetched UID + 1). Flags change only in active mode;
-    /// see [`Self::new_mail_fetch_item`].
-    async fn fetch_new(
+    /// Fetch messages with UID >= uid_threshold without changing server flags.
+    /// Carry each server UID with its parsed message until dispatch can acknowledge it.
+    async fn fetch_new<S>(
         &self,
-        session: &mut ImapSession,
+        session: &mut async_imap::Session<S>,
         uid_threshold: u32,
         uid_validity: Option<u32>,
-    ) -> Result<(Vec<ParsedEmail>, u32)> {
+    ) -> Result<(Vec<(u32, Option<ParsedEmail>)>, u32)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+    {
         let search = format!("UID {}:*", uid_threshold);
         let uids = session.uid_search(&search).await?;
 
@@ -538,40 +540,34 @@ impl EmailChannel {
                 .collect::<Vec<_>>()
                 .join(",");
 
-            let messages = session
-                .uid_fetch(
-                    &uid_set,
-                    Self::new_mail_fetch_item(self.config.observer_mode),
-                )
-                .await?;
+            // A later fetch or response-stream failure must leave every
+            // undelivered message recoverable by the next UNSEEN drain.
+            let messages = session.uid_fetch(&uid_set, "BODY.PEEK[]").await?;
             let messages: Vec<Fetch> = messages.try_collect().await?;
 
             for msg in messages {
-                if let Some(body) = msg.body()
-                    && let Some(parsed) = MessageParser::default().parse(body)
-                {
-                    results.push(self.build_parsed_email(
-                        &parsed,
-                        msg.uid.unwrap_or(0),
-                        uid_validity,
-                    ));
+                // Other clients' flag changes can arrive as unsolicited FETCH
+                // responses. Only acknowledge bodies from this requested batch.
+                let Some(body) = msg.body() else {
+                    continue;
+                };
+                // UID FETCH responses must include their UID. Never guess which
+                // mailbox message to acknowledge when a server omits it.
+                let uid = msg
+                    .uid
+                    .filter(|uid| *uid != 0)
+                    .context("IMAP fetch omitted a valid UID")?;
+                if !chunk.contains(&uid) {
+                    continue;
                 }
+                let email = MessageParser::default()
+                    .parse(body)
+                    .map(|parsed| self.build_parsed_email(&parsed, uid, uid_validity));
+                results.push((uid, email));
             }
         }
 
         Ok((results, new_threshold))
-    }
-
-    /// FETCH item for mail that arrives while the channel runs. Active mode
-    /// uses RFC822, which sets `\Seen` like the startup UNSEEN drain does, so a
-    /// restart does not answer the message again. Observer mode peeks and never
-    /// changes a flag.
-    fn new_mail_fetch_item(observer_mode: bool) -> &'static str {
-        if observer_mode {
-            "BODY.PEEK[]"
-        } else {
-            "RFC822"
-        }
     }
 
     /// Run the IDLE loop, returning when a new message arrives or timeout
@@ -845,19 +841,36 @@ impl EmailChannel {
     }
 
     /// Process newly arrived messages (UID >= uid_threshold). Returns updated threshold.
-    async fn process_new(
+    /// Active mode acknowledges evaluated messages only after dispatch accepts them;
+    /// this is queue acceptance, not confirmation that an agent has sent a reply.
+    async fn process_new<S>(
         &self,
-        session: &mut ImapSession,
+        session: &mut async_imap::Session<S>,
         tx: &mpsc::Sender<ChannelMessage>,
         uid_threshold: u32,
         uid_validity: Option<u32>,
-    ) -> Result<u32> {
+    ) -> Result<u32>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+    {
         let (messages, new_threshold) =
             self.fetch_new(session, uid_threshold, uid_validity).await?;
 
-        for email in messages {
-            if !self.dispatch_email(email, tx).await? {
+        for (uid, email) in messages {
+            if let Some(email) = email
+                && !self.dispatch_email(email, tx).await?
+            {
                 return Ok(new_threshold); // channel closed
+            }
+            if !self.config.observer_mode {
+                // Rejected, duplicate, or unparseable mail has also been
+                // evaluated. A failed STORE propagates; existing in-memory
+                // dedupe prevents a second dispatch while the process lives.
+                // Check the tagged completion explicitly: async-imap's streamed
+                // uid_store API discards NO/BAD completion status.
+                session
+                    .run_command_and_check_ok(format!("UID STORE {uid} +FLAGS.SILENT (\\Seen)"))
+                    .await?;
             }
         }
 
@@ -1163,12 +1176,308 @@ mod tests {
         assert!(!super::EmailConfig::default().observer_mode);
     }
 
-    #[test]
-    fn new_mail_fetch_marks_seen_only_in_active_mode() {
-        // Active mode must set \Seen (RFC822), or the startup UNSEEN drain
-        // answers the message again after a restart.
-        assert_eq!(EmailChannel::new_mail_fetch_item(false), "RFC822");
-        assert_eq!(EmailChannel::new_mail_fetch_item(true), "BODY.PEEK[]");
+    #[derive(Clone, Copy)]
+    enum ImapFailure {
+        None,
+        SecondFetch,
+        PartialFetch,
+        FirstStore,
+        UnsolicitedFlags,
+    }
+
+    struct ImapMailbox {
+        unseen: HashSet<u32>,
+        commands: Vec<String>,
+        queued_at_store: Vec<usize>,
+    }
+
+    /// The server owns UID/Seen state. RFC822 fetches mutate it before sending
+    /// literals, while PEEK fetches cannot consume mail on a broken response.
+    async fn live_mail_session(
+        uids: &[u32],
+        failure: ImapFailure,
+        tx: mpsc::Sender<ChannelMessage>,
+    ) -> (
+        async_imap::Session<tokio::io::DuplexStream>,
+        Arc<std::sync::Mutex<ImapMailbox>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let state = Arc::new(std::sync::Mutex::new(ImapMailbox {
+            unseen: uids.iter().copied().collect(),
+            commands: Vec::new(),
+            queued_at_store: Vec::new(),
+        }));
+        let mailbox = state.clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            let mut lines = BufReader::new(read).lines();
+            let mut fetches = 0;
+            let mut stores = 0;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let (tag, command) = line.split_once(' ').unwrap();
+                mailbox.lock().unwrap().commands.push(command.to_string());
+                let mut reply = String::new();
+                if let Some(range) = command.strip_prefix("UID SEARCH UID ") {
+                    let threshold: u32 = range.trim_end_matches(":*").parse().unwrap();
+                    let mut hits: Vec<u32> = mailbox
+                        .lock()
+                        .unwrap()
+                        .unseen
+                        .iter()
+                        .copied()
+                        .filter(|uid| *uid >= threshold)
+                        .collect();
+                    hits.sort_unstable();
+                    reply.push_str(&format!(
+                        "* SEARCH {}\r\n",
+                        hits.iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                } else if let Some(rest) = command.strip_prefix("UID FETCH ") {
+                    fetches += 1;
+                    if matches!(failure, ImapFailure::UnsolicitedFlags) {
+                        reply.push_str("* 99 FETCH (FLAGS (\\Flagged))\r\n");
+                        reply.push_str("* 99 FETCH (UID 99 FLAGS (\\Flagged))\r\n");
+                    }
+                    if matches!(failure, ImapFailure::SecondFetch) && fetches == 2 {
+                        write
+                            .write_all(b"* 11 FETCH (UID 11 BODY[] {100}\r\nfr")
+                            .await
+                            .unwrap();
+                        write.shutdown().await.unwrap();
+                        return;
+                    }
+                    let (uid_set, item) = rest.split_once(' ').unwrap();
+                    let uids: Vec<u32> =
+                        uid_set.split(',').map(|uid| uid.parse().unwrap()).collect();
+                    if item.contains("RFC822") {
+                        let mut mailbox = mailbox.lock().unwrap();
+                        for uid in &uids {
+                            mailbox.unseen.remove(uid);
+                        }
+                    } else {
+                        assert_eq!(item, "BODY.PEEK[]");
+                    }
+                    for uid in uids {
+                        let raw = format!(
+                            "From: sender@example.invalid\r\nMessage-ID: <{uid}@example.invalid>\r\nSubject: m{uid}\r\n\r\nbody {uid}\r\n"
+                        );
+                        reply.push_str(&format!(
+                            "* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n{raw})\r\n",
+                            raw.len()
+                        ));
+                        if matches!(failure, ImapFailure::PartialFetch) {
+                            reply.push_str("* 2 FETCH (UID 2 BODY[] {100}\r\nfr");
+                            write.write_all(reply.as_bytes()).await.unwrap();
+                            write.shutdown().await.unwrap();
+                            return;
+                        }
+                    }
+                } else if let Some(rest) = command.strip_prefix("UID STORE ") {
+                    stores += 1;
+                    let (uid, flags) = rest.split_once(' ').unwrap();
+                    assert_eq!(flags, "+FLAGS.SILENT (\\Seen)");
+                    mailbox
+                        .lock()
+                        .unwrap()
+                        .queued_at_store
+                        .push(tx.max_capacity() - tx.capacity());
+                    if matches!(failure, ImapFailure::FirstStore) && stores == 1 {
+                        write
+                            .write_all(format!("{tag} NO store failed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    mailbox.lock().unwrap().unseen.remove(&uid.parse().unwrap());
+                } else {
+                    assert!(
+                        command.starts_with("LOGIN "),
+                        "unexpected command: {command}"
+                    );
+                }
+                reply.push_str(&format!("{tag} OK done\r\n"));
+                write.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let session = async_imap::Client::new(client_io)
+            .login("fixture@example.invalid", "synthetic-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, state, task)
+    }
+
+    fn live_mail_channel(observer_mode: bool, allow_sender: bool) -> EmailChannel {
+        EmailChannel::new(
+            EmailConfig {
+                observer_mode,
+                ..mailbox_identity_config()
+            },
+            "email_fixture",
+            if allow_sender {
+                resolver_from(vec!["@example.invalid".to_string()])
+            } else {
+                empty_resolver()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn live_mail_marks_seen_only_after_active_dispatch() {
+        for observer in [false, true] {
+            let channel = live_mail_channel(observer, true);
+            let (tx, mut rx) = mpsc::channel(4);
+            let (mut session, state, server) =
+                live_mail_session(&[1, 2], ImapFailure::None, tx.clone()).await;
+            assert_eq!(
+                channel
+                    .process_new(&mut session, &tx, 1, Some(1))
+                    .await
+                    .unwrap(),
+                3
+            );
+            assert_eq!(rx.recv().await.unwrap().id, "1@example.invalid");
+            assert_eq!(rx.recv().await.unwrap().id, "2@example.invalid");
+            {
+                let state = state.lock().unwrap();
+                assert_eq!(state.unseen.len(), if observer { 2 } else { 0 });
+                assert_eq!(
+                    state.queued_at_store,
+                    if observer { vec![] } else { vec![1, 2] }
+                );
+                assert!(
+                    state
+                        .commands
+                        .iter()
+                        .any(|command| command == "UID FETCH 1,2 BODY.PEEK[]")
+                );
+            }
+            drop(session);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_mail_fetch_failures_leave_undelivered_messages_unseen() {
+        for failure in [ImapFailure::SecondFetch, ImapFailure::PartialFetch] {
+            let channel = live_mail_channel(false, true);
+            let uids: Vec<u32> = (1..=11).collect();
+            let (tx, mut rx) = mpsc::channel(16);
+            let (mut session, state, server) = live_mail_session(&uids, failure, tx.clone()).await;
+            assert!(
+                channel
+                    .process_new(&mut session, &tx, 1, Some(1))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "no partially collected batch reaches dispatch"
+            );
+            {
+                let state = state.lock().unwrap();
+                assert_eq!(
+                    state.unseen,
+                    uids.iter().copied().collect(),
+                    "a reconnect UNSEEN drain can recover every message"
+                );
+                assert!(state.queued_at_store.is_empty());
+            }
+            drop(session);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_mail_marks_rejected_messages_seen_only_in_active_mode() {
+        for observer in [false, true] {
+            let channel = live_mail_channel(observer, false);
+            let (tx, mut rx) = mpsc::channel(4);
+            let (mut session, state, server) =
+                live_mail_session(&[1], ImapFailure::None, tx.clone()).await;
+            channel
+                .process_new(&mut session, &tx, 1, Some(1))
+                .await
+                .unwrap();
+            assert!(rx.try_recv().is_err());
+            assert_eq!(state.lock().unwrap().unseen.len(), usize::from(observer));
+            drop(session);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_mail_store_failure_propagates_without_redispatch() {
+        let channel = live_mail_channel(false, true);
+        let (tx, mut rx) = mpsc::channel(4);
+        let (mut session, state, server) =
+            live_mail_session(&[1], ImapFailure::FirstStore, tx.clone()).await;
+        assert!(
+            channel
+                .process_new(&mut session, &tx, 1, Some(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(state.lock().unwrap().unseen.len(), 1);
+        channel
+            .process_new(&mut session, &tx, 1, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().id, "1@example.invalid");
+        assert!(
+            rx.try_recv().is_err(),
+            "the existing process dedupe survives the failed STORE"
+        );
+        assert!(state.lock().unwrap().unseen.is_empty());
+        drop(session);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_mail_closed_dispatch_leaves_messages_unseen() {
+        let channel = live_mail_channel(false, true);
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        let (mut session, state, server) =
+            live_mail_session(&[1], ImapFailure::None, tx.clone()).await;
+        channel
+            .process_new(&mut session, &tx, 1, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(state.lock().unwrap().unseen.len(), 1);
+        assert!(state.lock().unwrap().queued_at_store.is_empty());
+        drop(session);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_mail_does_not_acknowledge_unsolicited_flag_updates() {
+        let channel = live_mail_channel(false, true);
+        let (tx, mut rx) = mpsc::channel(4);
+        let (mut session, state, server) =
+            live_mail_session(&[1], ImapFailure::UnsolicitedFlags, tx.clone()).await;
+        channel
+            .process_new(&mut session, &tx, 1, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().id, "1@example.invalid");
+        assert_eq!(state.lock().unwrap().queued_at_store, vec![1]);
+        assert!(
+            !state
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| command.starts_with("UID STORE 99 "))
+        );
+        drop(session);
+        server.await.unwrap();
     }
 
     fn default_imap_port() -> u16 {
