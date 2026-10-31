@@ -41,7 +41,36 @@ unsafe extern "C" {
 /// leads its own process group. On Windows it also holds the Job Object the
 /// supervisor was created in, suspended, before it could start a descendant;
 /// the tree is stopped through that job, never by process ID.
-#[cfg(not(windows))]
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Supervisor {
+    child: Child,
+    /// This capability is created by spawning a fresh process group and is
+    /// retired by our reap. It is not a cached liveness observation: a later
+    /// PID lookup can never recreate permission to signal the group.
+    group_signal_authority: bool,
+}
+
+#[cfg(unix)]
+impl Supervisor {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            group_signal_authority: true,
+        }
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_child(self) -> Child {
+        self.child
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub type Supervisor = Child;
 #[cfg(windows)]
 pub type Supervisor = Box<dyn process_wrap::std::ChildWrapper>;
@@ -111,6 +140,10 @@ pub(crate) fn spawn_supervisor(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // A private inherited pipe is the graceful stop capability on Windows.
+    // Closing it (No, or an app crash) is deliberately not a stop request.
+    #[cfg(windows)]
+    cmd.stdin(Stdio::piped());
 
     // Its own process group, so signals aimed at the app's group (e.g. Ctrl-C
     // on a dev `cargo run`) don't reach it and cleanup can signal exactly this
@@ -121,7 +154,9 @@ pub(crate) fn spawn_supervisor(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    let mut child = Supervisor::new(cmd.spawn()?);
+    #[cfg(not(any(unix, windows)))]
     let mut child: Supervisor = cmd.spawn()?;
     // Created suspended and assigned to a job this handle owns before it
     // runs, so every descendant starts inside the job. The job does not kill
@@ -145,7 +180,9 @@ pub(crate) fn spawn_supervisor(
         guard.disarm();
         child
     };
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    let stdout = child.child.stdout.take();
+    #[cfg(not(any(unix, windows)))]
     let stdout = child.stdout.take();
     #[cfg(windows)]
     let stdout = child.stdout().take();
@@ -330,7 +367,7 @@ fn ensure_desktop_supervisor_capability_with_timeout(
         })?
     };
     #[cfg(not(windows))]
-    let mut child = command.spawn().map_err(|error| {
+    let child = command.spawn().map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!(
@@ -339,6 +376,8 @@ fn ensure_desktop_supervisor_capability_with_timeout(
             ),
         )
     })?;
+    #[cfg(unix)]
+    let mut child = Supervisor::new(child);
     let deadline = Instant::now() + timeout;
     let status = loop {
         #[cfg(not(windows))]
@@ -388,7 +427,7 @@ fn ensure_desktop_supervisor_capability_with_timeout(
 }
 
 #[cfg(not(windows))]
-fn terminate_capability_probe(child: &mut Child) -> std::io::Result<()> {
+fn terminate_capability_probe(child: &mut Supervisor) -> std::io::Result<()> {
     terminate_supervisor_tree(child, STARTUP_CLEANUP_GRACE)
 }
 
@@ -540,6 +579,11 @@ pub(crate) fn terminate_supervisor_tree(
 
     #[cfg(unix)]
     {
+        if !child.group_signal_authority {
+            return Err(std::io::Error::other(
+                "supervisor signal authority was retired after reaping; cleanup cannot be retried safely",
+            ));
+        }
         let pid = child.id();
         // ECHILD means the supervisor was already reaped, so its PID and group
         // ID are no longer reserved and must not be signalled.
@@ -550,7 +594,12 @@ pub(crate) fn terminate_supervisor_tree(
         if reserved {
             terminate_reserved_group(child, pid, grace, &mut utility_errors);
         } else {
+            child.group_signal_authority = false;
             utility_errors.push("supervisor was reaped before cleanup".to_string());
+        }
+        if child.group_signal_authority {
+            // A failed signal keeps the unreaped reservation for the next Yes.
+            return Err(std::io::Error::other(utility_errors.join("; ")));
         }
         // Only checks from here on: once the group empties its ID may be
         // reused, so nothing is signalled after the reap.
@@ -577,13 +626,44 @@ pub(crate) fn terminate_supervisor_tree(
     }
     #[cfg(windows)]
     {
-        // Terminating the job reaches exactly the processes created in it; no
-        // process ID or parent relationship is consulted. There is no graceful
-        // phase on Windows: the windowless supervisor has no console to signal.
+        use std::io::Write;
+
+        // ETX is an explicit stop request on this inherited private pipe. It
+        // reaches only the supervisor created by this handle; no console, PID
+        // discovery, named endpoint or remote dashboard authority is involved.
+        let request = child.stdin().as_mut().map_or_else(
+            || Err(std::io::Error::other("supervisor control pipe unavailable")),
+            |stdin| stdin.write_all(&[0x03]),
+        );
+        if let Err(error) = request
+            && !matches!(child.try_wait(), Ok(Some(_)))
+        {
+            utility_errors.push(format!(
+                "failed to request graceful supervisor shutdown: {error}"
+            ));
+        }
+        let deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    utility_errors.push(format!("failed to inspect supervisor: {error}"));
+                    break;
+                }
+            }
+        }
+        // After graceful exit, or the deadline, request force termination for
+        // every surviving job member. The retained job remains valid after
+        // parent exit. Windows may finish descendant termination asynchronously;
+        // the wait below witnesses the supervisor, not a job-wide exit barrier.
         if let Err(error) = child.start_kill() {
             utility_errors.push(format!("failed to terminate the supervisor's job: {error}"));
         }
-        let deadline = Instant::now() + grace.max(WINDOWS_JOB_EXIT_WAIT);
+        let deadline = Instant::now() + WINDOWS_JOB_EXIT_WAIT;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -617,7 +697,7 @@ pub(crate) fn terminate_supervisor_tree(
 /// reap.
 #[cfg(unix)]
 fn terminate_reserved_group(
-    child: &mut Child,
+    child: &mut Supervisor,
     pid: u32,
     grace: Duration,
     utility_errors: &mut Vec<String>,
@@ -645,17 +725,39 @@ fn terminate_reserved_group(
     // its group, which the unreaped supervisor keeps reserved.
     if let Err(error) = signal_reserved_group(pid, SIGKILL) {
         utility_errors.push(error.to_string());
-        if let Err(error) = child.kill() {
+        if let Err(error) = child.child.kill() {
             utility_errors.push(format!("fallback child kill failed: {error}"));
         }
     }
-    if let Err(error) = child.wait() {
+    if !utility_errors.is_empty() {
+        return;
+    }
+    // Retire authority before the potentially reaping operation. Even an
+    // error must never let a retry reconstruct ownership from this PID.
+    child.group_signal_authority = false;
+    if let Err(error) = child.child.wait() {
         utility_errors.push(format!("failed to reap supervisor: {error}"));
     }
 }
 
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(crate) static FAIL_GROUP_SIGNALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(unix)]
 fn signal_supervisor_group(pid: u32, signal: i32) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_GROUP_SIGNALS.with(|remaining| {
+        let count = remaining.get();
+        remaining.set(count.saturating_sub(1));
+        count != 0
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected group-signal failure",
+        ));
+    }
     let pid = i32::try_from(pid)
         .map_err(|_| std::io::Error::other("supervisor PID does not fit in pid_t"))?;
     let result = unsafe { kill(-pid, signal) };
@@ -749,7 +851,13 @@ pub(crate) fn peek_supervisor_exit(
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     #[cfg(unix)]
     {
-        supervisor_exit_status(child.id())
+        if child.group_signal_authority {
+            supervisor_exit_status(child.id())
+        } else {
+            Err(std::io::Error::other(
+                "supervisor signal authority was retired after reaping",
+            ))
+        }
     }
     #[cfg(not(unix))]
     {

@@ -29,7 +29,7 @@ process-wrap = { version = "=9.0.0", default-features = false, features = ["std"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSRunningApplication"] }
-objc2-foundation = { version = "0.3", features = ["NSData"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "objc2-core-services"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -41,3 +41,8 @@ windows = { version = "0.61", features = ["Win32_System_Threading"] }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+[[test]]
+name = "owned_processes"
+path = "tests/owned_processes.rs"
+harness = false

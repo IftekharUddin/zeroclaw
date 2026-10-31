@@ -1,8 +1,8 @@
 //! Tray menu construction.
 
 use tauri::{
-    App, Runtime,
-    menu::{Menu, MenuItemBuilder, PredefinedMenuItem},
+    App, AppHandle, Runtime,
+    menu::{Menu, MenuItem, MenuItemBuilder, PredefinedMenuItem},
 };
 
 pub fn create_tray_menu<R: Runtime>(app: &App<R>) -> Result<Menu<R>, tauri::Error> {
@@ -13,7 +13,16 @@ pub fn create_tray_menu<R: Runtime>(app: &App<R>) -> Result<Menu<R>, tauri::Erro
         .enabled(false)
         .build(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
+    let reset_quit = reset_quit_item(app.handle())?;
     let quit = MenuItemBuilder::with_id("quit", "Quit ZeroClaw").build(app)?;
 
-    Menu::with_items(app, &[&show, &chat, &sep1, &status, &sep2, &quit])
+    Menu::with_items(
+        app,
+        &[&show, &chat, &sep1, &status, &sep2, &reset_quit, &quit],
+    )
+}
+
+/// The same preference reset is available from the tray and native app menu.
+pub fn reset_quit_item<R: Runtime>(app: &AppHandle<R>) -> Result<MenuItem<R>, tauri::Error> {
+    MenuItemBuilder::with_id("reset-quit", "Ask Before Quitting Again").build(app)
 }

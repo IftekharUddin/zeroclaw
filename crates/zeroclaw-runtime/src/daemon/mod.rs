@@ -509,6 +509,17 @@ async fn wait_for_exit_signal(
         // this to request a graceful exit, e.g. for post-upgrade self-respawn.
         let respawn_shutdown = crate::restart::shutdown_notify().notified();
         tokio::pin!(respawn_shutdown);
+        let desktop_shutdown = async {
+            #[cfg(windows)]
+            {
+                if crate::restart::is_desktop_supervised() {
+                    let mut control = crate::restart::desktop_control::DesktopControl::inherited()?;
+                    return control.wait_for_stop().await;
+                }
+            }
+            std::future::pending::<std::io::Result<()>>().await
+        };
+        tokio::pin!(desktop_shutdown);
         loop {
             tokio::select! {
                 res = tokio::signal::ctrl_c() => {
@@ -518,6 +529,11 @@ async fn wait_for_exit_signal(
                 }
                 _ = &mut respawn_shutdown => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "In-process shutdown requested, shutting down...");
+                    return Ok(DaemonExit::Shutdown);
+                }
+                result = &mut desktop_shutdown => {
+                    result?;
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Desktop requested graceful shutdown");
                     return Ok(DaemonExit::Shutdown);
                 }
                 changed = reload_rx.changed() => {

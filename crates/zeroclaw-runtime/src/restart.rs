@@ -15,6 +15,9 @@
 //! resolves to a `"…/zeroclaw (deleted)"` path once the running inode is
 //! unlinked by the swap, which is not spawnable.
 
+#[cfg(windows)]
+pub(crate) mod desktop_control;
+
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;

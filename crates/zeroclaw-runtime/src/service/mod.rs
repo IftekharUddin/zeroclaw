@@ -1442,8 +1442,14 @@ async fn supervise_desktop_child(
 ) -> Result<()> {
     #[cfg(unix)]
     let mut signals = ServiceSignals::new()?;
+    #[cfg(windows)]
+    let mut desktop_control = crate::restart::desktop_control::DesktopControl::inherited()?;
     let mut first_generation = true;
     loop {
+        #[cfg(windows)]
+        if desktop_control.poll_stop()? {
+            return Ok(());
+        }
         let marker_path = prepare_desktop_restart_marker(logs_dir)?;
         let mut command = make_command()?;
         command
@@ -1453,6 +1459,8 @@ async fn supervise_desktop_child(
             .env(crate::restart::DESKTOP_SUPERVISED_ENV, "1")
             .env(crate::restart::DESKTOP_RESTART_MARKER_ENV, &marker_path)
             .kill_on_drop(true);
+        #[cfg(windows)]
+        command.stdin(Stdio::piped());
         #[cfg(windows)]
         let mut child = {
             let mut command = CommandWrap::from(command);
@@ -1500,7 +1508,10 @@ async fn supervise_desktop_child(
         }
         #[cfg(unix)]
         let outcome = wait_for_service_child(&mut child, &mut signals).await;
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let (outcome, desktop_stopped) =
+            wait_for_desktop_child_windows(child.as_mut(), &mut desktop_control).await;
+        #[cfg(not(any(unix, windows)))]
         let outcome = child
             .wait()
             .await
@@ -1508,6 +1519,12 @@ async fn supervise_desktop_child(
         finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT).await;
         let status = outcome?;
         let marked_restart = consume_desktop_restart_marker(&marker_path)?;
+        // A concurrent update may have already marked exit 75. An explicit
+        // desktop stop wins over that restart request.
+        #[cfg(windows)]
+        if desktop_stopped {
+            return Ok(());
+        }
         if status.code() == Some(crate::restart::DESKTOP_RESTART_EXIT_CODE) && marked_restart {
             continue;
         }
@@ -1515,6 +1532,54 @@ async fn supervise_desktop_child(
             return Ok(());
         }
         bail!("daemon child exited with status {status}");
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_desktop_child_windows(
+    child: &mut dyn ChildWrapper,
+    control: &mut crate::restart::desktop_control::DesktopControl,
+) -> (Result<std::process::ExitStatus>, bool) {
+    use crate::i18n::get_required_cli_string;
+    use tokio::io::AsyncWriteExt;
+
+    // EOF disables control and leaves the existing wait/restart behavior in
+    // place. Only the explicit byte enters the graceful shutdown path.
+    tokio::select! {
+        request = control.wait_for_stop() => {
+            let outcome = async {
+                request.context(get_required_cli_string("cli-desktop-control-read-failed"))?;
+                if let Some(mut stdin) = child.stdin().take() {
+                    let written = stdin.write_all(&[crate::restart::desktop_control::STOP]).await;
+                    if let Err(error) = written
+                        && child.try_wait()?.is_none()
+                    {
+                        return Err(error).context(get_required_cli_string("cli-desktop-control-write-failed"));
+                    }
+                } else if child.try_wait()?.is_none() {
+                    bail!(get_required_cli_string("cli-desktop-control-unavailable"));
+                }
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child.try_wait()? {
+                        // A graceful parent exit can leave descendants holding
+                        // output pipes. Clear only this retained inner job.
+                        child.start_kill()?;
+                        return Ok(status);
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        child.start_kill()?;
+                        return tokio::time::timeout(DESKTOP_PIPE_DRAIN_TIMEOUT, child.wait())
+                            .await
+                            .context(get_required_cli_string("cli-desktop-control-reap-timeout"))?
+                            .context(get_required_cli_string("cli-desktop-control-reap-failed"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }.await;
+            (outcome, true)
+        }
+        outcome = child.wait() => (outcome.context(get_required_cli_string("cli-desktop-control-wait-failed")), false),
     }
 }
 

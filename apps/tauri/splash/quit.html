@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quit ZeroClaw</title>
+  <style>
+    :root { color-scheme: light dark; font: 15px system-ui, sans-serif; }
+    body { padding: 24px; margin: 0; }
+    h1 { font-size: 20px; margin: 0 0 16px; }
+    p { line-height: 1.5; }
+    label { display: block; margin: 20px 0; }
+    footer { display: flex; justify-content: flex-end; gap: 10px; }
+    button { font: inherit; padding: 7px 16px; }
+    #error { color: light-dark(#9d1919, #ffb1b1); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Stop background work before quitting?</h1>
+  <p>Yes stops only work started by this desktop session. Active work may be interrupted; scheduled jobs wait until ZeroClaw starts again. No leaves that work running.</p>
+  <label><input id="remember" type="checkbox"> Don't ask again</label>
+  <p id="error" role="alert"></p>
+  <footer>
+    <button id="cancel" autofocus>Cancel</button>
+    <button id="no">No</button>
+    <button id="yes">Yes</button>
+  </footer>
+  <script>
+    const invoke = window.__TAURI__.core.invoke;
+    const error = document.getElementById('error');
+    const buttons = [...document.querySelectorAll('button')];
+    const showError = (message) => { error.textContent = String(message); };
+    invoke('quit_prompt_error').then(message => { if (message) showError(message); }).catch(showError);
+    async function choose(answer) {
+      buttons.forEach(button => { button.disabled = true; });
+      error.textContent = answer === 'stop_owned' ? 'Stopping background work…' : '';
+      try {
+        await invoke('confirm_quit', { answer, remember: document.getElementById('remember').checked });
+      } catch (message) {
+        showError(message);
+        buttons.forEach(button => { button.disabled = false; });
+      }
+    }
+    document.getElementById('yes').onclick = () => choose('stop_owned');
+    document.getElementById('no').onclick = () => choose('keep_running');
+    document.getElementById('cancel').onclick = () => invoke('cancel_quit').catch(showError);
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !document.getElementById('cancel').disabled) {
+        invoke('cancel_quit').catch(showError);
+      }
+    });
+  </script>
+</body>
+</html>

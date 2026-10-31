@@ -10,12 +10,14 @@
 //!
 //! A supervisor is recorded the moment it is spawned, under the same lock
 //! Quit takes to seal the registry, and before it reports readiness. Quit
-//! therefore holds every handle there is to hold, and stops each tree before
-//! it returns, whether or not that tree had finished starting.
+//! therefore holds every handle there is to hold. Yes attempts graceful stop,
+//! then bounded force through those capabilities; Windows descendant teardown
+//! may finish asynchronously after its supervisor exits. Failed cleanup keeps
+//! its exact capability for retry. No releases handles without termination.
 
 use crate::daemon::Supervisor;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// How long quitting waits for an owned supervisor to stop its daemon before
@@ -27,6 +29,7 @@ pub const QUIT_GRACE: Duration = Duration::from_secs(15);
 #[derive(Debug, Default)]
 pub struct OwnedProcesses {
     registry: Mutex<Registry>,
+    launch_finished: Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -34,12 +37,24 @@ struct Registry {
     next_id: u64,
     /// Oldest first, each with the ID its launch uses to find it again.
     launched: Vec<(u64, Supervisor)>,
+    /// Active launch operations, including the bounded capability probe before
+    /// a supervisor exists. This is the admission source, not process ownership.
+    launches_in_progress: usize,
     /// Set when quitting starts; nothing is spawned after it.
     closing: bool,
 }
 
 /// The owned-process registry shared between startup and exit.
 pub type SharedOwnedProcesses = Arc<OwnedProcesses>;
+
+struct LaunchAdmission<'a>(&'a OwnedProcesses);
+
+impl Drop for LaunchAdmission<'_> {
+    fn drop(&mut self) {
+        self.0.registry().launches_in_progress -= 1;
+        self.0.launch_finished.notify_all();
+    }
+}
 
 fn quitting() -> std::io::Error {
     std::io::Error::other("the app is quitting, so it does not start a daemon")
@@ -52,17 +67,44 @@ impl OwnedProcesses {
 
     /// Whether this instance owns any process.
     pub fn is_empty(&self) -> bool {
-        self.registry().launched.is_empty()
+        let registry = self.registry();
+        registry.launched.is_empty() && registry.launches_in_progress == 0
+    }
+
+    /// Atomically take the no-work exit path. A later startup decision cannot
+    /// spawn a daemon after Quit observed an empty registry.
+    pub fn close_if_empty(&self) -> bool {
+        let mut registry = self.registry();
+        if !registry.launched.is_empty() || registry.launches_in_progress != 0 {
+            return false;
+        }
+        registry.closing = true;
+        true
+    }
+
+    /// Quit only the UI. Losing these handles does not terminate a Unix child
+    /// or the Windows job, which deliberately has no kill-on-close limit.
+    pub fn keep_running(&self) {
+        let mut registry = self.registry();
+        registry.closing = true;
+        registry.launched.clear();
+    }
+
+    fn admit_launch(&self) -> std::io::Result<LaunchAdmission<'_>> {
+        let mut registry = self.registry();
+        if registry.closing {
+            return Err(quitting());
+        }
+        registry.launches_in_progress += 1;
+        Ok(LaunchAdmission(self))
     }
 
     /// Launch the desktop supervisor for `binary` and keep it as owned. It is
     /// refused once quitting has started. A launch whose readiness fails is
-    /// stopped and forgotten; one that Quit stopped while it was starting
-    /// reports so.
+    /// stopped and forgotten only after successful cleanup; a failed cleanup
+    /// keeps its capability for Quit. One stopped during startup reports so.
     pub fn launch(&self, binary: &Path, port: u16) -> std::io::Result<()> {
-        if self.registry().closing {
-            return Err(quitting());
-        }
+        let _admission = self.admit_launch()?;
         crate::daemon::ensure_desktop_supervisor_capability(binary)?;
         let (id, stdout) = {
             let mut registry = self.registry();
@@ -80,7 +122,7 @@ impl OwnedProcesses {
         let mut registry = self.registry();
         let Some(index) = registry.launched.iter().position(|(entry, _)| *entry == id) else {
             return Err(std::io::Error::other(
-                "the app quit while the daemon was starting; it was stopped",
+                "the app quit while the daemon was starting",
             ));
         };
         match ready {
@@ -88,11 +130,13 @@ impl OwnedProcesses {
             Err(startup_error) => {
                 // Stop it while still holding the registry: a Quit waiting
                 // for the lock must not see it gone until it is stopped.
-                let (_, mut child) = registry.launched.remove(index);
                 let stopped = crate::daemon::terminate_supervisor_tree(
-                    &mut child,
+                    &mut registry.launched[index].1,
                     crate::daemon::STARTUP_CLEANUP_GRACE,
                 );
+                if stopped.is_ok() {
+                    registry.launched.remove(index);
+                }
                 drop(registry);
                 Err(crate::daemon::attach_cleanup_error(startup_error, stopped))
             }
@@ -108,26 +152,36 @@ impl OwnedProcesses {
         }
     }
 
-    /// Seal the registry and stop every owned tree through its handle, newest
-    /// first, so a gateway launched after its core stops before the core.
-    /// Trees still starting are stopped too, so nothing this instance launched
-    /// is left running when this returns. Every handle is released either way;
-    /// the errors are returned.
-    ///
-    /// Every stop of a recorded tree, here or after a failed readiness check,
-    /// happens while the registry lock is held, so the registry is empty only
-    /// once the trees taken from it have stopped.
+    /// Seal the registry and stop owned trees newest first, so a gateway
+    /// launched after its core stops before the core. Every stop holds this
+    /// same registry lock, including cleanup after a failed readiness check.
+    /// Successful capabilities are released; failures retain their exact
+    /// handles here so retry or Cancel cannot silently lose cleanup authority.
     pub fn quit(&self, grace: Duration) -> Vec<std::io::Error> {
         let mut registry = self.registry();
         registry.closing = true;
-        let launched = std::mem::take(&mut registry.launched);
-        let errors = launched
-            .into_iter()
-            .rev()
-            .filter_map(|(_, mut child)| {
-                crate::daemon::terminate_supervisor_tree(&mut child, grace).err()
-            })
-            .collect();
+        let mut errors = Vec::new();
+        for index in (0..registry.launched.len()).rev() {
+            match crate::daemon::terminate_supervisor_tree(&mut registry.launched[index].1, grace) {
+                Ok(()) => {
+                    registry.launched.remove(index);
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        // A capability probe may still be running outside this lock. Sealing
+        // prevents its later spawn; wait for the bounded admission operation
+        // to settle without keeping the mutex it needs to return.
+        let (registry, wait) = self
+            .launch_finished
+            .wait_timeout_while(registry, grace, |state| state.launches_in_progress != 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        if wait.timed_out() && registry.launches_in_progress != 0 {
+            errors.push(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "a daemon launch did not finish before the quit deadline",
+            ));
+        }
         drop(registry);
         errors
     }
@@ -404,6 +458,56 @@ mod tests {
         }
 
         #[test]
+        fn failed_stop_retains_exact_handle_and_retries_cleanup() {
+            let fixture = Fixture::new("retry");
+            let binary = fixture.supervisor("core");
+            let owned = OwnedProcesses::default();
+            owned.launch(&binary, 0).expect("launch owned daemon");
+            let original = owned.launched_ids();
+            let descendant = fixture.descendant_of(original[0]);
+            // Fail both group signals at the native stop boundary. The parent
+            // fallback may exit, but it must remain unreaped to reserve the ID.
+            crate::daemon::FAIL_GROUP_SIGNALS.set(2);
+            let errors = owned.quit(TEST_GRACE);
+            assert_eq!(errors.len(), 1);
+            assert!(
+                errors[0]
+                    .to_string()
+                    .contains("injected group-signal failure")
+            );
+            assert_eq!(owned.launched_ids(), original);
+            assert!(!owned.is_empty());
+            assert!(!owned.close_if_empty());
+            assert!(alive(i32::try_from(original[0]).expect("pid")));
+            // This is the same operation the second Yes uses. It must actually
+            // stop the retained tree, not succeed because the first drained it.
+            assert!(owned.quit(TEST_GRACE).is_empty());
+            assert!(owned.is_empty());
+            assert!(wait_gone(descendant));
+        }
+
+        #[test]
+        fn retired_supervisor_never_signals_a_pid_on_retry() {
+            let fixture = Fixture::new("retired");
+            let binary = fixture.supervisor("core");
+            let (mut child, stdout) = crate::daemon::spawn_supervisor(&binary, 0).unwrap();
+            crate::daemon::validate_readiness_frame(crate::daemon::read_readiness(stdout), || {
+                crate::daemon::peek_supervisor_exit(&mut child)
+            })
+            .unwrap();
+            crate::daemon::terminate_supervisor_tree(&mut child, TEST_GRACE).unwrap();
+            crate::daemon::FAIL_GROUP_SIGNALS.set(1);
+            let error =
+                crate::daemon::terminate_supervisor_tree(&mut child, TEST_GRACE).unwrap_err();
+            assert!(error.to_string().contains("authority was retired"));
+            assert_eq!(
+                crate::daemon::FAIL_GROUP_SIGNALS.replace(0),
+                1,
+                "a retired capability must not attempt another group signal"
+            );
+        }
+
+        #[test]
         fn external_daemon_from_the_same_executable_survives_quit() {
             let fixture = Fixture::new("external");
             let binary = fixture.supervisor("core");
@@ -445,7 +549,7 @@ mod tests {
                 alive(leftover_pid),
                 "a relaunch stopped an earlier run's daemon"
             );
-            stop_external(leftover);
+            stop_external(leftover.into_child());
         }
 
         #[test]

@@ -7,6 +7,7 @@ pub mod gateway_client;
 pub mod health;
 pub mod macos;
 pub mod ownership;
+pub mod quit;
 pub mod state;
 pub mod tray;
 pub mod window;
@@ -14,7 +15,7 @@ pub mod window;
 use gateway_client::GatewayClient;
 use ownership::SharedOwnedProcesses;
 use state::{SplashStatus, shared_state};
-use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// Loopback port the desktop app expects the gateway/daemon on. Matches the
 /// port baked into [`state::AppState::default`]'s `gateway_url`.
@@ -226,9 +227,11 @@ pub fn run() {
             // When a second instance launches, bring this one's window back.
             window::show_main_window(app, None);
         }))
-        .on_window_event(window::on_window_event)
+        .on_window_event(quit::handle_window_event)
+        .on_menu_event(tray::events::handle_menu_event)
         .manage(shared.clone())
         .manage(owned.clone())
+        .manage(quit::SharedQuitController::default())
         .invoke_handler(tauri::generate_handler![
             commands::gateway::get_status,
             commands::gateway::get_health,
@@ -238,10 +241,17 @@ pub fn run() {
             commands::agent::send_message,
             open_dashboard,
             get_startup_failure,
+            quit::quit_prompt_error,
+            quit::cancel_quit,
+            quit::confirm_quit,
             capabilities::screenshot::take_screenshot,
             capabilities::applescript::run_applescript,
         ])
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            app.set_menu(quit::application_menu(app.handle())?)?;
+            #[cfg(target_os = "macos")]
+            macos::quit::install(app.handle())?;
             // Set macOS dock icon (needed for dev builds without .app bundle).
             #[cfg(target_os = "macos")]
             set_dock_icon();
@@ -272,20 +282,5 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| match event {
-            RunEvent::ExitRequested { code, api, .. } => {
-                if window::keep_running_on_exit_request(code) {
-                    api.prevent_exit();
-                }
-            }
-            // Stop only what this instance launched, newest first. A daemon it
-            // reused, or one left by an earlier run, keeps running.
-            RunEvent::Exit => {
-                let owned = app.state::<SharedOwnedProcesses>();
-                for error in owned.quit(ownership::QUIT_GRACE) {
-                    eprintln!("ZeroClaw Desktop: stopping the daemon it launched failed: {error}");
-                }
-            }
-            _ => {}
-        });
+        .run(quit::handle_run_event);
 }

@@ -7,6 +7,11 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
     match event.id().as_ref() {
         "show" => show_main_window(app, None),
         "chat" => show_main_window(app, Some("/agent")),
+        "reset-quit" => {
+            if let Err(error) = crate::quit::reset_preference(app) {
+                eprintln!("ZeroClaw Desktop: resetting the Quit preference failed: {error}");
+            }
+        }
         "quit" => {
             app.exit(0);
         }

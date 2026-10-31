@@ -21,6 +21,8 @@ mod daemon_startup_feedback;
 mod degraded_config_remediation;
 #[cfg(all(feature = "agent-runtime", feature = "gateway", target_os = "linux"))]
 mod desktop_cli_linux;
+#[cfg(all(feature = "agent-runtime", feature = "gateway", windows))]
+mod desktop_quit_windows;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
 #[cfg(feature = "gateway")]
