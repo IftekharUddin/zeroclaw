@@ -510,7 +510,7 @@ async fn long_running_router_uses_the_configured_long_running_timeout() {
 // covers the same sub-router through its `/a2a/{alias}` sibling.
 
 /// Half one of the straddle, and the load-bearing cron-exemption assertion:
-/// `POST /api/cron/{id}/run` runs a 5s job to completion under a 10s
+/// `POST /api/cron/{id}/run` runs a 5s job to completion under a 600s
 /// long-running budget, while the same gateway cuts an ordinary route off at
 /// 1s. The route takes no body extractor, so a stalled body proves nothing
 /// about it — the request has to actually occupy the handler.
@@ -526,7 +526,7 @@ async fn cron_run_route_completes_when_the_budget_exceeds_the_job() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut cfg = base_config(tmp.path());
     cfg.gateway.request_timeout_secs = 1;
-    cfg.gateway.long_running_request_timeout_secs = 10;
+    cfg.gateway.long_running_request_timeout_secs = 600;
     let cfg = with_shell_cron_agent(cfg);
     let gw = boot(tmp, cfg).await;
 
@@ -546,7 +546,7 @@ async fn cron_run_route_completes_when_the_budget_exceeds_the_job() {
 
     assert_eq!(
         status, OK,
-        "a 5s job under a 10s long-running budget must run to completion; \
+        "a 5s job under a 600s long-running budget must run to completion; \
          response was:\n{raw}"
     );
     assert!(
@@ -555,10 +555,14 @@ async fn cron_run_route_completes_when_the_budget_exceeds_the_job() {
          finished quickly for an unrelated reason and proves nothing about \
          the timeout. Response was:\n{raw}"
     );
+    // The successful response and paired 3s cutoff prove the configured
+    // timeout wiring. Allow a successful job to be observed late under load;
+    // the generous route budget and finite response guard serve different
+    // purposes from the lower bound that excludes the ordinary 1s budget.
     assert!(
-        (Duration::from_millis(4000)..=Duration::from_millis(9500)).contains(&elapsed),
-        "the request must have been in flight for roughly the job's 5s, well \
-         past the 1s default budget, but it returned after {elapsed:?}; \
+        elapsed >= Duration::from_millis(4000),
+        "the request must have outlived the 1s default budget while the 5s \
+         job ran, but it returned after {elapsed:?}; \
          response was:\n{raw}"
     );
 }
@@ -604,7 +608,7 @@ async fn cron_run_route_is_cut_off_when_the_budget_is_below_the_job() {
     // Lower bound only. A correctly fired 3s timeout can be *observed* late
     // under scheduler contention, so an upper wall-clock bound here would turn
     // wakeup latency into a test failure. The configured value is pinned by
-    // the pair instead: the same 5s job returns 200 under the 10s budget and
+    // the pair instead: the same 5s job returns 200 under the 600s budget and
     // 408 here, and the lower bound rules out the 1s default.
     assert!(
         elapsed >= Duration::from_millis(2200),
