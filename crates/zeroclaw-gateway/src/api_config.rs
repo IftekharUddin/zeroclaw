@@ -516,7 +516,7 @@ async fn persist_and_swap_retaining(
 }
 
 #[cfg(test)]
-mod test_pre_save_pause_gate {
+pub(crate) mod test_pre_save_pause_gate {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -542,16 +542,16 @@ mod test_pre_save_pause_gate {
             .retain(|registered| !Arc::ptr_eq(registered, gate));
     }
 
-    pub(super) struct GateHandle {
+    pub(crate) struct GateHandle {
         gate: Arc<Gate>,
     }
 
     impl GateHandle {
-        pub(super) async fn wait_paused(&self) {
+        pub(crate) async fn wait_paused(&self) {
             self.gate.reached.notified().await;
         }
 
-        pub(super) fn release(&self) {
+        pub(crate) fn release(&self) {
             disarm(&self.gate);
         }
     }
@@ -562,7 +562,7 @@ mod test_pre_save_pause_gate {
         }
     }
 
-    pub(super) fn arm(target: PathBuf) -> GateHandle {
+    pub(crate) fn arm(target: PathBuf) -> GateHandle {
         let gate = Arc::new(Gate {
             target,
             reached: Notify::new(),
@@ -574,7 +574,7 @@ mod test_pre_save_pause_gate {
         GateHandle { gate }
     }
 
-    pub(super) async fn pause(config_path: &Path) {
+    pub(crate) async fn pause(config_path: &Path) {
         let gate = GATES
             .lock()
             .unwrap()
@@ -669,6 +669,12 @@ async fn persist_and_swap_prepared(
     #[cfg(test)]
     test_pre_save_pause_gate::pause(&config_path).await;
 
+    // Session lifetime can end independently of the config writer while
+    // preparation awaits. This is the final admission; the dispatched save
+    // and its publication remain one retained commit after this point.
+    authorization
+        .admit_persistence()
+        .map_err(IntoResponse::into_response)?;
     if let Err(e) = new_config.save_dirty().await {
         if let Some(prev) = snapshot {
             let _ = tokio::fs::write(&config_path, prev).await;
@@ -2311,15 +2317,16 @@ async fn rename_agent_cascade(
     // agent's owned state). The complete write set, once the cascade has
     // computed it, is authorized again below before the persist.
     let before = state.config.read().clone();
-    if let Err(denied) = authorize_config_write(
+    let intent_authorization = match authorize_config_write(
         principal,
         ConfigWriteSet::default()
             .with(format!("{}.{from}", body.path), Verb::Delete)
             .with(format!("{}.{to}", body.path), Verb::Create),
         &guard,
     ) {
-        return denied.into_response();
-    }
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
 
     // Capture the OLD workspace path while the entry still lives under `from`
     // (custom paths are read off the entry, which is about to move).
@@ -2328,7 +2335,7 @@ async fn rename_agent_cascade(
     let committed_to = working.agent(from).is_none() && working.agent(to).is_some();
     let skip_persist = committed_to && rename_residue_exists(state, &working, from).await;
     let (dirty_count, authorization) = if skip_persist {
-        (0, None)
+        (0, intent_authorization)
     } else {
         match alias_refs::rename_with_cascade(&mut working, &AliasKind::Agent, from, to) {
             Ok(report) => {
@@ -2344,7 +2351,7 @@ async fn rename_agent_cascade(
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
                 };
-                (dirty_count, Some(authorization))
+                (dirty_count, authorization)
             }
             Err(e) => return rename_error_response(&body.path, from, e),
         }
@@ -2381,10 +2388,13 @@ async fn rename_agent_cascade(
                 pending_reload.clone(),
                 reload_controls,
                 working.clone(),
-                authorization.expect("persisting rename was authorized"),
+                authorization,
             )
             .await?
         } else {
+            authorization
+                .admit_persistence()
+                .map_err(IntoResponse::into_response)?;
             None
         };
         // Committed: advance both alias generations exactly once.
@@ -3088,6 +3098,11 @@ pub async fn handle_migrate(
             let pending_reload = Arc::clone(&state.pending_reload);
             let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(
                 Box::pin(async move {
+                    #[cfg(test)]
+                    test_pre_save_pause_gate::pause(&replace_config_path).await;
+                    authorization
+                        .admit_persistence()
+                        .map_err(IntoResponse::into_response)?;
                     // 1. Write migrated content to temp + fsync.
                     match tokio::fs::OpenOptions::new()
                         .create_new(true)
@@ -3099,34 +3114,34 @@ pub async fn handle_migrate(
                             use tokio::io::AsyncWriteExt;
                             if let Err(e) = temp.write_all(new_content.as_bytes()).await {
                                 let _ = tokio::fs::remove_file(&temp_path).await;
-                                return Err(ConfigApiError::new(
+                                return Err(error_response(ConfigApiError::new(
                                     ConfigApiCode::InternalError,
                                     format!("failed to write migrated config to temp: {e}"),
-                                ));
+                                )));
                             }
                             if let Err(e) = temp.sync_all().await {
                                 let _ = tokio::fs::remove_file(&temp_path).await;
-                                return Err(ConfigApiError::new(
+                                return Err(error_response(ConfigApiError::new(
                                     ConfigApiCode::InternalError,
                                     format!("failed to fsync migrated config temp: {e}"),
-                                ));
+                                )));
                             }
                         }
                         Err(e) => {
-                            return Err(ConfigApiError::new(
+                            return Err(error_response(ConfigApiError::new(
                                 ConfigApiCode::InternalError,
                                 format!("failed to create temp config file: {e}"),
-                            ));
+                            )));
                         }
                     }
 
                     // 2. Backup BEFORE replacing the original.
                     if let Err(e) = tokio::fs::copy(&replace_config_path, &backup_path).await {
                         let _ = tokio::fs::remove_file(&temp_path).await;
-                        return Err(ConfigApiError::new(
+                        return Err(error_response(ConfigApiError::new(
                             ConfigApiCode::InternalError,
                             format!("failed to write backup: {e}"),
-                        ));
+                        )));
                     }
 
                     // 3. Atomic rename. On failure, restore from backup.
@@ -3135,10 +3150,10 @@ pub async fn handle_migrate(
                         if backup_path.exists() {
                             let _ = tokio::fs::copy(&backup_path, &replace_config_path).await;
                         }
-                        return Err(ConfigApiError::new(
+                        return Err(error_response(ConfigApiError::new(
                             ConfigApiCode::InternalError,
                             format!("failed to atomically replace config: {e}"),
-                        ));
+                        )));
                     }
 
                     // 4. Fsync the parent directory so the rename is durable.
@@ -3158,14 +3173,14 @@ pub async fn handle_migrate(
                     authorization.publish_persisted(&prepared);
                     commit
                         .publish(revision, prepared)
-                        .map_err(config_commit_publish_error)?;
+                        .map_err(|e| error_response(config_commit_publish_error(e)))?;
                     pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
                     Ok(())
                 }),
             );
             match task.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => return error_response(error),
+                Ok(Err(error)) => return error,
                 Err(e) => {
                     return error_response(ConfigApiError::new(
                         ConfigApiCode::InternalError,

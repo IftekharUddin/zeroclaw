@@ -56,7 +56,7 @@ use zeroclaw_runtime::rpc::transport::TransportKind;
 use zeroclaw_runtime::security::auth_provider::Credential;
 
 use crate::ConfigWriteGuard;
-use crate::dashboard_session::DashboardCaller;
+use crate::dashboard_session::{DashboardCaller, SessionAuth, SessionRejection};
 
 /// Header naming the auth provider to verify the bearer with, mirroring
 /// the RPC handshake's `auth_provider` field (e.g. `oidc.corp`). Absent
@@ -213,17 +213,20 @@ fn forbidden(message: impl Into<String>) -> Response {
 /// the mutation. A 403 carries which path or grant fell short; a 401 means
 /// the credential that admitted the request is no longer live.
 #[derive(Debug)]
-pub struct WriteDenied {
-    status: StatusCode,
-    message: String,
+pub struct WriteDenied(WriteDenial);
+
+#[derive(Debug)]
+enum WriteDenial {
+    Authority { status: StatusCode, message: String },
+    Session(SessionRejection),
 }
 
 impl WriteDenied {
     fn forbidden(message: String) -> Self {
-        Self {
+        Self(WriteDenial::Authority {
             status: StatusCode::FORBIDDEN,
             message,
-        }
+        })
     }
 
     fn authority_lost(denied: AuthDenied) -> Self {
@@ -232,20 +235,21 @@ impl WriteDenied {
         } else {
             StatusCode::UNAUTHORIZED
         };
-        Self {
+        Self(WriteDenial::Authority {
             status,
             message: denied.message,
-        }
+        })
     }
 }
 
 impl IntoResponse for WriteDenied {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
+        match self.0 {
+            WriteDenial::Authority { status, message } => {
+                (status, Json(serde_json::json!({ "error": message }))).into_response()
+            }
+            WriteDenial::Session(rejection) => rejection.body().into_response(),
+        }
     }
 }
 
@@ -274,8 +278,32 @@ fn method_floor(method: &Method) -> Option<&'static [Verb]> {
 /// configuration it writes.
 #[derive(Clone)]
 pub struct RequestAuth {
-    principal: Option<Arc<ConnectionAuth>>,
+    principal: Option<RequestIdentity>,
     authority: Arc<GatewayInboundAuth>,
+}
+
+#[derive(Clone)]
+enum RequestIdentity {
+    Bearer(Arc<ConnectionAuth>),
+    Dashboard(Arc<SessionAuth>),
+}
+
+impl RequestIdentity {
+    fn connection(&self) -> &ConnectionAuth {
+        match self {
+            Self::Bearer(connection) => connection,
+            Self::Dashboard(session) => &session.connection,
+        }
+    }
+}
+
+impl RequestAuth {
+    fn session(&self) -> Option<&Arc<SessionAuth>> {
+        match &self.principal {
+            Some(RequestIdentity::Dashboard(session)) => Some(session),
+            _ => None,
+        }
+    }
 }
 
 /// The extractor a mutating handler declares to receive its
@@ -376,9 +404,19 @@ pub struct ConfigWriteAuthorization {
     /// wildcard selector.
     enforced: Option<ConfigWriteSet>,
     authority: Option<Arc<GatewayInboundAuth>>,
+    /// The existing session lifetime, not a second authority or grant snapshot.
+    session: Option<Arc<SessionAuth>>,
 }
 
 impl ConfigWriteAuthorization {
+    /// The last admission before dispatching an irreversible save (or a
+    /// destructive resume with no save). Call inside the retained task,
+    /// after preparation waits. Once admitted, save and publication finish
+    /// together even if the session ends or the HTTP request disconnects.
+    pub(crate) fn admit_persistence(&self) -> Result<(), WriteDenied> {
+        check_session_lifetime(self.session.as_deref())
+    }
+
     /// Refuse when `dirty`, the paths about to be persisted, reaches
     /// beyond the authorized write set: the handler could not identify its
     /// complete write set up front, and a scoped principal is refused
@@ -420,10 +458,20 @@ impl ConfigWriteAuthorization {
     }
 }
 
-fn unenforced(authority: Option<Arc<GatewayInboundAuth>>) -> ConfigWriteAuthorization {
+fn check_session_lifetime(session: Option<&SessionAuth>) -> Result<(), WriteDenied> {
+    match session {
+        Some(session) => session
+            .check_lifetime()
+            .map_err(|rejection| WriteDenied(WriteDenial::Session(rejection))),
+        None => Ok(()),
+    }
+}
+
+fn unenforced(request: Option<&RequestAuth>) -> ConfigWriteAuthorization {
     ConfigWriteAuthorization {
         enforced: None,
-        authority,
+        authority: request.map(|request| Arc::clone(&request.authority)),
+        session: request.and_then(RequestAuth::session).cloned(),
     }
 }
 
@@ -442,6 +490,7 @@ fn current_grants(
     conn: &ConnectionAuth,
     _guard: &ConfigWriteGuard,
 ) -> Result<ResolvedGrants, WriteDenied> {
+    check_session_lifetime(request.session().map(Arc::as_ref))?;
     request
         .authority
         .inner
@@ -463,13 +512,12 @@ pub fn authorize_config_write(
     let Some(axum::Extension(request)) = request else {
         return Ok(unenforced(None));
     };
-    let authority = Some(Arc::clone(&request.authority));
-    let Some(conn) = &request.principal else {
-        return Ok(unenforced(authority));
+    let Some(identity) = &request.principal else {
+        return Ok(unenforced(Some(request)));
     };
-    let grants = current_grants(request, conn, guard)?;
+    let grants = current_grants(request, identity.connection(), guard)?;
     if grants.admin {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(Some(request)));
     }
     for (path, verb) in &writes.writes {
         if !grants.permits(Resource::Config, *verb) {
@@ -486,7 +534,7 @@ pub fn authorize_config_write(
     }
     Ok(ConfigWriteAuthorization {
         enforced: Some(writes),
-        authority,
+        ..unenforced(Some(request))
     })
 }
 
@@ -502,13 +550,12 @@ pub fn authorize_whole_config_write(
     let Some(axum::Extension(request)) = request else {
         return Ok(unenforced(None));
     };
-    let authority = Some(Arc::clone(&request.authority));
-    let Some(conn) = &request.principal else {
-        return Ok(unenforced(authority));
+    let Some(identity) = &request.principal else {
+        return Ok(unenforced(Some(request)));
     };
-    let grants = current_grants(request, conn, guard)?;
+    let grants = current_grants(request, identity.connection(), guard)?;
     if grants.admin {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(Some(request)));
     }
     for verb in verbs {
         if !grants.permits(Resource::Config, *verb) {
@@ -524,7 +571,7 @@ pub fn authorize_whole_config_write(
                 .to_owned(),
         ));
     }
-    Ok(unenforced(authority))
+    Ok(unenforced(Some(request)))
 }
 
 /// Route-layer middleware for the config/onboarding route group.
@@ -565,10 +612,8 @@ pub async fn config_route_auth(
         {
             return forbidden("Principal lacks the config grant required for this method");
         }
-        let mut conn = session.connection.clone();
-        conn.grants = session.grants.clone();
         request.extensions_mut().insert(RequestAuth {
-            principal: Some(Arc::new(conn)),
+            principal: Some(RequestIdentity::Dashboard(session)),
             authority: Arc::clone(&auth),
         });
         return next.run(request).await;
@@ -633,7 +678,7 @@ pub async fn config_route_auth(
     }
 
     request.extensions_mut().insert(RequestAuth {
-        principal: Some(Arc::new(conn)),
+        principal: Some(RequestIdentity::Bearer(Arc::new(conn))),
         authority: Arc::clone(&auth),
     });
     next.run(request).await

@@ -431,6 +431,17 @@ impl SessionAuth {
         }
     }
 
+    /// Whether the lifetime that admitted this request still allows a new
+    /// effect. The store owns cancellation; the original session deadline
+    /// also applies before its idle sweep has noticed expiry.
+    pub(crate) fn check_lifetime(&self) -> Result<(), SessionRejection> {
+        if self.ended.is_cancelled() || self.expires_at <= now_unix() {
+            Err(SessionRejection::Expired)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn principal(&self) -> &Principal {
         &self.connection.principal
     }
@@ -1235,7 +1246,7 @@ impl SessionWatch {
     /// The close code if the session no longer admits the socket by what is
     /// already known (ended, expired, generation stopped), without a recheck.
     fn known_lost(&mut self) -> Option<u16> {
-        if self.session.ended.is_cancelled() || self.session.expires_at <= now_unix() {
+        if self.session.check_lifetime().is_err() {
             return Some(WS_CLOSE_SESSION_ENDED);
         }
         if self.stopped || self.stopping.has_changed().unwrap_or(true) {
@@ -2528,6 +2539,434 @@ mod tests {
     }
 
     // ── The store ────────────────────────────────────────────────────
+
+    // These tests hold the process-wide config writer while a real wall-clock
+    // session cap expires. Do not let one such hold consume another fixture's
+    // short cap before that fixture has reached the boundary under test.
+    static WRITE_LIFETIME_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Clone, Copy)]
+    enum WriteLifetime {
+        Live,
+        SignOut,
+        HardExpiry,
+    }
+
+    async fn write_lifetime_fixture() -> (MockServer, tempfile::TempDir, Fixture) {
+        let server = idp(&["admins"], "gw").await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = sign_in_config(&server.uri());
+        config.config_path = directory.path().join("config.toml");
+        config.data_dir = directory.path().join("data");
+        config.gateway.port = 43110;
+        config.save().await.unwrap();
+        (server, directory, fixture(config))
+    }
+
+    async fn sign_in_for_write(
+        fixture: &Fixture,
+        lifetime: WriteLifetime,
+    ) -> (String, Arc<SessionAuth>) {
+        let lifetime_secs = if matches!(lifetime, WriteLifetime::HardExpiry) {
+            2
+        } else {
+            600
+        };
+        fixture
+            .auth
+            .sign_in(
+                "corp",
+                pin_for(fixture, "corp"),
+                "at-alice".into(),
+                lifetime_secs,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn config_write_request(
+        cookie: &str,
+        session: &SessionAuth,
+        whole: bool,
+        paired: bool,
+    ) -> HttpRequest<Body> {
+        let cookie = format!("{SESSION_COOKIE}={cookie}");
+        let mut headers = vec![
+            ("cookie", cookie.as_str()),
+            ("origin", OWN_ORIGIN),
+            (CSRF_HEADER, session.csrf.as_str()),
+            ("content-type", "application/json"),
+        ];
+        if paired {
+            headers.push(("authorization", "Bearer zc_paired"));
+        }
+        let (method, path) = if whole {
+            ("POST", "/api/config/migrate")
+        } else {
+            ("PUT", "/api/config/prop")
+        };
+        let mut request = request(method, path, loopback(), &headers);
+        if !whole {
+            *request.body_mut() =
+                Body::from(serde_json::json!({"path": "gateway.port", "value": 43111}).to_string());
+        }
+        request
+    }
+
+    async fn end_write_session(
+        fixture: &Fixture,
+        cookie: &str,
+        session: &SessionAuth,
+        lifetime: WriteLifetime,
+    ) {
+        match lifetime {
+            WriteLifetime::Live => {}
+            WriteLifetime::SignOut => {
+                let cookie = format!("{SESSION_COOKIE}={cookie}");
+                let response = send(
+                    &fixture.router,
+                    request(
+                        "POST",
+                        "/auth/sign-out",
+                        loopback(),
+                        &[
+                            ("cookie", cookie.as_str()),
+                            ("origin", OWN_ORIGIN),
+                            (CSRF_HEADER, session.csrf.as_str()),
+                        ],
+                    ),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                assert!(session.ended.is_cancelled());
+            }
+            WriteLifetime::HardExpiry => {
+                // Expire the actual short session cap, without cancelling
+                // its token or changing the underlying OIDC credential.
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while now_unix() < session.expires_at {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("the short session cap expires");
+                assert!(!session.ended.is_cancelled(), "the idle sweep has not run");
+            }
+        }
+        assert!(
+            fixture
+                .auth
+                .inbound
+                .current_grants(&session.connection)
+                .is_ok(),
+            "the underlying access token still has authority"
+        );
+    }
+
+    async fn assert_queued_write_lifetime(lifetime: WriteLifetime, whole: bool, paired: bool) {
+        let _serial = WRITE_LIFETIME_TESTS.lock().await;
+        let (_server, _directory, fixture) = write_lifetime_fixture().await;
+        let path = fixture.state.config.read().config_path.clone();
+        let before = tokio::fs::read(&path).await.unwrap();
+        let generation = fixture.auth.inbound.generation();
+        let held = fixture.state.begin_config_commit().await.unwrap();
+        // Mint the short cap after waiting for the process-wide writer, so
+        // another test's commit cannot consume it before route admission.
+        let (cookie, session) = sign_in_for_write(&fixture, lifetime).await;
+        let mut write = Box::pin(
+            fixture
+                .router
+                .clone()
+                .oneshot(config_write_request(&cookie, &session, whole, paired)),
+        );
+        // The real router has admitted the cookie, extracted the complete
+        // body, and parked the handler on the canonical config writer.
+        for _ in 0..50 {
+            assert!(
+                std::future::Future::poll(
+                    write.as_mut(),
+                    &mut std::task::Context::from_waker(std::task::Waker::noop()),
+                )
+                .is_pending()
+            );
+        }
+        end_write_session(&fixture, &cookie, &session, lifetime).await;
+        drop(held);
+        let response = tokio::time::timeout(Duration::from_secs(5), write)
+            .await
+            .expect("the writer finishes after serialization is released")
+            .unwrap();
+        let admitted = paired || matches!(lifetime, WriteLifetime::Live);
+        assert_eq!(
+            response.status(),
+            if admitted {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        );
+        if !admitted {
+            assert_eq!(json(response).await["reason"], "session_expired");
+            assert!(
+                tokio::fs::read(&path).await.unwrap() == before,
+                "an ended session must leave the config file unchanged"
+            );
+            assert_eq!(fixture.state.config.read().gateway.port, 43110);
+            assert_eq!(fixture.auth.inbound.generation(), generation);
+            assert!(
+                !fixture
+                    .state
+                    .pending_reload
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        } else if !whole {
+            assert_eq!(fixture.state.config.read().gateway.port, 43111);
+            let raw = tokio::fs::read_to_string(&path).await.unwrap();
+            assert_eq!(
+                toml::from_str::<toml::Value>(&raw).unwrap()["gateway"]["port"].as_integer(),
+                Some(43111)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_queued_path_write_refuses_sign_out() {
+        assert_queued_write_lifetime(WriteLifetime::SignOut, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_queued_whole_write_refuses_sign_out() {
+        assert_queued_write_lifetime(WriteLifetime::SignOut, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_queued_path_write_refuses_hard_expiry() {
+        assert_queued_write_lifetime(WriteLifetime::HardExpiry, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_queued_whole_write_refuses_hard_expiry() {
+        assert_queued_write_lifetime(WriteLifetime::HardExpiry, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_live_and_pairing_writes_still_commit() {
+        assert_queued_write_lifetime(WriteLifetime::Live, false, false).await;
+        assert_queued_write_lifetime(WriteLifetime::Live, true, false).await;
+        assert_queued_write_lifetime(WriteLifetime::SignOut, false, true).await;
+    }
+
+    async fn assert_retained_write_lifetime(lifetime: WriteLifetime) {
+        let _serial = WRITE_LIFETIME_TESTS.lock().await;
+        let (_server, _directory, fixture) = write_lifetime_fixture().await;
+        let path = fixture.state.config.read().config_path.clone();
+        let before = tokio::fs::read(&path).await.unwrap();
+        let generation = fixture.auth.inbound.generation();
+        let gate = crate::api_config::test_pre_save_pause_gate::arm(path.clone());
+        let (cookie, session) = sign_in_for_write(&fixture, lifetime).await;
+        let router = fixture.router.clone();
+        let request = config_write_request(&cookie, &session, false, false);
+        let writer = zeroclaw_spawn::spawn!(async move { router.oneshot(request).await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_paused())
+            .await
+            .expect("the retained task reached its real pre-save boundary");
+        end_write_session(&fixture, &cookie, &session, lifetime).await;
+        // Dropping the HTTP future must neither bypass a lifetime refusal
+        // nor strand the valid session's already-dispatched save.
+        writer.abort();
+        let _ = writer.await;
+        gate.release();
+        let _completed =
+            tokio::time::timeout(Duration::from_secs(5), fixture.state.begin_config_commit())
+                .await
+                .expect("the retained task releases the writer")
+                .unwrap();
+        if matches!(lifetime, WriteLifetime::Live) {
+            assert_eq!(fixture.state.config.read().gateway.port, 43111);
+        } else {
+            assert!(
+                tokio::fs::read(&path).await.unwrap() == before,
+                "an ended session must leave the config file unchanged"
+            );
+            assert_eq!(fixture.state.config.read().gateway.port, 43110);
+            assert_eq!(fixture.auth.inbound.generation(), generation);
+            assert!(
+                !fixture
+                    .state
+                    .pending_reload
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_retained_write_refuses_sign_out_before_save() {
+        assert_retained_write_lifetime(WriteLifetime::SignOut).await;
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_retained_write_refuses_hard_expiry_before_save() {
+        assert_retained_write_lifetime(WriteLifetime::HardExpiry).await;
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_valid_retained_write_finishes_after_disconnect() {
+        assert_retained_write_lifetime(WriteLifetime::Live).await;
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_admitted_save_publishes_after_sign_out_and_disconnect() {
+        let _serial = WRITE_LIFETIME_TESTS.lock().await;
+        let (_server, _directory, fixture) = write_lifetime_fixture().await;
+        let path = fixture.state.config.read().config_path.clone();
+        let revision = fixture.state.config.revision();
+        let gate = zeroclaw_config::schema::test_post_replace_pause_gate::arm(path.clone());
+        let (cookie, session) = sign_in_for_write(&fixture, WriteLifetime::Live).await;
+        let router = fixture.router.clone();
+        let request = config_write_request(&cookie, &session, false, false);
+        let writer = zeroclaw_spawn::spawn!(async move { router.oneshot(request).await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_paused())
+            .await
+            .expect("the admitted save has atomically replaced the file");
+        let disk = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            toml::from_str::<toml::Value>(&disk).unwrap()["gateway"]["port"].as_integer(),
+            Some(43111)
+        );
+        assert_eq!(fixture.state.config.read().gateway.port, 43110);
+        assert_eq!(fixture.state.config.revision(), revision);
+        end_write_session(&fixture, &cookie, &session, WriteLifetime::SignOut).await;
+        writer.abort();
+        let _ = writer.await;
+        gate.release();
+        let _completed =
+            tokio::time::timeout(Duration::from_secs(5), fixture.state.begin_config_commit())
+                .await
+                .expect("the admitted retained commit finishes after sign-out")
+                .unwrap();
+        assert_eq!(fixture.state.config.read().gateway.port, 43111);
+        assert_ne!(fixture.state.config.revision(), revision);
+        assert!(
+            fixture
+                .state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(session.ended.is_cancelled());
+    }
+
+    async fn assert_retained_whole_write_lifetime(lifetime: WriteLifetime, quickstart: bool) {
+        let _serial = WRITE_LIFETIME_TESTS.lock().await;
+        let (_server, _directory, fixture) = write_lifetime_fixture().await;
+        let path = fixture.state.config.read().config_path.clone();
+        if !quickstart {
+            let legacy = zeroclaw_config::migration::generate(
+                2,
+                &zeroclaw_config::migration::GenerateOptions::default(),
+            )
+            .unwrap();
+            tokio::fs::write(&path, legacy).await.unwrap();
+        }
+        let before = tokio::fs::read(&path).await.unwrap();
+        let revision = fixture.state.config.revision();
+        let generation = fixture.auth.inbound.generation();
+        let (cookie, session) = sign_in_for_write(&fixture, lifetime).await;
+        let mut request = config_write_request(&cookie, &session, true, false);
+        if quickstart {
+            use zeroclaw_config::presets::{
+                AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+            };
+            let submission = BuilderSubmission {
+                model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                    provider_type: "anthropic".into(),
+                    alias: "anthropic".into(),
+                    model: "claude-sonnet-4-5".into(),
+                    fields: std::collections::HashMap::from([("api_key".into(), "sk-test".into())]),
+                }),
+                risk_profile: SelectorChoice::Fresh("balanced".into()),
+                runtime_profile: SelectorChoice::Fresh("balanced".into()),
+                memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+                channels: vec![],
+                peer_groups: vec![],
+                agent: AgentIdentity {
+                    name: "session_test".into(),
+                    system_prompt: "You are helpful.".into(),
+                    personality_file: None,
+                    personality_files: vec![],
+                },
+            };
+            *request.uri_mut() = "/api/quickstart/apply".parse().unwrap();
+            *request.body_mut() = Body::from(serde_json::to_vec(&submission).unwrap());
+        }
+        let gate = crate::api_config::test_pre_save_pause_gate::arm(path.clone());
+        let router = fixture.router.clone();
+        let mut writer = zeroclaw_spawn::spawn!(async move { router.oneshot(request).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                () = gate.wait_paused() => {},
+                response = &mut writer => {
+                    let response = response.unwrap().unwrap();
+                    let status = response.status();
+                    panic!("whole-config request ended before final admission (quickstart={quickstart}, status={status}): {}", json(response).await);
+                }
+            }
+        }).await.expect("the whole-config retained task reached final admission");
+        end_write_session(&fixture, &cookie, &session, lifetime).await;
+        gate.release();
+        let response = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let status = response.status();
+        let body = json(response).await;
+        if matches!(lifetime, WriteLifetime::Live) {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if quickstart {
+                assert_eq!(body["kind"], "applied", "{body}");
+                assert!(fixture.state.config.read().agent("session_test").is_some());
+            } else {
+                assert_eq!(body["migrated"], true, "{body}");
+                assert!(path.with_extension("toml.bak").exists());
+            }
+            assert_ne!(fixture.state.config.revision(), revision);
+        } else {
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["reason"], "session_expired");
+            assert!(tokio::fs::read(&path).await.unwrap() == before);
+            assert_eq!(fixture.state.config.revision(), revision);
+            assert_eq!(fixture.auth.inbound.generation(), generation);
+            assert!(!path.with_extension("toml.bak").exists());
+            assert!(fixture.state.config.read().agent("session_test").is_none());
+            assert!(
+                !fixture
+                    .state
+                    .pending_reload
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_whole_retained_writes_refuse_sign_out() {
+        for quickstart in [false, true] {
+            assert_retained_whole_write_lifetime(WriteLifetime::SignOut, quickstart).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_whole_retained_writes_refuse_hard_expiry() {
+        for quickstart in [false, true] {
+            assert_retained_whole_write_lifetime(WriteLifetime::HardExpiry, quickstart).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_valid_whole_retained_writes_still_commit() {
+        for quickstart in [false, true] {
+            assert_retained_whole_write_lifetime(WriteLifetime::Live, quickstart).await;
+        }
+    }
 
     async fn verified_auth(fixture: &Fixture) -> ConnectionAuth {
         fixture

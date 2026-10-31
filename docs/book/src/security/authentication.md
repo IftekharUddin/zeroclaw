@@ -552,6 +552,7 @@ Turning it on needs:
 - An identity provider client that uses Authorization Code with PKCE
   (S256), with `<dashboard origin><path_prefix>/oidc/callback` as a
   redirect URI (the same URI as the browser enrollment relay above).
+  Register the complete redirect URI exactly, with no wildcard or prefix patterns.
   Its client must be listed in `interactive_clients` (or classified by
   `actor_claim`), and its access tokens must carry the configured
   `audience`.
@@ -581,6 +582,14 @@ request that changes state must also send the session's CSRF token in
 `X-ZeroClaw-CSRF`, and requests and WebSocket upgrades that carry the
 cookie must come from the dashboard's own origin. A request with an
 `Authorization` header is judged by that header alone.
+
+Cookie-authenticated configuration writes retain the session lifetime through
+body parsing, the config-writer wait, and preparation for persistence. A
+session that ends before the final save admission is refused with
+`"reason": "session_expired"`. After irreversible persistence is dispatched,
+the retained commit finishes saving and publishing together, even if the
+session ends or the browser disconnects. Sign-out does not roll back that
+already admitted commit.
 
 What a signed-in account can do follows its permission profile:
 

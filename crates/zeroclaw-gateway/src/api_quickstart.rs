@@ -201,6 +201,12 @@ async fn apply_reserved(
     // truthful errors reach the caller below.
     let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
         async move {
+            #[cfg(test)]
+            crate::api_config::test_pre_save_pause_gate::pause(
+                &commit.current_config().config_path,
+            )
+            .await;
+            authorization.admit_persistence()?;
             let result = zeroclaw_runtime::quickstart::complete_staged_apply_as_commit(
                 staged, &commit, revision,
             )
@@ -216,11 +222,12 @@ async fn apply_reserved(
             ) {
                 authorization.publish_persisted(&commit.current_config());
             }
-            result
+            Ok::<_, crate::principal_gate::WriteDenied>(result)
         },
     ));
     let result = match task.await {
-        Ok(result) => result,
+        Ok(Ok(result)) => result,
+        Ok(Err(denied)) => return denied.into_response(),
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
