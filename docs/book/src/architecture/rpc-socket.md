@@ -48,7 +48,7 @@ Update the client and core binaries together, then stop and restart the daemon
 or its service. New daemons bind only the stable `zeroclaw-daemon-<hash>` name;
 old clients cannot discover them through the old default name. For zerocode,
 the daemon's package version must still equal the client's. The generic RPC
-client retains its existing protocol-version check instead.
+client retains its existing `initialize` protocol negotiation.
 
 The previous `\\.\pipe\zeroclaw-<hash>` name used Rust's `DefaultHasher`, whose
 output is not stable across toolchains. For one release, a client without an
