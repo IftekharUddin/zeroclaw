@@ -105,7 +105,16 @@ impl OwnedProcesses {
     /// keeps its capability for Quit. One stopped during startup reports so.
     pub fn launch(&self, binary: &Path, port: u16) -> std::io::Result<()> {
         let _admission = self.admit_launch()?;
-        crate::daemon::ensure_desktop_supervisor_capability(binary)?;
+        crate::daemon::ensure_desktop_supervisor_capability(
+            binary,
+            #[cfg(unix)]
+            |probe| {
+                let mut registry = self.registry();
+                let id = registry.next_id;
+                registry.next_id += 1;
+                registry.launched.push((id, probe));
+            },
+        )?;
         let (id, stdout) = {
             let mut registry = self.registry();
             if registry.closing {
@@ -180,6 +189,11 @@ impl OwnedProcesses {
             errors.push(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "a daemon launch did not finish before the quit deadline",
+            ));
+        }
+        if errors.is_empty() && !registry.launched.is_empty() {
+            errors.push(std::io::Error::other(
+                "capability probe cleanup retained an owned handle while Quit waited; retry to stop it",
             ));
         }
         drop(registry);
@@ -484,6 +498,74 @@ mod tests {
             assert!(owned.quit(TEST_GRACE).is_empty());
             assert!(owned.is_empty());
             assert!(wait_gone(descendant));
+        }
+
+        #[test]
+        fn force_exit_timeout_retains_unreaped_handle_for_retry() {
+            let fixture = Fixture::new("force-timeout");
+            let binary = fixture.supervisor("core");
+            let owned = OwnedProcesses::default();
+            owned.launch(&binary, 0).unwrap();
+            let original = owned.launched_ids();
+            crate::daemon::DELAY_FORCE_EXIT_OBSERVATION.set(true);
+            let started = Instant::now();
+            let errors = owned.quit(Duration::from_millis(25));
+            crate::daemon::DELAY_FORCE_EXIT_OBSERVATION.set(false);
+            assert!(
+                started.elapsed() < crate::daemon::UNIX_FORCE_EXIT_WAIT + Duration::from_secs(2)
+            );
+            assert_eq!(errors.len(), 1);
+            assert!(
+                errors[0]
+                    .to_string()
+                    .contains("timed out waiting for forced supervisor exit")
+            );
+            assert_eq!(owned.launched_ids(), original);
+            assert!(
+                alive(i32::try_from(original[0]).unwrap()),
+                "reservation was reaped on timeout"
+            );
+            assert!(!owned.close_if_empty());
+            assert!(owned.quit(TEST_GRACE).is_empty());
+            assert!(owned.is_empty());
+            assert!(!alive(i32::try_from(original[0]).unwrap()));
+        }
+
+        #[test]
+        fn failed_probe_cleanup_transfers_before_quit_can_report_success() {
+            let fixture = Fixture::new("probe-timeout");
+            let binary = fixture.supervisor("core");
+            let owned = Arc::new(OwnedProcesses::default());
+            let launching = Arc::clone(&owned);
+            let launch = std::thread::spawn(move || {
+                crate::daemon::DELAY_FORCE_EXIT_OBSERVATION.set(true);
+                let result = launching.launch(&binary, 0);
+                crate::daemon::DELAY_FORCE_EXIT_OBSERVATION.set(false);
+                result
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while owned.registry().launches_in_progress == 0 {
+                assert!(Instant::now() < deadline, "probe admission did not start");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Quit seals an empty registry, then the admitted probe's cleanup
+            // times out and transfers its exact unreaped capability while we wait.
+            let errors = owned.quit(Duration::from_secs(8));
+            assert!(launch.join().unwrap().is_err());
+            assert_eq!(errors.len(), 1);
+            assert!(
+                errors[0]
+                    .to_string()
+                    .contains("capability probe cleanup retained")
+            );
+            assert_eq!(owned.launched_ids().len(), 1);
+            assert!(!owned.close_if_empty());
+            assert!(
+                fixture.stop_order().is_empty(),
+                "a daemon was spawned after failed probing"
+            );
+            assert!(owned.quit(TEST_GRACE).is_empty());
+            assert!(owned.is_empty());
         }
 
         #[test]

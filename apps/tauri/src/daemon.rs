@@ -21,6 +21,10 @@ pub(crate) const STARTUP_CLEANUP_GRACE: Duration = Duration::from_millis(250);
 /// How long to wait for a terminated job's supervisor to report its exit.
 #[cfg(windows)]
 const WINDOWS_JOB_EXIT_WAIT: Duration = Duration::from_secs(5);
+/// A force request can still leave a process waiting on kernel I/O. Keep its
+/// unreaped reservation on timeout instead of blocking the app without a bound.
+#[cfg(unix)]
+pub(crate) const UNIX_FORCE_EXIT_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
@@ -330,13 +334,22 @@ where
     parse_readiness_line(&line).map_err(std::io::Error::other)
 }
 
-pub(crate) fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
-    ensure_desktop_supervisor_capability_with_timeout(binary, CAPABILITY_PROBE_TIMEOUT)
+pub(crate) fn ensure_desktop_supervisor_capability(
+    binary: &Path,
+    #[cfg(unix)] retain_failed_probe: impl FnOnce(Supervisor),
+) -> std::io::Result<()> {
+    ensure_desktop_supervisor_capability_with_timeout(
+        binary,
+        CAPABILITY_PROBE_TIMEOUT,
+        #[cfg(unix)]
+        retain_failed_probe,
+    )
 }
 
 fn ensure_desktop_supervisor_capability_with_timeout(
     binary: &Path,
     timeout: Duration,
+    #[cfg(unix)] retain_failed_probe: impl FnOnce(Supervisor),
 ) -> std::io::Result<()> {
     let mut command = Command::new(binary);
     command
@@ -379,20 +392,15 @@ fn ensure_desktop_supervisor_capability_with_timeout(
     #[cfg(unix)]
     let mut child = Supervisor::new(child);
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    let outcome = loop {
         #[cfg(not(windows))]
         let polled = peek_supervisor_exit(&mut child);
         #[cfg(windows)]
         let polled = child.try_wait();
         match polled {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
-            Err(error) => {
-                return Err(attach_capability_cleanup_error(
-                    error,
-                    terminate_capability_probe(&mut child),
-                ));
-            }
+            Err(error) => break Err(error),
         }
         if Instant::now() >= deadline {
             let timeout_error = std::io::Error::new(
@@ -402,28 +410,31 @@ fn ensure_desktop_supervisor_capability_with_timeout(
                     binary.display()
                 ),
             );
-            return Err(attach_capability_cleanup_error(
-                timeout_error,
-                terminate_capability_probe(&mut child),
-            ));
+            break Err(timeout_error);
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     let cleanup_result = terminate_capability_probe(&mut child);
-    if status.success() {
-        return cleanup_result;
+    #[cfg(unix)]
+    if cleanup_result.is_err() {
+        // Transfer before launch admission settles, including when Quit has
+        // already sealed it. The registry must still represent failed cleanup.
+        retain_failed_probe(child);
     }
-    let unsupported_error = std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "the ZeroClaw kernel at {} does not support the required Desktop supervisor command; install or bundle a kernel that supports this command",
-            binary.display()
-        ),
-    );
-    Err(attach_capability_cleanup_error(
-        unsupported_error,
-        cleanup_result,
-    ))
+    match outcome {
+        Ok(status) if status.success() => cleanup_result,
+        Ok(_) => Err(attach_capability_cleanup_error(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the ZeroClaw kernel at {} does not support the required Desktop supervisor command; install or bundle a kernel that supports this command",
+                    binary.display()
+                ),
+            ),
+            cleanup_result,
+        )),
+        Err(error) => Err(attach_capability_cleanup_error(error, cleanup_result)),
+    }
 }
 
 #[cfg(not(windows))]
@@ -732,8 +743,35 @@ fn terminate_reserved_group(
     if !utility_errors.is_empty() {
         return;
     }
-    // Retire authority before the potentially reaping operation. Even an
-    // error must never let a retry reconstruct ownership from this PID.
+    let deadline = Instant::now() + UNIX_FORCE_EXIT_WAIT;
+    loop {
+        #[cfg(test)]
+        let delayed = DELAY_FORCE_EXIT_OBSERVATION.get();
+        #[cfg(not(test))]
+        let delayed = false;
+        let exited = if delayed {
+            Ok(false)
+        } else {
+            supervisor_exited(pid)
+        };
+        match exited {
+            Ok(true) => break,
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(false) => {
+                utility_errors.push("timed out waiting for forced supervisor exit; its unreaped handle is retained for retry".into());
+                return;
+            }
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    child.group_signal_authority = false;
+                }
+                utility_errors.push(format!("failed to observe forced supervisor exit: {error}"));
+                return;
+            }
+        }
+    }
+    // WNOWAIT has witnessed exit, so this reap cannot wait for the process to
+    // stop. Retire authority first: an error cannot permit signaling a reused ID.
     child.group_signal_authority = false;
     if let Err(error) = child.child.wait() {
         utility_errors.push(format!("failed to reap supervisor: {error}"));
@@ -743,6 +781,7 @@ fn terminate_reserved_group(
 #[cfg(all(unix, test))]
 thread_local! {
     pub(crate) static FAIL_GROUP_SIGNALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static DELAY_FORCE_EXIT_OBSERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(unix)]
@@ -1066,9 +1105,16 @@ mod tests {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make stale kernel fixture executable");
 
-        let error =
-            ensure_desktop_supervisor_capability_with_timeout(&binary, Duration::from_millis(100))
-                .expect_err("stale kernel capability probe must time out");
+        let error = ensure_desktop_supervisor_capability_with_timeout(
+            &binary,
+            Duration::from_millis(100),
+            |mut child| {
+                terminate_supervisor_tree(&mut child, STARTUP_CLEANUP_GRACE)
+                    .expect("retry unexpected probe cleanup failure");
+                panic!("capability probe cleanup must succeed");
+            },
+        )
+        .expect_err("stale kernel capability probe must time out");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(error.to_string().contains(&binary.display().to_string()));
         assert!(!error.to_string().contains("cleanup failed"));

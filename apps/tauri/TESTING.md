@@ -145,6 +145,10 @@ error on retry rather than signaling a potentially reused group ID.
 - **Unix:** Yes sends SIGTERM to the owned supervisor's process group, then
   SIGKILL to anything left after the grace period. The supervisor is not reaped
   until all signals are sent, reserving its PID and group ID against reuse.
+  A bounded five-second non-reaping poll follows SIGKILL. A timeout retains
+  the reservation for retry; only a witnessed exit permits reaping. Failed
+  capability-probe cleanup transfers into the same registry before admission
+  settles, so a concurrent Quit cannot silently report success.
 - **Windows:** the supervisor is created suspended inside a retained Job
   Object before it can start descendants. Yes writes an explicit stop byte to
   its private inherited stdin pipe. The supervisor forwards the request over
