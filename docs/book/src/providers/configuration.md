@@ -44,10 +44,18 @@ model = "local-model"
 think = false
 ```
 
-When `think` is unset, these providers inherit
-`[runtime] reasoning_enabled`. If both are unset, ZeroClaw sends no on/off
-override and the backend keeps its default. An alias's explicit `think` value
-takes precedence over the global switch. On the Chat Completions wire it also
+An alias's explicit `think` value takes precedence over
+`[runtime] reasoning_enabled`. When the alias leaves `think` unset:
+
+- Ollama inherits global `false`. Global `true` or an unset global switch adds
+  no on/off override, leaving backend defaults and manual controls unchanged.
+  The backend may still default to thinking. Set `think = true` on a verified
+  thinking-capable alias to explicitly enable it; an unsupported model will
+  return its backend error, without a retry that disables thinking.
+- llama.cpp inherits either global value. If both are unset, it also keeps
+  backend defaults and manual controls unchanged.
+
+On the Chat Completions wire, an applied on/off control also
 overrides conflicting manual reasoning fields in `provider_extra` or
 `chat_template_kwargs`, while preserving unrelated request options.
 

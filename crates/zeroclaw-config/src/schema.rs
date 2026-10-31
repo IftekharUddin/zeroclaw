@@ -1143,8 +1143,10 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
     /// Request thinking on or off on Ollama and llama.cpp. Overrides
-    /// `runtime.reasoning_enabled` for this alias; unset inherits that switch
-    /// or the backend default. Ollama uses `reasoning_effort` on its compatible
+    /// `runtime.reasoning_enabled` for this alias. When unset, Ollama inherits
+    /// only global false; global true or unset leaves backend defaults/manual
+    /// controls unchanged. llama.cpp inherits either global value. Ollama uses
+    /// `reasoning_effort` on its compatible
     /// API. llama.cpp additionally uses `chat_template_kwargs.enable_thinking`
     /// on the chat-completions wire. Explicit on/off controls override
     /// conflicting manual reasoning fields. Models/templates without an off
@@ -15049,6 +15051,8 @@ pub struct RuntimeConfig {
 
     /// Global reasoning override for model_providers that expose explicit controls.
     /// On Ollama and llama.cpp, an alias's `think` field takes precedence.
+    /// Ollama inherits only false; true leaves backend defaults/manual controls
+    /// unchanged unless its alias explicitly sets `think = true`.
     /// This requests a backend mode; actual suppression depends on the model
     /// and chat template supporting it.
     /// - `None`: model_provider default behavior

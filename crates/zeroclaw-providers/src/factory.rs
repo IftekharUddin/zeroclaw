@@ -371,7 +371,15 @@ fn apply_compat_options_with_local_thinking(
     opts: &ModelProviderRuntimeOptions,
     thinking_wire: Option<LocalThinkingWire>,
 ) -> Box<dyn ModelProvider> {
-    let local_thinking = thinking_wire.zip(opts.think.or(opts.reasoning_enabled));
+    let local_thinking = thinking_wire.and_then(|wire| {
+        // Ollama rejects enabled thinking on models without that capability.
+        // Only an explicit alias opt-in may enable it; global off still applies.
+        let inherited = match wire {
+            LocalThinkingWire::Ollama => opts.reasoning_enabled.filter(|enabled| !enabled),
+            LocalThinkingWire::Llamacpp => opts.reasoning_enabled,
+        };
+        opts.think.or(inherited).map(|enabled| (wire, enabled))
+    });
     if let Some(native_tools) = opts.native_tools {
         b = b.with_native_tools(native_tools);
     }
@@ -2172,6 +2180,20 @@ mod tests {
         runtime_enabled: Option<bool>,
         runtime_effort: Option<&str>,
     ) -> Vec<serde_json::Value> {
+        capture_local_thinking_wire_requests(family, base, runtime_enabled, runtime_effort, None)
+            .await
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("valid request JSON"))
+            .collect()
+    }
+
+    async fn capture_local_thinking_wire_requests(
+        family: &str,
+        base: ModelProviderConfig,
+        runtime_enabled: Option<bool>,
+        runtime_effort: Option<&str>,
+        expected_error: Option<&str>,
+    ) -> Vec<String> {
         use axum::{Json, Router, response::IntoResponse, routing::post};
         use futures_util::StreamExt;
         use std::sync::{Arc, Mutex};
@@ -2185,10 +2207,29 @@ mod tests {
         let route_captured = Arc::clone(&captured);
         let app = Router::new().route(
             if responses_wire { "/v1/responses" } else { "/v1/chat/completions" },
-            post(move |Json(body): Json<serde_json::Value>| {
+            post(move |raw: String| {
                 let captured = Arc::clone(&route_captured);
                 async move {
-                    captured.lock().unwrap().push(body.clone());
+                    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    captured.lock().unwrap().push(raw);
+                    // Ollama v0.35.0 maps non-none effort to enabled thinking
+                    // and returns 400 if the selected model cannot think.
+                    // See openai/openai.go:ThinkingFromReasoningEffort and
+                    // server/routes.go:ChatHandler in that release.
+                    let effort = body["reasoning"]["effort"]
+                        .as_str()
+                        .or_else(|| body["reasoning_effort"].as_str());
+                    if body["model"] == "fixture-no-thinking"
+                        && effort.is_some_and(|value| !value.is_empty() && value != "none")
+                    {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": {
+                                "message": "\"fixture-no-thinking\" does not support thinking",
+                                "type": "invalid_request_error", "param": null, "code": null
+                            }})),
+                        ).into_response();
+                    }
                     if responses_wire {
                         let completed = serde_json::json!({
                             "id": "resp_fixture", "object": "response", "status": "completed",
@@ -2281,13 +2322,17 @@ mod tests {
         let provider = crate::create_model_provider_from_ref(&config, &format!("{family}.local"))
             .expect("resolve configured local provider");
         let messages = vec![ChatMessage::user("Reply ok")];
-        assert_eq!(
-            provider
-                .chat_with_history(&messages, &model, None)
-                .await
-                .expect("text chat succeeds"),
-            "ok"
-        );
+        let check_response = |result: anyhow::Result<String>| match expected_error {
+            Some(expected) => {
+                let error = result
+                    .expect_err("unsupported thinking must fail")
+                    .to_string();
+                assert!(error.contains(expected), "{error}");
+                assert!(error.contains("400"), "{error}");
+            }
+            None => assert_eq!(result.expect("chat succeeds"), "ok"),
+        };
+        check_response(provider.chat_with_history(&messages, &model, None).await);
         let tools = vec![ToolSpec::new(
             "fixture_tool",
             "A synthetic test tool",
@@ -2303,9 +2348,8 @@ mod tests {
                 &model,
                 None,
             )
-            .await
-            .expect("structured chat succeeds");
-        assert_eq!(response.text.as_deref(), Some("ok"));
+            .await;
+        check_response(response.map(|response| response.text.unwrap_or_default()));
         for stream_tools in [None, Some(tools.as_slice())] {
             let mut stream = provider.stream_chat(
                 ChatRequest {
@@ -2319,19 +2363,105 @@ mod tests {
             );
             let mut text = String::new();
             let mut finals = 0;
+            let mut errors = Vec::new();
             while let Some(event) = stream.next().await {
-                match event.expect("valid local thinking stream") {
-                    StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
-                    StreamEvent::Final => finals += 1,
+                match event {
+                    Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                    Ok(StreamEvent::Final) => finals += 1,
+                    Err(error) => errors.push(error.to_string()),
                     _ => {}
                 }
             }
-            assert_eq!(text, "ok");
-            assert_eq!(finals, 1);
+            if let Some(expected) = expected_error {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert!(errors[0].contains(expected), "{errors:?}");
+                assert!(errors[0].contains("400"), "{errors:?}");
+                assert!(text.is_empty());
+                assert_eq!(finals, 0);
+            } else {
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(text, "ok");
+                assert_eq!(finals, 1);
+            }
         }
         let requests = captured.lock().unwrap().clone();
         assert_eq!(requests.len(), 4);
         requests
+    }
+
+    #[tokio::test]
+    async fn local_thinking_ollama_inherits_only_global_off() {
+        for model in ["fixture-qwen-local", "fixture-no-thinking"] {
+            for runtime_enabled in [None, Some(true), Some(false)] {
+                for think in [None, Some(true), Some(false)] {
+                    let base = ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        think,
+                        ..Default::default()
+                    };
+                    let expected = match (think, runtime_enabled) {
+                        (Some(true), _) => Some("high"),
+                        (Some(false), _) | (None, Some(false)) => Some("none"),
+                        (None, None | Some(true)) => None,
+                    };
+                    let expected_error = (model == "fixture-no-thinking" && think == Some(true))
+                        .then_some("does not support thinking");
+                    for raw in capture_local_thinking_wire_requests(
+                        "ollama",
+                        base,
+                        runtime_enabled,
+                        Some("high"),
+                        expected_error,
+                    )
+                    .await
+                    {
+                        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                        assert_eq!(body["reasoning_effort"].as_str(), expected, "{raw}");
+                        assert!(body.get("think").is_none(), "{raw}");
+                        assert!(body.get("chat_template_kwargs").is_none(), "{raw}");
+                    }
+                }
+            }
+        }
+        // Global on must preserve an operator's existing manual effort.
+        let base = ModelProviderConfig {
+            provider_extra: Some(serde_json::json!({"reasoning_effort": "low"})),
+            ..Default::default()
+        };
+        for body in capture_local_thinking_requests("ollama", base, Some(true), Some("high")).await
+        {
+            assert_eq!(body["reasoning_effort"], "low");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_serializes_one_effort_field_with_passthrough() {
+        for family in ["ollama", "llamacpp"] {
+            for think in [true, false] {
+                let base = ModelProviderConfig {
+                    think: Some(think),
+                    reasoning_effort_passthrough: true,
+                    provider_extra: Some(serde_json::json!({"reasoning_effort": "low"})),
+                    ..Default::default()
+                };
+                for raw in capture_local_thinking_wire_requests(
+                    family,
+                    base,
+                    Some(!think),
+                    Some("high"),
+                    None,
+                )
+                .await
+                {
+                    // The fixture has no nested effort or text containing the
+                    // key. Count raw bytes: parsing Value would hide duplicates
+                    // from the generic field plus flattened provider_extra.
+                    assert_eq!(raw.matches("\"reasoning_effort\"").count(), 1, "{raw}");
+                    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    assert_eq!(body["reasoning_effort"], if think { "low" } else { "none" });
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2416,6 +2546,10 @@ mod tests {
                 ),
                 (ModelProviderConfig::default(), "medium"),
             ] {
+                let base = ModelProviderConfig {
+                    think: Some(true),
+                    ..base
+                };
                 for request in capture_local_thinking_requests(family, base, Some(true), None).await
                 {
                     assert_eq!(request["reasoning_effort"], expected, "{family}: {request}");
