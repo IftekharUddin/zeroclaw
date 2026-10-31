@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::{Config, SopDecisionProvider};
 
 use super::audit::SopAuditLogger;
@@ -84,7 +85,7 @@ pub async fn dispatch_webhook_event(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &Arc<SopAuditLogger>,
     driver_handles: Option<&SopDriverHandles>,
-    live_config: &Arc<parking_lot::RwLock<Config>>,
+    live_config: &LiveConfigHandle,
     path: &str,
     payload: Option<&str>,
     admission_check: Option<SopAdmissionCheck<'_>>,
@@ -115,7 +116,7 @@ pub async fn dispatch_webhook_event(
         if let DispatchResult::Started { action, .. } = result
             && matches!(action.as_ref(), SopRunAction::ExecuteStep { .. })
         {
-            let config = SopDriverConfig::Live(Arc::clone(live_config));
+            let config = SopDriverConfig::Live(live_config.clone());
             match driver_handles {
                 Some(handles) => {
                     super::spawn_and_register_sop_driver(

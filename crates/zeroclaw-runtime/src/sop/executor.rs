@@ -9,10 +9,13 @@ use anyhow::{Context, Result};
 use super::approval::{BrokerOutcome, ResolveOutcome};
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
-use super::types::{SopRun, SopRunAction, SopStep, SopStepResult, StepToolCall};
+use super::types::{
+    SopExecutionWitness, SopRun, SopRunAction, SopStep, SopStepResult, StepToolCall,
+};
 
 use crate::agent::history::truncate_tool_result;
 use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
+use crate::live_config_authority::AgentExecutionCapability;
 
 const MAX_STEP_TOOL_CALLS: usize = 256;
 const MAX_STEP_TOOL_OUTPUT_CHARS: usize = 4096;
@@ -147,6 +150,22 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
         Ok(mut queue) => queue.drain(..).collect(),
         Err(poisoned) => poisoned.into_inner().drain(..).collect(),
     }
+}
+
+fn validate_managed_execution_witness(
+    engine: &Arc<Mutex<SopEngine>>,
+    execution_capability: Option<&AgentExecutionCapability>,
+    execution_witness: Option<&SopExecutionWitness>,
+) -> Result<()> {
+    let managed = execution_capability.is_some()
+        || match engine.lock() {
+            Ok(engine) => engine.has_execution_capability(),
+            Err(poisoned) => poisoned.into_inner().has_execution_capability(),
+        };
+    if managed && execution_witness.is_none() {
+        anyhow::bail!("managed SOP ExecuteStep is missing its authority witness");
+    }
+    Ok(())
 }
 
 /// Failure recorded for a headless step whose scoped tool policy could not be
@@ -404,17 +423,17 @@ impl SopDriverSink {
     }
 }
 
-/// Where a headless driver reads the daemon configuration that a step runs
-/// under: whether its agent is configured and enabled, the step's tool policy,
-/// and the turn itself. The driver reads it once per step, at the step's
-/// execution boundary, after every wait that step makes.
+/// Fallback configuration for headless steps without a managed execution
+/// witness. The driver reads it per step after its engine waits. Managed
+/// actions use their witness's admitted config and alias instead, including
+/// the configured/enabled check, policy construction and the turn.
 #[derive(Clone)]
 pub enum SopDriverConfig {
     /// A copy fixed when the driver was requested.
     Snapshot(Arc<zeroclaw_config::schema::Config>),
     /// The daemon's live configuration, so an agent disabled or re-profiled
     /// while the driver waited is seen before the step runs as it.
-    Live(Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>),
+    Live(zeroclaw_config::live::LiveConfigHandle),
 }
 
 impl SopDriverConfig {
@@ -444,6 +463,16 @@ pub fn spawn_headless_run_driver(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_headless_run_driver_with_capability(config, engine, audit, first_action, None)
+}
+
+pub fn spawn_headless_run_driver_with_capability(
+    config: impl Into<SopDriverConfig>,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let lease = lease_for_first_action(&engine, &first_action).ok()?;
     Some(spawn_leased_driver(
         config.into(),
@@ -451,6 +480,7 @@ pub fn spawn_headless_run_driver(
         audit,
         first_action,
         lease,
+        execution_capability,
     ))
 }
 
@@ -488,12 +518,21 @@ fn spawn_leased_driver(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
     lease: Option<HeadlessDriverLease>,
+    execution_capability: Option<AgentExecutionCapability>,
 ) -> tokio::task::JoinHandle<()> {
     zeroclaw_spawn::spawn!(async move {
         // The driver hands the lease back the moment it produces an action it
         // will not keep driving; holding it here is the safety net for every
         // other exit path (advance failure, budget exhausted, terminal).
-        drive_headless_run(config, engine, audit, first_action, lease).await;
+        drive_headless_run(
+            config,
+            engine,
+            audit,
+            first_action,
+            lease,
+            execution_capability,
+        )
+        .await;
     })
 }
 
@@ -586,6 +625,24 @@ pub fn spawn_and_register_sop_driver(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) -> bool {
+    spawn_and_register_sop_driver_with_capability(
+        handles,
+        config,
+        engine,
+        audit,
+        first_action,
+        None,
+    )
+}
+
+pub fn spawn_and_register_sop_driver_with_capability(
+    handles: &SopDriverHandles,
+    config: impl Into<SopDriverConfig>,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> bool {
     let config = config.into();
     // Captured before the closure consumes the action, because a refusal has to
     // name the run it is abandoning.
@@ -600,15 +657,26 @@ pub fn spawn_and_register_sop_driver(
     let engine_for_refusal = Arc::clone(&engine);
     let engine_for_spawn = Arc::clone(&engine);
     let admitted = admit_sop_driver_for_run(handles, &run_id, &engine, move || {
-        spawn_leased_driver(config, engine_for_spawn, audit, first_action, lease)
+        spawn_leased_driver(
+            config,
+            engine_for_spawn,
+            audit,
+            first_action,
+            lease,
+            execution_capability,
+        )
     });
     if !admitted {
-        settle_refused_run(&engine_for_refusal, &run_id);
+        settle_undriven_run(
+            &engine_for_refusal,
+            &run_id,
+            crate::sop::engine::OrphanedRunSettlement::DrainedBeforeAdmission,
+        );
     }
     admitted
 }
 
-/// Take the run a refused driver would have advanced to a terminal state.
+/// Settle the run when its driver is refused or stops at execution rejection.
 ///
 /// Refusing the driver is only half the boundary. The producers reach here with
 /// the run already started and persisted — an approval resume, for instance,
@@ -618,22 +686,23 @@ pub fn spawn_and_register_sop_driver(
 /// and maintenance keeps renewing, so expiry never recovers it: the run holds
 /// concurrency capacity for as long as the daemon lives.
 ///
-/// Settling it here, at the single point every generation-owned producer funnels
-/// through, is what keeps that from depending on each caller remembering to.
+/// Both generation admission and execution rejection use the engine's retry
+/// owner so a failed terminal write cannot abandon the run.
 /// The engine lock is taken only after `admit_sop_driver` has released the
 /// registry lock, and no producer holds the engine lock across this call.
-fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+fn settle_undriven_run(
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+    kind: crate::sop::engine::OrphanedRunSettlement,
+) {
     let mut guard = match engine.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     // Through the owning path: if this terminal write fails, the engine keeps
-    // the run for maintenance to settle again. No driver was admitted, so
-    // nothing else would ever make that write.
-    if let Err(e) = guard.settle_orphaned_run(
-        run_id,
-        crate::sop::engine::OrphanedRunSettlement::DrainedBeforeAdmission,
-    ) {
+    // the run for maintenance to settle again. No driver will advance the
+    // run, so nothing else would ever make that write.
+    if let Err(e) = guard.settle_orphaned_run(run_id, kind) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -642,7 +711,7 @@ fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
                     "run_id": run_id,
                     "error": e.to_string(),
                 })),
-            "Could not settle a SOP run whose driver was refused; it stays active and SOP \
+            "Could not settle a SOP run no driver will advance; it stays active and SOP \
              maintenance retries the terminal write until it lands"
         );
     }
@@ -711,6 +780,17 @@ pub fn drive_resumed_broker_action(
     handles: Option<&SopDriverHandles>,
     outcome: &BrokerOutcome,
 ) {
+    drive_resumed_broker_action_with_capability(config, engine, audit, handles, outcome, None);
+}
+
+pub fn drive_resumed_broker_action_with_capability(
+    config: &zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    handles: Option<&SopDriverHandles>,
+    outcome: &BrokerOutcome,
+    execution_capability: Option<AgentExecutionCapability>,
+) {
     let BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) = outcome else {
         return;
     };
@@ -724,21 +804,23 @@ pub fn drive_resumed_broker_action(
         // and creation share one lock, so that case refuses the driver instead
         // of starting one nothing will drain.
         Some(handles) => {
-            spawn_and_register_sop_driver(
+            spawn_and_register_sop_driver_with_capability(
                 handles,
                 config.clone(),
                 engine,
                 audit,
                 action.as_ref().clone(),
+                execution_capability,
             );
         }
         // No generation supervisor on this surface (a one-shot command): the
         // process ends with the command, so the driver cannot outlive policy.
-        None => drop(spawn_headless_run_driver(
+        None => drop(spawn_headless_run_driver_with_capability(
             config.clone(),
             engine,
             audit,
             action.as_ref().clone(),
+            execution_capability,
         )),
     }
 }
@@ -758,7 +840,12 @@ fn headless_step_agent<'a>(
     step: &'a SopStep,
     run_initiator: Option<&'a str>,
 ) -> Result<&'a str> {
-    let alias = step
+    let alias = headless_step_owner(step, run_initiator)?;
+    configured_headless_step_agent(config, step.number, alias)
+}
+
+fn headless_step_owner<'a>(step: &'a SopStep, run_initiator: Option<&'a str>) -> Result<&'a str> {
+    step
         .agent
         .as_deref()
         .map(str::trim)
@@ -778,11 +865,18 @@ fn headless_step_agent<'a>(
                  (or on the step). Refusing to run an unattended step as an unrelated agent.",
                 step.number
             ))
-        })?;
+        })
+}
+
+fn configured_headless_step_agent<'a>(
+    config: &zeroclaw_config::schema::Config,
+    step_number: u32,
+    alias: &'a str,
+) -> Result<&'a str> {
     let Some(agent) = config.agents.get(alias) else {
         anyhow::bail!(
             "SOP step {} names agent '{alias}', which is not a configured agent",
-            step.number
+            step_number
         );
     };
     // `enabled = false` is the operator withdrawing an agent from service.
@@ -792,7 +886,7 @@ fn headless_step_agent<'a>(
     if !agent.enabled {
         anyhow::bail!(
             "SOP step {} names agent '{alias}', which is disabled",
-            step.number
+            step_number
         );
     }
     Ok(alias)
@@ -826,6 +920,7 @@ async fn drive_headless_run(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
     mut lease: Option<HeadlessDriverLease>,
+    execution_capability: Option<AgentExecutionCapability>,
 ) {
     use crate::sop::types::SopStepStatus;
 
@@ -836,7 +931,42 @@ async fn drive_headless_run(
                 run_id,
                 step,
                 context,
+                execution_witness,
             } => {
+                if let Err(error) = validate_managed_execution_witness(
+                    &engine,
+                    execution_capability.as_ref(),
+                    execution_witness.as_ref(),
+                ) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                        "SOP headless driver: managed ExecuteStep witness validation failed"
+                    );
+                    settle_undriven_run(
+                        &engine,
+                        &run_id,
+                        crate::sop::engine::OrphanedRunSettlement::ExecutionRejected,
+                    );
+                    return;
+                }
+                // Read per action, not once per driver: the run is the durable
+                // record of who started it, and it survives the daemon
+                // generation the initiating turn belonged to.
+                let run_initiator = {
+                    let guard = match engine.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard
+                        .get_run(&run_id)
+                        .and_then(|run| run.initiating_agent.clone())
+                };
                 let cancel_at_boundary = {
                     let mut guard = match engine.lock() {
                         Ok(g) => g,
@@ -868,36 +998,67 @@ async fn drive_headless_run(
                     }
                 }
                 let started_at = crate::sop::engine::now_iso8601();
-                // Read per action, not once per driver: the run is the durable
-                // record of who started it, and it survives the daemon
-                // generation the initiating turn belonged to.
-                let run_initiator = {
-                    let guard = match engine.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    guard
-                        .get_run(&run_id)
-                        .and_then(|run| run.initiating_agent.clone())
-                };
-                // Also taken under the engine lock, so it comes before the
-                // configuration is read below rather than after it.
+                // Take the remaining engine view before reading the step's config.
                 let scope = headless_step_scope(&engine, &run_id, &step);
                 #[cfg(test)]
                 step_boundary_pause::reached(&engine, &run_id).await;
-                // The step's execution boundary. Every wait this step makes
-                // (the driver lease, generation admission, the engine lock) is
-                // behind it, and nothing from here to the turn waits, so the
-                // owner check, the tool policy and the turn all use the
-                // configuration as it is now rather than as it was when the
-                // driver was requested.
-                let config = config_source.current();
-                let resolved_agent = headless_step_agent(&config, &step, run_initiator.as_deref());
+                // Resolve only the procedure's owner before witness admission.
+                // A fallback snapshot cannot decide whether a managed alias is
+                // currently configured or enabled.
+                let selected_agent =
+                    headless_step_owner(&step, run_initiator.as_deref()).map(str::to_string);
+                let execution_admission = match selected_agent
+                    .as_deref()
+                    .ok()
+                    .and_then(|alias| {
+                        execution_witness
+                            .as_ref()
+                            .map(|witness| witness.admit(alias))
+                    })
+                    .transpose()
+                {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                            "SOP headless driver: authority witness rejected before target execution"
+                        );
+                        settle_undriven_run(
+                            &engine,
+                            &run_id,
+                            crate::sop::engine::OrphanedRunSettlement::ExecutionRejected,
+                        );
+                        return;
+                    }
+                };
+                let resolved_agent = match execution_admission.as_ref() {
+                    Some(admission) => {
+                        let config = admission.config().as_ref().clone();
+                        configured_headless_step_agent(&config, step.number, admission.alias())
+                            .map(str::to_string)
+                            .map(|alias| (config, alias))
+                    }
+                    None => selected_agent.and_then(|_| {
+                        let config = config_source.current();
+                        headless_step_agent(&config, &step, run_initiator.as_deref())
+                            .map(str::to_string)
+                            .map(|alias| (config, alias))
+                    }),
+                };
                 // Attribution follows execution: a step that never ran — no
                 // owner, or an owner naming an unconfigured agent — is recorded
                 // against no agent at all, so a refusal can never read as an
                 // agent having done the work.
-                let effective_agent = resolved_agent.as_ref().ok().map(|a| (*a).to_string());
+                let effective_agent = resolved_agent.as_ref().ok().map(|(_, alias)| alias.clone());
                 // The audit sink the live path scopes around a delegated step.
                 // Without it a headless step records `tool_calls: []` — and an
                 // unattended run is precisely the one whose record of what it
@@ -917,87 +1078,92 @@ async fn drive_headless_run(
                     // policy construction is not safe: it touches the
                     // filesystem, so a transient error can clear on the retry
                     // and the turn would then run without the exclusions.
-                    Ok(agent_alias) => match step_turn_security(&config, agent_alias) {
-                        Ok(policy) => {
-                            let session_path = std::path::PathBuf::from(format!(
-                                "sop-{run_id}-step-{}",
-                                step.number
-                            ));
-                            // The scope is both handed to this run and published
-                            // on the task: a tool that starts a child run
-                            // (child-agent spawning) inherits the same boundary,
-                            // so the child cannot regain tools this step denies,
-                            // including the SOP control surface the step turn
-                            // always drops. Boxed innermost. The turn future is
-                            // large, and in a debug build composing it inline
-                            // with both scope wrappers overflows the worker stack
-                            // while the value is still being built on it, before
-                            // `Box::pin` can move it to the heap.
-                            let task_scope = scope.clone();
-                            let turn = Box::pin(crate::agent::run(
-                                config.clone(),
-                                agent_alias,
-                                Some(context),
-                                None,
-                                None,
-                                config
-                                    .model_provider_for_agent(agent_alias)
-                                    .and_then(|e| e.temperature),
-                                vec![],
-                                false,
-                                Some(session_path),
-                                None,
-                                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                                crate::agent::loop_::AgentRunOverrides {
-                                    security: Some(Arc::new(policy)),
-                                    sop_step_scope: Some(scope),
-                                    // Runtime-owned step identifier, matching
-                                    // the engine's nested-SOP turn-id shape.
-                                    internal_principal: Some(
-                                        zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                                            task: format!("sop:{run_id}:step:{}", step.number),
-                                        },
-                                    ),
-                                    ..Default::default()
-                                },
-                            ));
-                            // Canonical run attribution for every provider and
-                            // tool event the step turn emits, so a run-filtered
-                            // log query (and an OTLP collector) sees what the
-                            // step actually ran, not only its lifecycle rows.
-                            zeroclaw_log::scope!(
-                                sop_run_id: run_id.as_str(),
-                                =>
-                                scope_step_call_sink(
-                                    call_sink.clone(),
-                                    crate::sop::active_scope::with_active_headless_step_scope(
-                                        task_scope, turn,
-                                    ),
+                    Ok((effective_config, agent_alias)) => {
+                        match step_turn_security(&effective_config, &agent_alias) {
+                            Ok(policy) => {
+                                let session_path = std::path::PathBuf::from(format!(
+                                    "sop-{run_id}-step-{}",
+                                    step.number
+                                ));
+                                // The scope is both handed to this run and published
+                                // on the task: a tool that starts a child run
+                                // (child-agent spawning) inherits the same boundary,
+                                // so the child cannot regain tools this step denies,
+                                // including the SOP control surface the step turn
+                                // always drops. Boxed innermost. The turn future is
+                                // large, and in a debug build composing it inline
+                                // with both scope wrappers overflows the worker stack
+                                // while the value is still being built on it, before
+                                // `Box::pin` can move it to the heap.
+                                let task_scope = scope.clone();
+                                let turn = Box::pin(crate::agent::run(
+                                    effective_config.clone(),
+                                    &agent_alias,
+                                    Some(context),
+                                    None,
+                                    None,
+                                    effective_config
+                                        .model_provider_for_agent(&agent_alias)
+                                        .and_then(|e| e.temperature),
+                                    vec![],
+                                    false,
+                                    Some(session_path),
+                                    None,
+                                    zeroclaw_api::ingress::TurnOrigin::Daemon,
+                                    crate::agent::loop_::AgentRunOverrides {
+                                        security: Some(Arc::new(policy)),
+                                        execution_admission: execution_admission.clone(),
+                                        sop_step_scope: Some(scope),
+                                        // Runtime-owned step identifier, matching
+                                        // the engine's nested-SOP turn-id shape.
+                                        internal_principal: Some(
+                                            zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                                                task: format!("sop:{run_id}:step:{}", step.number),
+                                            },
+                                        ),
+                                        ..Default::default()
+                                    },
+                                ));
+                                // Canonical run attribution for every provider and
+                                // tool event the step turn emits, so a run-filtered
+                                // log query (and an OTLP collector) sees what the
+                                // step actually ran, not only its lifecycle rows.
+                                zeroclaw_log::scope!(
+                                    sop_run_id: run_id.as_str(),
+                                    =>
+                                    scope_step_call_sink(
+                                        call_sink.clone(),
+                                        crate::sop::active_scope::with_active_headless_step_scope(
+                                            task_scope, turn,
+                                        ),
+                                    )
                                 )
-                            )
-                            .await
+                                .await
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "run_id": run_id,
+                                            "step": step.number,
+                                            "agent": agent_alias,
+                                            "error": format!("{e:#}"),
+                                        })
+                                    ),
+                                    "SOP headless driver: step tool scope unavailable; failing the step"
+                                );
+                                Err(anyhow::Error::msg(format!(
+                                    "{STEP_TURN_SCOPE_UNAVAILABLE}: {e:#}"
+                                )))
+                            }
                         }
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Reject
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "run_id": run_id,
-                                    "step": step.number,
-                                    "agent": agent_alias,
-                                    "error": format!("{e:#}"),
-                                })),
-                                "SOP headless driver: step tool scope unavailable; failing the step"
-                            );
-                            Err(anyhow::Error::msg(format!(
-                                "{STEP_TURN_SCOPE_UNAVAILABLE}: {e:#}"
-                            )))
-                        }
-                    },
+                    }
                     Err(e) => Err(e),
                 };
                 // Drained for the failure arm too: a step that failed partway
@@ -1036,6 +1202,7 @@ async fn drive_headless_run(
                         )
                         .await;
                         action = next;
+                        drop(execution_admission);
                     }
                     Err(e) => {
                         ::zeroclaw_log::record!(
@@ -1316,10 +1483,9 @@ async fn audit_sop_step_emit(
     }
 }
 
-/// A test-only pause at a headless step's execution boundary: after the last
-/// wait the step makes and immediately before it reads the configuration it
-/// runs under. A test parks a driver here to change the configuration at the
-/// latest moment it can still take effect.
+/// A test-only pause after a headless step's last engine wait, immediately
+/// before it resolves its execution admission or fallback configuration.
+/// A test parks a driver here to change the configuration before that boundary.
 #[cfg(test)]
 pub(crate) mod step_boundary_pause {
     use std::collections::HashMap;
@@ -1371,6 +1537,7 @@ pub(crate) mod step_boundary_pause {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_config_authority::LiveConfigAuthority;
     use crate::sop::metrics::SopMetricsCollector;
     use crate::sop::store::{InMemoryRunStore, SopRunStore};
     use crate::sop::types::{
@@ -1418,6 +1585,320 @@ mod tests {
         match action {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn managed_sop_consumers_reject_missing_execution_witness() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let engine = Arc::new(Mutex::new(
+            SopEngine::new(SopConfig::default())
+                .with_execution_capability(authority.execution_capability()),
+        ));
+
+        let error = validate_managed_execution_witness(&engine, None, None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "managed SOP ExecuteStep is missing its authority witness"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_sop_driver_keeps_admitted_config_after_the_step_wait() {
+        for case in [
+            "unchanged",
+            "reprofiled",
+            "fallback-missing",
+            "fallback-disabled",
+            "canonical-disabled",
+            "canonical-deleted",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = zeroclaw_config::schema::Config {
+                data_dir: temp.path().join("data"),
+                config_path: temp.path().join("config.toml"),
+                ..Default::default()
+            };
+            config.agents.insert(
+                "alpha".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    risk_profile: "missing-original-profile".into(),
+                    workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                        path: Some(temp.path().join("workspace")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            if case == "reprofiled" {
+                config
+                    .risk_profiles
+                    .insert("original".into(), Default::default());
+                config.agents.get_mut("alpha").unwrap().risk_profile = "original".into();
+                assert!(step_turn_security(&config, "alpha").is_ok());
+            }
+            let authority = LiveConfigAuthority::new(config.clone());
+            let mut fallback = config.clone();
+            fallback
+                .risk_profiles
+                .insert("fallback".into(), Default::default());
+            fallback.agents.get_mut("alpha").unwrap().risk_profile = "fallback".into();
+            assert!(step_turn_security(&fallback, "alpha").is_ok());
+            match case {
+                "fallback-missing" => {
+                    fallback.agents.remove("alpha");
+                }
+                "fallback-disabled" => fallback.agents.get_mut("alpha").unwrap().enabled = false,
+                _ => {}
+            }
+            let name = format!("managed-driver-{case}");
+            let mut sop = test_sop(&name);
+            sop.agent = Some("alpha".into());
+            let mut engine = SopEngine::new(SopConfig::default())
+                .with_execution_capability(authority.execution_capability());
+            engine.set_sops_for_test(vec![sop]);
+            let action = engine.start_run(&name, manual_event()).unwrap();
+            let run_id = extract_run_id(&action);
+            let engine = Arc::new(Mutex::new(engine));
+            let (reached, release) = step_boundary_pause::arm(&name);
+            let driver = spawn_headless_run_driver_with_capability(
+                fallback,
+                engine.clone(),
+                None,
+                action,
+                Some(authority.execution_capability()),
+            )
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), reached.notified())
+                .await
+                .expect("managed driver reaches the final step wait");
+            assert!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .get_run(&run_id)
+                    .unwrap()
+                    .step_results
+                    .is_empty()
+            );
+            match case {
+                "reprofiled" => {
+                    config.agents.get_mut("alpha").unwrap().risk_profile =
+                        "missing-replacement-profile".into();
+                    authority.publish_for_test(config);
+                }
+                "canonical-disabled" => {
+                    config.agents.get_mut("alpha").unwrap().enabled = false;
+                    authority.publish_for_test(config);
+                }
+                "canonical-deleted" => {
+                    let mut delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+                    config.agents.remove("alpha");
+                    authority.publish_for_test(config);
+                    delete.commit_destructive_mutation();
+                }
+                _ => {}
+            }
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+                .await
+                .expect("managed driver records its result")
+                .unwrap();
+            let guard = engine.lock().unwrap();
+            let run = guard.get_run(&run_id).unwrap();
+            if case == "canonical-deleted" {
+                assert_eq!(run.status, SopRunStatus::Cancelled);
+                assert!(run.step_results.is_empty());
+                assert!(!guard.active_runs().contains_key(&run_id));
+            } else {
+                let step = &run.step_results[0];
+                assert_eq!(step.status, SopStepStatus::Failed);
+                if case == "canonical-disabled" {
+                    assert_eq!(step.effective_agent, None);
+                    assert!(
+                        step.output.contains("'alpha', which is disabled"),
+                        "{}",
+                        step.output
+                    );
+                    assert!(!step.output.contains(STEP_TURN_SCOPE_UNAVAILABLE));
+                } else {
+                    // The canonical missing profile refuses the step before any
+                    // model/tool turn, unlike the proven buildable fallback policy.
+                    // Absent/disabled fallback state cannot block this owner check.
+                    assert_eq!(step.effective_agent.as_deref(), Some("alpha"), "{case}");
+                    assert!(
+                        step.output.contains(STEP_TURN_SCOPE_UNAVAILABLE),
+                        "{}",
+                        step.output
+                    );
+                }
+                assert!(step.tool_calls.is_empty());
+            }
+            assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_sop_settles_rejected_action_without_executing() {
+        for rejection in ["stale", "closed", "missing"] {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.agents.insert("alpha".into(), Default::default());
+            let authority = LiveConfigAuthority::new(config.clone());
+            let store = Arc::new(InMemoryRunStore::new());
+            let mut engine = SopEngine::new(SopConfig::default())
+                .with_store(store.clone())
+                .with_execution_capability(authority.execution_capability());
+            let mut sop = test_sop("queued");
+            sop.agent = Some("alpha".into());
+            engine.set_sops_for_test(vec![sop]);
+            let mut action = engine.start_run("queued", manual_event()).unwrap();
+            let run_id = extract_run_id(&action);
+            match rejection {
+                "closed" => authority.close_agent_lifecycle(),
+                "stale" => {
+                    let mut delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+                    delete.commit_destructive_mutation();
+                    drop(delete);
+                }
+                "missing" => {
+                    if let SopRunAction::ExecuteStep {
+                        execution_witness, ..
+                    } = &mut action
+                    {
+                        *execution_witness = None;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(store.claim_counts("queued").unwrap().0, 1);
+            let engine = Arc::new(Mutex::new(engine));
+            drive_headless_run(
+                config.into(),
+                engine.clone(),
+                None,
+                action,
+                None,
+                Some(authority.execution_capability()),
+            )
+            .await;
+            let guard = engine.lock().unwrap();
+            let run = guard.get_run(&run_id).unwrap();
+            assert_eq!(run.status, SopRunStatus::Cancelled);
+            assert!(run.step_results.is_empty());
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert!(!guard.has_pending_orphan_settlement(&run_id));
+            assert_eq!(
+                store.load_run(&run_id).unwrap().unwrap().run.status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(store.claim_counts("queued").unwrap().0, 0);
+            assert_eq!(
+                store
+                    .list_events(&run_id)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.kind == "run_execution_rejected")
+                    .count(),
+                1
+            );
+            assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_preflight_rejection_settles_and_retries_without_holding_capacity() {
+        use crate::sop::store::testing::FailFirstTerminalWrite;
+
+        for fail_write in [false, true] {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.agents.insert("alpha".into(), Default::default());
+            let authority = LiveConfigAuthority::new(config.clone());
+            let delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+            let failing = Arc::new(FailFirstTerminalWrite::new(InMemoryRunStore::new()));
+            let store: Arc<dyn SopRunStore> = if fail_write {
+                failing.clone()
+            } else {
+                Arc::new(InMemoryRunStore::new())
+            };
+            let sop_name = "delete-preflight";
+            let mut engine = SopEngine::new(SopConfig::default())
+                .with_store(store.clone())
+                .with_execution_capability(authority.execution_capability());
+            let mut sop = test_sop(sop_name);
+            sop.agent = Some("alpha".into());
+            engine.set_sops_for_test(vec![sop]);
+            let action = engine.start_run(sop_name, manual_event()).unwrap();
+            let run_id = extract_run_id(&action);
+            assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+            let engine = Arc::new(Mutex::new(engine));
+            let lease = lease_for_first_action(&engine, &action).unwrap();
+            drive_headless_run(
+                config.into(),
+                engine.clone(),
+                None,
+                action,
+                lease,
+                Some(authority.execution_capability()),
+            )
+            .await;
+
+            // Preflight refused deletion; the alias remains usable, but this
+            // run has no driver and must not retain capacity indefinitely.
+            drop(delete);
+            assert!(authority.execution_capability().admit("alpha").is_ok());
+            assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
+            let mut guard = engine.lock().unwrap();
+            if fail_write {
+                assert!(failing.fired());
+                assert_eq!(
+                    guard.get_run(&run_id).unwrap().status,
+                    SopRunStatus::Running
+                );
+                assert!(guard.has_pending_orphan_settlement(&run_id));
+                assert_eq!(
+                    store.load_run(&run_id).unwrap().unwrap().run.status,
+                    SopRunStatus::Running
+                );
+                assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+                assert_eq!(guard.run_maintenance_tick().settled_orphaned_runs, 1);
+            }
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled
+            );
+            assert!(guard.get_run(&run_id).unwrap().step_results.is_empty());
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert!(!guard.has_pending_orphan_settlement(&run_id));
+            assert_eq!(
+                store.load_run(&run_id).unwrap().unwrap().run.status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(store.claim_counts(sop_name).unwrap().0, 0);
+            let events = store.list_events(&run_id).unwrap();
+            let rejected: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == "run_execution_rejected")
+                .collect();
+            assert_eq!(rejected.len(), 1);
+            assert!(
+                rejected[0]
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("before target execution")
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.kind == "run_generation_drained")
+            );
+            assert_eq!(guard.run_maintenance_tick().settled_orphaned_runs, 0);
+            assert!(guard.start_run(sop_name, manual_event()).is_ok());
         }
     }
 
@@ -1770,7 +2251,7 @@ mod tests {
                 ..zeroclaw_config::schema::AliasedAgentConfig::default()
             },
         );
-        drive_headless_run(config.into(), Arc::clone(&engine), None, action, None).await;
+        drive_headless_run(config.into(), Arc::clone(&engine), None, action, None, None).await;
 
         let guard = engine.lock().unwrap();
         let run = guard.get_run(&run_id).expect("run is still known");
@@ -1887,6 +2368,7 @@ mod tests {
             run_id: "run-1".to_string(),
             step: SopStep::default(),
             context: String::new(),
+            execution_witness: None,
         };
         assert_eq!(driven_run_id(&step_action), Some("run-1"));
         let deterministic = SopRunAction::DeterministicStep {
