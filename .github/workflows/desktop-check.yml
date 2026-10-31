@@ -71,3 +71,47 @@ jobs:
 
       - name: Clippy (zeroclaw-desktop)
         run: cargo clippy -p zeroclaw-desktop --all-targets -- -D warnings
+
+      - name: Native RPC endpoint derivation
+        if: runner.os == 'Windows' && !cancelled()
+        run: cargo test --locked -p zeroclaw-api --lib rpc_endpoint
+
+      - name: Native RPC client pipe migration
+        if: runner.os == 'Windows' && !cancelled()
+        run: cargo test --locked -p zeroclaw-rpc-client --lib local_pipe_
+
+      - name: Native ZeroCode endpoint selection
+        if: runner.os == 'Windows' && !cancelled()
+        run: cargo test --locked -p zerocode --bin zerocode client::endpoint_tests
+
+      - name: Native ZeroCode process refusal
+        if: runner.os == 'Windows' && !cancelled()
+        run: cargo test --locked -p zerocode --test local_endpoint_migration
+
+      - name: Native released-daemon migration
+        if: runner.os == 'Windows' && !cancelled()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixtureRoot = Join-Path $env:RUNNER_TEMP ('zeroclaw-release-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $fixtureRoot | Out-Null
+          try {
+            $archive = Join-Path $fixtureRoot 'release.zip'
+            $expectedDigest = '46ede57760dfccca71ed94f135e149b103dff12a76a63fd8d13c2a5fe097bca7'
+            Invoke-WebRequest -Uri 'https://github.com/zeroclaw-labs/zeroclaw/releases/download/v0.8.7/zeroclaw-x86_64-pc-windows-msvc.zip' -OutFile $archive
+            $actualDigest = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualDigest -ne $expectedDigest) { throw 'Released archive checksum mismatch' }
+            Write-Output "Verified v0.8.7 archive SHA256: $actualDigest"
+            $unpacked = Join-Path $fixtureRoot 'unpacked'
+            Expand-Archive -Path $archive -DestinationPath $unpacked
+            $binaries = @(Get-ChildItem -Path $unpacked -Recurse -File -Filter 'zeroclaw.exe')
+            if ($binaries.Count -ne 1) { throw 'Expected exactly one released zeroclaw.exe' }
+            $env:ZEROCLAW_LEGACY_DAEMON_EXE = $binaries[0].FullName
+            $env:ZEROCLAW_LEGACY_RELEASE_SHA256 = $actualDigest
+            cargo test --locked -p zeroclaw-rpc-client --test released_windows_daemon -- --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'Released daemon compatibility tests failed' }
+          } finally {
+            Remove-Item Env:ZEROCLAW_LEGACY_DAEMON_EXE -ErrorAction SilentlyContinue
+            Remove-Item Env:ZEROCLAW_LEGACY_RELEASE_SHA256 -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
