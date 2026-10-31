@@ -102,10 +102,15 @@ open /Applications/ZeroClaw.app
   usable. After completion, relaunching the app lands on the dashboard.
 - **Returning run** (agent already configured): the dashboard opens on the
   normal dashboard, not the Quickstart.
-- Close the dashboard window: the app and its daemon keep running in the tray.
+- Close the dashboard window: the app keeps running in the tray. Clicking the
+  tray icon, choosing **Show Dashboard** or **Agent Chat**, or launching the
+  app again brings the same window back, restored if it was minimized and
+  without reloading the page.
+- Close the splash before the dashboard opens: the same routes reopen the
+  splash, which shows any startup error again (such as a missing `zeroclaw`
+  binary) and hands off to the dashboard once the gateway is healthy.
 - Quit from the tray when this app instance started the daemon: the daemon
-  stops too (`pgrep -fl 'zeroclaw daemon'` shows nothing). Relaunch → splash →
-  dashboard again with a new daemon.
+  stops too. Relaunch opens the splash and dashboard with a new daemon.
 - Start `zeroclaw daemon` yourself first, then launch and Quit the app: the app
   reused your daemon, so it keeps running after Quit.
 - Inspect `<config-dir>/logs/zeroclaw-desktop-daemon.log` after startup to verify combined stdout/stderr capture; the file stays at or below 8 MiB and keeps the newest tail during continuous output.
@@ -144,6 +149,8 @@ ACL design.
 
 The app builds and runs the same splash → gateway → Quickstart flow. Bundle
 targets are unchanged (`.deb`/`.AppImage` on Linux, `.exe`/`.msi` on Windows).
+The window checks above apply on both. Linux tray icons report no clicks, so
+use the tray menu there.
 Screen capture and AppleScript capabilities remain macOS-only; the other
 platforms register stubs that return an unsupported-platform error.
 
@@ -161,5 +168,5 @@ cargo tauri build          # native build on each platform
 ```yaml
 # Suggested when #6501 lands — run all three at minimum on cargo check
 matrix:
-  os: [macos-14, ubuntu-22.04, windows-2022]
+  os: [macos-15, ubuntu-22.04, windows-2022]
 ```

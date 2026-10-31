@@ -9,25 +9,26 @@ pub mod macos;
 pub mod ownership;
 pub mod state;
 pub mod tray;
+pub mod window;
 
 use gateway_client::GatewayClient;
 use ownership::SharedOwnedProcesses;
-use state::shared_state;
+use state::{SplashStatus, shared_state};
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 /// Loopback port the desktop app expects the gateway/daemon on. Matches the
 /// port baked into [`state::AppState::default`]'s `gateway_url`.
 const GATEWAY_PORT: u16 = 42617;
 
-/// Status the splash listens for (`zeroclaw://splash-status`). Drives the
-/// splash copy when we're starting our own daemon or hit a problem; the happy
-/// path is covered by the splash's own health polling, so a missed event is
-/// harmless.
-#[derive(Clone, serde::Serialize)]
-struct SplashStatus {
-    /// `starting` | `error` | `missing`.
-    kind: &'static str,
-    message: String,
+/// Record a startup failure in shared state, then show it on the splash. A
+/// splash opened later reads it back through `get_startup_failure`.
+async fn report_startup_failure(
+    app: &tauri::AppHandle,
+    state: &state::SharedState,
+    failure: SplashStatus,
+) {
+    state.write().await.startup_failure = Some(failure.clone());
+    let _ = app.emit("zeroclaw://splash-status", failure);
 }
 
 /// Ensure a gateway/daemon is reachable: reuse one if it already answers,
@@ -67,29 +68,42 @@ async fn ensure_daemon(
                 },
             );
             if let Err(e) = owned.launch(&bin, GATEWAY_PORT) {
-                let _ = app.emit(
-                    "zeroclaw://splash-status",
+                report_startup_failure(
+                    &app,
+                    &state,
                     SplashStatus {
                         kind: "error",
                         message: format!("Couldn't start the ZeroClaw daemon: {e}"),
                     },
-                );
+                )
+                .await;
             }
             // On success the splash's health poll detects the daemon and
             // calls `open_dashboard`.
         }
         None => {
-            let _ = app.emit(
-                "zeroclaw://splash-status",
+            report_startup_failure(
+                &app,
+                &state,
                 SplashStatus {
                     kind: "missing",
                     message: "Couldn't find the `zeroclaw` binary. Install ZeroClaw \
                               (or start a daemon yourself) and reopen the app."
                         .to_string(),
                 },
-            );
+            )
+            .await;
         }
     }
+}
+
+/// The startup failure, if any, for a splash that opened after it was
+/// reported, such as one reopened from the tray.
+#[tauri::command]
+async fn get_startup_failure(
+    state: tauri::State<'_, state::SharedState>,
+) -> Result<Option<SplashStatus>, String> {
+    Ok(state.read().await.startup_failure.clone())
 }
 
 /// Attempt to auto-pair with the gateway so the WebView has a valid token
@@ -143,9 +157,8 @@ async fn open_dashboard(
     app: tauri::AppHandle,
     state: tauri::State<'_, state::SharedState>,
 ) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
+    if let Some(main) = app.get_webview_window(window::MAIN_WINDOW) {
+        window::reveal(&main);
         return Ok(());
     }
 
@@ -158,11 +171,12 @@ async fn open_dashboard(
     let dashboard_url = format!("{}/", base.trim_end_matches('/'));
     let parsed = tauri::Url::parse(&dashboard_url).map_err(|e| e.to_string())?;
 
-    let mut builder = WebviewWindowBuilder::new(&app, "main", WebviewUrl::External(parsed))
-        .title("ZeroClaw")
-        .inner_size(1200.0, 800.0)
-        .center()
-        .resizable(true);
+    let mut builder =
+        WebviewWindowBuilder::new(&app, window::MAIN_WINDOW, WebviewUrl::External(parsed))
+            .title("ZeroClaw")
+            .inner_size(1200.0, 800.0)
+            .center()
+            .resizable(true);
     if let Some(token) = token {
         let escaped = token.replace('\\', "\\\\").replace('\'', "\\'");
         let script = format!(
@@ -173,7 +187,7 @@ async fn open_dashboard(
     builder.build().map_err(|e| e.to_string())?;
 
     // Hand off from the splash to the dashboard.
-    if let Some(splash) = app.get_webview_window("splash") {
+    if let Some(splash) = app.get_webview_window(window::SPLASH_WINDOW) {
         let _ = splash.close();
     }
     Ok(())
@@ -209,15 +223,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // When a second instance launches, focus whichever surface is current.
-            let target = app
-                .get_webview_window("splash")
-                .or_else(|| app.get_webview_window("main"));
-            if let Some(window) = target {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            // When a second instance launches, bring this one's window back.
+            window::show_main_window(app, None);
         }))
+        .on_window_event(window::on_window_event)
         .manage(shared.clone())
         .manage(owned.clone())
         .invoke_handler(tauri::generate_handler![
@@ -228,6 +237,7 @@ pub fn run() {
             commands::pairing::get_devices,
             commands::agent::send_message,
             open_dashboard,
+            get_startup_failure,
             capabilities::screenshot::take_screenshot,
             capabilities::applescript::run_applescript,
         ])
@@ -263,10 +273,8 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
-            // Keep the app, and the daemon it launched, running in the tray
-            // when all windows are closed; an explicit exit (tray Quit) proceeds.
             RunEvent::ExitRequested { code, api, .. } => {
-                if ownership::keep_running_on_exit_request(code) {
+                if window::keep_running_on_exit_request(code) {
                     api.prevent_exit();
                 }
             }

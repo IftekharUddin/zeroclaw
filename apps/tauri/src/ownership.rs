@@ -152,22 +152,9 @@ impl OwnedProcesses {
     }
 }
 
-/// Whether an exit request should be declined so the app keeps running in the
-/// tray. Closing the last window (no exit code) keeps the app, and the
-/// processes it owns, running; an explicit exit such as tray Quit proceeds.
-pub fn keep_running_on_exit_request(code: Option<i32>) -> bool {
-    code.is_none()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn closing_the_last_window_keeps_running_but_quit_exits() {
-        assert!(keep_running_on_exit_request(None));
-        assert!(!keep_running_on_exit_request(Some(0)));
-    }
 
     #[test]
     fn a_new_registry_owns_nothing() {
