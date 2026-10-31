@@ -270,16 +270,14 @@ fn desktop_package_owns(exe: &std::path::Path, sidecar_build: bool) -> bool {
 /// installer owns such a kernel's upgrades: swapping it in place would leave
 /// the app and its kernel on different versions (and, on macOS, modify a
 /// signed bundle). A kernel installed separately keeps its own upgrade path
-/// even when the desktop app launches and supervises it. Cached: neither the
-/// build nor the executable's location changes for the process lifetime.
+/// even when the desktop app launches and supervises it. Resolve the package
+/// layout at use time so status and upgrade authorization use the same current
+/// ownership evidence, including after an installer changes the directory.
 pub fn desktop_bundled_kernel() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        recorded_launch_executable()
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_exe().ok())
-            .is_some_and(|exe| desktop_package_owns(&exe, desktop_sidecar_build()))
-    })
+    recorded_launch_executable()
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_exe().ok())
+        .is_some_and(|exe| desktop_package_owns(&exe, desktop_sidecar_build()))
 }
 
 #[cfg(test)]

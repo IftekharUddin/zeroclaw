@@ -1007,6 +1007,8 @@ cli-hardware-unsupported-platform = Hardware USB discovery is not supported on t
 cli-hardware-supported-platforms = Supported platforms: Linux, macOS, Windows.
 
 # ── update (zeroclaw update) ──
+cli-update-desktop-bundled = This ZeroClaw was installed by ZeroClaw Desktop; update the desktop app to upgrade it.
+cli-update-gateway-disabled = Self-upgrade is disabled; set gateway.allow_self_upgrade = true to enable it.
 cli-update-already-current = Already up to date (v{$version}).
 cli-update-success = Successfully updated to v{$version}!
 cli-update-prebuilt-channel-note = Pre-built updates use the lean standard distribution. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other channels outside that distribution.

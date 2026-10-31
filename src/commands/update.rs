@@ -177,6 +177,10 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
 }
 
 pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
+    if zeroclaw_runtime::restart::desktop_bundled_kernel() {
+        bail!(get_required_cli_string("cli-update-desktop-bundled"));
+    }
+
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
         INFO,

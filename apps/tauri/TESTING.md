@@ -47,8 +47,9 @@ cd apps/tauri && cargo tauri build --config tauri.bundled.conf.json
 ```
 
 `ZEROCLAW_KERNEL_PATH` can reuse a prebuilt single-target kernel, but that
-binary must already have been built with `--features embedded-web`; the staging
-script cannot add embedded assets to an existing executable.
+binary must already have been built with `ZEROCLAW_DESKTOP_SIDECAR=1` and
+`--features embedded-web`; the staging script cannot add the sidecar marker or
+embedded assets to an existing executable.
 
 The overlay keeps the default config untouched, so `cargo tauri build`
 without the staged kernel keeps working. Tauri places the sidecar next to the
@@ -136,3 +137,34 @@ cargo tauri build          # native build on each platform
 matrix:
   os: [macos-14, ubuntu-22.04, windows-2022]
 ```
+
+## Bundled-kernel updates
+
+A kernel built with `ZEROCLAW_DESKTOP_SIDECAR=1` and still beside the regular
+`zeroclaw-desktop` executable belongs to the desktop package. Both `zeroclaw
+update` (including `--force` and `--version`) and `POST /api/version/upgrade`
+refuse to replace it and direct the operator to update the desktop app through
+its installer. `gateway.allow_self_upgrade = true` does not override package
+ownership. `zeroclaw update --check` remains read-only and available.
+
+Separately built kernels, and sidecars copied out of their package, retain their
+existing update path even when Desktop supervises them. Status and upgrade
+requests resolve the current package layout through the same runtime predicate.
+The dashboard uses `desktop_bundled` from `/api/status` to replace the Upgrade
+button with the desktop-installer hint. This does not add an automatic desktop
+updater.
+
+Run the process and HTTP boundary regression in both build modes:
+
+```sh
+cargo test --locked --test component desktop_update
+ZEROCLAW_DESKTOP_SIDECAR=1 cargo test --locked --test component desktop_update
+```
+
+These tests copy the real binary to temporary package layouts, load a French
+Fluent override, and exercise the CLI and live gateway routes. Update traffic
+uses a closed loopback proxy, so no release is downloaded or installed. For
+installed-package proof, use an actual sidecar build, enable self-upgrade, open
+the version dialog against a newer release, and verify the hint and absent
+Upgrade button. An ordinary workspace binary beside an empty desktop file is
+not a bundled-kernel fixture without the compile-time marker.

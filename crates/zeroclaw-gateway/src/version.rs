@@ -164,10 +164,8 @@ pub fn desktop_bundled() -> bool {
     zeroclaw_runtime::restart::desktop_bundled_kernel()
 }
 
-const SELF_UPGRADE_DISABLED: &str =
-    "self-upgrade is disabled; set gateway.allow_self_upgrade = true to enable it";
-const SELF_UPGRADE_DESKTOP_BUNDLED: &str =
-    "this ZeroClaw was installed by ZeroClaw Desktop; update the desktop app to upgrade it";
+const SELF_UPGRADE_DISABLED: &str = "cli-update-gateway-disabled";
+const SELF_UPGRADE_DESKTOP_BUNDLED: &str = "cli-update-desktop-bundled";
 
 /// Why `POST /api/version/upgrade` must refuse to swap the binary, if it must.
 fn self_upgrade_refusal(allow_self_upgrade: bool, desktop_bundled: bool) -> Option<&'static str> {
@@ -439,7 +437,7 @@ pub async fn handle_version_upgrade(
 
     let allow_self_upgrade = state.config.read().gateway.allow_self_upgrade;
     if let Some(refusal) = self_upgrade_refusal(allow_self_upgrade, desktop_bundled()) {
-        return json_error(StatusCode::FORBIDDEN, refusal);
+        return json_error(StatusCode::FORBIDDEN, &get_required_cli_string(refusal));
     }
 
     let restart = detect_restart();
