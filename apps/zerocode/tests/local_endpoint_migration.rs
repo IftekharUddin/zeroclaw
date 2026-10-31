@@ -142,7 +142,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(dir.path().join("zerocode.toml"), "locale = \"en\"\n").unwrap();
+        std::fs::write(dir.path().join("zerocode-config.toml"), "locale = \"en\"\n").unwrap();
         let endpoints = rpc_endpoint::client_endpoints_with(None, &data);
         Self { dir, endpoints }
     }
