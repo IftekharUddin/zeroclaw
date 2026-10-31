@@ -62,7 +62,7 @@ fn rpc_proto_depends_only_on_foundation_crates() {
             assert!(
                 allowed.contains(dep.as_str()),
                 "zeroclaw-rpc-proto [{table}] declares `{dep}`, which is outside its allow-list. \
-                 The crate must stay linkable by RPC clients without the runtime or async I/O; \
+                 The crate must stay linkable by RPC clients without the runtime; \
                  extend ALLOWED_DEPENDENCIES only with a foundation crate and say why in the PR."
             );
         }

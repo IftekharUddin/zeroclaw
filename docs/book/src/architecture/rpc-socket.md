@@ -83,7 +83,7 @@ named pipes carry the same byte stream as Unix sockets.
 
 ```
 {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
-{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.5"},"id":1}\n
+{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.6"},"id":1}\n
 ```
 
 ## Connection limits
@@ -199,7 +199,9 @@ than answered, preventing response loops.
 
 ### Turn streaming
 
-`session/prompt` returns the final result when the turn completes. During
+The request form of `session/prompt` answers an empty object
+(`SessionPromptAck`) once the turn has ended; the turn's text and outcome
+arrive on the `turn_complete` `session/update` notification. During
 execution, the daemon sends `session/update` notifications with incremental
 events:
 

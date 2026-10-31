@@ -445,6 +445,37 @@ mod tests {
         }
     }
 
+    /// The request form of `session/prompt` is answered with `{}` once the
+    /// turn ends (the turn's text arrives on `turn_complete`). The declared
+    /// result must accept exactly that reply.
+    #[test]
+    fn session_prompt_result_accepts_the_dispatcher_reply() {
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        let method = doc["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .find(|m| m["name"] == json!("session/prompt"))
+            .expect("session/prompt is in the document");
+        let result_ref = &method["result"]["schema"]["$ref"];
+        let schema = json!({
+            "allOf": [{ "$ref": result_ref }],
+            "components": doc["components"],
+        });
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&schema)
+            .expect("Draft 7 schema compiles");
+        assert!(
+            validator.is_valid(&json!({})),
+            "the declared session/prompt result {result_ref} must accept the daemon's empty reply"
+        );
+        assert_eq!(
+            result_ref,
+            &json!(format!("{DEFINITIONS_PATH}SessionPromptAck"))
+        );
+    }
+
     /// OpenRPC orders every required parameter before every optional one.
     #[test]
     fn required_descriptors_precede_optional_ones() {

@@ -249,11 +249,21 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// The outcome of a prompt turn inside the daemon. It is not what the
+    /// request form of `session/prompt` answers; that reply is
+    /// [`SessionPromptAck`].
     pub struct SessionPromptResult {
         pub session_id: String,
         pub stop_reason: String,
         pub content: String,
     }
+}
+
+rpc_type! {
+    /// The reply to the request form of `session/prompt`: an empty object,
+    /// sent once the turn has ended. The turn's text and outcome arrive on
+    /// the `turn_complete` `session/update` notification, not in this reply.
+    pub struct SessionPromptAck {}
 }
 
 rpc_type! {
@@ -279,6 +289,83 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// `session/steer` params: a message folded into the session's running
+    /// turn as its own user turn before the next model round.
+    pub struct SessionSteerParams {
+        pub session_id: String,
+        pub content: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionSteerResult {
+        pub session_id: String,
+        pub accepted: bool,
+    }
+}
+
+rpc_type! {
+    /// `session/append` params: an assistant message written to the session
+    /// transcript without running a turn.
+    pub struct SessionAppendParams {
+        pub session_id: String,
+        pub content: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionAppendResult {
+        pub session_id: String,
+        /// Persisted transcript length after the append.
+        pub message_count: usize,
+    }
+}
+
+rpc_type! {
+    pub struct SessionRenameParams {
+        pub session_id: String,
+        pub name: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionRenameResult {
+        pub session_id: String,
+        pub name: String,
+    }
+}
+
+rpc_type! {
+    /// `session/run-once` params: create a session, run one prompt, and
+    /// close the session, in one call. The turn streams `session/update`
+    /// notifications like `session/prompt`; the response carries the final
+    /// result.
+    pub struct SessionRunOnceParams {
+        pub agent_alias: String,
+        pub prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cwd: Option<String>,
+        /// Caller-chosen id for the transient session. A fresh id is minted
+        /// when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub exclude_memory: Option<bool>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionRunOnceResult {
+        pub session_id: String,
+        pub stop_reason: String,
+        pub content: String,
+        /// Turn usage totals, as carried on the terminal `TurnComplete`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub usage: Option<TurnUsageTotals>,
+    }
+}
+
+rpc_type! {
     pub struct SessionGitBranchResult {
         pub session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,6 +383,11 @@ rpc_type! {
         pub query: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub limit: Option<usize>,
+        /// When true, only sessions with a turn in flight are returned: an
+        /// RPC session with a live turn, or a gateway/channel session whose
+        /// durable state is `running`. Absent or false lists every session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub running: Option<bool>,
     }
 }
 
@@ -622,6 +714,9 @@ rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
         pub set: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<PublishedConfigRevision>,
     }
 }
 
@@ -682,6 +777,9 @@ rpc_type! {
     pub struct ConfigDeleteResult {
         pub prop: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<PublishedConfigRevision>,
     }
 }
 
@@ -723,6 +821,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub created: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<PublishedConfigRevision>,
     }
 }
 
@@ -738,6 +839,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<PublishedConfigRevision>,
     }
 }
 
@@ -792,6 +896,82 @@ rpc_type! {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// ── Config publication and application ───────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+/// The live-config publication a mutating `config/*` call committed. The
+/// runtime's application ledger keys its records by this value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct PublishedConfigRevision {
+    pub epoch: String,
+    pub sequence: u64,
+}
+
+impl From<zeroclaw_config::live::ConfigRevision> for PublishedConfigRevision {
+    fn from(revision: zeroclaw_config::live::ConfigRevision) -> Self {
+        Self {
+            epoch: revision.epoch().to_string(),
+            sequence: revision.sequence(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum ConfigApplicationTarget {
+    /// Scoped to the publication epoch in the enclosing revision.
+    Daemon,
+    Session {
+        id: String,
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum ConfigApplicationOutcome {
+    Pending,
+    AppliedLive,
+    QueuedForReload,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum ConfigApplicationReason {
+    AwaitingAcknowledgement,
+    DaemonReloadRequired,
+    ChangeScopeUnavailable,
+    TargetRetired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ConfigApplicationRecord {
+    /// Canonical field/key components. A dotted map key is one component.
+    pub path: Vec<String>,
+    pub target: ConfigApplicationTarget,
+    pub revision: PublishedConfigRevision,
+    pub outcome: ConfigApplicationOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ConfigApplicationReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ConfigApplicationStatus {
+    pub published_revision: PublishedConfigRevision,
+    /// Latest observed changes/attempts, not every subsystem's startup state.
+    pub records: Vec<ConfigApplicationRecord>,
+    pub record_limit: usize,
+    pub truncated: bool,
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ── Agents ───────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
 
@@ -813,6 +993,10 @@ rpc_type! {
     pub struct AgentStatusEntry {
         pub alias: String,
         pub enabled: bool,
+        /// Current configured profile, not a running session's retained generation.
+        /// Absent when no configured runtime profile resolves for this agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub runtime_profile: Option<String>,
         #[serde(default)]
         pub live_sessions: usize,
         #[serde(default)]
@@ -1165,6 +1349,8 @@ rpc_type! {
 rpc_type! {
     /// Config readiness status for the dashboard/TUI.
     pub struct ConfigStatusResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub application: Option<ConfigApplicationStatus>,
         pub needs_quickstart: bool,
         pub reason: String,
         pub has_partial_state: bool,
@@ -1553,10 +1739,18 @@ pub enum SessionUpdateEvent {
     /// full context window (provider `context_window`), exposed distinctly so a
     /// client can render capacity and budget separately. Any may be absent when
     /// the provider doesn't report usage or the value can't be resolved.
+    ///
+    /// `input_tokens_source` states where `input_tokens` came from. It is
+    /// `provider` for a provider-reported count and `estimate` when the
+    /// provider omitted usage and the runtime substituted a local estimate so
+    /// the meter still has a numerator. Clients should render an estimated
+    /// value as approximate. It is absent when `input_tokens` is absent.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens_source: Option<zeroclaw_api::agent::TokenCountSource>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1585,6 +1779,25 @@ pub enum SessionUpdateEvent {
         /// Absent for legacy or missing-session terminal events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_count: Option<usize>,
+        /// Structured safeguard-fallback attribution for a completed turn.
+        /// `content` keeps its rendered footer for clients that predate this
+        /// field. Only model names cross the wire, never the classifier
+        /// category.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        safeguard_fallback: Option<SafeguardFallbackWire>,
+        /// Token, cost, and context totals for the turn. Absent when the
+        /// turn never reached a model call (refusals, missing sessions).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Box<TurnUsageTotals>>,
+    },
+    /// Recorded spend reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking and at most once per turn; the turn
+    /// continues. `period` is `"day"` or `"month"`.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        period: zeroclaw_api::agent::BudgetWarningPeriod,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
@@ -1633,6 +1846,74 @@ pub enum TurnCompletionOutcome {
     Completed,
     Cancelled,
     Failed,
+}
+
+/// Which leg served a safeguard (refusal-triggered) fallback.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SafeguardFallbackKindWire {
+    Server,
+    Client,
+    ClientServer,
+}
+
+rpc_type! {
+    /// Display-only safeguard-fallback notice on `TurnComplete`.
+    #[derive(PartialEq, Eq)]
+    pub struct SafeguardFallbackWire {
+        pub fallback_kind: SafeguardFallbackKindWire,
+        pub requested_model: String,
+        pub served_model: String,
+    }
+}
+
+rpc_type! {
+    /// Per-(provider, model) usage for one turn. Counts every billable
+    /// attempt, including rejected fallback attempts.
+    #[derive(Default, PartialEq)]
+    pub struct ProviderUsageTotals {
+        pub provider_ref: String,
+        pub model: String,
+        pub input_tokens: u64,
+        pub output_tokens: u64,
+        pub cached_input_tokens: u64,
+        pub cost_usd: f64,
+    }
+}
+
+rpc_type! {
+    /// Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the
+    /// gateway chat socket's `done` frame. Totals and `usage_by_provider`
+    /// include every billable attempt; the `last_*` fields and context
+    /// limits describe the accepted call that served the turn.
+    #[derive(Default, PartialEq)]
+    pub struct TurnUsageTotals {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub output_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tokens_used: Option<u64>,
+        /// Sum of `usage_by_provider[*].cost_usd`; absent when the sum is
+        /// not positive (an unpriced turn).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub provider_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_input_tokens: Option<u64>,
+        /// Proactive-trim budget of the serving route.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_context_tokens: Option<u64>,
+        /// Configured context window of the serving model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model_context_window: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub usage_by_provider: Vec<ProviderUsageTotals>,
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1887,11 +2168,77 @@ mod tests {
             content: "cancelled".into(),
             client_turn_generation: Some(9),
             message_count: Some(4),
+            safeguard_fallback: None,
+            usage: None,
         };
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("turn_complete"));
         assert_eq!(v["client_turn_generation"], json!(9));
         assert_eq!(v["message_count"], json!(4));
+        assert!(
+            v.get("safeguard_fallback").is_none() && v.get("usage").is_none(),
+            "absent extras must not appear on the wire for older clients: {v}"
+        );
+    }
+
+    #[test]
+    fn turn_complete_carries_safeguard_and_usage_totals_additively() {
+        let evt = SessionUpdateEvent::TurnComplete {
+            session_id: "s".into(),
+            outcome: TurnCompletionOutcome::Completed,
+            content: "answer".into(),
+            client_turn_generation: None,
+            message_count: Some(2),
+            safeguard_fallback: Some(SafeguardFallbackWire {
+                fallback_kind: SafeguardFallbackKindWire::ClientServer,
+                requested_model: "big".into(),
+                served_model: "small".into(),
+            }),
+            usage: Some(Box::new(TurnUsageTotals {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                tokens_used: Some(15),
+                cost_usd: Some(0.25),
+                provider_ref: Some("openai.default".into()),
+                model: Some("small".into()),
+                last_input_tokens: Some(10),
+                max_context_tokens: Some(8000),
+                model_context_window: Some(128_000),
+                usage_by_provider: vec![ProviderUsageTotals {
+                    provider_ref: "openai.default".into(),
+                    model: "small".into(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                    cost_usd: 0.25,
+                }],
+            })),
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        // Existing fields keep their meaning.
+        assert_eq!(v["content"], json!("answer"));
+        assert_eq!(v["outcome"], json!("completed"));
+        assert_eq!(
+            v["safeguard_fallback"],
+            json!({"fallback_kind": "client_server", "requested_model": "big", "served_model": "small"})
+        );
+        assert_eq!(v["usage"]["cost_usd"], json!(0.25));
+        assert_eq!(v["usage"]["tokens_used"], json!(15));
+        assert_eq!(v["usage"]["max_context_tokens"], json!(8000));
+        assert_eq!(v["usage"]["model_context_window"], json!(128_000));
+        assert_eq!(
+            v["usage"]["usage_by_provider"][0]["provider_ref"],
+            json!("openai.default")
+        );
+        let round: SessionUpdateEvent = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            round,
+            SessionUpdateEvent::TurnComplete {
+                usage: Some(_),
+                safeguard_fallback: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

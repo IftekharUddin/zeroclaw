@@ -20,6 +20,24 @@ pub use crate::quickstart::{
 };
 pub use crate::skills::frontmatter::SkillFrontmatter;
 
+/// Project a provider safeguard-fallback notice onto its wire form. The
+/// conversion stays in the runtime so the protocol crate does not depend on
+/// providers. The classifier category never crosses the wire.
+pub(crate) fn safeguard_fallback_wire(
+    notice: &zeroclaw_providers::SafeguardFallbackNotice,
+) -> SafeguardFallbackWire {
+    use zeroclaw_providers::SafeguardFallbackKind as K;
+    SafeguardFallbackWire {
+        fallback_kind: match notice.kind {
+            K::ServerSide => SafeguardFallbackKindWire::Server,
+            K::ClientSide => SafeguardFallbackKindWire::Client,
+            K::ClientAndServer => SafeguardFallbackKindWire::ClientServer,
+        },
+        requested_model: notice.requested_model.clone(),
+        served_model: notice.served_model.clone(),
+    }
+}
+
 // ── Derive helper ────────────────────────────────────────────────────
 //
 // Same shape as the proto crate's helper, minus the schema derive: the types
@@ -307,6 +325,29 @@ mod tests {
         assert_eq!(v["kind"], json!("applied"));
         assert_eq!(v["daemon_restarted"], json!(false));
         assert_eq!(v["agent"]["alias"], json!("primary"));
+    }
+
+    #[test]
+    fn safeguard_fallback_wire_maps_every_kind_and_drops_the_category() {
+        use zeroclaw_providers::{SafeguardFallbackKind as K, SafeguardFallbackNotice};
+
+        for (kind, wire) in [
+            (K::ServerSide, "server"),
+            (K::ClientSide, "client"),
+            (K::ClientAndServer, "client_server"),
+        ] {
+            let notice = SafeguardFallbackNotice {
+                kind,
+                requested_model: "big".into(),
+                served_model: "small".into(),
+                category: Some("cyber".into()),
+            };
+            let v = serde_json::to_value(safeguard_fallback_wire(&notice)).unwrap();
+            assert_eq!(
+                v,
+                json!({"fallback_kind": wire, "requested_model": "big", "served_model": "small"})
+            );
+        }
     }
 
     #[test]

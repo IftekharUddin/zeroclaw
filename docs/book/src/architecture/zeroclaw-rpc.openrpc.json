@@ -163,6 +163,13 @@
             "format": "uint",
             "minimum": 0,
             "type": "integer"
+          },
+          "runtime_profile": {
+            "description": "Current configured profile, not a running session's retained generation.\nAbsent when no configured runtime profile resolves for this agent.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -211,6 +218,14 @@
           "skill_bundles",
           "knowledge_bundles",
           "mcp_bundles"
+        ],
+        "type": "string"
+      },
+      "BudgetWarningPeriod": {
+        "description": "The cost-limit period a [`TurnEvent::BudgetWarning`] refers to.",
+        "enum": [
+          "day",
+          "month"
         ],
         "type": "string"
       },
@@ -414,6 +429,129 @@
         ],
         "type": "object"
       },
+      "ConfigApplicationOutcome": {
+        "enum": [
+          "pending",
+          "applied_live",
+          "queued_for_reload",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "ConfigApplicationReason": {
+        "enum": [
+          "awaiting_acknowledgement",
+          "daemon_reload_required",
+          "change_scope_unavailable",
+          "target_retired"
+        ],
+        "type": "string"
+      },
+      "ConfigApplicationRecord": {
+        "properties": {
+          "outcome": {
+            "$ref": "#/components/schemas/ConfigApplicationOutcome"
+          },
+          "path": {
+            "description": "Canonical field/key components. A dotted map key is one component.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigApplicationReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "$ref": "#/components/schemas/PublishedConfigRevision"
+          },
+          "target": {
+            "$ref": "#/components/schemas/ConfigApplicationTarget"
+          }
+        },
+        "required": [
+          "path",
+          "target",
+          "revision",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "ConfigApplicationStatus": {
+        "properties": {
+          "published_revision": {
+            "$ref": "#/components/schemas/PublishedConfigRevision"
+          },
+          "record_limit": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "description": "Latest observed changes/attempts, not every subsystem's startup state.",
+            "items": {
+              "$ref": "#/components/schemas/ConfigApplicationRecord"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "published_revision",
+          "records",
+          "record_limit",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ConfigApplicationTarget": {
+        "oneOf": [
+          {
+            "description": "Scoped to the publication epoch in the enclosing revision.",
+            "properties": {
+              "kind": {
+                "const": "daemon",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "generation": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "session",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "generation"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfigDeleteParams": {
         "properties": {
           "prop": {
@@ -432,6 +570,17 @@
           },
           "prop": {
             "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedConfigRevision"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact publication committed by this request, when available."
           }
         },
         "required": [
@@ -499,6 +648,17 @@
           },
           "path": {
             "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedConfigRevision"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact publication committed by this request, when available."
           }
         },
         "required": [
@@ -533,6 +693,17 @@
           },
           "path": {
             "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedConfigRevision"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact publication committed by this request, when available."
           }
         },
         "required": [
@@ -802,6 +973,17 @@
           "prop": {
             "type": "string"
           },
+          "revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedConfigRevision"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact publication committed by this request, when available."
+          },
           "set": {
             "type": "boolean"
           }
@@ -815,6 +997,16 @@
       "ConfigStatusResult": {
         "description": "Config readiness status for the dashboard/TUI.",
         "properties": {
+          "application": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigApplicationStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "has_partial_state": {
             "type": "boolean"
           },
@@ -2578,6 +2770,63 @@
         ],
         "type": "string"
       },
+      "ProviderUsageTotals": {
+        "description": "Per-(provider, model) usage for one turn. Counts every billable\nattempt, including rejected fallback attempts.",
+        "properties": {
+          "cached_input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cost_usd": {
+            "format": "double",
+            "type": "number"
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_ref",
+          "model",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cost_usd"
+        ],
+        "type": "object"
+      },
+      "PublishedConfigRevision": {
+        "description": "The live-config publication a mutating `config/*` call committed. The\nruntime's application ledger keys its records by this value.",
+        "properties": {
+          "epoch": {
+            "type": "string"
+          },
+          "sequence": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "epoch",
+          "sequence"
+        ],
+        "type": "object"
+      },
       "QuickstartApplyParams": {
         "properties": {
           "submission": {
@@ -2813,6 +3062,35 @@
         ],
         "type": "object"
       },
+      "SafeguardFallbackKindWire": {
+        "description": "Which leg served a safeguard (refusal-triggered) fallback.",
+        "enum": [
+          "server",
+          "client",
+          "client_server"
+        ],
+        "type": "string"
+      },
+      "SafeguardFallbackWire": {
+        "description": "Display-only safeguard-fallback notice on `TurnComplete`.",
+        "properties": {
+          "fallback_kind": {
+            "$ref": "#/components/schemas/SafeguardFallbackKindWire"
+          },
+          "requested_model": {
+            "type": "string"
+          },
+          "served_model": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fallback_kind",
+          "requested_model",
+          "served_model"
+        ],
+        "type": "object"
+      },
       "SectionShape": {
         "description": "UI rendering shape for a section. Drives picker / form dispatch on\nthe `/config` curated section explorer and the Quickstart flow.",
         "oneOf": [
@@ -2993,6 +3271,40 @@
             "type": "object"
           }
         ]
+      },
+      "SessionAppendParams": {
+        "description": "`session/append` params: an assistant message written to the session\ntranscript without running a turn.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "content"
+        ],
+        "type": "object"
+      },
+      "SessionAppendResult": {
+        "properties": {
+          "message_count": {
+            "description": "Persisted transcript length after the append.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "message_count"
+        ],
+        "type": "object"
       },
       "SessionApproveParams": {
         "properties": {
@@ -3241,6 +3553,13 @@
               "string",
               "null"
             ]
+          },
+          "running": {
+            "description": "When true, only sessions with a turn in flight are returned: an\nRPC session with a live turn, or a gateway/channel session whose\ndurable state is `running`. Absent or false lists every session.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -3389,6 +3708,10 @@
         },
         "type": "object"
       },
+      "SessionPromptAck": {
+        "description": "The reply to the request form of `session/prompt`: an empty object,\nsent once the turn has ended. The turn's text and outcome arrive on\nthe `turn_complete` `session/update` notification, not in this reply.",
+        "type": "object"
+      },
       "SessionPromptParams": {
         "properties": {
           "attachments": {
@@ -3420,7 +3743,72 @@
         ],
         "type": "object"
       },
-      "SessionPromptResult": {
+      "SessionRenameParams": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "SessionRenameResult": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "SessionRunOnceParams": {
+        "description": "`session/run-once` params: create a session, run one prompt, and\nclose the session, in one call. The turn streams `session/update`\nnotifications like `session/prompt`; the response carries the final\nresult.",
+        "properties": {
+          "agent_alias": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exclude_memory": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Caller-chosen id for the transient session. A fresh id is minted\nwhen absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent_alias",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "SessionRunOnceResult": {
         "properties": {
           "content": {
             "type": "string"
@@ -3430,6 +3818,17 @@
           },
           "stop_reason": {
             "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnUsageTotals"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Turn usage totals, as carried on the terminal `TurnComplete`."
           }
         },
         "required": [
@@ -3473,6 +3872,37 @@
         "required": [
           "session_id",
           "state"
+        ],
+        "type": "object"
+      },
+      "SessionSteerParams": {
+        "description": "`session/steer` params: a message folded into the session's running\nturn as its own user turn before the next model round.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "content"
+        ],
+        "type": "object"
+      },
+      "SessionSteerResult": {
+        "properties": {
+          "accepted": {
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "accepted"
         ],
         "type": "object"
       },
@@ -3608,7 +4038,7 @@
             "type": "object"
           },
           {
-            "description": "Per-LLM-call token usage. `input_tokens` is the cumulative context size\nfor this turn. `max_context_tokens` is the preemptive-trim budget (the\nresolved `effective_context_budget`), preserving its original meaning as\nthe value the meter fills toward. `model_context_window` is the model's\nfull context window (provider `context_window`), exposed distinctly so a\nclient can render capacity and budget separately. Any may be absent when\nthe provider doesn't report usage or the value can't be resolved.",
+            "description": "Per-LLM-call token usage. `input_tokens` is the cumulative context size\nfor this turn. `max_context_tokens` is the preemptive-trim budget (the\nresolved `effective_context_budget`), preserving its original meaning as\nthe value the meter fills toward. `model_context_window` is the model's\nfull context window (provider `context_window`), exposed distinctly so a\nclient can render capacity and budget separately. Any may be absent when\nthe provider doesn't report usage or the value can't be resolved.\n\n`input_tokens_source` states where `input_tokens` came from. It is\n`provider` for a provider-reported count and `estimate` when the\nprovider omitted usage and the runtime substituted a local estimate so\nthe meter still has a numerator. Clients should render an estimated\nvalue as approximate. It is absent when `input_tokens` is absent.",
             "properties": {
               "input_tokens": {
                 "format": "uint64",
@@ -3616,6 +4046,16 @@
                 "type": [
                   "integer",
                   "null"
+                ]
+              },
+              "input_tokens_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TokenCountSource"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               },
               "max_context_tokens": {
@@ -3700,12 +4140,34 @@
               "outcome": {
                 "$ref": "#/components/schemas/TurnCompletionOutcome"
               },
+              "safeguard_fallback": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SafeguardFallbackWire"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Structured safeguard-fallback attribution for a completed turn.\n`content` keeps its rendered footer for clients that predate this\nfield. Only model names cross the wire, never the classifier\ncategory."
+              },
               "session_id": {
                 "type": "string"
               },
               "type": {
                 "const": "turn_complete",
                 "type": "string"
+              },
+              "usage": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TurnUsageTotals"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Token, cost, and context totals for the turn. Absent when the\nturn never reached a model call (refusals, missing sessions)."
               }
             },
             "required": [
@@ -3713,6 +4175,37 @@
               "session_id",
               "outcome",
               "content"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Recorded spend reached `cost.warn_at_percent` of a shared daily or\nmonthly limit. Non-blocking and at most once per turn; the turn\ncontinues. `period` is `\"day\"` or `\"month\"`.",
+            "properties": {
+              "current_usd": {
+                "format": "double",
+                "type": "number"
+              },
+              "limit_usd": {
+                "format": "double",
+                "type": "number"
+              },
+              "period": {
+                "$ref": "#/components/schemas/BudgetWarningPeriod"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "budget_warning",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "current_usd",
+              "limit_usd",
+              "period"
             ],
             "type": "object"
           },
@@ -4215,6 +4708,88 @@
           "failed"
         ],
         "type": "string"
+      },
+      "TurnUsageTotals": {
+        "description": "Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the\ngateway chat socket's `done` frame. Totals and `usage_by_provider`\ninclude every billable attempt; the `last_*` fields and context\nlimits describe the accepted call that served the turn.",
+        "properties": {
+          "cost_usd": {
+            "description": "Sum of `usage_by_provider[*].cost_usd`; absent when the sum is\nnot positive (an unpriced turn).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_context_tokens": {
+            "description": "Proactive-trim budget of the serving route.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_context_window": {
+            "description": "Configured context window of the serving model.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "provider_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tokens_used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "usage_by_provider": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderUsageTotals"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
       }
     }
   },
@@ -4473,7 +5048,7 @@
       "result": {
         "name": "result",
         "schema": {
-          "$ref": "#/components/schemas/SessionPromptResult"
+          "$ref": "#/components/schemas/SessionPromptAck"
         },
         "x-zeroclaw-shape": "typed"
       },
@@ -4609,6 +5184,17 @@
             "description": "Full-text search query. When present, only sessions whose message\ncontent matches (via FTS5) are returned.",
             "type": [
               "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "running",
+          "required": false,
+          "schema": {
+            "description": "When true, only sessions with a turn in flight are returned: an\nRPC session with a live turn, or a gateway/channel session whose\ndurable state is `running`. Absent or false lists every session.",
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -4855,6 +5441,210 @@
       "x-zeroclaw-params": {
         "shape": "typed",
         "type": "SessionKillParams"
+      }
+    },
+    {
+      "name": "session/steer",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "content",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionSteerResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionSteerParams"
+      }
+    },
+    {
+      "name": "session/abort",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionCancelResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionIdParams"
+      }
+    },
+    {
+      "name": "session/append",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "content",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionAppendResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionAppendParams"
+      }
+    },
+    {
+      "name": "session/rename",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionRenameResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionRenameParams"
+      }
+    },
+    {
+      "name": "session/run-once",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "agent_alias",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "prompt",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "exclude_memory",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "session_id",
+          "required": false,
+          "schema": {
+            "description": "Caller-chosen id for the transient session. A fresh id is minted\nwhen absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionRunOnceResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionRunOnceParams"
       }
     },
     {

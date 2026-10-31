@@ -8,9 +8,10 @@ homepage.workspace = true
 description = "Wire contract for the ZeroClaw daemon RPC: method name table, request and response types, notification payloads and error codes, shared by the daemon and every RPC client without linking the runtime."
 publish = true
 
-# Pure protocol crate. It must never depend on `zeroclaw-runtime` or on any
-# crate that does async I/O: the whole point is that a client (zerocode, the
-# gateway process, a bridge) can link it without linking the daemon.
+# Protocol crate. It depends on serde and the foundation crates below, never
+# on `zeroclaw-runtime`, so a client (zerocode, the gateway process, a bridge)
+# can link it without linking the daemon. The boundary is the runtime, not
+# async I/O: `zeroclaw-config` brings in tokio and reqwest transitively.
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

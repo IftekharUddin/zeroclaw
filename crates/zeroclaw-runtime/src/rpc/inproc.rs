@@ -252,14 +252,48 @@ impl InprocConnector {
     }
 
     /// Attach the generation's RPC context. Waiters in
-    /// [`InprocConnector::connect`] proceed once this is called.
+    /// [`InprocConnector::connect`] proceed once this is called. A sealed
+    /// connector ignores it: a retired generation never takes a context back.
     pub fn bind(&self, ctx: Arc<RpcContext>) {
-        let _previous = self.inner.ctx.send_replace(Some(ctx));
+        let registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !registry.open {
+            return;
+        }
+        let previous = self.inner.ctx.send_replace(Some(ctx));
+        drop(registry);
+        drop(previous);
     }
 
-    /// Whether [`InprocConnector::bind`] has happened.
+    /// Whether a context is bound: from [`InprocConnector::bind`] until
+    /// admission is sealed.
     pub fn is_bound(&self) -> bool {
         self.inner.ctx.borrow().is_some()
+    }
+
+    fn admission_open(&self) -> bool {
+        self.inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+    }
+
+    /// Seal admission and let go of the generation's context in one critical
+    /// section, so a concurrent [`InprocConnector::bind`] cannot put it back.
+    /// Clones of this connector outlive the generation (the gateway's reload
+    /// controls hold one), so holding the context until the last clone drops
+    /// would keep the retiring generation's RPC state alive past its drain.
+    /// The context is dropped after the lock is released.
+    fn seal(
+        registry: &mut Registry,
+        ctx: &watch::Sender<Option<Arc<RpcContext>>>,
+    ) -> Option<Arc<RpcContext>> {
+        registry.open = false;
+        ctx.send_replace(None)
     }
 
     /// Live in-process activity: accepted connections plus the tasks they
@@ -270,16 +304,20 @@ impl InprocConnector {
         self.inner.connections.load(Ordering::Relaxed)
     }
 
-    /// Seal admission: from this call on, every `connect` returns `None`.
-    /// Idempotent; [`InprocConnector::drain`] seals as well. The daemon calls
-    /// this before it starts counting the generation's remaining activity, so
-    /// a zero it observes cannot be followed by a late admission.
+    /// Seal admission: from this call on, every `connect` returns `None` and
+    /// the connector no longer holds the generation's context. Idempotent;
+    /// [`InprocConnector::drain`] seals as well. The daemon calls this before
+    /// it starts counting the generation's remaining activity, so a zero it
+    /// observes cannot be followed by a late admission.
     pub fn close_admission(&self) {
-        self.inner
+        let mut registry = self
+            .inner
             .registry
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .open = false;
+            .unwrap_or_else(|e| e.into_inner());
+        let released = Self::seal(&mut registry, &self.inner.ctx);
+        drop(registry);
+        drop(released);
     }
 
     /// Retire the accepted connections of this generation.
@@ -299,8 +337,11 @@ impl InprocConnector {
                 .registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            registry.open = false;
-            std::mem::take(&mut registry.tasks)
+            let released = Self::seal(&mut registry, &self.inner.ctx);
+            let tasks = std::mem::take(&mut registry.tasks);
+            drop(registry);
+            drop(released);
+            tasks
         };
         tokio::select! {
             () = async {
@@ -323,6 +364,11 @@ impl InprocConnector {
                 let bound: Option<Arc<RpcContext>> = (*rx.borrow_and_update()).clone();
                 if let Some(ctx) = bound {
                     break ctx;
+                }
+                // Sealing clears the context; a waiter it wakes must give up
+                // rather than wait for a bind that will not come.
+                if !self.admission_open() {
+                    return None;
                 }
                 tokio::select! {
                     () = self.inner.cancel.cancelled() => return None,
@@ -825,5 +871,273 @@ mod tests {
             .expect("waiter ends on cancel")
             .expect("waiter task did not panic");
         assert!(!connected, "a cancelled generation hands out no connection");
+    }
+
+    /// Clones of the connector outlive the generation (the gateway's reload
+    /// controls hold one), so sealing must let go of the bound context:
+    /// otherwise the retiring generation's RPC state (sessions, lifecycle
+    /// leases) stays alive past the drain the daemon's reload waits on.
+    #[tokio::test]
+    async fn sealing_admission_releases_the_bound_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let weak = Arc::downgrade(&ctx);
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        let surviving_clone = connector.clone();
+        connector.bind(ctx);
+        assert!(connector.is_bound());
+        assert!(weak.upgrade().is_some(), "the connector holds the context");
+
+        connector.close_admission();
+        assert!(!surviving_clone.is_bound(), "sealing unbinds every clone");
+        assert!(
+            weak.upgrade().is_none(),
+            "a sealed connector must not keep the generation's context alive"
+        );
+        let late = tokio::time::timeout(Duration::from_secs(2), surviving_clone.connect())
+            .await
+            .expect("a sealed connector answers without waiting for cancel");
+        assert!(late.is_none(), "a sealed connector hands out no connection");
+
+        let rebound = ctx_for(base_config(tmp.path()));
+        let rebound_weak = Arc::downgrade(&rebound);
+        surviving_clone.bind(rebound);
+        assert!(
+            !surviving_clone.is_bound(),
+            "a sealed connector stays unbound"
+        );
+        assert!(rebound_weak.upgrade().is_none());
+        assert!(
+            !cancel.is_cancelled(),
+            "none of this relied on cancellation"
+        );
+    }
+
+    /// A connect waiting for a bind that never comes gives up when the
+    /// generation is sealed, even before its token is cancelled.
+    #[tokio::test]
+    async fn connect_waiting_for_bind_gives_up_when_sealed() {
+        let connector = InprocConnector::new(CancellationToken::new());
+        let waiter = connector.clone();
+        let pending = zeroclaw_spawn::spawn!(async move { waiter.connect().await.is_some() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "connect waits for a bound context");
+        connector.close_admission();
+        let connected = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("waiter ends on seal")
+            .expect("waiter task did not panic");
+        assert!(!connected);
+    }
+
+    /// A config with one agent, so a session can be opened over the duplex.
+    /// Its provider is never reached: these tests are refused before a turn
+    /// would run.
+    fn agent_config(tmp: &std::path::Path) -> Config {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let provider = providers
+                .models
+                .ensure("openai", "test-provider")
+                .expect("`openai` slot must exist");
+            provider.api_key = Some("test-key".into());
+            provider.model = Some("test-model".into());
+            provider.uri = Some("http://127.0.0.1:1".into());
+        }
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let mut risk_profiles = HashMap::new();
+        risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
+        Config {
+            providers,
+            agents,
+            risk_profiles,
+            ..base_config(tmp)
+        }
+    }
+
+    /// An initialized duplex for the shared operator (a paired token). Its
+    /// grants are the widest a caller holds, so a local-only check that
+    /// refuses it refuses every in-process caller.
+    async fn operator_duplex(
+        mut config: Config,
+        tmp: &std::path::Path,
+    ) -> (
+        CancellationToken,
+        InprocConnector,
+        BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        tokio::io::WriteHalf<DuplexStream>,
+    ) {
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_inproc_test_token".to_string()];
+        let ctx = with_tui_signing(ctx_for(config), tmp);
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let stream = connector.connect().await.expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let params = InitializeParams {
+            auth_token: Some("zc_inproc_test_token".to_string()),
+            ..initialize_params()
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+        (cancel, connector, reader, writer)
+    }
+
+    /// The response to request `id`, skipping notifications.
+    async fn response_to(
+        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        id: u64,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = read_frame(reader).await;
+                if frame["id"] == serde_json::json!(id) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the request is answered")
+    }
+
+    /// Open a new `test-agent` session over the duplex and return its id. A
+    /// remote caller cannot choose the id of a session that does not exist
+    /// yet, so the daemon assigns it.
+    async fn open_session(
+        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        writer: &mut tokio::io::WriteHalf<DuplexStream>,
+    ) -> String {
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionNew,
+                    &serde_json::json!({ "agent_alias": "test-agent" }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let frame = response_to(reader, 2).await;
+        assert!(frame["error"].is_null(), "session/new failed: {frame}");
+        frame["result"]["session_id"]
+            .as_str()
+            .expect("session/new returns the session id")
+            .to_string()
+    }
+
+    /// A file on this host, the kind of path a remote caller must not have
+    /// the daemon read for it.
+    fn host_file(tmp: &std::path::Path) -> String {
+        let path = tmp.join("host-only.txt");
+        std::fs::write(&path, "read by path from the daemon host").unwrap();
+        path.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn duplex_file_attach_refuses_a_path_source_as_wss_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cancel, _connector, mut reader, mut writer) =
+            operator_duplex(agent_config(tmp.path()), tmp.path()).await;
+        let session_id = open_session(&mut reader, &mut writer).await;
+
+        let attach = serde_json::json!({
+            "session_id": session_id,
+            "files": [{ "path": host_file(tmp.path()) }],
+        });
+        writer
+            .write_all(rpc_request(Method::FileAttach, &attach, 3).as_bytes())
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 3).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
+            "an in-process caller is remote: no path sources, even for the operator: {frame}"
+        );
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Path mode is not available")),
+            "{frame}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn duplex_prompt_refuses_a_path_attachment_as_wss_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cancel, _connector, mut reader, mut writer) =
+            operator_duplex(agent_config(tmp.path()), tmp.path()).await;
+        let session_id = open_session(&mut reader, &mut writer).await;
+
+        let prompt = serde_json::json!({
+            "session_id": session_id,
+            "prompt": "summarize the attachment",
+            "attachments": [{ "path": host_file(tmp.path()) }],
+        });
+        writer
+            .write_all(rpc_request(Method::SessionPrompt, &prompt, 3).as_bytes())
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 3).await;
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Path mode is not available")),
+            "an in-process caller is remote: a prompt may not attach by path: {frame}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn duplex_is_refused_sop_run_detail_as_wss_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cancel, _connector, mut reader, mut writer) =
+            operator_duplex(base_config(tmp.path()), tmp.path()).await;
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SopsRunDetail,
+                    &serde_json::json!({ "run_id": "any-run" }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 2).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED,
+            "sops/run-detail is for local IPC only: {frame}"
+        );
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("is not served over remote")),
+            "{frame}"
+        );
+        cancel.cancel();
     }
 }
