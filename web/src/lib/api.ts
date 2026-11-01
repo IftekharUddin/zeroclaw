@@ -196,6 +196,7 @@ async function apiFetchOnce<T>(
   const mode = getAuthMode();
   const requestKey = authRequestKey();
   const principalId = getOidcSession()?.principal_id;
+  const samePrincipal = () => principalId !== undefined && getOidcSession()?.principal_id === principalId;
   const url = `${apiOrigin}${basePath}${path}`;
   const method = (options.method ?? "GET").toUpperCase();
   // Only idempotent, body-less GETs are safe to coalesce. Skip coalescing when
@@ -253,7 +254,7 @@ async function apiFetchOnce<T>(
     await routeUnauthorized(mode, result.text, requestKey, principalId);
     // One shared retry for a read refused under replaced auth or stale CSRF.
     // A mutation is never replayed after an authentication failure.
-    if (method === "GET" && !retried) return apiFetchOnce<T>(path, options, true);
+    if (method === "GET" && !retried && samePrincipal()) return apiFetchOnce<T>(path, options, true);
     throw new UnauthorizedError();
   }
 
@@ -262,7 +263,7 @@ async function apiFetchOnce<T>(
     if (reason === "operator_required") {
       throw new OperatorRequiredError();
     }
-    if (reason === "csrf" && requestKey === authRequestKey() && !retried && (await recoverFromCsrfRefusal(requestKey))) {
+    if (reason === "csrf" && requestKey === authRequestKey() && !retried && (await recoverFromCsrfRefusal(requestKey)) && samePrincipal()) {
       return apiFetchOnce<T>(path, options, true);
     }
   }

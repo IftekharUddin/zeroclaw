@@ -423,3 +423,59 @@ for (const reason of ["session_invalid", "session_expired"]) {
     });
   }
 }
+
+test("a current invalid SSE session remains halted after the mounted auth listener signs out", async () => {
+  auth.setOidcSession(session);
+  let streams = 0;
+  let liveStream!: ReadableStreamDefaultController<Uint8Array>;
+  sseResponder = (url) => {
+    if (url.endsWith("/api/auth/session")) return new Response(JSON.stringify({ reason: "session_invalid" }), { status: 401 });
+    if (++streams === 1) return new Response(JSON.stringify({ reason: "session_invalid" }), { status: 401 });
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) { liveStream = controller; } }));
+  };
+  const clearSession = () => auth.setOidcSession(null);
+  fakeWindow.addEventListener(auth.AUTH_EVENTS.unauthorized, clearSession);
+  const events = countEvents();
+  const client = new SSEClient({ autoReconnect: false });
+  try {
+    client.connect();
+    await settle();
+    assert.equal(events.unauthorized, 1);
+    assert.equal(auth.getOidcSession(), null);
+    assert.equal(streams, 1, "genuine sign-out must not open a new anonymous/pairing stream");
+  } finally {
+    client.disconnect(); liveStream?.close(); events.stop();
+    fakeWindow.removeEventListener(auth.AUTH_EVENTS.unauthorized, clearSession);
+  }
+});
+
+for (const phase of ["headers", "body", "error"] as const) {
+  test(`an obsolete SSE ${phase} cannot reconnect after explicit logout before cleanup`, async () => {
+    auth.setOidcSession(session);
+    let release!: () => void;
+    let liveStream!: ReadableStreamDefaultController<Uint8Array>;
+    let calls = 0;
+    sseResponder = () => {
+      if (++calls > 1) return new Response(new ReadableStream<Uint8Array>({ start(controller) { liveStream = controller; } }));
+      if (phase === "headers") return new Promise<Response>(resolve => { release = () => resolve(new Response(JSON.stringify({ reason: "session_invalid" }), { status: 401 })); });
+      if (phase === "error") return new Promise<Response>((_resolve, reject) => { release = () => reject(new Error("old stream failed")); });
+      return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        release = () => { controller.enqueue(new TextEncoder().encode(JSON.stringify({ reason: "session_invalid" }))); controller.close(); };
+      } }), { status: 401 });
+    };
+    const events = countEvents();
+    const client = new SSEClient({ autoReconnect: false });
+    try {
+      client.connect();
+      await settle();
+      auth.setOidcSession(null);
+      // React has not yet disconnected the still-current controller.
+      release();
+      await settle();
+      assert.equal(calls, 1, "logout must not dispatch an anonymous successor");
+      assert.equal(events.unauthorized + events.reauth, 0);
+    } finally {
+      client.disconnect(); liveStream?.close(); events.stop();
+    }
+  });
+}

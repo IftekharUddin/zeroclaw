@@ -509,3 +509,29 @@ for (const reason of ["session_invalid", "session_expired"]) {
     assert.equal(requests.filter((r) => r.method === "POST").length, 1);
   });
 }
+
+for (const method of ["GET", "POST"]) {
+  for (const next of ["account", "pairing"]) {
+    test(`recovery retry admission rejects an intervening ${next} change (${method})`, async () => {
+      auth.setOidcSession(session());
+      let sends = 0;
+      responder = (url) => {
+        if (url.endsWith("/api/auth/session")) return json(200, session({ csrf_token: "csrf-renewed" }));
+        if (++sends > 1) return json(200, { ok: true });
+        return method === "GET" ? json(401, { reason: "session_invalid" }) : json(403, { reason: "csrf" });
+      };
+      const switchIdentity = () => queueMicrotask(() => {
+        if (next === "account") auth.setOidcSession(session({ principal_id: "principal-b", csrf_token: "csrf-b" }));
+        else { auth.setOidcSession(null); auth.setToken("new-pairing"); }
+      });
+      fakeWindow.addEventListener(auth.AUTH_EVENTS.resumed, switchIdentity);
+      try {
+        const outcome = await api.apiFetch("/api/x", method === "GET" ? {} : { method, body: "{}" }).then(value => ({ value }), error => ({ error }));
+        assert.equal(sends, 1, "no old request may be retried under the intervening identity");
+        assert.ok("error" in outcome);
+      } finally {
+        fakeWindow.removeEventListener(auth.AUTH_EVENTS.resumed, switchIdentity);
+      }
+    });
+  }
+}

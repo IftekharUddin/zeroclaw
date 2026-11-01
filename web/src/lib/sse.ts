@@ -1,5 +1,5 @@
 import type { SSEEvent } from '../types/api';
-import { AUTH_EVENTS, authRequestKey, getAuthMode, getToken, isReauthPending } from './auth';
+import { AUTH_EVENTS, authRequestKey, getAuthMode, getOidcSession, getToken, isReauthPending, type AuthMode } from './auth';
 import { routeSessionRefusal } from './authSession';
 import { apiOrigin, basePath } from './basePath';
 
@@ -65,6 +65,7 @@ export class SSEClient {
 
     const mode = getAuthMode();
     const requestKey = authRequestKey();
+    const principalId = getOidcSession()?.principal_id;
     const token = getToken();
     const headers: Record<string, string> = {
       Accept: 'text/event-stream',
@@ -84,7 +85,7 @@ export class SSEClient {
         }
         if (!response.ok && requestKey !== authRequestKey()) {
           void response.body?.cancel().catch(() => {});
-          this.connect();
+          this.reconnectForCurrentAuth(controller, mode, principalId);
           return;
         }
         if (mode === 'oidc' && (response.status === 401 || response.status === 403)) {
@@ -93,10 +94,10 @@ export class SSEClient {
           if (requestKey !== authRequestKey()) {
             // A resume may have arrived while this response was pending.
             // Reconnect once with current auth instead of halting on old auth.
-            this.connect();
+            this.reconnectForCurrentAuth(controller, mode, principalId);
             return;
           }
-          await this.haltForAuth(response.status, body, controller, requestKey);
+          await this.haltForAuth(response.status, body, controller, requestKey, principalId);
           return;
         }
         if (!response.ok) {
@@ -113,7 +114,7 @@ export class SSEClient {
       })
       .catch((err: unknown) => {
         if (!this.isCurrent(controller)) return;
-        if (requestKey !== authRequestKey()) { this.connect(); return; }
+        if (requestKey !== authRequestKey()) { this.reconnectForCurrentAuth(controller, mode, principalId); return; }
         if (err instanceof DOMException && err.name === 'AbortError') {
           return; // intentional disconnect
         }
@@ -211,14 +212,26 @@ export class SSEClient {
   // ---------------------------------------------------------------------------
 
   /** A current 401 may discover an unannounced same-account renewal. */
-  private async haltForAuth(status: number, body: string, controller: AbortController, requestKey: string): Promise<void> {
+  private async haltForAuth(status: number, body: string, controller: AbortController, requestKey: string, principalId: string | undefined): Promise<void> {
     this.haltedForAuth = true;
     if (status === 401) {
-      await routeSessionRefusal(body, () => this.isCurrent(controller) && requestKey === authRequestKey());
-      // A successful refresh dispatches resumed and may have already replaced
-      // this controller. Only this still-current connection needs a successor.
-      if (this.isCurrent(controller) && requestKey !== authRequestKey()) this.connect();
+      const outcome = await routeSessionRefusal(body, () => this.isCurrent(controller) && requestKey === authRequestKey());
+      // A successful refresh may already have replaced this controller. A
+      // genuine refusal stays halted even if its notification clears auth.
+      if ((outcome === 'resumed' || outcome === 'obsolete') && requestKey !== authRequestKey()) {
+        this.reconnectForCurrentAuth(controller, 'oidc', principalId);
+      }
     }
+  }
+
+  /** Resolve successor eligibility at dispatch, including logout before UI cleanup. */
+  private reconnectForCurrentAuth(controller: AbortController, mode: AuthMode, principalId: string | undefined): void {
+    if (!this.isCurrent(controller)) return;
+    const current = getOidcSession();
+    if (mode === 'oidc') {
+      if (!current || current.principal_id !== principalId) return;
+    } else if (!current && !getToken()) return;
+    this.connect();
   }
 
   private readonly handleAuthResumed = (): void => {
