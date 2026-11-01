@@ -55,23 +55,23 @@ use std::time::{Duration, Instant};
 use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
 
 use crate::dashboard_session::{
-    self, CookieScope, DashboardAuth, DashboardCaller, ProviderPin, SessionRejection, SignInRefusal,
+    self, BrowserContext, BrowserTicket, BrowserView, CookieScope, DashboardAuth, DashboardCaller,
+    ProviderPin, SessionRejection, SignInRefusal,
 };
 use crate::{AppState, SlidingWindowRateLimiter};
 
-const FLOW_TTL: Duration = Duration::from_secs(600);
-const FLOW_CAP: usize = 32;
+pub(crate) const FLOW_TTL: Duration = Duration::from_secs(600);
+pub(crate) const FLOW_CAP: usize = 32;
 
 /// Pending flows one remote client may hold at once. The store is shared,
 /// so a process-wide cap alone lets one caller park every slot for the
@@ -85,7 +85,7 @@ const FLOW_CAP: usize = 32;
 /// key, and a share would throttle the local surface rather than protect
 /// it. A deployment behind a reverse proxy wants `trust_forwarded_headers`
 /// so its callers are told apart here as well.
-const PER_CLIENT_FLOW_CAP: usize = 8;
+pub(crate) const PER_CLIENT_FLOW_CAP: usize = 8;
 
 /// Refusal when the pending-flow store cannot take another flow, either
 /// because the shared store is full or because this client already holds
@@ -139,6 +139,7 @@ enum FlowMode {
     Enrollment,
     /// `GET /auth/sign-in/{alias}`: a dashboard session.
     Dashboard {
+        browser: BrowserTicket,
         /// SHA-256 of the binding cookie set on the browser that started
         /// the flow. The callback must present the cookie.
         binding_hash: [u8; 32],
@@ -272,7 +273,15 @@ pub(crate) fn routes_with(enrollment_state: Arc<OidcEnrollmentState>) -> Router<
         .route("/api/oidc/{alias}/device/poll", post(handle_device_poll))
         .route("/oidc/login/{alias}", get(handle_pkce_login))
         .route("/oidc/callback", get(handle_pkce_callback))
-        .route("/auth/sign-in/{alias}", get(handle_dashboard_sign_in))
+        .route(
+            "/auth/sign-in/{alias}",
+            get(handle_dashboard_sign_in).post(handle_dashboard_flow_start),
+        )
+        .route(
+            "/api/auth/browser",
+            get(handle_browser_context).post(handle_browser_bootstrap),
+        )
+        .route("/api/auth/browser/confirm", post(handle_browser_confirm))
         .route("/api/auth/methods", get(handle_auth_methods))
         .route("/api/auth/session", get(handle_auth_session))
         .route("/auth/sign-out", post(handle_sign_out))
@@ -820,7 +829,11 @@ fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
 }
 
 /// Fixed page for a dashboard sign-in that cannot start here.
-fn sign_in_unavailable_page(status: StatusCode, explanation: &'static str) -> Response {
+fn sign_in_unavailable_page(status: StatusCode, explanation: &str) -> Response {
+    let explanation = explanation
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     (
         status,
         Html(format!(
@@ -837,7 +850,7 @@ fn sign_in_unavailable_page(status: StatusCode, explanation: &'static str) -> Re
 /// `GET /oidc/login/{alias}`, with two differences: the flow is bound to
 /// this browser by a short-lived cookie, and the callback ends in a
 /// dashboard session instead of a token page.
-async fn handle_dashboard_sign_in(
+async fn handle_dashboard_flow_start(
     State(state): State<AppState>,
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     Extension(dashboard): Extension<Arc<DashboardAuth>>,
@@ -845,7 +858,22 @@ async fn handle_dashboard_sign_in(
     Path(alias): Path<String>,
     Query(query): Query<SignInQuery>,
     headers: HeaderMap,
+    Json(browser): Json<BrowserView>,
 ) -> Response {
+    if let Err(response) = browser_gate(&state, &dashboard, &headers, &Method::POST) {
+        return *response;
+    }
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers),
+        path_prefix: &state.path_prefix,
+    };
+    if !dashboard.sessions.admit_browser_flow(
+        scope.browser_value(&headers).as_deref(),
+        scope.session_value(&headers).as_deref(),
+        &browser,
+    ) {
+        return browser_changed();
+    }
     let key = client_key(&state, peer, &headers);
     if let Err(denied) = auth_gate(&relay, &key, false) {
         return *denied;
@@ -882,7 +910,7 @@ async fn handle_dashboard_sign_in(
              to enable TLS on the gateway.",
         );
     }
-    if !dashboard.sessions.has_room() {
+    if !dashboard.sessions.has_room_for(&browser.ticket) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -913,6 +941,15 @@ async fn handle_dashboard_sign_in(
             Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
         }
     };
+    if dashboard.is_retired()
+        || !dashboard.sessions.admit_browser_flow(
+            scope.browser_value(&headers).as_deref(),
+            scope.session_value(&headers).as_deref(),
+            &browser,
+        )
+    {
+        return browser_changed();
+    }
     let binding = dashboard_session::random_token();
     let authorize_url = flow.authorize_url.clone();
     let flow_state = flow.state.clone();
@@ -922,6 +959,7 @@ async fn handle_dashboard_sign_in(
         created: Instant::now(),
         client: key,
         mode: FlowMode::Dashboard {
+            browser: browser.ticket,
             binding_hash: dashboard_session::session_key(&binding),
             return_to: safe_return_path(query.return_to.as_deref()),
             popup: query.popup.as_deref() == Some("1"),
@@ -933,12 +971,216 @@ async fn handle_dashboard_sign_in(
         https,
         path_prefix: &state.path_prefix,
     };
-    let mut response = Redirect::temporary(&authorize_url).into_response();
+    let mut response = Json(serde_json::json!({"authorize_url": authorize_url})).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
         scope.binding_cookie(&flow_state, &binding, FLOW_TTL.as_secs()),
     );
     response
+}
+
+/// Coordination is never ordinary authentication. These same-origin, non-simple
+/// requests have their own revocation-only CSRF proof; normal mutation CSRF stays per session.
+const BROWSER_HEADER: &str = "x-zeroclaw-browser";
+
+fn browser_gate(
+    state: &AppState,
+    dashboard: &DashboardAuth,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Result<(), Box<Response>> {
+    if dashboard.is_retired() || !state.config.read().gateway.dashboard_sign_in.enabled() {
+        return Err(Box::new(browser_changed()));
+    }
+    if headers.contains_key(header::AUTHORIZATION)
+        || headers.get(BROWSER_HEADER).and_then(|v| v.to_str().ok()) != Some("1")
+    {
+        return Err(Box::new(dashboard_session::rejection_response(
+            SessionRejection::Csrf,
+        )));
+    }
+    let Some(host) = request_authority(headers) else {
+        return Err(Box::new(dashboard_session::rejection_response(
+            SessionRejection::Origin,
+        )));
+    };
+    dashboard_session::check_origin(
+        method,
+        headers,
+        &dashboard_session::origin_of(request_is_https(state, headers), host),
+    )
+    .map_err(|rejection| Box::new(dashboard_session::rejection_response(rejection)))
+}
+
+fn browser_changed() -> Response {
+    (StatusCode::CONFLICT, Json(serde_json::json!({
+        "reason": "browser_context_changed",
+        "error": zeroclaw_runtime::i18n::get_required_cli_string("dashboard-sign-in-interrupted"),
+    }))).into_response()
+}
+
+fn session_in(
+    caller: &Option<Extension<DashboardCaller>>,
+) -> Option<&dashboard_session::SessionAuth> {
+    match caller {
+        Some(Extension(DashboardCaller::Session(s))) => Some(s),
+        _ => None,
+    }
+}
+
+async fn handle_browser_context(
+    State(state): State<AppState>,
+    Extension(dashboard): Extension<Arc<DashboardAuth>>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    caller: Option<Extension<DashboardCaller>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = browser_gate(&state, &dashboard, &headers, &Method::GET) {
+        return *response;
+    }
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers),
+        path_prefix: &state.path_prefix,
+    };
+    Json(dashboard.sessions.browser_context(
+        scope.browser_value(&headers).as_deref(),
+        session_in(&caller),
+    ))
+    .into_response()
+}
+
+async fn handle_browser_bootstrap(
+    State(state): State<AppState>,
+    Extension(dashboard): Extension<Arc<DashboardAuth>>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    caller: Option<Extension<DashboardCaller>>,
+    headers: HeaderMap,
+    Json(expected): Json<BrowserContext>,
+) -> Response {
+    if let Err(response) = browser_gate(&state, &dashboard, &headers, &Method::POST) {
+        return *response;
+    }
+    if matches!(
+        caller,
+        Some(Extension(DashboardCaller::Rejected(
+            SessionRejection::Csrf | SessionRejection::Origin
+        )))
+    ) {
+        return browser_changed();
+    }
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers),
+        path_prefix: &state.path_prefix,
+    };
+    match dashboard.sessions.bootstrap_browser(
+        scope.browser_value(&headers).as_deref(),
+        session_in(&caller),
+        &expected,
+        &key,
+    ) {
+        Ok(view) => Json(view).into_response(),
+        Err(SignInRefusal::Full) => sessions_full_page(),
+        Err(_) => browser_changed(),
+    }
+}
+
+async fn handle_browser_confirm(
+    State(state): State<AppState>,
+    Extension(dashboard): Extension<Arc<DashboardAuth>>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(browser): Json<BrowserView>,
+) -> Response {
+    if let Err(response) = browser_gate(&state, &dashboard, &headers, &Method::POST) {
+        return *response;
+    }
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers),
+        path_prefix: &state.path_prefix,
+    };
+    if dashboard.sessions.admit_browser_flow(
+        scope.browser_value(&headers).as_deref(),
+        scope.session_value(&headers).as_deref(),
+        &browser,
+    ) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        browser_changed()
+    }
+}
+
+/// The preparation page holds a browser-wide lock only while bootstrapping.
+/// No asynchronous HTTP response ever writes the association cookie.
+async fn handle_dashboard_sign_in(
+    State(state): State<AppState>,
+    Extension(dashboard): Extension<Arc<DashboardAuth>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(alias): Path<String>,
+    Query(query): Query<SignInQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if dashboard.is_retired() {
+        return browser_changed();
+    }
+    if !state.config.read().gateway.dashboard_sign_in.offers(&alias) {
+        return sign_in_unavailable_page(
+            StatusCode::NOT_FOUND,
+            &zeroclaw_runtime::i18n::get_required_cli_string("dashboard-sign-in-not-offered"),
+        );
+    }
+    if request_authority(&headers).is_none()
+        || (!request_is_https(&state, &headers) && !is_loopback_request(peer, &headers))
+    {
+        return sign_in_unavailable_page(
+            StatusCode::BAD_REQUEST,
+            &zeroclaw_runtime::i18n::get_required_cli_string("dashboard-sign-in-https"),
+        );
+    }
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers),
+        path_prefix: &state.path_prefix,
+    };
+    let return_to = safe_return_path(query.return_to.as_deref());
+    browser_page(serde_json::json!({
+        "mode": "prepare", "prefix": state.path_prefix,
+        "alias": alias, "return_to": return_to, "popup": query.popup.as_deref() == Some("1"),
+        "cookie_name": scope.browser_name(), "cookie_suffix": scope.browser_cookie_suffix(),
+    }))
+}
+
+fn browser_page(mut settings: serde_json::Value) -> Response {
+    use zeroclaw_runtime::i18n::get_required_cli_string as text;
+    settings["text"] = serde_json::json!({
+        "prepare": text("dashboard-sign-in-preparing"),
+        "checking": text("dashboard-sign-in-checking"),
+        "interrupted": text("dashboard-sign-in-interrupted"),
+        "interrupted_title": text("dashboard-sign-in-interrupted-title"),
+        "storage": text("dashboard-sign-in-storage"),
+        "retry": text("dashboard-sign-in-retry"),
+        "complete": text("dashboard-sign-in-complete"),
+        "close": text("dashboard-sign-in-close"),
+    });
+    // JSON is embedded in a script element: escape '<' even in translations/aliases.
+    let settings = settings.to_string().replace('<', "\\u003c");
+    Html(format!("<!doctype html><meta charset=\"utf-8\"><title></title><body style=\"font-family:system-ui;margin:3rem\"><h1 id=\"title\"></h1><p id=\"message\"></p><a id=\"retry\" hidden></a><script>const settings={settings};{}</script>", include_str!("dashboard_sign_in.js"))).into_response()
 }
 
 /// `GET /api/auth/methods`: how this dashboard can be signed in to. Public,
@@ -1012,6 +1254,7 @@ async fn handle_auth_session(
                 "admin": admin,
                 "expires_at": session.expires_at,
                 "csrf_token": session.csrf,
+                "session_tag": session.tag(),
                 "features": {
                     // Chat for other accounts needs the core session path.
                     "chat": admin,
@@ -1031,49 +1274,76 @@ async fn handle_auth_session(
 /// layer has already required the CSRF token and the dashboard's origin.
 /// Signing out of ZeroClaw does not sign the user out of the identity
 /// provider.
+#[derive(Default, Deserialize)]
+struct SignOutRequest {
+    #[serde(default)]
+    proofs: Vec<BrowserView>,
+}
+
 async fn handle_sign_out(
     State(state): State<AppState>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     caller: Option<Extension<DashboardCaller>>,
     headers: HeaderMap,
+    body: Option<Json<SignOutRequest>>,
 ) -> Response {
+    let Some(Extension(dashboard)) = dashboard else {
+        return browser_changed();
+    };
+    let Some(host) = request_authority(&headers) else {
+        return browser_changed();
+    };
+    if let Err(rejection) = dashboard_session::check_origin(
+        &Method::POST,
+        &headers,
+        &dashboard_session::origin_of(request_is_https(&state, &headers), host),
+    ) {
+        return dashboard_session::rejection_response(rejection);
+    }
+    if dashboard.is_retired() || !state.config.read().gateway.dashboard_sign_in.enabled() {
+        return browser_changed();
+    }
     let scope = CookieScope {
         https: request_is_https(&state, &headers),
         path_prefix: &state.path_prefix,
     };
-    let (Some(Extension(dashboard)), Some(Extension(caller))) = (dashboard, caller) else {
-        return dashboard_session::rejection_response(SessionRejection::Invalid);
-    };
-    let session = match caller {
-        DashboardCaller::Session(session) => session,
-        DashboardCaller::Rejected(rejection) => {
-            let mut response = dashboard_session::rejection_response(rejection);
-            // An ended session's cookie is kept so every tab hears why it
-            // ended; signing out is when it goes. The layer has already
-            // refused a request from another origin.
-            if matches!(
-                rejection,
-                SessionRejection::Expired | SessionRejection::Invalid
-            ) {
-                for value in scope.clear_session_cookies() {
-                    response.headers_mut().append(header::SET_COOKIE, value);
-                }
-            }
-            return response;
-        }
-    };
-    dashboard.end(&session);
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Disconnect)
-            .with_outcome(::zeroclaw_log::EventOutcome::Success)
-            .with_attrs(::serde_json::json!({
-                "alias": session.alias,
-                "principal_id": session.principal().id.as_str(),
-            })),
-        "dashboard sign-out"
+    let proofs = body.map(|Json(body)| body.proofs).unwrap_or_default();
+    let browser_request = headers.contains_key("x-zeroclaw-browser");
+    if (browser_request || !proofs.is_empty())
+        && let Err(response) = browser_gate(&state, &dashboard, &headers, &Method::POST)
+    {
+        return *response;
+    }
+    if matches!(
+        caller,
+        Some(Extension(DashboardCaller::Rejected(SessionRejection::Csrf)))
+    ) && proofs.is_empty()
+    {
+        return dashboard_session::rejection_response(SessionRejection::Csrf);
+    }
+    let ended = dashboard.sessions.end_browser_context(
+        scope.browser_value(&headers).as_deref(),
+        scope.session_value(&headers).as_deref(),
+        session_in(&caller),
+        &proofs,
     );
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = match ended {
+        Ok(true) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Disconnect)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "dashboard browser sign-out"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        // The owner checked every known presented family under its lock.
+        // With the explicit browser request gate, no remaining target is an
+        // idempotent acknowledgment, not an inference from session 401.
+        Ok(false) if browser_request => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => dashboard_session::rejection_response(SessionRejection::Invalid),
+        Err(_) => return browser_changed(),
+    };
     for value in scope.clear_session_cookies() {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
@@ -1258,6 +1528,15 @@ async fn handle_pkce_callback(
             let Some(Extension(dashboard)) = dashboard_ext else {
                 return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
             };
+            let FlowMode::Dashboard { browser, .. } = &pending.mode else {
+                return browser_changed();
+            };
+            if dashboard.is_retired()
+                || scope.browser_value(&headers).as_deref() != Some(browser.nonce.as_str())
+                || !dashboard.sessions.ticket_current(browser)
+            {
+                return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+            }
             // The provider as configured now, and whether it is still
             // offered: a sign-in whose provider was taken off the screen
             // while it was pending is refused before its code is spent.
@@ -1275,7 +1554,7 @@ async fn handle_pkce_callback(
             };
             // Refused before the code exchange, so the refusal costs the
             // identity provider nothing and the unused code can be retried.
-            if !dashboard.sessions.has_room() {
+            if !dashboard.sessions.has_room_for(browser) {
                 relay.flows.restore(pending);
                 return sessions_full_page();
             }
@@ -1344,7 +1623,10 @@ async fn handle_pkce_callback(
         ),
         (
             FlowMode::Dashboard {
-                return_to, popup, ..
+                browser,
+                return_to,
+                popup,
+                ..
             },
             Some((dashboard, provider, lifetime_secs)),
         ) => {
@@ -1352,6 +1634,7 @@ async fn handle_pkce_callback(
             // returned anyway is wiped here rather than merely dropped.
             drop(token.refresh_token.map(zeroize::Zeroizing::new));
             let landing = DashboardLanding {
+                browser,
                 alias,
                 provider,
                 lifetime_secs,
@@ -1371,6 +1654,7 @@ async fn handle_pkce_callback(
 
 /// A completed dashboard sign-in: what it was for and where it lands.
 struct DashboardLanding {
+    browser: BrowserTicket,
     alias: String,
     /// The issuer and client the alias named when the callback arrived.
     provider: ProviderPin,
@@ -1395,6 +1679,7 @@ async fn finish_dashboard_sign_in(
     access_token: String,
 ) -> Response {
     let DashboardLanding {
+        browser,
         alias,
         provider,
         lifetime_secs,
@@ -1404,7 +1689,7 @@ async fn finish_dashboard_sign_in(
         popup,
     } = landing;
     match dashboard
-        .sign_in(&alias, provider, access_token, lifetime_secs)
+        .sign_in_browser(&alias, provider, access_token, lifetime_secs, &browser)
         .await
     {
         Ok((cookie, session)) => {
@@ -1424,11 +1709,10 @@ async fn finish_dashboard_sign_in(
                 https: request_is_https(state, headers),
                 path_prefix: &state.path_prefix,
             };
-            let mut response = if popup {
-                signed_in_popup_page(session.principal().id.as_str())
-            } else {
-                Redirect::to(&format!("{}{return_to}", state.path_prefix)).into_response()
-            };
+            let mut response = browser_page(serde_json::json!({
+                "mode": "complete", "prefix": state.path_prefix, "alias": alias,
+                "return_to": return_to, "popup": popup, "session_tag": session.tag(),
+            }));
             let response_headers = response.headers_mut();
             response_headers.append(header::SET_COOKIE, scope.session_cookie(&cookie));
             response_headers.append(header::SET_COOKIE, scope.clear_binding_cookie(&flow_state));
@@ -1448,6 +1732,10 @@ async fn finish_dashboard_sign_in(
             );
             match refusal {
                 SignInRefusal::Full => sessions_full_page(),
+                SignInRefusal::Changed => browser_page(serde_json::json!({
+                    "mode": "interrupted", "prefix": state.path_prefix, "alias": alias,
+                    "return_to": return_to, "popup": popup,
+                })),
                 SignInRefusal::Denied | SignInRefusal::Service => sign_in_refused_page(),
             }
         }
@@ -1485,28 +1773,6 @@ fn sessions_full_page() -> Response {
         .into_response();
     set_retry_after(&mut response, CAPACITY_RETRY_AFTER_SECS);
     response
-}
-
-/// Re-authentication in a popup ends here: tell the dashboard's other tabs
-/// on a same-origin channel (which, unlike `window.opener`, survives the
-/// opener policy) and close. The page carries no token; `principal` is a
-/// digest the tabs compare to see whether the same account signed in again.
-fn signed_in_popup_page(principal_id: &str) -> Response {
-    let digest = hex::encode(&Sha256::digest(principal_id.as_bytes())[..8]);
-    Html(format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
-         <body style=\"font-family:system-ui;margin:3rem\"><h1>Signed in</h1>\
-         <p>You can close this window.</p>\
-         <script>(function () {{\
-           try {{\
-             var channel = new BroadcastChannel(\"zeroclaw-auth\");\
-             channel.postMessage({{ type: \"signed-in\", principal: \"{digest}\" }});\
-             channel.close();\
-           }} catch (e) {{}}\
-           window.close();\
-         }})();</script>"
-    ))
-    .into_response()
 }
 
 #[cfg(test)]

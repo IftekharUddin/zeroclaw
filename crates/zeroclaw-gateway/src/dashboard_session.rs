@@ -125,6 +125,7 @@ impl ProviderPin {
 
 /// One signed-in browser.
 struct Session {
+    browser: String,
     alias: String,
     provider: ProviderPin,
     /// The access token the sign-in was issued. Memory only; never logged
@@ -172,6 +173,7 @@ impl Session {
 }
 
 /// A sign-in the store could not take.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct StoreFull;
 
@@ -194,10 +196,64 @@ const EXPIRED_MEMORY_SECS: u64 = 60 * 60;
 /// Expired sessions remembered at once; the oldest is forgotten first.
 const MAX_EXPIRED_REMEMBERED: usize = 1024;
 
+/// A flow's immutable browser/logout-generation binding, never authentication.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct BrowserTicket {
+    pub nonce: String,
+    pub generation: u64,
+}
+
+/// Narrow same-origin coordination/revocation proof. Never accepted by auth gates.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BrowserView {
+    #[serde(flatten)]
+    pub ticket: BrowserTicket,
+    pub csrf: String,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BrowserContext {
+    pub browser: Option<BrowserView>,
+    pub session: Option<BrowserView>,
+    pub session_tag: Option<String>,
+    pub session_csrf: Option<String>,
+}
+
+struct BrowserAssociation {
+    generation: u64,
+    csrf: String,
+    client: String,
+    last_activity: u64,
+}
+
+impl BrowserAssociation {
+    fn view(&self, nonce: &str) -> BrowserView {
+        BrowserView {
+            ticket: BrowserTicket {
+                nonce: nonce.into(),
+                generation: self.generation,
+            },
+            csrf: self.csrf.clone(),
+        }
+    }
+
+    fn proves(&self, proof: &BrowserView) -> bool {
+        zeroclaw_config::pairing::constant_time_eq(&self.csrf, &proof.csrf)
+    }
+}
+
+/// One lock linearizes replacement, logout, bootstrap and ticket admission.
+/// Session.browser is the canonical ownership relationship; no active-session cache.
+#[derive(Default)]
+struct SessionStore {
+    live: HashMap<[u8; 32], Session>,
+    browsers: HashMap<String, BrowserAssociation>,
+}
+
 /// Every live dashboard session in this process.
 #[derive(Default)]
 pub struct DashboardSessions {
-    sessions: parking_lot::Mutex<HashMap<[u8; 32], Session>>,
+    inner: parking_lot::Mutex<SessionStore>,
     /// Keys of sessions that ended by expiring, with when they expired.
     /// Holds no credential; only answers "expired" instead of "invalid".
     expired: parking_lot::Mutex<HashMap<[u8; 32], u64>>,
@@ -209,12 +265,237 @@ pub struct DashboardSessions {
 impl std::fmt::Debug for DashboardSessions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DashboardSessions")
-            .field("sessions", &self.sessions.lock().len())
+            .field("sessions", &self.live_sessions().len())
             .finish()
     }
 }
 
 impl DashboardSessions {
+    fn live_sessions(&self) -> parking_lot::MappedMutexGuard<'_, HashMap<[u8; 32], Session>> {
+        parking_lot::MutexGuard::map(self.inner.lock(), |store| &mut store.live)
+    }
+
+    fn sweep_browsers(store: &mut SessionStore, now: u64) {
+        store.browsers.retain(|nonce, browser| {
+            now.saturating_sub(browser.last_activity) < crate::api_oidc::FLOW_TTL.as_secs()
+                || store.live.values().any(|session| session.browser == *nonce)
+        });
+    }
+
+    pub(crate) fn browser_context(
+        &self,
+        cookie: Option<&str>,
+        session: Option<&SessionAuth>,
+    ) -> BrowserContext {
+        let mut store = self.inner.lock();
+        let now = now_unix();
+        self.sweep(&mut store.live, now);
+        Self::sweep_browsers(&mut store, now);
+        let live = session.and_then(|s| store.live.get(&s.key).map(|live| (s, live)));
+        BrowserContext {
+            browser: cookie.and_then(|nonce| store.browsers.get(nonce).map(|b| b.view(nonce))),
+            session: live
+                .and_then(|(_, s)| store.browsers.get(&s.browser).map(|b| b.view(&s.browser))),
+            session_tag: live.map(|(s, _)| s.tag()),
+            session_csrf: live.map(|(_, s)| s.csrf.clone()),
+        }
+    }
+
+    /// Restore only a noncredential association from a still-live session.
+    /// A different, proven cookie association is retired conservatively.
+    pub(crate) fn bootstrap_browser(
+        &self,
+        cookie: Option<&str>,
+        session: Option<&SessionAuth>,
+        expected: &BrowserContext,
+        client: &str,
+    ) -> Result<BrowserView, SignInRefusal> {
+        let now = now_unix();
+        let mut store = self.inner.lock();
+        self.sweep(&mut store.live, now);
+        Self::sweep_browsers(&mut store, now);
+        let current = cookie.filter(|nonce| store.browsers.contains_key(*nonce));
+        if current != expected.browser.as_ref().map(|v| v.ticket.nonce.as_str()) {
+            return Err(SignInRefusal::Changed);
+        }
+        if let Some(proof) = &expected.browser {
+            let record = &store.browsers[&proof.ticket.nonce];
+            if !record.proves(proof) || record.generation != proof.ticket.generation {
+                return Err(SignInRefusal::Changed);
+            }
+        }
+        let live = session.and_then(|s| store.live.get(&s.key).map(|live| (s, live)));
+        if live.map(|(s, _)| s.tag()).as_ref() != expected.session_tag.as_ref() {
+            return Err(SignInRefusal::Changed);
+        }
+        if let Some((_, live)) = live {
+            if expected
+                .session_csrf
+                .as_ref()
+                .is_none_or(|csrf| !zeroclaw_config::pairing::constant_time_eq(csrf, &live.csrf))
+            {
+                return Err(SignInRefusal::Changed);
+            }
+            let nonce = live.browser.clone();
+            if let Some(other) = current.filter(|other| *other != nonce) {
+                Self::retire_browser(&mut store, other, now);
+            }
+            return store
+                .browsers
+                .get(&nonce)
+                .map(|b| b.view(&nonce))
+                .ok_or(SignInRefusal::Changed);
+        }
+        if let Some(nonce) = current {
+            return Ok(store.browsers[nonce].view(nonce));
+        }
+        if store.browsers.len() >= MAX_SESSIONS + crate::api_oidc::FLOW_CAP {
+            return Err(SignInRefusal::Full);
+        }
+        // The same remote client share as pending flows; live browsers are not evicted.
+        if !crate::auth_rate_limit::is_loopback_key(client)
+            && store
+                .browsers
+                .iter()
+                .filter(|(nonce, b)| {
+                    b.client == client && !store.live.values().any(|s| s.browser == **nonce)
+                })
+                .count()
+                >= crate::api_oidc::PER_CLIENT_FLOW_CAP
+        {
+            return Err(SignInRefusal::Full);
+        }
+        let nonce = random_token();
+        let browser = BrowserAssociation {
+            generation: 0,
+            csrf: random_token(),
+            client: client.into(),
+            last_activity: now,
+        };
+        let view = browser.view(&nonce);
+        store.browsers.insert(nonce, browser);
+        self.occupied
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(view)
+    }
+
+    /// Cookie, CSRF and logout generation all match before a flow starts.
+    pub(crate) fn admit_browser_flow(
+        &self,
+        cookie: Option<&str>,
+        presented_session: Option<&str>,
+        proof: &BrowserView,
+    ) -> bool {
+        if cookie != Some(proof.ticket.nonce.as_str()) {
+            return false;
+        }
+        let now = now_unix();
+        let mut store = self.inner.lock();
+        self.sweep(&mut store.live, now);
+        Self::sweep_browsers(&mut store, now);
+        // A credential response may have arrived since bootstrap. Its live
+        // family is a mandatory reconciliation target, even with stale session
+        // CSRF. Same-family concurrent replacements remain admissible.
+        if presented_session
+            .and_then(|cookie| store.live.get(&session_key(cookie)))
+            .is_some_and(|session| session.browser != proof.ticket.nonce)
+        {
+            return false;
+        }
+        let Some(browser) = store.browsers.get_mut(&proof.ticket.nonce) else {
+            return false;
+        };
+        if !browser.proves(proof) || browser.generation != proof.ticket.generation {
+            return false;
+        }
+        browser.last_activity = now;
+        true
+    }
+
+    pub(crate) fn ticket_current(&self, ticket: &BrowserTicket) -> bool {
+        let now = now_unix();
+        let mut store = self.inner.lock();
+        self.sweep(&mut store.live, now);
+        Self::sweep_browsers(&mut store, now);
+        store
+            .browsers
+            .get(&ticket.nonce)
+            .is_some_and(|b| b.generation == ticket.generation)
+    }
+
+    fn retire_browser(store: &mut SessionStore, nonce: &str, now: u64) {
+        if let Some(browser) = store.browsers.get_mut(nonce) {
+            // Saturation fails closed for future flows rather than wrapping old tickets.
+            if let Some(next) = browser.generation.checked_add(1) {
+                browser.generation = next;
+                browser.last_activity = now;
+            } else {
+                store.browsers.remove(nonce);
+            }
+        }
+        store.live.retain(|_, session| {
+            if session.browser == nonce {
+                session.ended.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Lookup-only logout proofs remain revocation-only even after their session retires.
+    pub(crate) fn end_browser_context(
+        &self,
+        cookie: Option<&str>,
+        presented_session: Option<&str>,
+        session: Option<&SessionAuth>,
+        proofs: &[BrowserView],
+    ) -> Result<bool, SignInRefusal> {
+        if proofs.len() > 2 {
+            return Err(SignInRefusal::Changed);
+        }
+        let now = now_unix();
+        let mut store = self.inner.lock();
+        self.sweep(&mut store.live, now);
+        let own = session
+            .and_then(|s| store.live.get(&s.key))
+            .map(|s| s.browser.clone());
+        let mut targets = Vec::new();
+        if let Some(own) = &own {
+            targets.push(own.clone());
+        }
+        for proof in proofs {
+            let Some(browser) = store.browsers.get(&proof.ticket.nonce) else {
+                continue;
+            };
+            if !browser.proves(proof) {
+                return Err(SignInRefusal::Changed);
+            }
+            targets.push(proof.ticket.nonce.clone());
+        }
+        // Even when ordinary session CSRF was stale, a raw cookie naming a
+        // still-live session identifies a mandatory revocation target. It
+        // grants no authority: that target must separately have a browser
+        // proof or the admitted session's CSRF before any family is changed.
+        if let Some(known) =
+            presented_session.and_then(|cookie| store.live.get(&session_key(cookie)))
+            && !targets.iter().any(|target| target == &known.browser)
+        {
+            return Err(SignInRefusal::Changed);
+        }
+        if let Some(nonce) = cookie.filter(|nonce| store.browsers.contains_key(*nonce))
+            && !targets.iter().any(|target| target == nonce)
+        {
+            return Err(SignInRefusal::Changed);
+        }
+        targets.sort();
+        targets.dedup();
+        for nonce in &targets {
+            Self::retire_browser(&mut store, nonce, now);
+        }
+        Ok(!targets.is_empty())
+    }
+
     /// The process's one store, shared by every gateway generation.
     pub fn process_shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<DashboardSessions>> = OnceLock::new();
@@ -239,9 +520,10 @@ impl DashboardSessions {
     /// Sweep with no request in hand: the idle sweep, so an expired
     /// session's token leaves memory even if nothing names it again.
     fn sweep_now(&self, now: u64) {
-        let mut sessions = self.sessions.lock();
-        self.sweep(&mut sessions, now);
-        drop(sessions);
+        let mut store = self.inner.lock();
+        self.sweep(&mut store.live, now);
+        Self::sweep_browsers(&mut store, now);
+        drop(store);
         self.expired
             .lock()
             .retain(|_, at| now.saturating_sub(*at) < EXPIRED_MEMORY_SECS);
@@ -277,8 +559,9 @@ impl DashboardSessions {
     /// Whether a new sign-in could land now. Checked before the code
     /// exchange so a refusal costs no round trip to the identity provider;
     /// [`Self::insert`] checks again.
+    #[cfg(test)]
     pub(crate) fn has_room(&self) -> bool {
-        let mut sessions = self.sessions.lock();
+        let mut sessions = self.live_sessions();
         self.sweep(&mut sessions, now_unix());
         sessions.len() < MAX_SESSIONS
     }
@@ -287,7 +570,39 @@ impl DashboardSessions {
     ///
     /// A principal at its own cap gives up its oldest session. Nobody else's
     /// session is ever evicted: at the global cap the sign-in is refused.
+    #[cfg(test)]
     fn insert(&self, new: NewSession, now: u64) -> Result<(String, Arc<SessionAuth>), StoreFull> {
+        let browser = self
+            .bootstrap_browser(None, None, &BrowserContext::default(), "127.0.0.1")
+            .map_err(|_| StoreFull)?;
+        self.inner
+            .lock()
+            .browsers
+            .get_mut(&browser.ticket.nonce)
+            .unwrap()
+            .last_activity = now;
+        self.replace(new, &browser.ticket, now, || true)
+            .map_err(|_| StoreFull)
+    }
+
+    pub(crate) fn has_room_for(&self, ticket: &BrowserTicket) -> bool {
+        let mut store = self.inner.lock();
+        self.sweep(&mut store.live, now_unix());
+        store
+            .live
+            .values()
+            .filter(|s| s.browser != ticket.nonce)
+            .count()
+            < MAX_SESSIONS
+    }
+
+    fn replace(
+        &self,
+        new: NewSession,
+        ticket: &BrowserTicket,
+        now: u64,
+        admits: impl FnOnce() -> bool,
+    ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
         let NewSession {
             alias,
             provider,
@@ -297,14 +612,46 @@ impl DashboardSessions {
             display_name,
             lifetime_secs,
         } = new;
-        let mut sessions = self.sessions.lock();
-        self.sweep(&mut sessions, now);
+        let mut store = self.inner.lock();
+        // Resolve generation retirement after any wait for this store. A stop
+        // after admission does not roll back an already admitted replacement.
+        if !admits() {
+            return Err(SignInRefusal::Changed);
+        }
+        self.sweep(&mut store.live, now);
+        Self::sweep_browsers(&mut store, now);
+        if store
+            .browsers
+            .get(&ticket.nonce)
+            .is_none_or(|b| b.generation != ticket.generation)
+        {
+            return Err(SignInRefusal::Changed);
+        }
+        let sessions = &mut store.live;
         let principal = auth.principal.id.clone();
         let mut own: Vec<([u8; 32], u64)> = sessions
             .iter()
-            .filter(|(_, session)| session.auth.principal.id == principal)
+            .filter(|(_, session)| {
+                session.auth.principal.id == principal && session.browser != ticket.nonce
+            })
             .map(|(key, session)| (*key, session.created))
             .collect();
+        let replaced = sessions
+            .values()
+            .filter(|s| s.browser == ticket.nonce)
+            .count();
+        let evicted = (own.len() + 1).saturating_sub(MAX_SESSIONS_PER_PRINCIPAL);
+        if sessions.len().saturating_sub(replaced + evicted) >= MAX_SESSIONS {
+            return Err(SignInRefusal::Full);
+        }
+        sessions.retain(|_, session| {
+            if session.browser == ticket.nonce {
+                session.ended.cancel();
+                false
+            } else {
+                true
+            }
+        });
         if own.len() >= MAX_SESSIONS_PER_PRINCIPAL {
             own.sort_by_key(|(_, created)| *created);
             let excess = own.len() + 1 - MAX_SESSIONS_PER_PRINCIPAL;
@@ -314,12 +661,10 @@ impl DashboardSessions {
                 }
             }
         }
-        if sessions.len() >= MAX_SESSIONS {
-            return Err(StoreFull);
-        }
         let cookie = random_token();
         let key = session_key(&cookie);
         let session = Session {
+            browser: ticket.nonce.clone(),
             alias,
             provider,
             bearer,
@@ -344,8 +689,9 @@ impl DashboardSessions {
         if !self.occupied.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let mut sessions = self.sessions.lock();
-        for (_, session) in sessions.drain() {
+        let mut store = self.inner.lock();
+        store.browsers.clear();
+        for (_, session) in store.live.drain() {
             session.ended.cancel();
         }
         self.occupied
@@ -359,7 +705,7 @@ impl DashboardSessions {
         if !self.occupied.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        self.sessions.lock().retain(|_, session| {
+        self.live_sessions().retain(|_, session| {
             let kept = provider_for(offered, &session.alias).as_ref() == Some(&session.provider);
             if !kept {
                 session.ended.cancel();
@@ -369,7 +715,7 @@ impl DashboardSessions {
     }
 
     fn remove_key(&self, key: &[u8; 32]) -> bool {
-        match self.sessions.lock().remove(key) {
+        match self.live_sessions().remove(key) {
             Some(session) => {
                 session.ended.cancel();
                 true
@@ -380,7 +726,7 @@ impl DashboardSessions {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.sessions.lock().len()
+        self.live_sessions().len()
     }
 }
 
@@ -440,6 +786,11 @@ impl SessionAuth {
         } else {
             Ok(())
         }
+    }
+
+    /// A comparison tag, never an authentication credential or recovery handle.
+    pub(crate) fn tag(&self) -> String {
+        hex::encode(self.key)
     }
 
     pub fn principal(&self) -> &Principal {
@@ -630,6 +981,8 @@ impl Drop for SweeperGuard {
 /// session. Each maps to a fixed page; details go to the log only.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SignInRefusal {
+    /// Browser context changed or its pending flow was signed out.
+    Changed,
     /// The core's provider refused the access token, or the policy grants
     /// the identity nothing.
     Denied,
@@ -685,12 +1038,34 @@ impl DashboardAuth {
     /// RPC verifies a bearer; the resolved principal must be a human.
     /// `provider` is the alias's issuer and client as configured now, which
     /// the session is pinned to.
+    #[cfg(test)]
     pub(crate) async fn sign_in(
         &self,
         alias: &str,
         provider: ProviderPin,
         access_token: String,
         lifetime_secs: u64,
+    ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
+        let browser =
+            self.sessions
+                .bootstrap_browser(None, None, &BrowserContext::default(), "127.0.0.1")?;
+        self.sign_in_browser(
+            alias,
+            provider,
+            access_token,
+            lifetime_secs,
+            &browser.ticket,
+        )
+        .await
+    }
+
+    pub(crate) async fn sign_in_browser(
+        &self,
+        alias: &str,
+        provider: ProviderPin,
+        access_token: String,
+        lifetime_secs: u64,
+        ticket: &BrowserTicket,
     ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
         // Wiped on every path out, a refused sign-in included.
         let access_token = Zeroizing::new(access_token);
@@ -713,9 +1088,11 @@ impl DashboardAuth {
             display_name,
             lifetime_secs,
         };
+        if self.is_retired() {
+            return Err(SignInRefusal::Changed);
+        }
         self.sessions
-            .insert(new, now_unix())
-            .map_err(|StoreFull| SignInRefusal::Full)
+            .replace(new, ticket, now_unix(), || !self.is_retired())
     }
 
     /// Check again, from a long-lived socket, the session a request admitted
@@ -745,7 +1122,7 @@ impl DashboardAuth {
     ) -> DashboardCaller {
         let now = now_unix();
         let snapshot = {
-            let mut sessions = self.sessions.sessions.lock();
+            let mut sessions = self.sessions.live_sessions();
             // Expired sessions go now rather than at the next sign-in, so
             // their tokens leave memory with them.
             self.sessions.sweep(&mut sessions, now);
@@ -819,7 +1196,7 @@ impl DashboardAuth {
         // expiry to pass meanwhile, with a token that is still valid.
         let checked_at = now_unix();
         let admitted = {
-            let sessions = self.sessions.sessions.lock();
+            let sessions = self.sessions.live_sessions();
             match sessions.get(&key) {
                 Some(session) if session.expires_at() <= checked_at => None,
                 Some(session) => Some(DashboardCaller::Session(Arc::new(
@@ -869,7 +1246,7 @@ impl DashboardAuth {
                 if fresh.principal.id == previous.principal.id
                     && fresh.principal.actor != ActorKind::Service =>
             {
-                let mut sessions = self.sessions.sessions.lock();
+                let mut sessions = self.sessions.live_sessions();
                 let session = sessions.get_mut(key)?;
                 session.auth = fresh.clone();
                 session.authority = self.inbound.authority_ref();
@@ -896,8 +1273,11 @@ impl DashboardAuth {
     }
 
     /// End the session behind `session` (sign-out).
+    #[cfg(test)]
     pub(crate) fn end(&self, session: &SessionAuth) -> bool {
-        self.sessions.remove_key(&session.key)
+        self.sessions
+            .end_browser_context(None, None, Some(session), &[])
+            .unwrap_or(false)
     }
 }
 
@@ -955,6 +1335,27 @@ impl CookieScope<'_> {
     /// The session cookie the request carries, under this scope's one name.
     pub(crate) fn session_value(&self, headers: &HeaderMap) -> Option<String> {
         cookie_value(headers, self.session_name())
+    }
+
+    pub(crate) fn browser_name(&self) -> &'static str {
+        if self.host_prefixed() {
+            "__Host-zc_browser"
+        } else {
+            "zc_browser"
+        }
+    }
+
+    pub(crate) fn browser_value(&self, headers: &HeaderMap) -> Option<String> {
+        cookie_value(headers, self.browser_name())
+    }
+
+    /// Only the preparation script writes this noncredential cookie, synchronously.
+    pub(crate) fn browser_cookie_suffix(&self) -> String {
+        format!(
+            "; Path={}/; SameSite=Lax{}",
+            self.path_prefix,
+            self.secure()
+        )
     }
 
     /// `Set-Cookie` for a new session. No `Max-Age`: the browser keeps it
@@ -1069,7 +1470,7 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// requests that change state and on upgrades. `Sec-Fetch-Site`, where
 /// sent, must say the request came from this origin (or, for a plain
 /// navigation, from the user).
-fn check_origin(
+pub(crate) fn check_origin(
     method: &Method,
     headers: &HeaderMap,
     own_origin: &str,
@@ -1981,6 +2382,7 @@ mod tests {
     /// A started sign-in: the binding cookie and the flow's `state` and
     /// `nonce`, read back from the redirect to the identity provider.
     struct Started {
+        browser: String,
         binding_name: String,
         binding: String,
         state: String,
@@ -1988,15 +2390,94 @@ mod tests {
     }
 
     async fn start(fixture: &Fixture, path: &str) -> Started {
-        let response = send(&fixture.router, request("GET", path, loopback(), &[])).await;
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
-        let location = response
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
+        start_with_cookies(fixture, path, "").await
+    }
+
+    async fn start_with_cookies(fixture: &Fixture, path: &str, cookies: &str) -> Started {
+        let prepared = send(
+            &fixture.router,
+            request("GET", path, loopback(), &[("cookie", cookies)]),
+        )
+        .await;
+        assert_eq!(prepared.status(), StatusCode::OK, "{path}");
+        assert!(
+            set_cookies(&prepared).is_empty(),
+            "preparation never asynchronously writes association cookies"
+        );
+        let context = json(
+            send(
+                &fixture.router,
+                request(
+                    "GET",
+                    "/api/auth/browser",
+                    loopback(),
+                    &[("cookie", cookies), ("x-zeroclaw-browser", "1")],
+                ),
+            )
+            .await,
+        )
+        .await;
+        let csrf = context["session_csrf"].as_str().unwrap_or("");
+        let mut bootstrap = request(
+            "POST",
+            "/api/auth/browser",
+            loopback(),
+            &[
+                ("cookie", cookies),
+                ("origin", OWN_ORIGIN),
+                ("x-zeroclaw-browser", "1"),
+                ("content-type", "application/json"),
+                (CSRF_HEADER, csrf),
+            ],
+        );
+        *bootstrap.body_mut() = Body::from(context.to_string());
+        let response = send(&fixture.router, bootstrap).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            set_cookies(&response).is_empty(),
+            "bootstrap never writes a cookie"
+        );
+        let browser = json(response).await;
+        let browser_nonce = browser["nonce"].as_str().unwrap().to_string();
+        let mut cookies: Vec<_> = cookies
+            .split(';')
+            .filter(|s| !s.trim().starts_with("zc_browser=") && !s.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        cookies.push(format!("zc_browser={browser_nonce}"));
+        let cookies = cookies.join("; ");
+        let mut confirm = request(
+            "POST",
+            "/api/auth/browser/confirm",
+            loopback(),
+            &[
+                ("cookie", &cookies),
+                ("origin", OWN_ORIGIN),
+                ("x-zeroclaw-browser", "1"),
+                ("content-type", "application/json"),
+                (CSRF_HEADER, csrf),
+            ],
+        );
+        *confirm.body_mut() = Body::from(browser.to_string());
+        assert_eq!(
+            send(&fixture.router, confirm).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        let mut start = request(
+            "POST",
+            path,
+            loopback(),
+            &[
+                ("cookie", &cookies),
+                ("origin", OWN_ORIGIN),
+                ("x-zeroclaw-browser", "1"),
+                ("content-type", "application/json"),
+                (CSRF_HEADER, csrf),
+            ],
+        );
+        *start.body_mut() = Body::from(browser.to_string());
+        let response = send(&fixture.router, start).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
         let binding_cookie = set_cookies(&response)
             .into_iter()
             .find(|c| c.starts_with(BINDING_COOKIE_STEM))
@@ -2009,6 +2490,10 @@ mod tests {
         );
         let (binding_name, rest) = binding_cookie.split_once('=').unwrap();
         let binding = rest.split(';').next().unwrap().to_string();
+        let location = json(response).await["authorize_url"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let state = query_param(&location, "state");
         let scope = CookieScope {
             https: false,
@@ -2020,6 +2505,7 @@ mod tests {
             "the binding cookie is named after its flow"
         );
         Started {
+            browser: browser_nonce,
             binding_name: binding_name.to_string(),
             binding,
             state,
@@ -2061,6 +2547,7 @@ mod tests {
         other_cookies: &[String],
     ) -> HttpRequest<Body> {
         let mut cookies: Vec<String> = other_cookies.to_vec();
+        cookies.push(format!("zc_browser={}", started.browser));
         if let Some(binding) = binding {
             cookies.push(format!("{}={binding}", started.binding_name));
         }
@@ -2078,6 +2565,7 @@ mod tests {
     }
 
     struct SignedIn {
+        browser: String,
         cookie: String,
         csrf: String,
         session: serde_json::Value,
@@ -2085,7 +2573,10 @@ mod tests {
 
     impl SignedIn {
         fn cookie_header(&self) -> String {
-            format!("{SESSION_COOKIE}={}", self.cookie)
+            format!(
+                "{SESSION_COOKIE}={}; zc_browser={}",
+                self.cookie, self.browser
+            )
         }
     }
 
@@ -2093,8 +2584,7 @@ mod tests {
         let started = start(fixture, "/auth/sign-in/corp?return=/chat").await;
         mount_token(server, &started.nonce, true).await;
         let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(response.headers()[header::LOCATION], "/chat");
+        assert_eq!(response.status(), StatusCode::OK);
         let session_cookie = set_cookies(&response)
             .into_iter()
             .find(|c| c.starts_with(SESSION_COOKIE))
@@ -2137,6 +2627,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let session = json(response).await;
         SignedIn {
+            browser: started.browser,
             cookie,
             csrf: session["csrf_token"].as_str().unwrap().to_string(),
             session,
@@ -2151,6 +2642,91 @@ mod tests {
         .await;
         let status = response.status();
         (status, json(response).await)
+    }
+
+    async fn mount_replacement_token(server: &MockServer, nonce: &str) {
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(wiremock::matchers::body_string_contains("code=replacement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "replacement-token", "token_type": "Bearer", "expires_in": 600,
+                "id_token": id_token(serde_json::json!({
+                    "iss": server.uri(), "aud": "gw", "sub": "alice", "exp": unix_now() + 600,
+                    "nonce": nonce,
+                })),
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_retires_the_displaced_session() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let old = sign_in(&fixture, &server).await;
+        let DashboardCaller::Session(session) = fixture
+            .auth
+            .admit(|_| Some(pin_for(&fixture, "corp")), &old.cookie)
+            .await
+        else {
+            panic!("initial session admitted")
+        };
+        let started =
+            start_with_cookies(&fixture, "/auth/sign-in/corp", &old.cookie_header()).await;
+        mount_replacement_token(&server, &started.nonce).await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "replacement", &[]),
+        )
+        .await;
+        assert!(
+            cookie_from(&response, SESSION_COOKIE).is_some(),
+            "replacement completes"
+        );
+        assert!(
+            session.ended.is_cancelled(),
+            "successful browser replacement must retire old watchers"
+        );
+        assert_eq!(
+            probe(&fixture, &[("cookie", &old.cookie_header())]).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_logout_invalidates_already_pending_flow() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let old = sign_in(&fixture, &server).await;
+        let started =
+            start_with_cookies(&fixture, "/auth/sign-in/corp", &old.cookie_header()).await;
+        mount_replacement_token(&server, &started.nonce).await;
+        let logout = send(
+            &fixture.router,
+            request(
+                "POST",
+                "/auth/sign-out",
+                loopback(),
+                &[
+                    ("cookie", &old.cookie_header()),
+                    ("origin", OWN_ORIGIN),
+                    (CSRF_HEADER, &old.csrf),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "replacement", &[]),
+        )
+        .await;
+        assert!(
+            cookie_from(&response, SESSION_COOKIE).is_none(),
+            "a pre-logout flow must not create a later session"
+        );
+        assert_eq!(fixture.auth.sessions.len(), 0);
     }
 
     // ── Off by default ───────────────────────────────────────────────
@@ -2410,8 +2986,12 @@ mod tests {
             mount_discovery_and_introspection(&server, &["admins"], "gw").await;
             mount_token(&server, &started.nonce, true).await;
             let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
-            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{target}");
-            assert_eq!(response.headers()[header::LOCATION], "/", "{target}");
+            assert_eq!(response.status(), StatusCode::OK, "{target}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                String::from_utf8_lossy(&body).contains("\"return_to\":\"/\""),
+                "{target}"
+            );
         }
     }
 
@@ -3019,12 +3599,25 @@ mod tests {
         );
         assert_eq!(refused.err(), Some(StoreFull));
 
-        // The starter refuses before any round trip to the provider.
-        let response = send(
-            &fixture.router,
-            request("GET", "/auth/sign-in/corp", loopback(), &[]),
-        )
-        .await;
+        // Preparation is local; the actual start refuses before provider discovery.
+        let browser = fixture
+            .auth
+            .sessions
+            .bootstrap_browser(None, None, &BrowserContext::default(), "127.0.0.1")
+            .unwrap();
+        let mut req = request(
+            "POST",
+            "/auth/sign-in/corp",
+            loopback(),
+            &[
+                ("cookie", &format!("zc_browser={}", browser.ticket.nonce)),
+                ("origin", OWN_ORIGIN),
+                ("x-zeroclaw-browser", "1"),
+                ("content-type", "application/json"),
+            ],
+        );
+        *req.body_mut() = Body::from(serde_json::to_string(&browser).unwrap());
+        let response = send(&fixture.router, req).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
         assert_eq!(fixture.auth.sessions.len(), MAX_SESSIONS);
@@ -3033,8 +3626,7 @@ mod tests {
                 fixture
                     .auth
                     .sessions
-                    .sessions
-                    .lock()
+                    .live_sessions()
                     .contains_key(&session_key(cookie))
             }),
             "every existing session survives"
@@ -3072,8 +3664,7 @@ mod tests {
             fixture
                 .auth
                 .sessions
-                .sessions
-                .lock()
+                .live_sessions()
                 .contains_key(&session_key(cookie))
         };
         assert!(
@@ -3439,7 +4030,12 @@ mod tests {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));
         let first = start(&fixture, "/auth/sign-in/corp?return=/a").await;
-        let second = start(&fixture, "/auth/sign-in/corp?return=/b").await;
+        let second = start_with_cookies(
+            &fixture,
+            "/auth/sign-in/corp?return=/b",
+            &format!("zc_browser={}", first.browser),
+        )
+        .await;
         assert_ne!(first.binding_name, second.binding_name);
         for (started, code) in [(&first, "code-a"), (&second, "code-b")] {
             Mock::given(http_method("POST"))
@@ -3472,15 +4068,22 @@ mod tests {
             callback_with(&second, None, "code-b", &both),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(response.headers()[header::LOCATION], "/b");
+        assert_eq!(response.status(), StatusCode::OK);
+        let replaced = cookie_from(&response, SESSION_COOKIE).unwrap();
         let response = send(
             &fixture.router,
             callback_with(&first, None, "code-a", &both),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(response.headers()[header::LOCATION], "/a");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.auth.sessions.len(), 1);
+        assert!(matches!(
+            fixture
+                .auth
+                .admit(|_| Some(pin_for(&fixture, "corp")), &replaced)
+                .await,
+            DashboardCaller::Rejected(_)
+        ));
     }
 
     #[tokio::test]
@@ -3700,7 +4303,7 @@ mod tests {
             "a staged sign-in holds the token as {staged}"
         );
         fixture.auth.sessions.insert(new, unix_now()).unwrap();
-        let sessions = fixture.auth.sessions.sessions.lock();
+        let sessions = fixture.auth.sessions.live_sessions();
         let held = sessions.values().next().expect("the session is stored");
         let stored = std::any::type_name_of_val(&held.bearer);
         assert!(
@@ -5230,5 +5833,770 @@ mod tests {
             "a suspended event stream kept its ended session's watch"
         );
         drop(body);
+    }
+    #[tokio::test]
+    async fn browser_replacement_failed_verification_preserves_old_and_other_browser() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let old = sign_in(&fixture, &server).await;
+        let other = fixture
+            .auth
+            .sign_in(
+                "corp",
+                pin_for(&fixture, "corp"),
+                "other-token".into(),
+                3600,
+            )
+            .await
+            .unwrap()
+            .1;
+        let started =
+            start_with_cookies(&fixture, "/auth/sign-in/corp", &old.cookie_header()).await;
+        // No token answer with this attempt's nonce: failure cannot retire either session.
+        let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
+        assert!(cookie_from(&response, SESSION_COOKIE).is_none());
+        assert_eq!(
+            probe(&fixture, &[("cookie", &old.cookie_header())]).await.0,
+            StatusCode::OK
+        );
+        assert!(!other.ended.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_mismatch_preserves_proven_session_and_retires_other_family() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (old_cookie, old) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "old-token".into(), 3600)
+            .await
+            .unwrap();
+        let (_, current) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "new-token".into(), 3600)
+            .await
+            .unwrap();
+        let a = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&old))
+            .session
+            .unwrap();
+        let b = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&current))
+            .session
+            .unwrap();
+        let context = fixture
+            .auth
+            .sessions
+            .browser_context(Some(&a.ticket.nonce), Some(&current));
+        let reconciled = fixture
+            .auth
+            .sessions
+            .bootstrap_browser(Some(&a.ticket.nonce), Some(&current), &context, "127.0.0.1")
+            .unwrap();
+        assert!(
+            reconciled.ticket == b.ticket,
+            "restore only the valid session's existing association"
+        );
+        assert!(
+            !current.ended.is_cancelled(),
+            "failed subsequent sign-in must retain current access"
+        );
+        assert!(old.ended.is_cancelled());
+        assert!(
+            !fixture.auth.sessions.ticket_current(&a.ticket),
+            "mismatched family pending attempts retired"
+        );
+        assert!(
+            fixture.auth.sessions.ticket_current(&b.ticket),
+            "current family's pending attempts preserved"
+        );
+        let missing = fixture.auth.sessions.browser_context(None, Some(&current));
+        assert!(
+            fixture
+                .auth
+                .sessions
+                .bootstrap_browser(None, Some(&current), &missing, "127.0.0.1")
+                .unwrap()
+                .ticket
+                == b.ticket
+        );
+        assert!(matches!(
+            fixture
+                .auth
+                .admit(|_| Some(pin_for(&fixture, "corp")), &old_cookie)
+                .await,
+            DashboardCaller::Rejected(_)
+        ));
+        let no_recovery = fixture.auth.sessions.browser_context(None, Some(&old));
+        assert!(no_recovery.session.is_none() && no_recovery.session_tag.is_none());
+        assert!(
+            fixture
+                .auth
+                .sessions
+                .bootstrap_browser(Some(&a.ticket.nonce), Some(&old), &context, "127.0.0.1")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_logout_proofs_survive_held_response_and_cover_mismatch() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (_, a_session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "a".into(), 3600)
+            .await
+            .unwrap();
+        let (_, b_session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "b".into(), 3600)
+            .await
+            .unwrap();
+        let a = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&a_session))
+            .session
+            .unwrap();
+        let b = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&b_session))
+            .session
+            .unwrap();
+        let verified = verified_auth(&fixture).await;
+        let (_, fresh) = fixture
+            .auth
+            .sessions
+            .replace(
+                new_session(verified.clone(), &fixture.auth.inbound, 3600),
+                &b.ticket,
+                unix_now(),
+                || true,
+            )
+            .unwrap();
+        assert!(
+            b_session.ended.is_cancelled(),
+            "response carrying fresh cookie is still held"
+        );
+        assert!(
+            fixture
+                .auth
+                .sessions
+                .end_browser_context(
+                    Some(&a.ticket.nonce),
+                    None,
+                    Some(&b_session),
+                    &[a.clone(), b.clone()]
+                )
+                .unwrap()
+        );
+        assert!(fresh.ended.is_cancelled() && a_session.ended.is_cancelled());
+        for ticket in [&a.ticket, &b.ticket] {
+            assert!(!fixture.auth.sessions.ticket_current(ticket));
+            assert!(matches!(
+                fixture.auth.sessions.replace(
+                    new_session(verified.clone(), &fixture.auth.inbound, 3600),
+                    ticket,
+                    unix_now(),
+                    || true
+                ),
+                Err(SignInRefusal::Changed)
+            ));
+        }
+        let after = fixture
+            .auth
+            .sessions
+            .browser_context(Some(&b.ticket.nonce), None)
+            .browser
+            .unwrap();
+        assert!(after.ticket.generation > b.ticket.generation);
+        let (_, explicit) = fixture
+            .auth
+            .sessions
+            .replace(
+                new_session(verified, &fixture.auth.inbound, 3600),
+                &after.ticket,
+                unix_now(),
+                || true,
+            )
+            .unwrap();
+        assert!(
+            !explicit.ended.is_cancelled(),
+            "a new explicit post-logout sign-in is allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_renews_at_global_and_principal_caps_without_other_eviction() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let verified = verified_auth(&fixture).await;
+        let store = &fixture.auth.sessions;
+        let mut sessions = Vec::new();
+        for i in 0..MAX_SESSIONS {
+            let mut auth = verified.clone();
+            if i >= MAX_SESSIONS_PER_PRINCIPAL {
+                auth.principal.id = zeroclaw_api::principal::PrincipalId(format!("other-{i}"));
+            }
+            sessions.push(
+                store
+                    .insert(new_session(auth, &fixture.auth.inbound, 3600), unix_now())
+                    .unwrap()
+                    .1,
+            );
+        }
+        let browser = store
+            .browser_context(None, Some(&sessions[0]))
+            .session
+            .unwrap();
+        assert!(store.has_room_for(&browser.ticket));
+        let (_, replacement) = store
+            .replace(
+                new_session(verified, &fixture.auth.inbound, 3600),
+                &browser.ticket,
+                unix_now(),
+                || true,
+            )
+            .unwrap();
+        assert!(sessions[0].ended.is_cancelled());
+        assert!(sessions[1..].iter().all(|s| !s.ended.is_cancelled()));
+        assert!(!replacement.ended.is_cancelled());
+        assert_eq!(store.len(), MAX_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_cleanup_never_precedes_owned_session_and_old_ticket_never_revives()
+    {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let mut verified = verified_auth(&fixture).await;
+        verified.principal.expires_at = Some(unix_now() + 3600);
+        let now = unix_now();
+        let (_, session) = fixture
+            .auth
+            .sessions
+            .insert(new_session(verified, &fixture.auth.inbound, 3600), now)
+            .unwrap();
+        let browser = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&session))
+            .session
+            .unwrap();
+        fixture.auth.sessions.sweep_now(now + 599);
+        fixture.auth.sessions.sweep_now(now + 600);
+        assert!(fixture.auth.sessions.ticket_current(&browser.ticket));
+        assert!(
+            !session.ended.is_cancelled(),
+            "idle association TTL cannot expire its owned session"
+        );
+        fixture.auth.sessions.sweep_now(session.expires_at);
+        assert!(session.ended.is_cancelled());
+        assert!(!fixture.auth.sessions.ticket_current(&browser.ticket));
+        assert!(
+            fixture
+                .auth
+                .sessions
+                .browser_context(Some(&browser.ticket.nonce), None)
+                .browser
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_coordination_proofs_are_not_authentication_or_mutation_csrf() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let old = sign_in(&fixture, &server).await;
+        let view = fixture
+            .auth
+            .sessions
+            .browser_context(Some(&old.browser), None)
+            .browser
+            .unwrap();
+        assert_eq!(
+            probe(
+                &fixture,
+                &[("cookie", &format!("zc_browser={}", old.browser))]
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let bad_csrf = send(
+            &fixture.router,
+            request(
+                "POST",
+                "/auth/sign-out",
+                loopback(),
+                &[
+                    ("cookie", &old.cookie_header()),
+                    ("origin", OWN_ORIGIN),
+                    (CSRF_HEADER, &view.csrf),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(bad_csrf.status(), StatusCode::FORBIDDEN);
+        let before = fixture.auth.sessions.inner.lock().browsers.len();
+        for (origin, header) in [("http://evil.example", "1"), (OWN_ORIGIN, "")] {
+            let mut req = request(
+                "POST",
+                "/api/auth/browser",
+                loopback(),
+                &[
+                    ("origin", origin),
+                    ("x-zeroclaw-browser", header),
+                    ("content-type", "application/json"),
+                ],
+            );
+            *req.body_mut() = Body::from("{}");
+            assert_eq!(
+                send(&fixture.router, req).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(fixture.auth.sessions.inner.lock().browsers.len(), before);
+    }
+
+    /// Real Chromium drives the production preparation/completion pages and
+    /// routes; only the identity provider and landing document are synthetic.
+    #[tokio::test]
+    #[ignore = "requires a local Chromium acceptance driver"]
+    async fn browser_replacement_acceptance_harness() {
+        let server = Arc::new(idp(&["admins"], "gw").await);
+        Mock::given(http_method("GET")).and(http_path("/authorize"))
+            .respond_with(|request: &wiremock::Request| {
+                let query: HashMap<_, _> = request.url.query_pairs().into_owned().collect();
+                let link = |name: &str| format!("{}?state={}&code={}.{}", query["redirect_uri"], query["state"], query["nonce"], name);
+                ResponseTemplate::new(200).set_body_raw(format!(
+                    "<!doctype html><title>Mock IdP</title><a id=\"alice\" href=\"{}\">Synthetic Alice</a><a id=\"bob\" href=\"{}\">Synthetic Bob</a>",
+                    link("alice").replace('&', "&amp;"), link("bob").replace('&', "&amp;")
+                ), "text/html; charset=utf-8")
+            }).mount(&server).await;
+        let issuer = server.uri();
+        Mock::given(http_method("POST")).and(http_path("/token"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                let code = body.split('&').find_map(|p| p.strip_prefix("code=")).unwrap_or("");
+                let (nonce, who) = code.rsplit_once('.').unwrap_or(("", "alice"));
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": format!("at-{who}"), "token_type": "Bearer", "expires_in": 600,
+                    "id_token": id_token(serde_json::json!({"iss": issuer, "aud":"gw", "sub":who, "exp":unix_now()+600, "nonce":nonce})),
+                }))
+            }).mount(&server).await;
+        let issuer = server.uri();
+        Mock::given(http_method("POST")).and(http_path("/introspect"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                let who = if body.contains("token=at-bob") { "bob" } else { "alice" };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "active":true, "token_type":"Bearer", "client_id":"gw", "iss":issuer,
+                    "sub":who, "aud":"zeroclaw", "exp":unix_now()+600, "groups":["admins"], "preferred_username":who,
+                }))
+            }).with_priority(1).mount(&server).await;
+        let base = fixture(sign_in_config(&server.uri()));
+        let mut state = base.state.clone();
+        state.path_prefix = "/gw".into();
+        state.sop_engine = Some(Arc::new(std::sync::Mutex::new(
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default()),
+        )));
+        let auth = Arc::new(
+            DashboardAuth::new(
+                Arc::clone(&base.auth.sessions),
+                Arc::clone(&base.auth.inbound),
+            )
+            .for_generation(&state),
+        );
+        let app = Router::new()
+            .merge(crate::api_oidc::routes())
+            .route("/ws/sop/runs", get(crate::ws_sop_runs::handle_ws_sop_runs))
+            .route(
+                "/landing",
+                get(|| async {
+                    axum::response::Html(
+                        "<!doctype html><title>Landing</title><p>Synthetic dashboard landing</p>",
+                    )
+                }),
+            )
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                DashboardLayer {
+                    state: state.clone(),
+                    auth,
+                },
+                layer,
+            ));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let stop = Arc::new(parking_lot::Mutex::new(Some(stop_tx)));
+        type HeldResponses =
+            Arc<parking_lot::Mutex<HashMap<String, (Arc<tokio::sync::Notify>, bool)>>>;
+        let held: HeldResponses = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let hold_bootstrap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hold_next = Arc::clone(&hold_bootstrap);
+        let held_status = Arc::clone(&held);
+        let held_release = Arc::clone(&held);
+        let app = Router::new().nest("/gw", app)
+            .layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let held = Arc::clone(&held);
+                let hold_bootstrap = Arc::clone(&hold_bootstrap);
+                async move {
+                    let mut hold = request.uri().query().and_then(|q| q.split('&').find_map(|p| p.strip_prefix("hold="))).map(str::to_string);
+                    if request.uri().path() == "/gw/api/auth/browser" && request.method() == Method::POST
+                        && hold_bootstrap.swap(false, std::sync::atomic::Ordering::SeqCst) { hold = Some("bootstrap".into()); }
+                    let response = next.run(request).await;
+                    if let Some(hold) = hold {
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        let association_cookie = response.headers().get_all(header::SET_COOKIE).iter().any(|v| v.to_str().is_ok_and(|s| s.starts_with("zc_browser=") || s.starts_with("__Host-zc_browser=")));
+                        held.lock().insert(hold, (Arc::clone(&notify), association_cookie));
+                        notify.notified().await;
+                    }
+                    response
+                }
+            }))
+            .route("/__qa/hold-bootstrap", axum::routing::post(move || async move {
+                hold_next.store(true, std::sync::atomic::Ordering::SeqCst); StatusCode::NO_CONTENT
+            }))
+            .route("/__qa/held/{id}", get(move |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                let held = held_status.lock();
+                Json(serde_json::json!({"held": held.contains_key(&id), "association_set_cookie": held.get(&id).map(|(_, cookie)| *cookie)}))
+            }))
+            .route("/__qa/release/{id}", axum::routing::post(move |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                if let Some((notify, _)) = held_release.lock().remove(&id) { notify.notify_one(); }
+                StatusCode::NO_CONTENT
+            }))
+            .route("/__qa/stop", get(move || async move {
+                if let Some(tx) = stop.lock().take() { let _ = tx.send(()); }
+                StatusCode::NO_CONTENT
+            }))
+            .layer(axum::middleware::from_fn(crate::security_headers::apply));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            std::env::var("ZC_BROWSER_QA_READY").unwrap(),
+            format!("http://localhost:{port}"),
+        )
+        .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = tokio::time::timeout(Duration::from_secs(900), stop_rx).await;
+        })
+        .await
+        .unwrap();
+    }
+    async fn logout_context_case(
+        complete: bool,
+        changed_family: bool,
+        same_family: bool,
+        csrf: Option<&str>,
+    ) {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (_, a) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "a".into(), 3600)
+            .await
+            .unwrap();
+        let (b_cookie, b) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "b".into(), 3600)
+            .await
+            .unwrap();
+        let (c_cookie, c) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "c".into(), 3600)
+            .await
+            .unwrap();
+        let av = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&a))
+            .session
+            .unwrap();
+        let bv = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&b))
+            .session
+            .unwrap();
+        // Make any renewal on a refused request observable, even within one second.
+        let before = {
+            let mut store = fixture.auth.sessions.inner.lock();
+            for record in store.browsers.values_mut() {
+                record.last_activity = unix_now() - 10;
+            }
+            store
+                .browsers
+                .iter()
+                .map(|(nonce, record)| (nonce.clone(), (record.generation, record.last_activity)))
+                .collect::<HashMap<_, _>>()
+        };
+        let (cookie_family, proofs) = if same_family {
+            (&bv.ticket.nonce, vec![bv.clone()])
+        } else {
+            (
+                &av.ticket.nonce,
+                if complete {
+                    vec![av.clone(), bv.clone()]
+                } else {
+                    vec![av.clone()]
+                },
+            )
+        };
+        let cookie = format!(
+            "zc_browser={cookie_family}; zc_session={}",
+            if changed_family { &c_cookie } else { &b_cookie }
+        );
+        let mut headers = vec![
+            ("cookie", cookie.as_str()),
+            ("origin", OWN_ORIGIN),
+            ("x-zeroclaw-browser", "1"),
+            ("content-type", "application/json"),
+        ];
+        if let Some(csrf) = csrf {
+            headers.push((CSRF_HEADER, csrf));
+        }
+        let mut req = request("POST", "/auth/sign-out", loopback(), &headers);
+        *req.body_mut() = Body::from(serde_json::json!({"proofs":proofs}).to_string());
+        let response = send(&fixture.router, req).await;
+        if changed_family || (!complete && !same_family) {
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "every presented live family must be proven before logout succeeds"
+            );
+            assert!(
+                set_cookies(&response).is_empty(),
+                "refusal must not clear a still-live credential"
+            );
+            assert!(
+                !a.ended.is_cancelled() && !b.ended.is_cancelled() && !c.ended.is_cancelled(),
+                "refusal has no partial revocation"
+            );
+            let after = fixture
+                .auth
+                .sessions
+                .inner
+                .lock()
+                .browsers
+                .iter()
+                .map(|(nonce, record)| (nonce.clone(), (record.generation, record.last_activity)))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                after, before,
+                "refusal cannot renew or partially retire a family"
+            );
+        } else {
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(b.ended.is_cancelled());
+            assert_eq!(a.ended.is_cancelled(), !same_family);
+            assert!(!c.ended.is_cancelled(), "another browser stays signed in");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_logout_missing_session_csrf_requires_every_known_family() {
+        logout_context_case(false, false, false, None).await;
+    }
+
+    #[tokio::test]
+    async fn browser_logout_stale_session_csrf_requires_every_known_family() {
+        logout_context_case(false, false, false, Some("stale")).await;
+    }
+
+    #[tokio::test]
+    async fn browser_logout_family_changed_after_lookup_refuses_before_mutation() {
+        logout_context_case(true, true, false, Some("stale")).await;
+    }
+
+    #[tokio::test]
+    async fn browser_logout_complete_family_proofs_work_with_stale_session_csrf() {
+        logout_context_case(true, false, false, Some("stale")).await;
+        logout_context_case(false, false, true, Some("stale")).await;
+    }
+
+    #[tokio::test]
+    async fn browser_logout_no_known_target_acknowledges_only_gated_request() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        for (origin, marker, expected) in [
+            (OWN_ORIGIN, "1", StatusCode::NO_CONTENT),
+            (OWN_ORIGIN, "wrong", StatusCode::FORBIDDEN),
+            ("http://elsewhere.invalid", "1", StatusCode::FORBIDDEN),
+        ] {
+            let mut req = request(
+                "POST",
+                "/auth/sign-out",
+                loopback(),
+                &[
+                    ("origin", origin),
+                    ("x-zeroclaw-browser", marker),
+                    ("content-type", "application/json"),
+                    ("cookie", "zc_session=already-gone; zc_browser=already-gone"),
+                ],
+            );
+            *req.body_mut() = Body::from(r#"{"proofs":[]}"#);
+            let response = send(&fixture.router, req).await;
+            assert_eq!(response.status(), expected);
+            assert_eq!(fixture.auth.sessions.len(), 0);
+            assert!(
+                fixture.auth.sessions.inner.lock().browsers.is_empty(),
+                "logout never bootstraps"
+            );
+            if expected != StatusCode::NO_CONTENT {
+                assert!(set_cookies(&response).is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_replacement_resolves_retirement_after_waiting_for_store() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let verified = verified_auth(&fixture).await;
+        let browser = fixture
+            .auth
+            .sessions
+            .bootstrap_browser(None, None, &BrowserContext::default(), "127.0.0.1")
+            .unwrap();
+        let new = new_session(verified, &fixture.auth.inbound, 3600);
+        let store = Arc::clone(&fixture.auth.sessions);
+        let auth = Arc::clone(&fixture.auth);
+        let locked = fixture.auth.sessions.inner.lock();
+        let (checking, observed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            store.replace(new, &browser.ticket, unix_now(), || {
+                checking.send(()).unwrap();
+                !auth.is_retired()
+            })
+        });
+        let before_release = observed.recv_timeout(Duration::from_millis(100));
+        fixture.state.shutdown_tx.send_replace(true);
+        drop(locked);
+        let result = worker.join().unwrap();
+        assert!(
+            before_release.is_err(),
+            "retirement predicate ran before acquiring the owner lock"
+        );
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)),
+            Ok(()),
+            "the live predicate was resolved under lock"
+        );
+        assert!(matches!(result, Err(SignInRefusal::Changed)));
+        assert_eq!(
+            fixture.auth.sessions.len(),
+            0,
+            "a retired generation cannot install a session"
+        );
+    }
+
+    async fn browser_admission_case(path: &str, same_family: bool) {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let anonymous = fixture
+            .auth
+            .sessions
+            .bootstrap_browser(None, None, &BrowserContext::default(), "127.0.0.1")
+            .unwrap();
+        let (cookie, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "live-b".into(), 3600)
+            .await
+            .unwrap();
+        let live = fixture
+            .auth
+            .sessions
+            .browser_context(None, Some(&session))
+            .session
+            .unwrap();
+        let proof = if same_family { &live } else { &anonymous };
+        let cookies = format!("zc_browser={}; zc_session={cookie}", proof.ticket.nonce);
+        let activity = unix_now() - 10;
+        fixture
+            .auth
+            .sessions
+            .inner
+            .lock()
+            .browsers
+            .get_mut(&proof.ticket.nonce)
+            .unwrap()
+            .last_activity = activity;
+        let mut req = request(
+            "POST",
+            path,
+            loopback(),
+            &[
+                ("cookie", &cookies),
+                ("origin", OWN_ORIGIN),
+                ("x-zeroclaw-browser", "1"),
+                ("content-type", "application/json"),
+                (CSRF_HEADER, "stale-session-csrf"),
+            ],
+        );
+        *req.body_mut() = Body::from(serde_json::to_string(proof).unwrap());
+        let response = send(&fixture.router, req).await;
+        if same_family {
+            assert_eq!(
+                response.status(),
+                if path.ends_with("confirm") {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::OK
+                }
+            );
+        } else {
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "a newly presented foreign live family requires reconciliation"
+            );
+            assert!(
+                set_cookies(&response).is_empty(),
+                "refusal cannot create a usable flow binding"
+            );
+            assert_eq!(
+                fixture.auth.sessions.inner.lock().browsers[&proof.ticket.nonce].last_activity,
+                activity,
+                "refusal does not renew the abandoned family"
+            );
+            let retried = start_with_cookies(&fixture, "/auth/sign-in/corp", &cookies).await;
+            assert_eq!(
+                retried.browser, live.ticket.nonce,
+                "explicit retry reconciles to the still-live family's noncredential association"
+            );
+            assert!(
+                !fixture.auth.sessions.ticket_current(&anonymous.ticket),
+                "reconciliation retires the previous anonymous generation"
+            );
+        }
+        assert!(
+            !session.ended.is_cancelled(),
+            "preparation must preserve the proven live session"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_admission_confirm_refuses_a_newly_presented_foreign_family() {
+        browser_admission_case("/api/auth/browser/confirm", false).await;
+    }
+
+    #[tokio::test]
+    async fn browser_admission_start_refuses_a_newly_presented_foreign_family() {
+        browser_admission_case("/auth/sign-in/corp", false).await;
+    }
+
+    #[tokio::test]
+    async fn browser_admission_same_family_stale_session_csrf_remains_usable() {
+        browser_admission_case("/api/auth/browser/confirm", true).await;
+        browser_admission_case("/auth/sign-in/corp", true).await;
     }
 }

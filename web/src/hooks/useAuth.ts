@@ -380,22 +380,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const signOut = useCallback(async (): Promise<void> => {
     const held = getOidcSession();
-    if (!held) return;
     try {
-      await postSignOut(held.csrf_token);
-    } catch (err) {
-      // A stale CSRF token (the session was replaced in another tab) is
-      // refused; re-read the session and try once more with the new one.
-      const outcome = await refreshOidcSession();
-      const fresh = getOidcSession();
-      if (outcome === 'resumed' && fresh) {
-        await postSignOut(fresh.csrf_token);
-      } else if (outcome !== 'expired' && outcome !== 'signed-out') {
-        throw err;
-      }
+      await postSignOut(held?.csrf_token ?? '');
+    } catch {
+      // The browser context can change between lookup and revocation. Retry
+      // one fresh metadata lookup; a session 401 alone cannot prove that its
+      // family's pending sign-in attempts were invalidated.
+      await postSignOut(held?.csrf_token ?? '');
     }
     post({ type: 'signed-out' });
-    dropToSignedOut({ kind: 'signed-out', provider: providerAlias(held.provider) });
+    dropToSignedOut(held
+      ? { kind: 'signed-out', provider: providerAlias(held.provider) }
+      : { kind: 'session-ended' });
   }, [dropToSignedOut, post]);
 
   const logout = useCallback((): void => {

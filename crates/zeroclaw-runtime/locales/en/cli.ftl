@@ -1715,3 +1715,15 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+# Gateway-owned browser authentication preparation and completion pages.
+dashboard-sign-in-preparing = Preparing sign-in
+dashboard-sign-in-checking = Checking sign-in
+dashboard-sign-in-interrupted = This sign-in was superseded or interrupted. Start a new sign-in to continue.
+dashboard-sign-in-storage = Allow this site's cookies and browser storage, then try again.
+dashboard-sign-in-retry = Start a new sign-in
+dashboard-sign-in-complete = Signed in
+dashboard-sign-in-close = You can close this window.
+dashboard-sign-in-not-offered = This dashboard does not offer that sign-in.
+dashboard-sign-in-https = Dashboard sign-in needs HTTPS or a loopback address.
+dashboard-sign-in-interrupted-title = Sign-in interrupted

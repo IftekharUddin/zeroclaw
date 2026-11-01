@@ -573,6 +573,29 @@ the browser holds only an opaque `HttpOnly`, `SameSite=Strict` session
 cookie (`Secure` over HTTPS), and no token reaches browser storage or
 script.
 
+A browser profile also holds a separate, script-readable `SameSite=Lax`
+association cookie. It coordinates sign-in replacement and local sign-out;
+it cannot authenticate a request, reveal an access token, or recover a
+newer session credential. The authentication and per-flow binding cookies
+remain `HttpOnly`. A short same-origin Web Lock establishes the association
+across initially anonymous tabs, then releases before provider sign-in.
+Full-page sign-in, reauthentication popups and concurrent flows remain
+available. Allow the site's cookies and browser storage for this flow.
+
+Starting another sign-in keeps the current session usable. A failed
+replacement preserves it; a successful replacement ends the prior session
+and its viewers in that browser profile. Concurrent verified completions
+are ordered by their server commits, with the last one replacing the
+previous one. Other browser profiles remain signed in, subject to the
+existing session caps. If delayed HTTP responses overwrite a cookie with
+an already-retired session, the completion page shows an explicit retry;
+that old cookie cannot restore access or obtain the newer credential.
+Completion confirms the cookie through a same-origin session lookup before
+announcing success. It repeats that lookup, at most three times, if another
+tab announces sign-in or sign-out while the answer is pending. This confirms
+a snapshot at the server lookup; later changes, or changes whose notification
+cannot be observed, still follow the existing session-ended checks.
+
 Every request carrying the cookie is checked again against the same
 authority RPC uses: the token's expiry, the introspection revalidation
 deadline, and the grants the account holds under the policy in force
@@ -603,9 +626,20 @@ What a signed-in account can do follows its permission profile:
   the dashboard hides them. Use zerocode for that account's own chat
   sessions.
 
-Sign-out ends the session in this ZeroClaw and drops its cookie, also
-when the session had already ended; it does not sign the user out of the
-identity provider. When a session ends (sign-out, expiry, or a
+Local sign-out ends this browser profile's active session and invalidates
+all sign-ins started before it, including an exchange already in flight.
+A fresh explicit sign-in after sign-out is allowed. Lookup-only browser
+metadata and a separate origin-checked revocation proof let sign-out work
+even when a concurrent replacement has just retired its authentication
+cookie. These proofs never authorize ordinary dashboard mutations. The UI
+reports sign-out only after the session owner acknowledges revocation (or
+confirms no known targets remain); a failed request or session 401 alone is
+not confirmation. A changed browser context is retried once with fresh
+lookup-only metadata, then reported as a failure if it still cannot be revoked.
+Sign-out drops the authentication cookie; it does not sign the user out of
+the identity provider. Manually deleting every browser identifier is not
+server sign-out: an unidentified old viewer then ends at its existing
+expiry, eviction or reload boundary. When a session ends (sign-out, expiry, or a
 check it fails) or loses the access a page needs, that page's sockets and
 event streams close at once. A chat turn already running finishes
 unattended, as when a viewer leaves, and a tool approval it was waiting
@@ -621,8 +655,12 @@ session ends. Expired sessions are swept every minute even when no
 request arrives. A daemon restart signs everyone out, while a reload
 keeps sessions and verifies each one again against the new configuration
 before its next use. At most 256 sessions
-are held at once, eight per account; at the cap a new sign-in is refused
-rather than signing somebody else out.
+are held at once, eight per account. Renewal discounts the session being
+replaced in the same browser. A new browser at the global cap is refused;
+an account above its own cap gives up its oldest session. Browser
+associations share this process owner, are bounded, and expire after the
+pending-flow window when they own no live session. They never expire
+before a session they own.
 
 Things to know before turning it on:
 

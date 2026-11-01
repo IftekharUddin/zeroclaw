@@ -439,9 +439,9 @@ test("a reload's 503 gateway_restarting is waited out by the methods, session an
   assert.equal(probe.kind, "oidc");
   assert.equal(p.calls.length, 3);
 
-  const o = answers(restarting, () => new Response(null, { status: 204 }));
+  const o = answers(() => new Response('{"browser":null,"session":null}'), restarting, () => new Response(null, { status: 204 }));
   await authSession.postSignOut("csrf-1", o.fetchImpl);
-  assert.equal(o.calls.length, 2);
+  assert.equal(o.calls.length, 3);
 });
 
 test("only gateway_restarting is tried again, and only a few times", async () => {
@@ -466,4 +466,32 @@ test("Retry-After sets the wait before trying again, within bounds", () => {
   assert.equal(wait(), 1000);
   assert.equal(wait("soon"), 1000);
   assert.equal(wait("120"), 5000);
+});
+
+
+test("logout looks up both browser families and sends only revocation proofs", async () => {
+  const browser = { nonce: "old-association", generation: 3, csrf: "browser-csrf" };
+  const session = { nonce: "current-association", generation: 7, csrf: "current-csrf" };
+  const calls: { url: string; init?: RequestInit }[] = [];
+  await authSession.postSignOut("stale-session-csrf", async (url, init) => {
+    calls.push({ url, init });
+    if (url.endsWith("/api/auth/browser")) return new Response(JSON.stringify({ browser, session, session_csrf: "fresh-session-csrf" }));
+    assert.equal(url.endsWith("/auth/sign-out"), true);
+    assert.deepEqual(JSON.parse(String(init?.body)), { proofs: [browser, session] });
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get("X-ZeroClaw-Browser"), "1");
+    assert.equal(headers.get("X-ZeroClaw-CSRF"), "fresh-session-csrf");
+    return new Response(null, { status: 204 });
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0]!.init?.method, undefined, "logout never bootstraps an association");
+});
+
+test("logout lookup failure does not claim completion or create a new family", async () => {
+  const calls: string[] = [];
+  await assert.rejects(authSession.postSignOut("stale", async url => {
+    calls.push(url); return new Response(null, { status: 500 });
+  }));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.endsWith("/api/auth/browser"), true);
 });

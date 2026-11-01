@@ -87,6 +87,8 @@ let requests: Recorded[] = [];
 let health = { require_pairing: true, paired: true };
 let providers: string[] = [];
 let sessionResponse: () => Response = () => new Response("", { status: 401 });
+let browserResponse: () => Response = () => json(200, { browser: null, session: null });
+let signOutResponse: () => Response = () => new Response(null, { status: 204 });
 // Paths whose next request meets a gateway generation that is stopping for a reload.
 let restartingOnce = new Set<string>();
 
@@ -114,7 +116,8 @@ globalThis.fetch = async (input, init) => {
     });
   }
   if (url.endsWith("/api/auth/session")) return sessionResponse();
-  if (url.endsWith("/auth/sign-out")) return new Response(null, { status: 204 });
+  if (url.endsWith("/api/auth/browser")) return browserResponse();
+  if (url.endsWith("/auth/sign-out")) return signOutResponse();
   return json(404, {});
 };
 
@@ -183,6 +186,8 @@ beforeEach(() => {
   health = { require_pairing: true, paired: true };
   providers = [];
   sessionResponse = () => new Response("", { status: 401 });
+  browserResponse = () => json(200, { browser: null, session: null });
+  signOutResponse = () => new Response(null, { status: 204 });
   restartingOnce = new Set();
   latest = null;
 });
@@ -523,3 +528,71 @@ test("sign-out that meets a gateway reload still signs out", async () => {
   assert.equal(state().isAuthenticated, false);
   assert.deepEqual(state().signOutNotice, { kind: "signed-out", provider: "corp" });
 });
+
+
+for (const failure of ["lookup", "revocation", "unauthorized"] as const) {
+  test(`logout ${failure} failure is not completion when the session probe would be 401`, async () => {
+    await mountSignedIn();
+    sessionResponse = () => new Response("", { status: 401 });
+    if (failure === "lookup") browserResponse = () => new Response(null, { status: 500 });
+    else signOutResponse = () => new Response(null, { status: failure === "revocation" ? 409 : 401 });
+    const heard: unknown[] = [];
+    const other = new BroadcastChannel("zeroclaw-auth");
+    other.onmessage = event => heard.push(event.data);
+    const before = requests.length;
+    try {
+      await act(async () => { await assert.rejects(state().signOut()); });
+      await act(settle);
+      assert.deepEqual(heard, []);
+      assert.equal(state().signOutNotice, null);
+      assert.equal(state().isAuthenticated, true, "failed logout must not claim local completion");
+      assert.equal(requests.slice(before).filter(r => r.url.endsWith("/api/auth/session")).length, 0);
+      assert.equal(requests.slice(before).filter(r => r.url.endsWith("/api/auth/browser")).length, 2);
+    } finally { other.close(); }
+  });
+}
+
+test("logout retries fresh browser metadata once and waits for its acknowledgment", async () => {
+  await mountSignedIn();
+  sessionResponse = () => new Response("", { status: 401 });
+  let attempts = 0;
+  signOutResponse = () => new Response(null, { status: ++attempts === 1 ? 409 : 204 });
+  const heard: unknown[] = [];
+  const other = new BroadcastChannel("zeroclaw-auth");
+  other.onmessage = event => heard.push(event.data);
+  const before = requests.length;
+  try {
+    await act(async () => { await state().signOut(); });
+    await act(settle);
+    assert.equal(attempts, 2);
+    assert.equal(requests.slice(before).filter(r => r.url.endsWith("/api/auth/browser")).length, 2);
+    assert.equal(requests.slice(before).filter(r => r.url.endsWith("/api/auth/session")).length, 0);
+    assert.deepEqual(heard, [{ type: "signed-out" }]);
+    assert.deepEqual(state().signOutNotice, { kind: "signed-out", provider: "corp" });
+  } finally { other.close(); }
+});
+
+
+for (const succeeds of [false, true]) {
+  test(`a retained sign-out action still requires family acknowledgment after canonical session clears (${succeeds})`, async () => {
+    await mountSignedIn();
+    const retained = state().signOut;
+    auth.setOidcSession(null);
+    signOutResponse = () => new Response(null, { status: succeeds ? 204 : 409 });
+    const heard: unknown[] = [];
+    const other = new BroadcastChannel("zeroclaw-auth");
+    other.onmessage = event => heard.push(event.data);
+    const before = requests.length;
+    try {
+      await act(async () => {
+        if (succeeds) await retained();
+        else await assert.rejects(retained());
+      });
+      await act(settle);
+      assert.equal(requests.slice(before).filter(r => r.url.endsWith("/api/auth/browser")).length, succeeds ? 1 : 2);
+      assert.equal(requests.slice(before).filter(r => r.url.endsWith("/auth/sign-out")).length, succeeds ? 1 : 2);
+      assert.deepEqual(heard, succeeds ? [{ type: "signed-out" }] : []);
+      assert.deepEqual(state().signOutNotice, succeeds ? { kind: "session-ended" } : null);
+    } finally { other.close(); }
+  });
+}

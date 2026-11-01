@@ -277,16 +277,35 @@ export async function postSignOut(
   csrfToken: string,
   fetchImpl: FetchLike = fetch,
 ): Promise<void> {
+  // Lookup only: a retired authentication cookie must not prevent logout from
+  // invalidating a newer committed session and every pre-logout flow.
+  const lookup = await fetchThroughRestart(
+    gatewayUrl('/api/auth/browser'),
+    { cache: 'no-store', credentials: 'same-origin', headers: { 'X-ZeroClaw-Browser': '1' } },
+    fetchImpl,
+  );
+  if (!lookup.ok) throw new Error(`Sign-out failed (${lookup.status})`);
+  const context = await lookup.json() as {
+    browser?: { nonce: string; generation: number; csrf: string } | null;
+    session?: { nonce: string; generation: number; csrf: string } | null;
+    session_csrf?: string | null;
+  };
+  const proofs = [context.browser, context.session].filter((proof) => proof != null);
   const response = await fetchThroughRestart(
     gatewayUrl('/auth/sign-out'),
     {
       method: 'POST',
       credentials: 'same-origin',
-      headers: { [CSRF_HEADER]: csrfToken },
+      headers: {
+        [CSRF_HEADER]: context.session_csrf || csrfToken,
+        'X-ZeroClaw-Browser': '1',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ proofs }),
     },
     fetchImpl,
   );
-  if (response.ok || response.status === 401) return;
+  if (response.status === 204) return;
   throw new Error(`Sign-out failed (${response.status})`);
 }
 
