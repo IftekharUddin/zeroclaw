@@ -21,10 +21,11 @@ import {
   authRequestKey,
   clearToken,
   getAuthMode,
+  getOidcSession,
   setToken,
   type AuthMode,
 } from "./auth";
-import { failureReason, fetchThroughRestart, refreshOidcSession } from "./authSession";
+import { failureReason, fetchThroughRestart, refreshOidcSession, routeSessionRefusal } from "./authSession";
 import { apiOrigin, basePath } from "./basePath";
 
 // ---------------------------------------------------------------------------
@@ -147,24 +148,22 @@ function invalidateInFlightGet(path: string): void {
 }
 
 /**
- * Route a 401. Pairing clears the token and signs out, as always. A signed-in
- * session asks for re-authentication when it expired (keeping the page) and
- * signs out otherwise.
+ * Route only a failure of the current credential. An already adopted same-account
+ * replacement can satisfy a read retry; a mutation still fails as an action.
  */
-function rejectUnauthorized(mode: AuthMode, body: string, requestKey: string): never {
-  const current = requestKey === authRequestKey();
-  if (mode === "oidc") {
-    if (failureReason(body) === "session_expired") {
-      if (current) window.dispatchEvent(new Event(AUTH_EVENTS.reauth));
-      throw new SessionExpiredError();
-    }
-    if (current) window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+async function routeUnauthorized(mode: AuthMode, body: string, requestKey: string, principalId: string | undefined): Promise<void> {
+  if (requestKey !== authRequestKey()) {
+    if (mode === "oidc" && failureReason(body) === "session_expired") throw new SessionExpiredError();
+    if (mode === "oidc" && principalId !== undefined && getOidcSession()?.principal_id === principalId) return;
     throw new UnauthorizedError();
   }
-  if (current) {
-    clearToken();
-    window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+  if (mode === "oidc") {
+    const outcome = await routeSessionRefusal(body, () => requestKey === authRequestKey());
+    if (outcome === "resumed" || (outcome === "obsolete" && principalId !== undefined && getOidcSession()?.principal_id === principalId)) return;
+    throw outcome === "reauth" ? new SessionExpiredError() : new UnauthorizedError();
   }
+  clearToken();
+  window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
   throw new UnauthorizedError();
 }
 
@@ -192,10 +191,11 @@ export async function apiFetch<T = unknown>(
 async function apiFetchOnce<T>(
   path: string,
   options: RequestInit,
-  csrfRetried: boolean,
+  retried: boolean,
 ): Promise<T> {
   const mode = getAuthMode();
   const requestKey = authRequestKey();
+  const principalId = getOidcSession()?.principal_id;
   const url = `${apiOrigin}${basePath}${path}`;
   const method = (options.method ?? "GET").toUpperCase();
   // Only idempotent, body-less GETs are safe to coalesce. Skip coalescing when
@@ -250,7 +250,11 @@ async function apiFetchOnce<T>(
   }
 
   if (result.status === 401) {
-    rejectUnauthorized(mode, result.text, requestKey);
+    await routeUnauthorized(mode, result.text, requestKey, principalId);
+    // One shared retry for a read refused under replaced auth or stale CSRF.
+    // A mutation is never replayed after an authentication failure.
+    if (method === "GET" && !retried) return apiFetchOnce<T>(path, options, true);
+    throw new UnauthorizedError();
   }
 
   if (result.status === 403 && mode === "oidc") {
@@ -258,7 +262,7 @@ async function apiFetchOnce<T>(
     if (reason === "operator_required") {
       throw new OperatorRequiredError();
     }
-    if (reason === "csrf" && requestKey === authRequestKey() && !csrfRetried && (await recoverFromCsrfRefusal(requestKey))) {
+    if (reason === "csrf" && requestKey === authRequestKey() && !retried && (await recoverFromCsrfRefusal(requestKey))) {
       return apiFetchOnce<T>(path, options, true);
     }
   }
@@ -845,6 +849,7 @@ export async function putPersonalityFile(
   const url = `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`;
   const mode = getAuthMode();
   const requestKey = authRequestKey();
+  const principalId = getOidcSession()?.principal_id;
   const headers = authHeaders("PUT", { "Content-Type": "application/json" });
   const response = await fetchThroughRestart(`${apiOrigin}${basePath}${url}`, {
     method: "PUT",
@@ -855,7 +860,8 @@ export async function putPersonalityFile(
     }),
   });
   if (response.status === 401) {
-    rejectUnauthorized(mode, await response.text().catch(() => ""), requestKey);
+    await routeUnauthorized(mode, await response.text().catch(() => ""), requestKey, principalId);
+    throw new UnauthorizedError();
   }
   if (response.status === 409) {
     const body = (await response

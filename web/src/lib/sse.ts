@@ -1,6 +1,6 @@
 import type { SSEEvent } from '../types/api';
 import { AUTH_EVENTS, authRequestKey, getAuthMode, getToken, isReauthPending } from './auth';
-import { failureReason } from './authSession';
+import { routeSessionRefusal } from './authSession';
 import { apiOrigin, basePath } from './basePath';
 
 export type SSEEventHandler = (event: SSEEvent) => void;
@@ -96,7 +96,7 @@ export class SSEClient {
             this.connect();
             return;
           }
-          this.haltForAuth(response.status, body);
+          await this.haltForAuth(response.status, body, controller, requestKey);
           return;
         }
         if (!response.ok) {
@@ -210,20 +210,14 @@ export class SSEClient {
   // Reconnection logic
   // ---------------------------------------------------------------------------
 
-  /**
-   * A signed-in session was refused: 401 asks for re-auth (expired) or signs
-   * out, 403 means this account can't read the stream. None of them is retried.
-   */
-  private haltForAuth(status: number, body: string): void {
+  /** A current 401 may discover an unannounced same-account renewal. */
+  private async haltForAuth(status: number, body: string, controller: AbortController, requestKey: string): Promise<void> {
     this.haltedForAuth = true;
     if (status === 401) {
-      window.dispatchEvent(
-        new Event(
-          failureReason(body) === 'session_expired'
-            ? AUTH_EVENTS.reauth
-            : AUTH_EVENTS.unauthorized,
-        ),
-      );
+      await routeSessionRefusal(body, () => this.isCurrent(controller) && requestKey === authRequestKey());
+      // A successful refresh dispatches resumed and may have already replaced
+      // this controller. Only this still-current connection needs a successor.
+      if (this.isCurrent(controller) && requestKey !== authRequestKey()) this.connect();
     }
   }
 

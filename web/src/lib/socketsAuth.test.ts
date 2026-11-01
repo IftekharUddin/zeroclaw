@@ -54,11 +54,12 @@ Object.assign(globalThis, {
   WebSocket: FakeWebSocket,
 });
 
-let sseResponder: () => Response | Promise<Response> = () => new Response("", { status: 503 });
+let sseResponder: (url: string) => Response | Promise<Response> = () => new Response("", { status: 503 });
 const sseRequests: Headers[] = [];
-globalThis.fetch = async (_input, init) => {
+globalThis.fetch = async (input, init) => {
   sseRequests.push(new Headers(init?.headers));
-  return sseResponder();
+  const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  return sseResponder(url);
 };
 
 const auth = await import("./auth.ts");
@@ -258,6 +259,33 @@ test("signed in: an expired session stops the stream and asks for re-auth", asyn
   assert.ok(sseRequests.length >= 2);
 });
 
+test("signed in: a stream refused under a replaced session re-reads the session and reconnects", async () => {
+  // Signing in again ends the session the browser held; a stream opened under
+  // it just before is refused session_invalid while a new session holds.
+  auth.setOidcSession(session);
+  let opened = 0;
+  sseResponder = (url) => {
+    if (url.endsWith("/api/auth/session")) {
+      return new Response(JSON.stringify({ ...session, csrf_token: "csrf-2" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    opened += 1;
+    return opened === 1
+      ? new Response(JSON.stringify({ error: "gone", reason: "session_invalid" }), { status: 401 })
+      : new Response("", { status: 503 });
+  };
+  const events = countEvents();
+  const client = new SSEClient({ reconnectDelay: 1 });
+  client.connect();
+  await settle();
+  client.disconnect();
+  events.stop();
+  assert.equal(events.unauthorized, 0, "a stale refusal must not sign out");
+  assert.ok(opened >= 2, "the stream reconnects on the current session");
+});
+
 test("signed in: while a re-auth is pending, an ended stream waits for the resume", async () => {
   auth.setOidcSession(session);
   auth.markReauthPending(true);
@@ -355,6 +383,42 @@ for (const replacedController of [false, true]) {
         client.disconnect();
         liveStream?.close();
         events.stop();
+      }
+    });
+  }
+}
+
+for (const reason of ["session_invalid", "session_expired"]) {
+  for (const renewal of ["auth", "controller", "both"]) {
+    test(`a held SSE refusal probe cannot affect renewal (${reason}, ${renewal})`, async () => {
+      auth.setOidcSession(session);
+      let release!: (response: Response) => void;
+      let reached!: () => void;
+      let liveStream!: ReadableStreamDefaultController<Uint8Array>;
+      const started = new Promise<void>(resolve => { reached = resolve; });
+      const held = new Promise<Response>(resolve => { release = resolve; });
+      let streams = 0;
+      sseResponder = (url) => {
+        if (url.endsWith("/api/auth/session")) { reached(); return held; }
+        if (++streams === 1) return new Response(JSON.stringify({ reason: "session_invalid" }), { status: 401 });
+        return new Response(new ReadableStream<Uint8Array>({ start(controller) { liveStream = controller; } }));
+      };
+      const events = countEvents();
+      const client = new SSEClient({ autoReconnect: false });
+      let connections = 0;
+      client.onConnect = () => { connections += 1; };
+      try {
+        client.connect();
+        await started;
+        if (renewal !== "controller") auth.setOidcSession({ ...session, csrf_token: "csrf-2" });
+        if (renewal !== "auth") client.connect();
+        release(new Response(JSON.stringify({ reason }), { status: 401 }));
+        await settle();
+        assert.equal(events.unauthorized + events.reauth, 0);
+        assert.equal(streams, 2, "one successor uses the current auth/controller");
+        assert.equal(connections, 1);
+      } finally {
+        client.disconnect(); liveStream?.close(); events.stop();
       }
     });
   }
