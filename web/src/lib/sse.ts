@@ -1,5 +1,5 @@
 import type { SSEEvent } from '../types/api';
-import { AUTH_EVENTS, getAuthMode, getToken, isReauthPending } from './auth';
+import { AUTH_EVENTS, authRequestKey, getAuthMode, getToken, isReauthPending } from './auth';
 import { failureReason } from './authSession';
 import { apiOrigin, basePath } from './basePath';
 
@@ -58,10 +58,13 @@ export class SSEClient {
     this.intentionallyClosed = false;
     this.haltedForAuth = false;
     this.clearReconnectTimer();
-    this.controller = new AbortController();
+    this.controller?.abort();
+    const controller = new AbortController();
+    this.controller = controller;
     window.addEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);
 
     const mode = getAuthMode();
+    const requestKey = authRequestKey();
     const token = getToken();
     const headers: Record<string, string> = {
       Accept: 'text/event-stream',
@@ -72,11 +75,28 @@ export class SSEClient {
 
     fetch(this.path, {
       headers,
-      signal: this.controller.signal,
+      signal: controller.signal,
     })
       .then(async (response) => {
+        if (!this.isCurrent(controller)) {
+          void response.body?.cancel().catch(() => {});
+          return;
+        }
+        if (!response.ok && requestKey !== authRequestKey()) {
+          void response.body?.cancel().catch(() => {});
+          this.connect();
+          return;
+        }
         if (mode === 'oidc' && (response.status === 401 || response.status === 403)) {
-          this.haltForAuth(response.status, await response.text().catch(() => ''));
+          const body = await response.text().catch(() => '');
+          if (!this.isCurrent(controller)) return;
+          if (requestKey !== authRequestKey()) {
+            // A resume may have arrived while this response was pending.
+            // Reconnect once with current auth instead of halting on old auth.
+            this.connect();
+            return;
+          }
+          this.haltForAuth(response.status, body);
           return;
         }
         if (!response.ok) {
@@ -89,9 +109,11 @@ export class SSEClient {
         this.currentDelay = this.reconnectDelay;
         this.onConnect?.();
 
-        return this.consumeStream(response.body);
+        return this.consumeStream(response.body, controller);
       })
       .catch((err: unknown) => {
+        if (!this.isCurrent(controller)) return;
+        if (requestKey !== authRequestKey()) { this.connect(); return; }
         if (err instanceof DOMException && err.name === 'AbortError') {
           return; // intentional disconnect
         }
@@ -116,14 +138,20 @@ export class SSEClient {
   // Stream consumption
   // ---------------------------------------------------------------------------
 
-  private async consumeStream(body: ReadableStream<Uint8Array>): Promise<void> {
+  private isCurrent(controller: AbortController): boolean {
+    return this.controller === controller && !controller.signal.aborted && !this.intentionallyClosed;
+  }
+
+  private async consumeStream(body: ReadableStream<Uint8Array>, controller: AbortController): Promise<void> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
     try {
       for (;;) {
+        if (!this.isCurrent(controller)) return;
         const { done, value } = await reader.read();
+        if (!this.isCurrent(controller)) return;
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -137,6 +165,7 @@ export class SSEClient {
         }
       }
     } catch (err: unknown) {
+      if (!this.isCurrent(controller)) return;
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
       }
@@ -145,8 +174,8 @@ export class SSEClient {
       reader.releaseLock();
     }
 
-    // Stream ended – schedule reconnect
-    this.scheduleReconnect();
+    // Only this connection may schedule its successor.
+    if (this.isCurrent(controller)) this.scheduleReconnect();
   }
 
   private parseEvent(raw: string): void {

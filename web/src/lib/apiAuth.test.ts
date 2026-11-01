@@ -349,3 +349,81 @@ test("pairing: the pair, pair-code and new-code requests wait out a reload too",
     "/admin/paircode/new", "/admin/paircode/new",
   ]);
 });
+
+
+for (const kind of ["api", "personality"] as const) {
+  for (const reason of ["session_invalid", "session_expired"]) {
+    test(`${kind}: a held old-session ${reason} rejects only its caller after replacement`, async () => {
+      auth.setOidcSession(session());
+      let release!: (response: Response) => void;
+      responder = () => new Promise<Response>(resolve => { release = resolve; });
+      const events = countEvents();
+      const pending = kind === "api"
+        ? api.apiFetch("/api/held-write", { method: "PUT", body: "{}" })
+        : api.putPersonalityFile("SOUL.md", "old draft", null);
+      auth.setOidcSession(session({ csrf_token: "csrf-2" }));
+      release(json(401, { reason }));
+      try {
+        await assert.rejects(pending, api.UnauthorizedError);
+        assert.equal(events.unauthorized + events.reauth + events.resumed, 0);
+        assert.equal(auth.getOidcSession()?.csrf_token, "csrf-2");
+        assert.equal(requests.length, 1, "old mutations are not replayed");
+      } finally { events.stop(); }
+    });
+  }
+}
+
+test("same-principal replacement GETs never join the previous session's request", async () => {
+  auth.setOidcSession(session());
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  responder = async () => { const request = requests.length; await gate; return json(200, { request }); };
+  const first = api.apiFetch("/api/same-principal");
+  auth.setOidcSession(session({ csrf_token: "csrf-2" }));
+  const second = api.apiFetch("/api/same-principal");
+  const dispatched = requests.length;
+  release();
+  const results = await Promise.all([first, second]);
+  assert.equal(dispatched, 2);
+  assert.deepEqual(results, [{ request: 1 }, { request: 2 }]);
+});
+
+test("an old pairing failure cannot clear a subsequently adopted OIDC session", async () => {
+  auth.setToken("old-pairing");
+  let release!: (response: Response) => void;
+  responder = () => new Promise<Response>(resolve => { release = resolve; });
+  const events = countEvents();
+  const pending = api.apiFetch("/api/old-pairing");
+  auth.setOidcSession(session({ csrf_token: "csrf-2" }));
+  release(json(401, {}));
+  try {
+    await assert.rejects(pending, api.UnauthorizedError);
+    assert.equal(events.unauthorized + events.reauth, 0);
+    assert.equal(auth.getOidcSession()?.csrf_token, "csrf-2");
+    assert.equal(storage.getItem("zeroclaw_token"), "old-pairing");
+  } finally { events.stop(); }
+});
+
+for (const reason of ["session_invalid", "session_expired"]) {
+  test(`a held CSRF recovery ${reason} cannot disturb a newer session`, async () => {
+    auth.setOidcSession(session());
+    let release: (response: Response) => void = () => {};
+    let reached: () => void = () => {};
+    const probeStarted = new Promise<void>((resolve) => { reached = resolve; });
+    const held = new Promise<Response>((resolve) => { release = resolve; });
+    responder = (url) => {
+      if (url.endsWith("/api/auth/session")) { reached(); return held; }
+      return json(403, { reason: "csrf" });
+    };
+    const events = countEvents();
+    const pending = assert.rejects(api.apiFetch("/api/x", { method: "POST", body: "{}" }), api.HttpError);
+    await probeStarted;
+    auth.setOidcSession(session({ csrf_token: "csrf-new" }));
+    release(json(401, { reason }));
+    await pending;
+    events.stop();
+    assert.equal(events.unauthorized + events.reauth, 0);
+    assert.equal(auth.getOidcSession()?.csrf_token, "csrf-new");
+    assert.equal(requests.filter((r) => r.method === "POST").length, 1, "the old mutation is not replayed");
+  });
+}

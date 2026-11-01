@@ -18,10 +18,9 @@ import type { components } from "./api-generated";
 import {
   AUTH_EVENTS,
   authHeaders,
+  authRequestKey,
   clearToken,
   getAuthMode,
-  getOidcSession,
-  getToken,
   setToken,
   type AuthMode,
 } from "./auth";
@@ -152,17 +151,20 @@ function invalidateInFlightGet(path: string): void {
  * session asks for re-authentication when it expired (keeping the page) and
  * signs out otherwise.
  */
-function rejectUnauthorized(mode: AuthMode, body: string): never {
+function rejectUnauthorized(mode: AuthMode, body: string, requestKey: string): never {
+  const current = requestKey === authRequestKey();
   if (mode === "oidc") {
     if (failureReason(body) === "session_expired") {
-      window.dispatchEvent(new Event(AUTH_EVENTS.reauth));
+      if (current) window.dispatchEvent(new Event(AUTH_EVENTS.reauth));
       throw new SessionExpiredError();
     }
-    window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+    if (current) window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
     throw new UnauthorizedError();
   }
-  clearToken();
-  window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+  if (current) {
+    clearToken();
+    window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+  }
   throw new UnauthorizedError();
 }
 
@@ -170,11 +172,11 @@ function rejectUnauthorized(mode: AuthMode, body: string): never {
  * A CSRF refusal in OIDC mode means the session was replaced, e.g. by a
  * sign-in in another tab. Re-read it; true when a retry may use the new one.
  */
-async function recoverFromCsrfRefusal(): Promise<boolean> {
+async function recoverFromCsrfRefusal(requestKey: string): Promise<boolean> {
   const outcome = await refreshOidcSession();
-  if (outcome === "expired") {
+  if (outcome === "expired" && requestKey === authRequestKey()) {
     window.dispatchEvent(new Event(AUTH_EVENTS.reauth));
-  } else if (outcome === "signed-out") {
+  } else if (outcome === "signed-out" && requestKey === authRequestKey()) {
     window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
   }
   return outcome === "resumed";
@@ -193,7 +195,7 @@ async function apiFetchOnce<T>(
   csrfRetried: boolean,
 ): Promise<T> {
   const mode = getAuthMode();
-  const token = getToken();
+  const requestKey = authRequestKey();
   const url = `${apiOrigin}${basePath}${path}`;
   const method = (options.method ?? "GET").toUpperCase();
   // Only idempotent, body-less GETs are safe to coalesce. Skip coalescing when
@@ -202,11 +204,11 @@ async function apiFetchOnce<T>(
   // later caller would silently get the wrong response and have its signal
   // ignored. Plain header-less, signal-less GETs still share one request.
   // The key carries the credential: the pairing token, or the signed-in
-  // account (the page can't read its cookie), so one account never receives
-  // a response fetched for another.
+  // per-session CSRF identity (the page cannot read its cookie), so even
+  // replacements for the same principal cannot join an old request.
   const coalesceKey =
     method === "GET" && !options.body && !options.headers && !options.signal
-      ? `${mode === "oidc" ? `oidc:${getOidcSession()?.principal_id ?? ""}` : (token ?? "")} ${url}`
+      ? `${requestKey} ${url}`
       : null;
 
   const doFetch = async (): Promise<RawResult> => {
@@ -248,7 +250,7 @@ async function apiFetchOnce<T>(
   }
 
   if (result.status === 401) {
-    rejectUnauthorized(mode, result.text);
+    rejectUnauthorized(mode, result.text, requestKey);
   }
 
   if (result.status === 403 && mode === "oidc") {
@@ -256,7 +258,7 @@ async function apiFetchOnce<T>(
     if (reason === "operator_required") {
       throw new OperatorRequiredError();
     }
-    if (reason === "csrf" && !csrfRetried && (await recoverFromCsrfRefusal())) {
+    if (reason === "csrf" && requestKey === authRequestKey() && !csrfRetried && (await recoverFromCsrfRefusal(requestKey))) {
       return apiFetchOnce<T>(path, options, true);
     }
   }
@@ -842,6 +844,7 @@ export async function putPersonalityFile(
 ): Promise<PersonalityPutResult> {
   const url = `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`;
   const mode = getAuthMode();
+  const requestKey = authRequestKey();
   const headers = authHeaders("PUT", { "Content-Type": "application/json" });
   const response = await fetchThroughRestart(`${apiOrigin}${basePath}${url}`, {
     method: "PUT",
@@ -852,7 +855,7 @@ export async function putPersonalityFile(
     }),
   });
   if (response.status === 401) {
-    rejectUnauthorized(mode, await response.text().catch(() => ""));
+    rejectUnauthorized(mode, await response.text().catch(() => ""), requestKey);
   }
   if (response.status === 409) {
     const body = (await response

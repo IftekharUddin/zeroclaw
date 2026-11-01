@@ -552,7 +552,10 @@ Turning it on needs:
 - An identity provider client that uses Authorization Code with PKCE
   (S256), with `<dashboard origin><path_prefix>/oidc/callback` as a
   redirect URI (the same URI as the browser enrollment relay above).
-  Register the complete redirect URI exactly, with no wildcard or prefix patterns.
+  Register that exact URI, with no wildcard or prefix pattern: until the
+  gateway checks the URI against a configured dashboard origin (#12048),
+  it builds it from the request's `Host`, and the identity provider's
+  exact match is what keeps a sign-in code from going to another address.
   Its client must be listed in `interactive_clients` (or classified by
   `actor_claim`), and its access tokens must carry the configured
   `audience`.
@@ -609,7 +612,8 @@ cookie must come from the dashboard's own origin. A request with an
 Cookie-authenticated configuration writes retain the session lifetime through
 body parsing, the config-writer wait, and preparation for persistence. A
 session that ends before the final save admission is refused with
-`"reason": "session_expired"`. After irreversible persistence is dispatched,
+`"reason": "session_invalid"` after revocation or `"session_expired"` after
+its deadline passes. After irreversible persistence is dispatched,
 the retained commit finishes saving and publishing together, even if the
 session ends or the browser disconnects. Sign-out does not roll back that
 already admitted commit.
@@ -641,7 +645,8 @@ the identity provider. Manually deleting every browser identifier is not
 server sign-out: an unidentified old viewer then ends at its existing
 expiry, eviction or reload boundary. When a session ends (sign-out, expiry, or a
 check it fails) or loses the access a page needs, that page's sockets and
-event streams close at once. A chat turn already running finishes
+event streams close at once. An operator request that is still reading its
+body when the session ends is refused before its effect. A chat turn already running finishes
 unattended, as when a viewer leaves, and a tool approval it was waiting
 on is refused; nothing the closed socket sent afterwards is acted on. A
 reload also closes the sockets a session opened, and the dashboard

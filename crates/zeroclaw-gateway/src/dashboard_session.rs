@@ -396,9 +396,7 @@ impl DashboardSessions {
         // A credential response may have arrived since bootstrap. Its live
         // family is a mandatory reconciliation target, even with stale session
         // CSRF. Same-family concurrent replacements remain admissible.
-        if presented_session
-            .and_then(|cookie| store.live.get(&session_key(cookie)))
-            .is_some_and(|session| session.browser != proof.ticket.nonce)
+        if !Self::presented_session_matches_browser(&store, &proof.ticket.nonce, presented_session)
         {
             return false;
         }
@@ -412,15 +410,30 @@ impl DashboardSessions {
         true
     }
 
-    pub(crate) fn ticket_current(&self, ticket: &BrowserTicket) -> bool {
+    fn presented_session_matches_browser(
+        store: &SessionStore,
+        nonce: &str,
+        cookie: Option<&str>,
+    ) -> bool {
+        cookie
+            .and_then(|value| store.live.get(&session_key(value)))
+            .is_none_or(|session| session.browser == nonce)
+    }
+
+    pub(crate) fn ticket_current(
+        &self,
+        ticket: &BrowserTicket,
+        presented_session: Option<&str>,
+    ) -> bool {
         let now = now_unix();
         let mut store = self.inner.lock();
         self.sweep(&mut store.live, now);
         Self::sweep_browsers(&mut store, now);
-        store
-            .browsers
-            .get(&ticket.nonce)
-            .is_some_and(|b| b.generation == ticket.generation)
+        Self::presented_session_matches_browser(&store, &ticket.nonce, presented_session)
+            && store
+                .browsers
+                .get(&ticket.nonce)
+                .is_some_and(|b| b.generation == ticket.generation)
     }
 
     fn retire_browser(store: &mut SessionStore, nonce: &str, now: u64) {
@@ -581,7 +594,7 @@ impl DashboardSessions {
             .get_mut(&browser.ticket.nonce)
             .unwrap()
             .last_activity = now;
-        self.replace(new, &browser.ticket, now, || true)
+        self.replace(new, &browser.ticket, now, None, || true)
             .map_err(|_| StoreFull)
     }
 
@@ -601,6 +614,7 @@ impl DashboardSessions {
         new: NewSession,
         ticket: &BrowserTicket,
         now: u64,
+        presented_session: Option<&str>,
         admits: impl FnOnce() -> bool,
     ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
         let NewSession {
@@ -620,10 +634,11 @@ impl DashboardSessions {
         }
         self.sweep(&mut store.live, now);
         Self::sweep_browsers(&mut store, now);
-        if store
-            .browsers
-            .get(&ticket.nonce)
-            .is_none_or(|b| b.generation != ticket.generation)
+        if !Self::presented_session_matches_browser(&store, &ticket.nonce, presented_session)
+            || store
+                .browsers
+                .get(&ticket.nonce)
+                .is_none_or(|b| b.generation != ticket.generation)
         {
             return Err(SignInRefusal::Changed);
         }
@@ -781,11 +796,7 @@ impl SessionAuth {
     /// effect. The store owns cancellation; the original session deadline
     /// also applies before its idle sweep has noticed expiry.
     pub(crate) fn check_lifetime(&self) -> Result<(), SessionRejection> {
-        if self.ended.is_cancelled() || self.expires_at <= now_unix() {
-            Err(SessionRejection::Expired)
-        } else {
-            Ok(())
-        }
+        self.ended_now().map_or(Ok(()), Err)
     }
 
     /// A comparison tag, never an authentication credential or recovery handle.
@@ -800,6 +811,21 @@ impl SessionAuth {
     /// Operator-equivalent: the grant set the shared operator itself holds.
     pub fn is_admin(&self) -> bool {
         self.grants.admin
+    }
+
+    /// Why this session no longer admits anything, by what is already known
+    /// and without verifying again: its expiry passed, or it ended (sign-out,
+    /// eviction, revocation, its provider taken off sign-in). A route that
+    /// acts some time after admission, once it has read a body or taken a
+    /// lock, checks this where it acts.
+    pub(crate) fn ended_now(&self) -> Option<SessionRejection> {
+        if self.expires_at <= now_unix() {
+            Some(SessionRejection::Expired)
+        } else if self.ended.is_cancelled() {
+            Some(SessionRejection::Invalid)
+        } else {
+            None
+        }
     }
 }
 
@@ -820,7 +846,7 @@ pub enum SessionRejection {
 }
 
 impl SessionRejection {
-    fn reason(self) -> &'static str {
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Expired => "session_expired",
             Self::Invalid => "session_invalid",
@@ -829,14 +855,14 @@ impl SessionRejection {
         }
     }
 
-    fn status(self) -> StatusCode {
+    pub(crate) fn status(self) -> StatusCode {
         match self {
             Self::Expired | Self::Invalid => StatusCode::UNAUTHORIZED,
             Self::Csrf | Self::Origin => StatusCode::FORBIDDEN,
         }
     }
 
-    fn message(self) -> &'static str {
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::Expired => "Your dashboard sign-in has expired. Sign in again.",
             Self::Invalid => "This dashboard sign-in is no longer valid. Sign in again.",
@@ -895,8 +921,12 @@ impl DashboardCaller {
     /// answers with its own reason instead of the pairing prompt.
     pub(crate) fn admit_operator(&self) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
         match self {
-            Self::Session(session) if session.is_admin() => Ok(()),
-            Self::Session(_) => Err(operator_required()),
+            // A route may read its body after initial admission.
+            Self::Session(session) => match session.ended_now() {
+                Some(rejection) => Err(rejection.body()),
+                None if session.is_admin() => Ok(()),
+                None => Err(operator_required()),
+            },
             Self::Rejected(rejection) => Err(rejection.body()),
         }
     }
@@ -1055,6 +1085,7 @@ impl DashboardAuth {
             access_token,
             lifetime_secs,
             &browser.ticket,
+            None,
         )
         .await
     }
@@ -1066,6 +1097,7 @@ impl DashboardAuth {
         access_token: String,
         lifetime_secs: u64,
         ticket: &BrowserTicket,
+        presented_session: Option<&str>,
     ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
         // Wiped on every path out, a refused sign-in included.
         let access_token = Zeroizing::new(access_token);
@@ -1092,7 +1124,9 @@ impl DashboardAuth {
             return Err(SignInRefusal::Changed);
         }
         self.sessions
-            .replace(new, ticket, now_unix(), || !self.is_retired())
+            .replace(new, ticket, now_unix(), presented_session, || {
+                !self.is_retired()
+            })
     }
 
     /// Check again, from a long-lived socket, the session a request admitted
@@ -2229,6 +2263,16 @@ mod tests {
         }
     }
 
+    /// An operator route that reads its whole body before deciding, as the
+    /// handlers that take `Json` and then call `require_auth` do.
+    async fn operator_probe_after_body(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        _body: axum::body::Bytes,
+    ) -> Response {
+        operator_probe(State(state), headers).await
+    }
+
     struct Fixture {
         router: Router,
         auth: Arc<DashboardAuth>,
@@ -2300,7 +2344,10 @@ mod tests {
         let router = Router::new()
             .merge(crate::config_admin_router(&inbound))
             .merge(crate::api_oidc::routes())
-            .route("/api/operator-probe", get(operator_probe))
+            .route(
+                "/api/operator-probe",
+                get(operator_probe).post(operator_probe_after_body),
+            )
             .route("/ws/canvas/{id}", get(crate::canvas::handle_ws_canvas))
             .route("/api/events", get(crate::sse::handle_sse_events))
             .route("/ws/sop/runs", get(crate::ws_sop_runs::handle_ws_sop_runs))
@@ -3286,7 +3333,14 @@ mod tests {
             }
         );
         if !admitted {
-            assert_eq!(json(response).await["reason"], "session_expired");
+            assert_eq!(
+                json(response).await["reason"],
+                if matches!(lifetime, WriteLifetime::HardExpiry) {
+                    "session_expired"
+                } else {
+                    "session_invalid"
+                }
+            );
             assert!(
                 tokio::fs::read(&path).await.unwrap() == before,
                 "an ended session must leave the config file unchanged"
@@ -3512,7 +3566,14 @@ mod tests {
             assert_ne!(fixture.state.config.revision(), revision);
         } else {
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-            assert_eq!(body["reason"], "session_expired");
+            assert_eq!(
+                body["reason"],
+                if matches!(lifetime, WriteLifetime::HardExpiry) {
+                    "session_expired"
+                } else {
+                    "session_invalid"
+                }
+            );
             assert!(tokio::fs::read(&path).await.unwrap() == before);
             assert_eq!(fixture.state.config.revision(), revision);
             assert_eq!(fixture.auth.inbound.generation(), generation);
@@ -3931,6 +3992,540 @@ mod tests {
             .is_err(),
             "a socket without a session is never closed by it"
         );
+    }
+
+    // ── Signing in again ─────────────────────────────────────────────
+
+    /// The code exchange for `code` answers with `access_token` and an ID
+    /// token for `started`'s nonce, ahead of any catch-all answer, so several
+    /// flows can finish against one provider.
+    async fn mount_token_for(
+        server: &MockServer,
+        started: &Started,
+        code: &str,
+        access_token: &str,
+    ) {
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "code={code}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": 600,
+                "id_token": id_token(serde_json::json!({
+                    "iss": server.uri(),
+                    "aud": "gw",
+                    "sub": "alice",
+                    "exp": unix_now() + 600,
+                    "nonce": started.nonce,
+                })),
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    /// The provider vouches for `access_token` as `sub` in `groups`.
+    async fn mount_identity(server: &MockServer, access_token: &str, sub: &str, groups: &[&str]) {
+        Mock::given(http_method("POST"))
+            .and(http_path("/introspect"))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "token={access_token}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true,
+                "token_type": "Bearer",
+                "client_id": "gw",
+                "iss": server.uri(),
+                "sub": sub,
+                "aud": "zeroclaw",
+                "exp": unix_now() + 600,
+                "groups": groups,
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn session_for(fixture: &Fixture, cookie: &str) -> Arc<SessionAuth> {
+        match fixture
+            .auth
+            .admit(|alias| Some(pin_for(fixture, alias)), cookie)
+            .await
+        {
+            DashboardCaller::Session(session) => session,
+            DashboardCaller::Rejected(rejection) => panic!("not signed in: {rejection:?}"),
+        }
+    }
+
+    async fn sign_out(fixture: &Fixture, cookie_header: &str, csrf: &str) -> StatusCode {
+        let context = json(
+            send(
+                &fixture.router,
+                request(
+                    "GET",
+                    "/api/auth/browser",
+                    loopback(),
+                    &[("cookie", cookie_header), ("x-zeroclaw-browser", "1")],
+                ),
+            )
+            .await,
+        )
+        .await;
+        let proofs: Vec<_> = [context["browser"].clone(), context["session"].clone()]
+            .into_iter()
+            .filter(|value| !value.is_null())
+            .collect();
+        let mut req = request(
+            "POST",
+            "/auth/sign-out",
+            loopback(),
+            &[
+                ("cookie", cookie_header),
+                ("origin", OWN_ORIGIN),
+                (CSRF_HEADER, csrf),
+                ("x-zeroclaw-browser", "1"),
+                ("content-type", "application/json"),
+            ],
+        );
+        *req.body_mut() = Body::from(serde_json::json!({"proofs":proofs}).to_string());
+        send(&fixture.router, req).await.status()
+    }
+
+    /// A browser that signs in again holds only the new session: the one its
+    /// cookie named before ends, and the sockets it opened close, so signing
+    /// out afterwards leaves nothing of that browser signed in. The start is
+    /// a navigation from the dashboard and carries the `SameSite=Strict`
+    /// session cookie; the callback comes from the identity provider's site
+    /// and does not.
+    #[tokio::test]
+    async fn signing_in_again_ends_the_session_the_browser_held() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let first = sign_in(&fixture, &server).await;
+        let earlier = session_for(&fixture, &first.cookie).await;
+        // Another tab's socket, still on the first session.
+        let mut watch = Some(SessionWatch::new(
+            Arc::clone(&fixture.auth),
+            Arc::clone(&earlier),
+            true,
+            &fixture.state,
+        ));
+
+        let started =
+            start_with_cookies(&fixture, "/auth/sign-in/corp", &first.cookie_header()).await;
+        mount_token_for(&server, &started, "code-2", "at-alice").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-2", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let second = cookie_from(&response, SESSION_COOKIE).expect("a new session");
+        assert_ne!(second, first.cookie);
+        assert!(
+            earlier.ended.is_cancelled(),
+            "signing in again must end the session the browser held"
+        );
+
+        let csrf = session_for(&fixture, &second).await.csrf.clone();
+        assert_eq!(
+            sign_out(&fixture, &cookie_for(&second), &csrf).await,
+            StatusCode::NO_CONTENT
+        );
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            session_lost(&mut watch, &fixture.state),
+        )
+        .await
+        .expect("the first session's socket closes");
+        assert_eq!(code, WS_CLOSE_SESSION_ENDED);
+        let (status, body) = probe(&fixture, &[("cookie", &first.cookie_header())]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_invalid");
+        assert_eq!(
+            fixture.auth.sessions.len(),
+            0,
+            "nothing of this browser stays signed in"
+        );
+    }
+
+    /// With an identity provider on the dashboard's own site the callback
+    /// carries the session cookie too. It can name a session another tab
+    /// signed in while this flow was at the provider, and that one ends as
+    /// well.
+    #[tokio::test]
+    async fn a_sign_in_ends_the_session_its_callback_cookie_names() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let started = start(&fixture, "/auth/sign-in/corp").await;
+        let other_started = start_with_cookies(
+            &fixture,
+            "/auth/sign-in/corp",
+            &format!("zc_browser={}", started.browser),
+        )
+        .await;
+        mount_token_for(&server, &other_started, "other-tab", "at-alice").await;
+        let other_response = send(
+            &fixture.router,
+            callback_with(
+                &other_started,
+                Some(&other_started.binding),
+                "other-tab",
+                &[],
+            ),
+        )
+        .await;
+        let other_cookie =
+            cookie_from(&other_response, SESSION_COOKIE).expect("other tab signs in");
+        let earlier = session_for(&fixture, &other_cookie).await;
+
+        mount_token_for(&server, &started, "code-2", "at-alice").await;
+        let response = send(
+            &fixture.router,
+            callback_with(
+                &started,
+                Some(&started.binding),
+                "code-2",
+                &[cookie_for(&other_cookie)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            earlier.ended.is_cancelled(),
+            "the session the callback's cookie names must end"
+        );
+        assert_eq!(fixture.auth.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_callback_refuses_a_newly_presented_foreign_family_before_exchange() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let started = start(&fixture, "/auth/sign-in/corp").await;
+        let other = sign_in(&fixture, &server).await;
+        let earlier = session_for(&fixture, &other.cookie).await;
+        mount_token_for(&server, &started, "foreign-family", "at-alice").await;
+        let before = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/token")
+            .count();
+        let response = send(
+            &fixture.router,
+            callback_with(
+                &started,
+                Some(&started.binding),
+                "foreign-family",
+                &[cookie_for(&other.cookie)],
+            ),
+        )
+        .await;
+        assert!(
+            cookie_from(&response, SESSION_COOKIE).is_none(),
+            "a known foreign live family must not be overwritten"
+        );
+        let page = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            page.contains("\"mode\":\"interrupted\""),
+            "callback must invite explicit context reconciliation"
+        );
+        let after = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/token")
+            .count();
+        assert_eq!(
+            after, before,
+            "refuse the foreign family before spending the code"
+        );
+        assert!(
+            !earlier.ended.is_cancelled(),
+            "refusal preserves the presented live session"
+        );
+        let cookies = format!(
+            "zc_browser={}; {}",
+            started.browser,
+            cookie_for(&other.cookie)
+        );
+        let retry = start_with_cookies(&fixture, "/auth/sign-in/corp", &cookies).await;
+        assert_eq!(
+            retry.browser, other.browser,
+            "retry reconciles to the proven live family"
+        );
+        mount_token_for(&server, &retry, "reconciled", "at-alice").await;
+        let response = send(
+            &fixture.router,
+            callback_with(
+                &retry,
+                Some(&retry.binding),
+                "reconciled",
+                &[cookie_for(&other.cookie)],
+            ),
+        )
+        .await;
+        assert!(cookie_from(&response, SESSION_COOKIE).is_some());
+        assert!(
+            earlier.ended.is_cancelled(),
+            "successful reconciled replacement ends the previous session"
+        );
+        assert_eq!(fixture.auth.sessions.len(), 1);
+    }
+
+    /// The session a browser held ends only once the new sign-in has
+    /// succeeded; a cookie that names no session is ignored; and whose
+    /// session it was does not matter, since the browser now belongs to
+    /// whoever signed in last.
+    #[tokio::test]
+    async fn a_held_session_ends_only_when_the_new_sign_in_succeeds() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let first = sign_in(&fixture, &server).await;
+        let earlier = session_for(&fixture, &first.cookie).await;
+        let held = first.cookie_header();
+
+        mount_identity(&server, "at-nobody", "nobody", &["nobody"]).await;
+        let started = start_with_cookies(&fixture, "/auth/sign-in/corp", &held).await;
+        mount_token_for(&server, &started, "code-refused", "at-nobody").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-refused", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !earlier.ended.is_cancelled(),
+            "a refused sign-in keeps the session the browser held"
+        );
+        assert_eq!(
+            probe(&fixture, &[("cookie", &held)]).await.0,
+            StatusCode::OK
+        );
+
+        let forged = format!("{SESSION_COOKIE}=forged");
+        let started = start_with_cookies(&fixture, "/auth/sign-in/corp", &forged).await;
+        mount_token_for(&server, &started, "code-forged", "at-alice").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-forged", &[forged]),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a cookie naming no session is no obstacle"
+        );
+        assert!(!earlier.ended.is_cancelled());
+
+        mount_identity(&server, "at-bob", "bob", &["admins"]).await;
+        let started = start_with_cookies(&fixture, "/auth/sign-in/corp", &held).await;
+        mount_token_for(&server, &started, "code-bob", "at-bob").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-bob", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bob = cookie_from(&response, SESSION_COOKIE).expect("bob signs in");
+        assert_ne!(
+            session_for(&fixture, &bob).await.principal().id,
+            earlier.principal().id,
+            "the new session is another account's"
+        );
+        assert!(
+            earlier.ended.is_cancelled(),
+            "another account signing in on this browser ends alice's session"
+        );
+    }
+
+    // ── Ends that land while a request is under way ──────────────────
+
+    /// A request body the test hands over when it chooses, and a signal for
+    /// when the handler starts reading it: by then every route layer has
+    /// admitted the request.
+    fn paced_body() -> (
+        Body,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::mpsc::UnboundedSender<axum::body::Bytes>,
+    ) {
+        let (chunks, mut queued) = tokio::sync::mpsc::unbounded_channel::<axum::body::Bytes>();
+        let (reading, read_started) = tokio::sync::oneshot::channel();
+        let mut reading = Some(reading);
+        let body = futures_util::stream::poll_fn(move |cx| {
+            if let Some(reading) = reading.take() {
+                let _ = reading.send(());
+            }
+            queued
+                .poll_recv(cx)
+                .map(|chunk| chunk.map(Ok::<_, std::io::Error>))
+        });
+        (Body::from_stream(body), read_started, chunks)
+    }
+
+    fn request_with_body(
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Body,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header("host", HOST);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(body).unwrap();
+        request.extensions_mut().insert(ConnectInfo(loopback()));
+        request
+    }
+
+    /// Send a cookie request whose body is still arriving when its session
+    /// ends (`case` is "sign-out" or "expiry"), and return the answer.
+    async fn answer_after_the_session_ends(
+        fixture: &Fixture,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let lifetime = if case == "expiry" { 2 } else { 3600 };
+        let (cookie, session) = fixture
+            .auth
+            .sign_in(
+                "corp",
+                pin_for(fixture, "corp"),
+                "at-alice".into(),
+                lifetime,
+            )
+            .await
+            .expect("alice signs in");
+        let cookie = cookie_for(&cookie);
+        let (paced, read_started, chunks) = paced_body();
+        let request = request_with_body(
+            method,
+            path,
+            &[
+                ("cookie", &cookie),
+                ("origin", OWN_ORIGIN),
+                (CSRF_HEADER, &session.csrf),
+                ("content-type", "application/json"),
+            ],
+            paced,
+        );
+        let router = fixture.router.clone();
+        let answer = zeroclaw_spawn::spawn!(async move { router.oneshot(request).await.unwrap() });
+        read_started.await.expect("the handler reads the body");
+        match case {
+            "sign-out" => assert!(fixture.auth.end(&session)),
+            // Past the session's two-second cap; the token itself is valid
+            // for ten minutes.
+            _ => tokio::time::sleep(Duration::from_secs(3)).await,
+        }
+        chunks
+            .send(axum::body::Bytes::from(body.to_string()))
+            .expect("the body is still being read");
+        drop(chunks);
+        let response = answer.await.unwrap();
+        let status = response.status();
+        (status, json(response).await)
+    }
+
+    /// A config write admitted while its session was live, whose body was
+    /// still arriving when the session ended, is refused at the write: the
+    /// check under the config write lock binds the session's end, not only
+    /// the token's.
+    #[tokio::test]
+    async fn a_config_write_admitted_before_its_session_ended_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = sign_in_config(&server.uri());
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        let fixture = fixture(config);
+        let paired = [("authorization", "Bearer zc_paired")];
+        let response = send(
+            &fixture.router,
+            request(
+                "POST",
+                "/api/config/map-key?path=agents&key=alpha",
+                loopback(),
+                &paired,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "fixture agent");
+        let path = "agents.alpha.workspace.path";
+        let prop = format!("/api/config/prop?path={path}");
+        let read_back = || async {
+            let response = send(&fixture.router, request("GET", &prop, loopback(), &paired)).await;
+            json(response).await["value"].clone()
+        };
+        let before = read_back().await;
+
+        for (case, reason) in [
+            ("sign-out", "session_invalid"),
+            ("expiry", "session_expired"),
+        ] {
+            let (status, body) = answer_after_the_session_ends(
+                &fixture,
+                case,
+                "PUT",
+                "/api/config/prop",
+                serde_json::json!({"path": path, "value": format!("written-after-{case}")}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{case}: the write must be refused: {body}"
+            );
+            assert_eq!(body["reason"], reason, "{case}: {body}");
+            assert_eq!(read_back().await, before, "{case}: nothing was written");
+        }
+    }
+
+    /// The same for an operator route that reads its body before
+    /// `require_auth` decides: the decision binds the session's end.
+    #[tokio::test]
+    async fn an_operator_request_admitted_before_its_session_ended_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        for (case, reason) in [
+            ("sign-out", "session_invalid"),
+            ("expiry", "session_expired"),
+        ] {
+            let (status, body) = answer_after_the_session_ends(
+                &fixture,
+                case,
+                "POST",
+                "/api/operator-probe",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{case}: the request must be refused: {body}"
+            );
+            assert_eq!(body["reason"], reason, "{case}: {body}");
+        }
     }
 
     #[test]
@@ -5133,7 +5728,9 @@ mod tests {
         client_socket.set_recv_buffer_size(1024).unwrap();
         let stream = client_socket.connect(addr).await.unwrap();
         // The request only reaches this test's loopback listener.
-        let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+        let mut request = format!("ws://{addr}{path}") // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            .into_client_request()
+            .unwrap();
         request
             .headers_mut()
             .insert("cookie", cookie_for(&cookie).parse().unwrap());
@@ -5907,11 +6504,11 @@ mod tests {
         );
         assert!(old.ended.is_cancelled());
         assert!(
-            !fixture.auth.sessions.ticket_current(&a.ticket),
+            !fixture.auth.sessions.ticket_current(&a.ticket, None),
             "mismatched family pending attempts retired"
         );
         assert!(
-            fixture.auth.sessions.ticket_current(&b.ticket),
+            fixture.auth.sessions.ticket_current(&b.ticket, None),
             "current family's pending attempts preserved"
         );
         let missing = fixture.auth.sessions.browser_context(None, Some(&current));
@@ -5976,6 +6573,7 @@ mod tests {
                 new_session(verified.clone(), &fixture.auth.inbound, 3600),
                 &b.ticket,
                 unix_now(),
+                None,
                 || true,
             )
             .unwrap();
@@ -5997,12 +6595,13 @@ mod tests {
         );
         assert!(fresh.ended.is_cancelled() && a_session.ended.is_cancelled());
         for ticket in [&a.ticket, &b.ticket] {
-            assert!(!fixture.auth.sessions.ticket_current(ticket));
+            assert!(!fixture.auth.sessions.ticket_current(ticket, None));
             assert!(matches!(
                 fixture.auth.sessions.replace(
                     new_session(verified.clone(), &fixture.auth.inbound, 3600),
                     ticket,
                     unix_now(),
+                    None,
                     || true
                 ),
                 Err(SignInRefusal::Changed)
@@ -6022,6 +6621,7 @@ mod tests {
                 new_session(verified, &fixture.auth.inbound, 3600),
                 &after.ticket,
                 unix_now(),
+                None,
                 || true,
             )
             .unwrap();
@@ -6060,6 +6660,7 @@ mod tests {
                 new_session(verified, &fixture.auth.inbound, 3600),
                 &browser.ticket,
                 unix_now(),
+                None,
                 || true,
             )
             .unwrap();
@@ -6090,14 +6691,14 @@ mod tests {
             .unwrap();
         fixture.auth.sessions.sweep_now(now + 599);
         fixture.auth.sessions.sweep_now(now + 600);
-        assert!(fixture.auth.sessions.ticket_current(&browser.ticket));
+        assert!(fixture.auth.sessions.ticket_current(&browser.ticket, None));
         assert!(
             !session.ended.is_cancelled(),
             "idle association TTL cannot expire its owned session"
         );
         fixture.auth.sessions.sweep_now(session.expires_at);
         assert!(session.ended.is_cancelled());
-        assert!(!fixture.auth.sessions.ticket_current(&browser.ticket));
+        assert!(!fixture.auth.sessions.ticket_current(&browser.ticket, None));
         assert!(
             fixture
                 .auth
@@ -6458,6 +7059,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_callback_rechecks_presented_family_at_atomic_replacement() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let browser = fixture
+            .auth
+            .sessions
+            .bootstrap_browser(None, None, &BrowserContext::default(), "127.0.0.1")
+            .unwrap();
+        assert!(fixture.auth.sessions.ticket_current(&browser.ticket, None));
+        let (cookie, live) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .unwrap();
+        let new = new_session(verified_auth(&fixture).await, &fixture.auth.inbound, 3600);
+        let result =
+            fixture
+                .auth
+                .sessions
+                .replace(new, &browser.ticket, unix_now(), Some(&cookie), || true);
+        assert!(matches!(result, Err(SignInRefusal::Changed)));
+        assert!(!live.ended.is_cancelled());
+        assert_eq!(fixture.auth.sessions.len(), 1);
+        assert!(fixture.auth.sessions.ticket_current(&browser.ticket, None));
+    }
+
+    #[tokio::test]
     async fn browser_replacement_resolves_retirement_after_waiting_for_store() {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));
@@ -6473,7 +7101,7 @@ mod tests {
         let locked = fixture.auth.sessions.inner.lock();
         let (checking, observed) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            store.replace(new, &browser.ticket, unix_now(), || {
+            store.replace(new, &browser.ticket, unix_now(), None, || {
                 checking.send(()).unwrap();
                 !auth.is_retired()
             })
@@ -6574,7 +7202,10 @@ mod tests {
                 "explicit retry reconciles to the still-live family's noncredential association"
             );
             assert!(
-                !fixture.auth.sessions.ticket_current(&anonymous.ticket),
+                !fixture
+                    .auth
+                    .sessions
+                    .ticket_current(&anonymous.ticket, None),
                 "reconciliation retires the previous anonymous generation"
             );
         }

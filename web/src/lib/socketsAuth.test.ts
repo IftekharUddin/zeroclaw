@@ -54,7 +54,7 @@ Object.assign(globalThis, {
   WebSocket: FakeWebSocket,
 });
 
-let sseResponder: () => Response = () => new Response("", { status: 503 });
+let sseResponder: () => Response | Promise<Response> = () => new Response("", { status: 503 });
 const sseRequests: Headers[] = [];
 globalThis.fetch = async (_input, init) => {
   sseRequests.push(new Headers(init?.headers));
@@ -315,3 +315,47 @@ test("signed in: a reload's 503 gateway_restarting reconnects the stream, with n
   assert.ok(sseRequests.length >= 2);
   assert.equal(events.unauthorized + events.reauth + events.sessionEnded + events.accessLost, 0);
 });
+
+
+for (const replacedController of [false, true]) {
+  for (const phase of ["headers", "body"] as const) {
+    test(`a delayed SSE refusal cannot halt replacement auth (controller=${replacedController}, phase=${phase})`, async () => {
+      auth.setOidcSession(session);
+      let release!: () => void;
+      let liveStream!: ReadableStreamDefaultController<Uint8Array>;
+      const reason = phase === "headers" ? "session_invalid" : "session_expired";
+      const rejected = JSON.stringify({ reason });
+      let calls = 0;
+      sseResponder = () => {
+        if (++calls > 1) return new Response(new ReadableStream<Uint8Array>({ start(controller) { liveStream = controller; } }));
+        if (phase === "headers") return new Promise<Response>(resolve => { release = () => resolve(new Response(rejected, { status: 401 })); });
+        return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+          release = () => { controller.enqueue(new TextEncoder().encode(rejected)); controller.close(); };
+        } }), { status: 401 });
+      };
+      const events = countEvents();
+      const client = new SSEClient({ reconnectDelay: 1 });
+      let connections = 0;
+      client.onConnect = () => { connections += 1; };
+      try {
+        client.connect();
+        await settle();
+        auth.setOidcSession({ ...session, csrf_token: "csrf-2" });
+        // A resume while the old fetch is pending was formerly consumed before
+        // its stale refusal halted the stream forever.
+        fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
+        if (replacedController) client.connect();
+        release();
+        await settle();
+        assert.equal(events.unauthorized + events.reauth + events.sessionEnded + events.accessLost, 0);
+        assert.equal(auth.getOidcSession()?.csrf_token, "csrf-2");
+        assert.equal(calls, 2, "exactly one request uses the newly adopted session");
+        assert.equal(connections, 1);
+      } finally {
+        client.disconnect();
+        liveStream?.close();
+        events.stop();
+      }
+    });
+  }
+}

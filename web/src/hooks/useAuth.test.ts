@@ -84,6 +84,7 @@ interface Recorded {
   headers: Headers;
 }
 let requests: Recorded[] = [];
+let heldApiResponse: () => Response | Promise<Response> = () => new Response(null, { status: 404 });
 let health = { require_pairing: true, paired: true };
 let providers: string[] = [];
 let sessionResponse: () => Response = () => new Response("", { status: 401 });
@@ -115,6 +116,7 @@ globalThis.fetch = async (input, init) => {
       oidc: providers.map((alias) => ({ alias, provider: `oidc.${alias}` })),
     });
   }
+  if (url.endsWith("/api/held-before-replacement")) return heldApiResponse();
   if (url.endsWith("/api/auth/session")) return sessionResponse();
   if (url.endsWith("/api/auth/browser")) return browserResponse();
   if (url.endsWith("/auth/sign-out")) return signOutResponse();
@@ -124,6 +126,7 @@ globalThis.fetch = async (input, init) => {
 const auth = await import("../lib/auth.ts");
 const { AuthProvider, useAuth } = await import("./useAuth.ts");
 const { WebSocketClient } = await import("../lib/ws.ts");
+const { apiFetch, UnauthorizedError } = await import("../lib/api.ts");
 
 function session(overrides: Partial<OidcSession> = {}): OidcSession {
   return {
@@ -179,6 +182,7 @@ beforeEach(() => {
   storage.clear();
   auth.setOidcSession(null);
   requests = [];
+  heldApiResponse = () => new Response(null, { status: 404 });
   reloads = 0;
   assigned = [];
   opened = [];
@@ -594,5 +598,28 @@ for (const succeeds of [false, true]) {
       assert.deepEqual(heard, succeeds ? [{ type: "signed-out" }] : []);
       assert.deepEqual(state().signOutNotice, succeeds ? { kind: "session-ended" } : null);
     } finally { other.close(); }
+  });
+}
+
+
+for (const reason of ["session_invalid", "session_expired"]) {
+  test(`an old request's ${reason} does not disrupt an adopted same-principal session`, async () => {
+    await mountSignedIn();
+    let release!: (response: Response) => void;
+    heldApiResponse = () => new Promise<Response>(resolve => { release = resolve; });
+    const pending = apiFetch("/api/held-before-replacement", { method: "PUT", body: "{}" });
+    sessionResponse = () => json(200, session({ csrf_token: "csrf-2" }));
+    await broadcast({ type: "signed-in" });
+    assert.equal(state().session?.csrf_token, "csrf-2");
+    await act(async () => {
+      release(json(401, { reason }));
+      await assert.rejects(pending, UnauthorizedError);
+    });
+    await act(settle);
+    assert.equal(state().isAuthenticated, true);
+    assert.equal(state().session?.csrf_token, "csrf-2");
+    assert.equal(state().reauthRequired, false);
+    assert.equal(state().signOutNotice, null);
+    assert.equal(reloads, 0);
   });
 }

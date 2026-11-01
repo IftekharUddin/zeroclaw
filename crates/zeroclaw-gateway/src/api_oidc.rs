@@ -1528,14 +1528,29 @@ async fn handle_pkce_callback(
             let Some(Extension(dashboard)) = dashboard_ext else {
                 return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
             };
-            let FlowMode::Dashboard { browser, .. } = &pending.mode else {
+            let FlowMode::Dashboard {
+                browser,
+                return_to,
+                popup,
+                ..
+            } = &pending.mode
+            else {
                 return browser_changed();
             };
             if dashboard.is_retired()
                 || scope.browser_value(&headers).as_deref() != Some(browser.nonce.as_str())
-                || !dashboard.sessions.ticket_current(browser)
+                || !dashboard.sessions.ticket_current(browser, None)
             {
                 return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+            }
+            if !dashboard
+                .sessions
+                .ticket_current(browser, scope.session_value(&headers).as_deref())
+            {
+                return browser_page(serde_json::json!({
+                    "mode": "interrupted", "prefix": state.path_prefix, "alias": pending.alias,
+                    "return_to": return_to, "popup": popup,
+                }));
             }
             // The provider as configured now, and whether it is still
             // offered: a sign-in whose provider was taken off the screen
@@ -1688,8 +1703,20 @@ async fn finish_dashboard_sign_in(
         return_to,
         popup,
     } = landing;
+    let scope = CookieScope {
+        https: request_is_https(state, headers),
+        path_prefix: &state.path_prefix,
+    };
+    let presented_session = scope.session_value(headers);
     match dashboard
-        .sign_in_browser(&alias, provider, access_token, lifetime_secs, &browser)
+        .sign_in_browser(
+            &alias,
+            provider,
+            access_token,
+            lifetime_secs,
+            &browser,
+            presented_session.as_deref(),
+        )
         .await
     {
         Ok((cookie, session)) => {
@@ -1705,10 +1732,6 @@ async fn finish_dashboard_sign_in(
                     })),
                 "dashboard sign-in"
             );
-            let scope = CookieScope {
-                https: request_is_https(state, headers),
-                path_prefix: &state.path_prefix,
-            };
             let mut response = browser_page(serde_json::json!({
                 "mode": "complete", "prefix": state.path_prefix, "alias": alias,
                 "return_to": return_to, "popup": popup, "session_tag": session.tag(),

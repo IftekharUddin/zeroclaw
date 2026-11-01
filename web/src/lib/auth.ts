@@ -163,6 +163,15 @@ export function getToken(): string | null {
 }
 
 /**
+ * The current request credential's comparison key, derived from canonical auth
+ * state. OIDC uses the per-session CSRF identity, never a principal-wide key.
+ * Keep this in memory only; it is not a new session store or an auth proof.
+ */
+export function authRequestKey(): string {
+  return oidcSession ? `oidc:${oidcSession.csrf_token}` : `pairing:${getToken() ?? ''}`;
+}
+
+/**
  * Store an authentication token.
  */
 export function setToken(token: string): void {
