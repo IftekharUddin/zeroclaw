@@ -262,9 +262,11 @@ impl Tool for ShellTool {
                         resolved,
                         &self.security.workspace_dir,
                         &write_subtree_allowed,
-                    ) || self
-                        .sandbox
-                        .protects_read_only_argument(resolved, &write_subtree_allowed)
+                        &|| {
+                            self.sandbox
+                                .protects_read_only_argument(resolved, &write_subtree_allowed)
+                        },
+                    )
                 },
             );
         if let Some(path) = blocked_path {
@@ -1179,6 +1181,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_docker_runtime_does_not_borrow_host_wrapper_protection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct HostOnlyProof {
+            checks: Arc<AtomicUsize>,
+            wraps: Arc<AtomicUsize>,
+        }
+        impl Sandbox for HostOnlyProof {
+            fn wrap_command(&self, _command: &mut std::process::Command) -> std::io::Result<()> {
+                self.wraps.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::other(
+                    "test refuses before any Docker process can spawn",
+                ))
+            }
+            fn protects_read_only_argument(
+                &self,
+                _resolved: &std::path::Path,
+                _allowed: &dyn Fn(&std::path::Path) -> bool,
+            ) -> bool {
+                self.checks.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &str {
+                "host-proof-fixture"
+            }
+            fn description(&self) -> &str {
+                "A host-only proof that never executes the command"
+            }
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().canonicalize().unwrap();
+        let forbidden = workspace.join("blocked");
+        let readable = forbidden.join("docs");
+        std::fs::create_dir_all(&readable).unwrap();
+        std::fs::write(workspace.join("input.txt"), b"replacement").unwrap();
+        std::fs::write(readable.join("existing.txt"), b"original").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![
+                readable.clone(),
+                std::path::PathBuf::from("/workspace/blocked/docs"),
+            ],
+            forbidden_paths: vec![forbidden.to_string_lossy().into()],
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        assert!(security.is_resolved_path_readable(&readable.join("existing.txt")));
+        assert!(!security.is_resolved_path_allowed(&readable.join("existing.txt")));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let wraps = Arc::new(AtomicUsize::new(0));
+        let tool = ShellTool::new_with_sandbox(
+            security,
+            Arc::new(DockerRuntime::new(DockerRuntimeConfig::default())),
+            Arc::new(HostOnlyProof {
+                checks: Arc::clone(&checks),
+                wraps: Arc::clone(&wraps),
+            }),
+        );
+        let mut results = Vec::new();
+        for command in [
+            "cp ./input.txt ./blocked/docs/existing.txt",
+            "cp ./input.txt /workspace/blocked/docs/new.txt",
+        ] {
+            results.push((command, tool.execute(json!({"command": command})).await));
+        }
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            0,
+            "the old OR borrows a host proof for Docker daemon writes: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|(_, result)| result.as_ref().is_ok_and(|result| {
+                    !result.success
+                        && result
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("Path blocked"))
+                })),
+            "both actual backing targets must be denied before construction: {results:?}"
+        );
+        assert_eq!(wraps.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(readable.join("existing.txt")).unwrap(),
+            b"original"
+        );
+        assert!(!readable.join("new.txt").exists());
+    }
+
+    #[tokio::test]
     async fn shell_reports_invalid_docker_workspace_root() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
         let read_only = tempfile::tempdir().expect("read-only root tempdir should be created");
@@ -1200,9 +1300,9 @@ mod tests {
         }));
         let tool = ShellTool::new(security, runtime);
 
-        for command in [
-            "echo hello".to_owned(),
-            format!("cat '{}'", read_path.display()),
+        for (command, read_only_argument) in [
+            ("echo hello".to_owned(), false),
+            (format!("cat '{}'", read_path.display()), true),
         ] {
             let result = tool
                 .execute(json!({"command": command}))
@@ -1210,11 +1310,16 @@ mod tests {
                 .expect("invalid Docker root should return a tool result");
             assert!(!result.success);
             let error = result.error.as_deref().unwrap_or("");
-            assert!(
-                error.contains("Failed to canonicalize Docker workspace root"),
-                "{error}"
-            );
-            assert!(error.contains(missing_root_text.as_str()));
+            if read_only_argument {
+                // An invalid mount cannot prove protection for a new RO argument.
+                assert!(error.contains("Path blocked"), "{error}");
+            } else {
+                assert!(
+                    error.contains("Failed to canonicalize Docker workspace root"),
+                    "{error}"
+                );
+                assert!(error.contains(missing_root_text.as_str()));
+            }
         }
     }
 

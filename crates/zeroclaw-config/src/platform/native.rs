@@ -418,6 +418,18 @@ impl RuntimeAdapter for NativeRuntime {
         Some(OsStr::new(&self.shell))
     }
 
+    fn protects_shell_read_only_argument(
+        &self,
+        _argument: &str,
+        _resolved_argument: &Path,
+        _workspace_dir: &Path,
+        _write_subtree_allowed: &dyn Fn(&Path) -> bool,
+        host_protects_argument: &dyn Fn() -> bool,
+    ) -> bool {
+        // This builder creates the local shell child that the wrapper restricts.
+        host_protects_argument()
+    }
+
     fn build_shell_command(
         &self,
         command: &str,

@@ -267,14 +267,17 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// The spelling and resolved host target let a container adapter account for
     /// its actual backing mount. Any exposed writable overlap must be authorized
-    /// by `write_subtree_allowed`. Successful command construction and execution
-    /// through this adapter remain required; availability alone proves nothing.
+    /// by `write_subtree_allowed`. An adapter may borrow `host_protects_argument`
+    /// only when that wrapper restricts the actual execution, not merely a client
+    /// of another process. Unknown adapters default closed. Successful command
+    /// construction and wrapping remain required; availability proves nothing.
     fn protects_shell_read_only_argument(
         &self,
         _argument: &str,
         _resolved_argument: &Path,
         _workspace_dir: &Path,
         _write_subtree_allowed: &dyn Fn(&Path) -> bool,
+        _host_protects_argument: &dyn Fn() -> bool,
     ) -> bool {
         false
     }
@@ -344,6 +347,22 @@ pub trait RuntimeAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_runtime_cannot_borrow_host_read_only_proof() {
+        let calls = std::cell::Cell::new(0);
+        assert!(!DummyRuntime.protects_shell_read_only_argument(
+            "./shared/file",
+            Path::new("/workspace/shared/file"),
+            Path::new("/workspace"),
+            &|_| true,
+            &|| {
+                calls.set(calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(calls.get(), 0);
+    }
 
     struct DummyRuntime;
 

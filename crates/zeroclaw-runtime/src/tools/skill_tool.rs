@@ -200,6 +200,7 @@ impl Tool for SkillShellTool {
                         resolved,
                         &self.security.workspace_dir,
                         &write_subtree_allowed,
+                        &|| false,
                     )
                 },
             );
@@ -950,9 +951,9 @@ mod tests {
         let tool =
             SkillShellTool::new_with_runtime("test", &sample_skill_tool(), security, runtime);
 
-        for path in [
-            "src/main.rs".to_owned(),
-            read_path.to_string_lossy().into_owned(),
+        for (path, read_only_argument) in [
+            ("src/main.rs".to_owned(), false),
+            (read_path.to_string_lossy().into_owned(), true),
         ] {
             let result = tool
                 .execute(serde_json::json!({"file": path, "format": "text"}))
@@ -960,11 +961,16 @@ mod tests {
                 .expect("invalid Docker root should return a tool result");
             assert!(!result.success);
             let error = result.error.as_deref().unwrap_or("");
-            assert!(
-                error.contains("Failed to canonicalize Docker workspace root"),
-                "{error}"
-            );
-            assert!(error.contains(missing_root_text.as_str()));
+            if read_only_argument {
+                // An invalid mount cannot prove protection for a new RO argument.
+                assert!(error.contains("Path blocked"), "{error}");
+            } else {
+                assert!(
+                    error.contains("Failed to canonicalize Docker workspace root"),
+                    "{error}"
+                );
+                assert!(error.contains(missing_root_text.as_str()));
+            }
         }
     }
 

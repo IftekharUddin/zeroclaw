@@ -274,7 +274,9 @@ impl RuntimeAdapter for DockerRuntime {
         resolved_argument: &Path,
         workspace_dir: &Path,
         write_subtree_allowed: &dyn Fn(&Path) -> bool,
+        _host_protects_argument: &dyn Fn() -> bool,
     ) -> bool {
+        // A host wrapper restricts the client, not the daemon or its mounts.
         let Ok(mount) = self.validated_workspace_mount(workspace_dir) else {
             return false;
         };
@@ -421,6 +423,7 @@ mod tests {
         };
         let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
         let allows = |path: &Path| policy.shell_write_subtree_is_authorized(path);
+        let host = || panic!("Docker must not borrow a host-only proof");
         let command = runtime
             .build_shell_command_for_test("true", &workspace)
             .unwrap();
@@ -444,20 +447,24 @@ mod tests {
             ),
         ] {
             assert!(
-                !runtime.protects_shell_read_only_argument(spelling, &target, &workspace, &allows)
+                !runtime.protects_shell_read_only_argument(
+                    spelling, &target, &workspace, &allows, &host
+                )
             );
         }
         assert!(runtime.protects_shell_read_only_argument(
             "/unmounted/shared/file",
             Path::new("/unmounted/shared/file"),
             &workspace,
-            &allows
+            &allows,
+            &host,
         ));
         assert!(runtime.protects_shell_read_only_argument(
             "ordinary/new.txt",
             &workspace.join("ordinary/new.txt"),
             &workspace,
-            &allows
+            &allows,
+            &host,
         ));
         let no_mount = DockerRuntime::new(DockerRuntimeConfig {
             mount_workspace: false,
@@ -467,7 +474,8 @@ mod tests {
             "/workspace/private/docs/new.txt",
             &readable.join("new.txt"),
             &workspace,
-            &|_| false
+            &|_| false,
+            &host,
         ));
         let command = no_mount
             .build_shell_command_for_test("true", &workspace)
@@ -489,7 +497,8 @@ mod tests {
                 spelling,
                 &target.join("file"),
                 &workspace,
-                &|_| true
+                &|_| true,
+                &|| panic!("Docker must not borrow a host-only proof"),
             ));
         }
     }
