@@ -10606,10 +10606,12 @@ mod tests {
             "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
             bash_grammar(),
         ));
-        assert!(strict.is_command_allowed_for_grammar(
-            "cat <<'EOF'\nwc -l /etc/passwd\nEOF",
-            bash_grammar(),
-        ));
+        assert!(
+            strict.is_command_allowed_for_grammar(
+                "cat <<'EOF'\nwc -l /etc/passwd\nEOF",
+                bash_grammar(),
+            )
+        );
     }
 
     /// The strict allowlist decision for grouping and substitution syntax is
