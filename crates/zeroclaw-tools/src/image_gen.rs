@@ -561,6 +561,12 @@ mod tests {
 
         let server = zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192, "test request headers exceed 8 KiB");
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET "));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
