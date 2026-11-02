@@ -996,7 +996,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "agent-runtime")]
     #[tokio::test]
     async fn seatbelt_shell_retains_read_only_arguments_without_writes() {
         use crate::platform::NativeRuntime;
