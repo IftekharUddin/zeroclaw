@@ -384,7 +384,7 @@ pub struct SecurityPolicy {
     /// configured `[runtime].shell`, or the detected default, as the runtime
     /// factory chooses it. `None` when the runtime is not native or the
     /// policy was built without a config. POSIX command checks use it to
-    /// identify bash (see [`SecurityPolicy::posix_shell`]); otherwise they
+    /// identify bash (see `SecurityPolicy::posix_shell`); otherwise they
     /// keep the rules that are safe for any POSIX shell.
     pub native_shell: Option<String>,
     pub tracker: PerSenderTracker,
@@ -10563,6 +10563,10 @@ mod tests {
         let bash = |command: &str| p.forbidden_path_argument_impl(command, bash_grammar(), false);
         for command in [
             "cat <<EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            // Continuations in an unquoted delimiter are removed before
+            // quote removal, so the body still joins its terminator.
+            "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<E\\\nOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
             "cat <<EOF\nE\\\nO\\\nF\nwc -l /etc/passwd\nEOF",
             "cat <<EOF\nEOF\\\n\nwc -l /etc/passwd\nEOF",
             "cat <<EOF\nE\\\n\\\nOF\nwc -l /etc/passwd\nEOF",
@@ -10582,10 +10586,26 @@ mod tests {
             "cat <<EOF\nbody \\\nEOF\n/etc/passwd\nEOF",
             "cat <<EOF\n \\\nEOF\nwc -l /etc/passwd\nEOF",
             "cat <<'EOF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<E\\\n'OF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
             "cat <<-EOF\n\tEO\\\n\tF\nwc -l /etc/passwd\nEOF",
         ] {
             assert_eq!(bash(command), None, "{command:?}");
         }
+        // The same boundary must expose the following command to a strict
+        // allowlist, while a quoted delimiter leaves that text as body data.
+        let strict = SecurityPolicy {
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!strict.is_command_allowed_for_grammar(
+            "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd",
+            bash_grammar(),
+        ));
+        assert!(strict.is_command_allowed_for_grammar(
+            "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            bash_grammar(),
+        ));
     }
 
     /// The strict allowlist decision for grouping and substitution syntax is
