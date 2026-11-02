@@ -67,6 +67,20 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+fn assert_normal_config_dispatch(output: &Output) {
+    if cfg!(feature = "agent-runtime") {
+        assert!(output.status.success(), "{}", stderr_of(output));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "48123");
+    } else {
+        assert!(!output.status.success());
+        assert!(
+            stderr_of(output).contains("This command requires the full runtime."),
+            "CLI-only builds must reach the normal runtime stub: {}",
+            stderr_of(output)
+        );
+    }
+}
+
 #[test]
 fn config_set_is_refused_when_spawned_by_an_agent_shell() {
     let output = run_cli(
@@ -111,10 +125,9 @@ fn every_subcommand_is_refused_not_just_the_mutating_ones() {
 
 #[test]
 fn an_operator_terminal_is_unaffected() {
-    // The same read without the marker must reach the isolated configuration.
+    // The same read without the marker must reach normal command dispatch.
     let output = run_cli(&["config", "get", "gateway.port"], None);
-    assert!(output.status.success(), "{}", stderr_of(&output));
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "48123");
+    assert_normal_config_dispatch(&output);
 
     assert!(
         !stderr_of(&output).contains("operator authority"),
@@ -127,8 +140,7 @@ fn an_operator_terminal_is_unaffected() {
 fn an_empty_marker_reads_as_absent() {
     // A stray `export ZEROCLAW_AGENT_SHELL=` must not lock an operator out.
     let output = run_cli(&["config", "get", "gateway.port"], Some(""));
-    assert!(output.status.success(), "{}", stderr_of(&output));
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "48123");
+    assert_normal_config_dispatch(&output);
 
     assert!(
         !stderr_of(&output).contains("operator authority"),
