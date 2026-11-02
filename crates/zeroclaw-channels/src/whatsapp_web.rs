@@ -1471,6 +1471,62 @@ impl WhatsAppWebChannel {
         crate::whatsapp_passkey::clear_session_files(&expanded, Self::session_file_paths(&expanded))
     }
 
+    /// Retire prior file work before opening or loading replacement storage.
+    pub(crate) async fn open_session_storage(
+        &self,
+        expanded_session_path: &str,
+        passkey_confirmation: &crate::whatsapp_passkey::FilePasskeyConfirmation,
+    ) -> Result<(Arc<RusqliteStore>, whatsapp_rust::store::Device)> {
+        use wacore_binary::jid::JidExt as _;
+        use whatsapp_rust::store::{Device, DeviceStore};
+
+        passkey_confirmation.claim_files().await?;
+        // Initialize storage backend
+        let storage = RusqliteStore::new(expanded_session_path)?;
+        let backend = Arc::new(storage);
+
+        // Check if we have a saved device to load
+        let mut device = Device::new(backend.clone());
+        if backend.exists().await? {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "found existing session, loading device"
+            );
+            if let Some(core_device) = backend.load().await? {
+                device.load_from_serializable(core_device);
+            } else {
+                anyhow::bail!("Device exists but failed to load");
+            }
+            if let Some(ref pn) = device.pn
+                && let Some(digits) = Self::store_jid_digits(&self.bot_phone, pn.user())
+            {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("pre-resolved bot phone from saved session: +{}", digits)
+                );
+            }
+            if let Some(ref lid) = device.lid
+                && let Some(digits) = Self::store_jid_digits(&self.bot_lid, lid.user())
+            {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("pre-resolved bot LID from saved session: {}", digits)
+                );
+            }
+        } else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "no existing session, new device will be created during pairing"
+            );
+        };
+
+        Ok((backend, device))
+    }
+
     /// Wait on the actual supervisor-token bridge or the SDK logout signal.
     pub(crate) async fn wait_for_session_end(
         &self,
@@ -3862,7 +3918,6 @@ impl Channel for WhatsAppWebChannel {
         use whatsapp_rust::TokioRuntime;
         use whatsapp_rust::bot::Bot;
         use whatsapp_rust::pair_code::PairCodeOptions;
-        use whatsapp_rust::store::{Device, DeviceStore};
         use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
         use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -3877,48 +3932,22 @@ impl Channel for WhatsAppWebChannel {
                 &format!("channel starting (session: {})", expanded_session_path)
             );
 
-            // Initialize storage backend
-            let storage = RusqliteStore::new(&expanded_session_path)?;
-            let backend = Arc::new(storage);
-
-            // Check if we have a saved device to load
-            let mut device = Device::new(backend.clone());
-            if backend.exists().await? {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "found existing session, loading device"
-                );
-                if let Some(core_device) = backend.load().await? {
-                    device.load_from_serializable(core_device);
-                } else {
-                    anyhow::bail!("Device exists but failed to load");
-                }
-                if let Some(ref pn) = device.pn
-                    && let Some(digits) = Self::store_jid_digits(&self.bot_phone, pn.user())
-                {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!("pre-resolved bot phone from saved session: +{}", digits)
-                    );
-                }
-                if let Some(ref lid) = device.lid
-                    && let Some(digits) = Self::store_jid_digits(&self.bot_lid, lid.user())
-                {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!("pre-resolved bot LID from saved session: {}", digits)
-                    );
-                }
-            } else {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "no existing session, new device will be created during pairing"
-                );
-            };
+            let passkey_closed = tokio_util::sync::CancellationToken::new();
+            // Listener cancellation must revoke callbacks even when the run loop
+            // is dropped before it reaches explicit shutdown.
+            let _passkey_guard = passkey_closed.clone().drop_guard();
+            let passkey_confirmation = Arc::new(
+                crate::whatsapp_passkey::FilePasskeyConfirmation::new(&expanded_session_path)
+                    .with_cancellation(passkey_closed.clone()),
+            );
+            let passkey_authenticator = Arc::new(
+                crate::whatsapp_passkey::FilePasskeyAuthenticator::new(&expanded_session_path)
+                    .with_cancellation(passkey_closed.clone())
+                    .with_confirmation(Arc::clone(&passkey_confirmation)),
+            );
+            let (backend, device) = self
+                .open_session_storage(&expanded_session_path, &passkey_confirmation)
+                .await?;
 
             // Create transport factory. WebSocket URL override comes from
             // `[whatsapp.ws_url]`; legacy `WHATSAPP_WS_URL` env var is gone.
@@ -3944,21 +3973,6 @@ impl Channel for WhatsAppWebChannel {
             let bot_phone_clone = self.bot_phone.clone();
             let bot_lid_clone = self.bot_lid.clone();
             let persist_clone = self.persist.clone();
-            let passkey_closed = tokio_util::sync::CancellationToken::new();
-            // Listener cancellation must revoke callbacks even when the run loop
-            // is dropped before it reaches explicit shutdown.
-            let _passkey_guard = passkey_closed.clone().drop_guard();
-            let passkey_confirmation = Arc::new(
-                crate::whatsapp_passkey::FilePasskeyConfirmation::new(&expanded_session_path)
-                    .with_cancellation(passkey_closed.clone()),
-            );
-            let passkey_authenticator = Arc::new(
-                crate::whatsapp_passkey::FilePasskeyAuthenticator::new(&expanded_session_path)
-                    .with_cancellation(passkey_closed.clone())
-                    .with_confirmation(Arc::clone(&passkey_confirmation)),
-            );
-            // Both brokers share this one claim before any detached callback can run.
-            passkey_confirmation.claim_files().await?;
             let inbound_context = WhatsAppInboundContext {
                 tx: tx.clone(),
                 alias: Arc::clone(&alias),

@@ -600,6 +600,8 @@ impl FilePasskeyConfirmation {
         self.files
             .transaction(&self.session_path, &self.closed, true, move || {
                 for path in paths {
+                    #[cfg(test)]
+                    pause_file_operation(&path);
                     if let Err(error) = remove_if_present(&path) {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -1380,6 +1382,108 @@ mod tests {
             .unwrap();
         assert_eq!(confirmations.load(Ordering::Relaxed), 1);
         replacement.shutdown().await.unwrap();
+    }
+
+    async fn replacement_startup_waits_for_stalled_logout_purge(saved_device: bool) {
+        use std::path::Path;
+        use wacore::store::Device as CoreDevice;
+        use wacore::store::traits::DeviceStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        if saved_device {
+            let storage = crate::whatsapp_storage::RusqliteStore::new(&session).unwrap();
+            let mut device = CoreDevice::new();
+            device.pn = Some(wacore_binary::jid::Jid::pn("15551234567"));
+            device.push_name = "retired device".to_string();
+            storage.save(&device).await.unwrap();
+        }
+        let closed = CancellationToken::new();
+        let old =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_cancellation(closed.clone()));
+        old.claim_files().await.unwrap();
+        closed.cancel();
+        let pause = InstalledPause::new(session.clone());
+        let mut paths = vec![
+            session.clone(),
+            format!("{session}-wal"),
+            format!("{session}-shm"),
+        ];
+        paths.extend(artifact_paths(&session));
+        let broker = Arc::clone(&old);
+        let purge_paths = paths.clone();
+        let purge =
+            zeroclaw_spawn::spawn!(async move { broker.purge_session_files(purge_paths).await });
+        pause.entered().await;
+        // A listener may be dropped while its already admitted deletion worker
+        // still owns the gate. Dropping the async waiter cannot retire that work.
+        purge.abort();
+        assert!(purge.await.unwrap_err().is_cancelled());
+
+        let replacement = Arc::new(FilePasskeyConfirmation::new(&session));
+        let channel = crate::whatsapp_web::WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            uuid::Uuid::new_v4().to_string(),
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
+        let broker = Arc::clone(&replacement);
+        let startup_path = session.clone();
+        // This is the real storage open/exists/load seam called by listen,
+        // before any SDK transport or network callback is created.
+        let startup = zeroclaw_spawn::spawn!(async move {
+            channel.open_session_storage(&startup_path, &broker).await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            replacement.files.claiming.notified(),
+        )
+        .await
+        .expect("replacement storage startup must reach the old file gate");
+        assert!(
+            !startup.is_finished(),
+            "replacement startup finished while old logout deletion was admitted"
+        );
+        if !saved_device {
+            assert!(
+                !Path::new(&session).exists(),
+                "replacement opened its database before old logout deletion retired"
+            );
+        }
+        pause.release();
+        let (storage, device) = tokio::time::timeout(Duration::from_secs(5), startup)
+            .await
+            .expect("replacement storage must start after old deletion retires")
+            .unwrap()
+            .unwrap();
+        assert!(
+            device.pn.is_none(),
+            "replacement loaded the retired device before old logout deletion"
+        );
+        assert!(!storage.exists().await.unwrap());
+        let mut saved = CoreDevice::new();
+        saved.push_name = "replacement device".to_string();
+        storage.save(&saved).await.unwrap();
+        drop(device);
+        drop(storage);
+        old.purge_session_files(paths).await.unwrap();
+        assert!(Path::new(&session).is_file());
+        let reopened = crate::whatsapp_storage::RusqliteStore::new(&session).unwrap();
+        assert_eq!(
+            reopened.load().await.unwrap().unwrap().push_name,
+            "replacement device",
+            "replacement database must survive physical old deletion and late cleanup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_startup_does_not_open_storage_before_old_purge_retires() {
+        replacement_startup_waits_for_stalled_logout_purge(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_startup_does_not_load_storage_before_old_purge_retires() {
+        replacement_startup_waits_for_stalled_logout_purge(true).await;
     }
 
     async fn replacement_and_relink_through_alias(session: &str, alias: &str) {
