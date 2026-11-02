@@ -613,7 +613,7 @@ fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
     let outside = format!("{}{}", &release[..start], &release[end..]);
     assert_eq!(
         format!("{:x}", Sha256::digest(outside.as_bytes())),
-        "188c8f6bef4d2eb7bbeb3a8885607a09ed363e7b2cbdb57c1265251d19528899"
+        "9a307d06b8fbb55a416f62e513d62c102216f0a2bb38ac83b0292096dfa16a91"
     );
     let matrix = yaml_block(build, "      matrix:\n");
     for context in RELEASE_RECIPE_CONTEXTS {
@@ -1138,7 +1138,7 @@ fn assert_manual_qualification_wiring(manual: &str) {
         assert!(!receipt.contains(".removeprefix("));
         let cache = yaml_block(
             job,
-            "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n",
+            "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3\n",
         );
         let prefix = match role {
             "build" => "          prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n",
@@ -1239,7 +1239,7 @@ fn stable_and_qualification_builds_share_the_actual_cache_prefix() {
     let release = workflow("release-stable-manual.yml");
     let manual = workflow("cross-platform-build-manual.yml");
     let cache_header =
-        "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n";
+        "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3\n";
     let stable_cache = yaml_block(yaml_block(&release, "  build:\n"), cache_header);
     let qualifier_cache = yaml_block(yaml_block(&manual, "  stable-gnu-build:\n"), cache_header);
     let stable_prefix = yaml_block(stable_cache, "        with:\n")
@@ -1614,7 +1614,7 @@ fn assert_arm64_baseline_wiring(manual: &str) {
         upload.trim_end(),
         r##"        if: matrix.target == 'aarch64-unknown-linux-gnu'
         timeout-minutes: 2
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runner-baseline-gnu-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1695,7 +1695,7 @@ fn gnu_arm64_runner_baseline_wiring_refuses_scope_upload_and_budget_mutants() {
             "          if-no-files-found: warn\n",
         ),
         (
-            "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n",
+            "        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2\n",
             "        uses: actions/upload-artifact@main\n",
         ),
         ("READ_LIMIT = 4096", "READ_LIMIT = 8192"),

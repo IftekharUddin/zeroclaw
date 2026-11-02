@@ -253,7 +253,7 @@ fn windows_recovery_pins_its_runner_and_trusted_cache_writer() {
         "recovery must pin the measured Windows runner"
     );
     assert!(
-        recovery.contains("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6")
+        recovery.contains("uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0")
             && !recovery.contains("uses: ./.github/actions/rust-cache"),
         "recovery must use the tested pinned cache action, not the archived Blacksmith fork"
     );
