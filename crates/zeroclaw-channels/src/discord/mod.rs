@@ -5597,6 +5597,113 @@ mod tests {
         .unwrap();
     }
 
+    async fn check_inactive_builtin_ask_ownership(
+        scope: SlashScope,
+        stale_ask: serde_json::Value,
+        enabled: bool,
+        should_delete: bool,
+    ) {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let global = "/applications/app1/commands";
+        let guild = "/applications/app1/guilds/g1/commands";
+        let (active, inactive) = match scope {
+            SlashScope::Global => (global, guild),
+            SlashScope::Guild => (guild, global),
+        };
+        let id = stale_ask["id"].as_str().unwrap();
+        let delete_path = format!("{inactive}/{id}");
+        let desired = slash_command_registration_body(&[], enabled);
+        for (endpoint, listing) in [
+            (inactive, serde_json::json!([stale_ask])),
+            (active, desired.clone()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .and(query_param("with_localizations", "true"))
+                .and(header("Authorization", "Bot synthetic-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(listing))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("DELETE"))
+            .and(path(&delete_path))
+            .and(header("Authorization", "Bot synthetic-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(u64::from(should_delete))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let outcome = reconcile_slash_commands(
+            &reqwest::Client::new(),
+            "synthetic-token",
+            "app1",
+            &desired,
+            &server.uri(),
+            scope,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ReconcileOutcome::Reconciled));
+        let requests = server.received_requests().await.unwrap();
+        let deleted: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .map(|request| request.url.path())
+            .collect();
+        let expected = if should_delete {
+            vec![delete_path.as_str()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(deleted, expected);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn disabled_builtin_ask_reaps_older_inactive_commands_in_both_scopes() {
+        for scope in [SlashScope::Global, SlashScope::Guild] {
+            check_inactive_builtin_ask_ownership(scope, older_builds_ask("old"), false, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_builtin_ask_spares_foreign_inactive_shapes_in_both_scopes() {
+        let mut query = older_builds_ask("query");
+        query["options"][0]["name"] = serde_json::json!("query");
+        let mut optional = older_builds_ask("optional");
+        optional["options"][0]["required"] = serde_json::json!(false);
+        let mut extra = older_builds_ask("extra");
+        extra["options"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "other", "type": 3, "required": false, "description": "Other input"
+            }));
+        for scope in [SlashScope::Global, SlashScope::Guild] {
+            for command in [&query, &optional, &extra] {
+                check_inactive_builtin_ask_ownership(scope, command.clone(), false, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_builtin_ask_keeps_exact_inactive_projection_ownership() {
+        for scope in [SlashScope::Global, SlashScope::Guild] {
+            check_inactive_builtin_ask_ownership(scope, older_builds_ask("old"), true, false).await;
+            let mut canonical = builtin_ask_command();
+            canonical["id"] = serde_json::json!("canonical");
+            check_inactive_builtin_ask_ownership(scope, canonical, true, true).await;
+        }
+    }
+
     #[tokio::test]
     async fn reconcile_returns_rate_limited_on_post_429() {
         // A 429 on an upsert must surface as RateLimited (with the body's

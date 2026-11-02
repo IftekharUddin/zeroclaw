@@ -499,11 +499,9 @@ pub(crate) async fn reconcile_slash_commands(
             vec![global_base],
         ),
     };
-    // The canonical `/ask` we register, used to prove ownership before reaping
-    // a `/ask` from the inactive scope: a foreign `/ask` whose projection
-    // differs is left untouched. Resolved from the constructor rather than
-    // from `desired`, so a channel that opted out of the built-in still reaps
-    // its own `/ask` from the inactive scope.
+    // Enabled cross-scope cleanup retains the exact canonical projection
+    // check. Opt-out cleanup instead recognizes the built-in signature, just
+    // like the active endpoint, so older wording does not leave a stale `/ask`.
     let canonical_ask = builtin_ask_command();
     let expected_ask = Some(&canonical_ask);
     let ask_desired = desired_names.contains("ask");
@@ -511,7 +509,7 @@ pub(crate) async fn reconcile_slash_commands(
     // cooldown like any active-scope pass would.
     for base in &inactive {
         if let ReconcileOutcome::RateLimited { until } =
-            reap_all_owned_commands(client, &auth, base, expected_ask).await?
+            reap_all_owned_commands(client, &auth, base, expected_ask, ask_desired).await?
         {
             return Ok(ReconcileOutcome::RateLimited { until });
         }
@@ -533,6 +531,7 @@ async fn reap_all_owned_commands(
     auth: &str,
     base: &str,
     expected_ask: Option<&serde_json::Value>,
+    ask_desired: bool,
 ) -> anyhow::Result<ReconcileOutcome> {
     // `with_localizations=true` so the listing echoes the full `*_localizations`
     // dictionaries; without it Discord returns them null and our `/ask`
@@ -575,12 +574,16 @@ async fn reap_all_owned_commands(
     };
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        // Only reap a `/ask` that is *ours* - one whose projection matches the
-        // `/ask` we register Deleting by name alone would reap a `/ask`
-        // registered by other tooling that happens to share the inactive scope.
+        // Opting out recognizes older built-in wording by signature. Enabled
+        // scope changes keep the existing exact-projection ownership rule.
+        // Neither case deletes another tool's `/ask` by name alone.
         // Skill commands keep their own shape-based ownership marker.
         let is_owned_ask = name == "ask"
-            && expected_ask.is_some_and(|a| command_projection(cmd) == command_projection(a));
+            && if ask_desired {
+                expected_ask.is_some_and(|a| command_projection(cmd) == command_projection(a))
+            } else {
+                is_builtin_ask_shape(cmd)
+            };
         if !is_owned_ask && !is_skill_command_shape(cmd) {
             continue;
         }
@@ -618,7 +621,7 @@ async fn reap_all_owned_commands(
 
 /// True when `cmd` has the built-in `/ask` signature: exactly one required
 /// string option named `prompt`. Used to reap a disabled `/ask` from the
-/// active endpoint. Deliberately shape-based rather than a full projection
+/// active or inactive endpoint. Deliberately shape-based rather than a full projection
 /// match: a `/ask` being disabled was typically registered by an earlier build
 /// whose description or localizations may differ from today's, and a
 /// projection match would leave it registered. A `/ask` with any other
