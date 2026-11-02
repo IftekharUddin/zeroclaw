@@ -653,6 +653,10 @@ impl Sandbox for LandlockSandbox {
         Ok(())
     }
 
+    fn enforces_read_only_paths(&self) -> bool {
+        true
+    }
+
     fn is_available(&self) -> bool {
         // Try to create a minimal ruleset to verify availability
         Ruleset::default()

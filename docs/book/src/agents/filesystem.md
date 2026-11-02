@@ -68,17 +68,18 @@ can_use_shared_workspace = true
 ```
 
 The flag is **deny-by-default**. With it off, the only reach an agent has into
-`shared/` is the code-enforced read-only wire to its own skill bundles under
-`shared/skills/<bundle>/`. With it on, `<install>/shared/` is added to the
+`shared/` is the code-enforced read-only grant to the whole
+`shared/skills/` directory. With it on, `<install>/shared/` is added to the
 agent's read-only allowlist. The environment form follows the usual convention:
 `ZEROCLAW_agents__<alias>__can_use_shared_workspace=true`.
 
-The grant is **read-only by design**, not by omission. Allowlist matching is a
-path-prefix test and explicit allowed roots are consulted before
-`forbidden_paths`, so a writable root over the whole of `shared/` would shadow
-the narrower `shared/skills/` wire and let one agent overwrite skills that other
-agents execute. Write access to `shared/`, if you ever need it, needs a narrower
-surface than this flag.
+The grant is **read-only by design**, not by omission. Path rules use the most
+specific matching allow or deny; a deny wins at equal specificity. A broad
+default deny does not override a more specific allow, while a nested
+`forbidden_paths` entry can restrict an allowed root. This flag adds no write
+rights, including under `shared/skills/`. A separate writable grant there can
+let one agent overwrite skills that other agents execute and is outside this
+flag's scope.
 
 The location derives from the config file's own directory
 (`config_path.parent()/shared`), not from `data_dir`. An install that points
@@ -92,15 +93,17 @@ Three limits are worth knowing before you turn it on:
   ignores the read-only tier, so files under `shared/` are readable but are not
   enumerated by that search. The agent will not discover them by listing; give it
   the path.
-- **Shell access is bounded separately.** Under an active OS sandbox (Landlock
-  or Seatbelt) shell commands touching `shared/` are denied outright, because the
-  sandbox is built from the workspace directory alone and does not yet receive
-  the allowlist tiers. That is fail-closed, an availability gap rather than a
-  widening. With the sandbox disabled or pass-through, a shell **redirect** into
-  a read-only root is refused: a redirect target must belong to a write tier,
-  never merely a readable one. For a non-redirect argument the static scan cannot
-  tell a read from a write, so the OS sandbox remains the complete write boundary
-  for shell.
+- **Shell access is bounded separately.** Landlock and Seatbelt receive the
+  resolved allowlist tiers and can grant reads while denying writes to a
+  read-only root. Docker retains its container boundary; it does not mount
+  these extra host roots. Without an enforcing read-only boundary, ordinary
+  path-shaped arguments must be writable because the static scan cannot tell
+  a read from a write. This also refuses a command such as `cat` against a
+  read-only root; use the file-read tool for that path. Explicit input redirects
+  remain read operations, and output or read/write redirects require write
+  access. Native skill shell tools use the same conservative scan because they
+  do not install an OS sandbox. The scan is best-effort: computed paths, script
+  bodies and other unsupported token forms still need execution-time containment.
 
 ## Memory
 

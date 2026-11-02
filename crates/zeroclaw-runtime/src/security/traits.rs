@@ -27,6 +27,15 @@ pub trait Sandbox: Send + Sync {
         Ok(())
     }
 
+    /// Whether successful wrapping enforces the caller's read-only path grants.
+    ///
+    /// Backends that consume the policy's tiers, or isolate host paths outside
+    /// the workspace entirely, may opt in. Pass-through and generic wrappers
+    /// default to false; availability and a backend name do not prove this.
+    fn enforces_read_only_paths(&self) -> bool {
+        false
+    }
+
     fn is_available(&self) -> bool;
 
     /// Return the human-readable name of this sandbox backend.
@@ -84,6 +93,7 @@ mod tests {
     #[test]
     fn noop_sandbox_is_always_available() {
         assert!(NoopSandbox.is_available());
+        assert!(!NoopSandbox.enforces_read_only_paths());
         assert!(NoopSandbox.check_initialization().is_ok());
     }
 

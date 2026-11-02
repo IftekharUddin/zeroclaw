@@ -4731,7 +4731,7 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, false)
+        self.forbidden_path_argument_impl(command, dialect, false, true)
     }
 
     /// Like [`SecurityPolicy::forbidden_workspace_path_argument`], but against
@@ -4744,7 +4744,20 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, true)
+        self.forbidden_path_argument_impl(command, dialect, true, true)
+    }
+
+    /// Workspace-resolving scan for execution without a read-only filesystem boundary.
+    ///
+    /// Ordinary arguments may be read or written, so they require write access.
+    /// Explicit input redirects remain reads. This retains the same best-effort
+    /// token and dialect limits as the sandboxed scan; it is not containment.
+    pub fn forbidden_unsandboxed_workspace_path_argument_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, dialect, true, false)
     }
 
     fn forbidden_path_argument_impl(
@@ -4752,6 +4765,7 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
         resolve_workspace: bool,
+        read_only_arguments_enforced: bool,
     ) -> Option<String> {
         if split_unquoted_segments_checked(command, dialect).is_err() {
             // Name the opener rather than a path. The shell wrapper refuses
@@ -4838,6 +4852,13 @@ impl SecurityPolicy {
                 RedirectionDirection::Write => forbidden_write_candidate(target),
                 RedirectionDirection::Read => forbidden_candidate(target),
             };
+        let forbidden_argument_candidate = |raw: &str| {
+            if read_only_arguments_enforced {
+                forbidden_candidate(raw)
+            } else {
+                forbidden_write_candidate(raw)
+            }
+        };
         let forbidden_non_redirect_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -4845,18 +4866,18 @@ impl SecurityPolicy {
             }
             if candidate.starts_with('-') {
                 if let Some((_, value)) = candidate.split_once('=')
-                    && let Some(blocked) = forbidden_candidate(value)
+                    && let Some(blocked) = forbidden_argument_candidate(value)
                 {
                     return Some(blocked);
                 }
                 if let Some(value) = attached_short_option_value(candidate)
-                    && let Some(blocked) = forbidden_candidate(value)
+                    && let Some(blocked) = forbidden_argument_candidate(value)
                 {
                     return Some(blocked);
                 }
                 return None;
             }
-            forbidden_candidate(candidate)
+            forbidden_argument_candidate(candidate)
         };
         let executable_has_explicit_path_allowlist = |raw: &str| {
             let executable = strip_wrapping_quotes(raw).trim();
@@ -5920,53 +5941,20 @@ impl SecurityPolicy {
             // hand-writing absolute `allowed_roots` entries that encode
             // the install layout and break when the install moves.
             //
-            // The grant is READ-ONLY by design, not by omission. Allowlist
-            // matching is a path-prefix test, and `is_resolved_path_allowed`
-            // consults the explicit allowed roots BEFORE `forbidden_paths`.
-            // A read+write entry on the whole of `shared/` would therefore
-            // shadow the narrower `shared/skills/` read-only wire pushed
-            // above and let an opted-in agent overwrite skills that other
-            // agents execute — with no way for `forbidden_paths` to claw
-            // it back. Write access to `shared/`, if ever wanted, needs a
-            // narrower surface than this flag.
+            // This flag adds a read grant, never a write grant. Matching uses
+            // the most specific allow/deny, with deny winning equal depth; a
+            // nested forbidden path can still restrict an allowed root.
+            // Separately granting writes to shared/skills can let an agent
+            // overwrite another agent's executable skills and is not this flag.
             //
-            // Scope: the file tools honor this grant because they consult
-            // these allowlists. Two limits on the SHELL path are worth
-            // stating plainly, because choosing the read-only tier fixes
-            // neither:
-            //
-            // (a) Under an ACTIVE OS sandbox (Landlock/Seatbelt), the
-            //     sandbox is built from `security.workspace_dir` alone and
-            //     does not yet receive the allowed-root tiers, so shell
-            //     commands touching `shared/` are denied even with this
-            //     flag on. Fail-closed — an availability gap, not a
-            //     widening. Tier propagation into the sandbox backends is
-            //     a separate runtime change, tracked by the open sandbox tier-propagation PR.
-            //
-            // (b) Under a DISABLED or pass-through sandbox, the command
-            //     still runs unchanged, so the static argument scan is the
-            //     only boundary left. For the write-shaped position that
-            //     scan CAN identify, the shell redirect target, it now
-            //     requires membership in a WRITE tier
-            //     (`is_write_target_allowed_for_shell` plus
-            //     `is_resolved_path_allowed`, without the readable
-            //     fallback), so this read-only tier does stop a redirect
-            //     writing into `shared/`. That rule is unconditional: it
-            //     does not consult the sandbox, and it closes the same hole
-            //     for every read-only root, the `shared/skills/` wire
-            //     pushed above included.
-            //
-            //     The residual limit is positional, not tiered. For a
-            //     NON-redirect argument the scan cannot tell a read from a
-            //     write (`cp a shared/x` and `cat shared/x` are the same
-            //     shape to a command-agnostic scanner), so such an argument
-            //     is still accepted when the target is merely readable.
-            //     Closing that would require denying reads too, which would
-            //     defeat the point of the grant. The OS sandbox remains the
-            //     complete write boundary for shell; this tier is now an
-            //     enforced boundary for redirects specifically, and remains
-            //     the boundary for the file tools, which is what this flag
-            //     governs.
+            // File tools enforce their operation's tier. Landlock and Seatbelt
+            // receive those tiers; Docker does not expose these extra host
+            // roots. Without a read-only execution boundary, shell and native
+            // skill-shell ordinary path arguments require write permission,
+            // since the scanner cannot distinguish reads from writes. Explicit
+            // input redirects remain reads; output/read-write redirects require
+            // writes. The scanner remains best-effort for computed paths and
+            // script bodies, which need execution-time containment.
             //
             // Discoverability: `is_under_allowed_root` (glob-style path
             // search) deliberately reads only the read-write and
@@ -11736,6 +11724,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsandboxed_arguments_require_writes_but_input_redirects_keep_reads() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let shared = root.join("shared");
+        let writable = root.join("writable");
+        let write_only = root.join("write-only");
+        for path in [&workspace, &shared, &writable, &write_only] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(shared.join("data.txt"), b"original").unwrap();
+        symlink(&shared, workspace.join("alias")).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            allowed_roots_read_only: vec![shared.clone()],
+            allowed_roots: vec![writable.clone()],
+            allowed_roots_write_only: vec![write_only.clone()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            for command in [
+                format!("cp ./input.txt {}/data.txt", shared.display()),
+                format!("cp ./input.txt {}/new.txt", shared.display()),
+                format!("tool --output={}/new.txt", shared.display()),
+                format!("tool -I{}/data.txt", shared.display()),
+                "cp ./input.txt alias/new.txt".into(),
+            ] {
+                assert!(
+                    policy
+                        .forbidden_unsandboxed_workspace_path_argument_for_shell(&command, dialect,)
+                        .is_some(),
+                    "{dialect:?}: {command}"
+                );
+                assert!(
+                    policy
+                        .forbidden_workspace_path_argument_for_shell(&command, dialect,)
+                        .is_none(),
+                    "an enforcing backend must still receive {command}"
+                );
+            }
+            for command in [
+                format!("cat < {}/data.txt", shared.display()),
+                format!("cp ./input.txt {}/new.txt", writable.display()),
+                format!("cp ./input.txt {}/new.txt", write_only.display()),
+                "cp ./input.txt ./new.txt".into(),
+            ] {
+                assert!(
+                    policy
+                        .forbidden_unsandboxed_workspace_path_argument_for_shell(&command, dialect,)
+                        .is_none(),
+                    "{dialect:?}: {command}"
+                );
+            }
+            for op in [">", ">>", "<>"] {
+                let command = format!("tool {op} {}/data.txt", shared.display());
+                assert!(
+                    policy
+                        .forbidden_unsandboxed_workspace_path_argument_for_shell(&command, dialect,)
+                        .is_some(),
+                    "{dialect:?}: {command}"
+                );
+            }
+        }
+        assert!(
+            policy
+                .forbidden_unsandboxed_workspace_path_argument_for_shell(
+                    r"Copy-Item ./input.txt alias\new.txt",
+                    ShellDialect::PowerShell,
+                )
+                .is_some(),
+            "PowerShell's relative separator must reach canonical RO checking"
+        );
     }
 
     /// A read-only root grants READS. A shell redirect WRITES, so the target

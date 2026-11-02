@@ -268,6 +268,12 @@ impl RuntimeAdapter for DockerRuntime {
         ShellDialect::Posix
     }
 
+    fn enforces_shell_read_only_paths(&self) -> bool {
+        // The builder mounts only the validated workspace, at /workspace. Host
+        // read-only roots outside it are not exposed to the container at all.
+        true
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -342,6 +348,7 @@ mod tests {
     fn docker_reports_posix_shell_dialect() {
         let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
+        assert!(runtime.enforces_shell_read_only_paths());
     }
 
     #[test]

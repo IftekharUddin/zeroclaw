@@ -263,6 +263,16 @@ pub trait RuntimeAdapter: Send + Sync {
         None
     }
 
+    /// Whether the command builder protects host read-only paths from writes.
+    ///
+    /// Return true only when the actual execution boundary enforces those paths
+    /// or excludes host paths outside the writable workspace from the child.
+    /// The default is conservative for native and third-party adapters. This is
+    /// not an availability probe or a claim derived from a configured name.
+    fn enforces_shell_read_only_paths(&self) -> bool {
+        false
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`

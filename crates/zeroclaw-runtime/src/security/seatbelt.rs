@@ -162,6 +162,10 @@ impl Sandbox for SeatbeltSandbox {
         self.wrap_invocation(cmd, &invocation)
     }
 
+    fn enforces_read_only_paths(&self) -> bool {
+        true
+    }
+
     fn is_available(&self) -> bool {
         Self::is_installed() && self.policy_path.exists()
     }
@@ -989,6 +993,80 @@ mod tests {
         assert!(
             !out.status.success(),
             "retargeted alias must not authorize an unlisted root"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn seatbelt_shell_retains_read_only_arguments_without_writes() {
+        use crate::platform::NativeRuntime;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        use crate::tools::shell::ShellTool;
+        use std::sync::Arc;
+        use zeroclaw_api::tool::Tool;
+
+        let fixture = HomeFixture::new("shell-read-only");
+        let workspace = fixture.child("workspace");
+        let shared = fixture.child("shared");
+        std::fs::write(shared.join("existing.txt"), b"original").unwrap();
+        std::fs::write(workspace.join("input.txt"), b"replacement").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![shared.clone()],
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let sandbox =
+            SeatbeltSandbox::with_roots(Some(&workspace), &[], std::slice::from_ref(&shared), &[])
+                .unwrap();
+        let tool = ShellTool::new_with_sandbox(
+            security,
+            Arc::new(NativeRuntime::with_shell("/bin/sh".into())),
+            Arc::new(sandbox),
+        );
+        let read = tool
+            .execute(serde_json::json!({
+                "command": format!("cat '{}'", shared.join("existing.txt").display()),
+            }))
+            .await
+            .unwrap();
+        assert!(read.success, "{:?}", read.error);
+        assert_eq!(read.output.trim(), "original");
+        for target in [shared.join("existing.txt"), shared.join("new.txt")] {
+            let result = tool
+                .execute(serde_json::json!({
+                    "command": format!("cp ./input.txt '{}'", target.display()),
+                }))
+                .await
+                .unwrap();
+            assert!(!result.success, "the native sandbox must reject {target:?}");
+            assert!(
+                !result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Path blocked"),
+                "this must exercise sandbox enforcement, not conservative preflight"
+            );
+        }
+        assert_eq!(
+            std::fs::read(shared.join("existing.txt")).unwrap(),
+            b"original"
+        );
+        assert!(!shared.join("new.txt").exists());
+        let write = tool
+            .execute(serde_json::json!({
+                "command": "cp ./input.txt ./copied.txt",
+            }))
+            .await
+            .unwrap();
+        assert!(write.success, "{:?}", write.error);
+        assert_eq!(
+            std::fs::read(workspace.join("copied.txt")).unwrap(),
+            b"replacement"
         );
     }
 

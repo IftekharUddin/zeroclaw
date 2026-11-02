@@ -249,10 +249,19 @@ impl Tool for ShellTool {
         // rather than relying on an outer generic path guard that defaults to
         // POSIX. This keeps symlink-escape hardening while allowing cmd.exe's
         // null device only on the native Windows execution path.
-        if let Some(path) = self
-            .security
-            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+        let blocked_path = if self.runtime.enforces_shell_read_only_paths()
+            || self.sandbox.enforces_read_only_paths()
         {
+            self.security
+                .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+        } else {
+            self.security
+                .forbidden_unsandboxed_workspace_path_argument_for_shell(
+                    command,
+                    self.runtime.shell_dialect(),
+                )
+        };
+        if let Some(path) = blocked_path {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1166,11 +1175,15 @@ mod tests {
     #[tokio::test]
     async fn shell_reports_invalid_docker_workspace_root() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
+        let read_only = tempfile::tempdir().expect("read-only root tempdir should be created");
+        let read_path = read_only.path().join("data.txt");
+        std::fs::write(&read_path, b"read-only").unwrap();
         let missing_root = workspace.path().join("missing-root");
         let missing_root_text = missing_root.to_string_lossy().into_owned();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_read_only: vec![read_only.path().to_path_buf()],
             allowed_commands: vec!["*".into()],
             block_high_risk_commands: false,
             ..SecurityPolicy::default()
@@ -1181,15 +1194,22 @@ mod tests {
         }));
         let tool = ShellTool::new(security, runtime);
 
-        let result = tool
-            .execute(json!({"command": "echo hello"}))
-            .await
-            .expect("invalid Docker root should return a tool result");
-
-        assert!(!result.success);
-        let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("Failed to canonicalize Docker workspace root"));
-        assert!(error.contains(missing_root_text.as_str()));
+        for command in [
+            "echo hello".to_owned(),
+            format!("cat '{}'", read_path.display()),
+        ] {
+            let result = tool
+                .execute(json!({"command": command}))
+                .await
+                .expect("invalid Docker root should return a tool result");
+            assert!(!result.success);
+            let error = result.error.as_deref().unwrap_or("");
+            assert!(
+                error.contains("Failed to canonicalize Docker workspace root"),
+                "{error}"
+            );
+            assert!(error.contains(missing_root_text.as_str()));
+        }
     }
 
     #[tokio::test]
@@ -1715,21 +1735,107 @@ mod tests {
             "the in-workspace write must actually have happened"
         );
 
-        // Reads through the shell remain permitted where they already were.
-        let result = run(format!("cat {}/data.txt", shared.display())).await;
-        assert!(
-            result.success,
-            "reading under the shared read-only root must remain allowed, got: {:?}",
-            result.error
-        );
-        let result = run(format!("cat {}/run.sh", skills.display())).await;
-        assert!(
-            result.success,
-            "reading under shared/skills/ must remain allowed, got: {:?}",
-            result.error
-        );
+        // Without enforcement the scanner cannot distinguish these ordinary
+        // arguments from write destinations, so their read grant is insufficient.
+        for path in [shared.join("data.txt"), skills.join("run.sh")] {
+            let result = run(format!("cat {}", path.display())).await;
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Path blocked")
+            );
+        }
+        // An explicit input redirect has a known read direction.
+        let result = run(format!("cat < {}/data.txt", shared.display())).await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output.trim(), "shared-original");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_denies_unsandboxed_copy_to_read_only_shared_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let shared = root.join("shared");
+        let skills = shared.join("skills");
+        let writable = root.join("writable");
+        let write_only = root.join("write-only");
+        for path in [&workspace, &skills, &writable, &write_only] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(workspace.join("input.txt"), b"replacement").unwrap();
+        for path in [shared.join("existing.txt"), skills.join("existing.txt")] {
+            std::fs::write(path, b"original").unwrap();
+        }
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![shared.clone()],
+            allowed_roots: vec![writable.clone()],
+            allowed_roots_write_only: vec![write_only.clone()],
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new_with_sandbox(
+            Arc::clone(&security),
+            Arc::new(NativeRuntime::with_shell("/bin/sh".into())),
+            Arc::new(crate::security::NoopSandbox),
+        );
+        let mut results = Vec::new();
+        for target in [
+            shared.join("existing.txt"),
+            shared.join("new.txt"),
+            skills.join("existing.txt"),
+            skills.join("new.txt"),
+        ] {
+            let result = tool
+                .execute(json!({
+                    "command": format!("cp ./input.txt '{}'", target.display()), "approved": true,
+                }))
+                .await
+                .unwrap();
+            results.push((target, result.success, result.error));
+        }
+        // Run every mutator before asserting so the old-production control
+        // exercises both overwrite and create under shared and shared/skills.
+        assert!(
+            results.iter().all(|(_, success, error)| !success
+                && error.as_deref().is_some_and(|e| e.contains("Path blocked"))),
+            "{results:?}"
+        );
+        for path in [shared.join("existing.txt"), skills.join("existing.txt")] {
+            assert_eq!(std::fs::read(&path).unwrap(), b"original");
+            let read = crate::tools::FileReadTool::new(Arc::clone(&security))
+                .execute(json!({"path": path.to_string_lossy()}))
+                .await
+                .unwrap();
+            assert!(read.success, "{:?}", read.error);
+            assert!(read.output.contains("original"));
+        }
+        assert!(!shared.join("new.txt").exists());
+        assert!(!skills.join("new.txt").exists());
+        for target in [
+            workspace.join("copied.txt"),
+            writable.join("copied.txt"),
+            write_only.join("copied.txt"),
+        ] {
+            let result = tool
+                .execute(json!({
+                    "command": format!("cp ./input.txt '{}'", target.display()), "approved": true,
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(std::fs::read(target).unwrap(), b"replacement");
+        }
     }
 
     #[tokio::test]

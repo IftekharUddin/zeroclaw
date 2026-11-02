@@ -185,10 +185,19 @@ impl Tool for SkillShellTool {
             }
         }
 
-        if let Some(path) = self
-            .security
-            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
-        {
+        // Skill shell tools do not install an OS sandbox wrapper. Only the
+        // runtime's actual command builder can supply a read-only boundary.
+        let blocked_path = if self.runtime.enforces_shell_read_only_paths() {
+            self.security
+                .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+        } else {
+            self.security
+                .forbidden_unsandboxed_workspace_path_argument_for_shell(
+                    &command,
+                    self.runtime.shell_dialect(),
+                )
+        };
+        if let Some(path) = blocked_path {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -555,6 +564,94 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_shell_denies_unsandboxed_copy_to_read_only_shared_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let shared = root.join("shared");
+        let skills = shared.join("skills");
+        let writable = root.join("writable");
+        let write_only = root.join("write-only");
+        for path in [&workspace, &skills, &writable, &write_only] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(workspace.join("input.txt"), b"replacement").unwrap();
+        for path in [shared.join("existing.txt"), skills.join("existing.txt")] {
+            std::fs::write(path, b"original").unwrap();
+        }
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![shared.clone()],
+            allowed_roots: vec![writable.clone()],
+            allowed_roots_write_only: vec![write_only.clone()],
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let run = |command: String| {
+            let mut manifest = sample_skill_tool();
+            manifest.command = command;
+            manifest.args.clear();
+            SkillShellTool::new_with_runtime(
+                "copy-fixture",
+                &manifest,
+                Arc::clone(&security),
+                Arc::new(NativeRuntime::with_shell("/bin/sh".into())),
+            )
+        };
+        let mut results = Vec::new();
+        for target in [
+            shared.join("existing.txt"),
+            shared.join("new.txt"),
+            skills.join("existing.txt"),
+            skills.join("new.txt"),
+        ] {
+            let result = run(format!("cp ./input.txt '{}'", target.display()))
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap();
+            results.push((target, result.success, result.error));
+        }
+        assert!(
+            results.iter().all(|(_, success, error)| !success
+                && error.as_deref().is_some_and(|e| e.contains("Path blocked"))),
+            "{results:?}"
+        );
+        for path in [shared.join("existing.txt"), skills.join("existing.txt")] {
+            assert_eq!(std::fs::read(path).unwrap(), b"original");
+        }
+        assert!(!shared.join("new.txt").exists());
+        assert!(!skills.join("new.txt").exists());
+        let read = run(format!("cat '{}'", shared.join("existing.txt").display()))
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(!read.success);
+        assert!(read.error.as_deref().unwrap_or("").contains("Path blocked"));
+        let read = run(format!("cat < '{}'", shared.join("existing.txt").display()))
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(read.success, "{:?}", read.error);
+        assert_eq!(read.output.trim(), "original");
+        for target in [
+            workspace.join("copied.txt"),
+            writable.join("copied.txt"),
+            write_only.join("copied.txt"),
+        ] {
+            let result = run(format!("cp ./input.txt '{}'", target.display()))
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(std::fs::read(target).unwrap(), b"replacement");
+        }
+    }
+
     #[test]
     fn skill_shell_tool_name_is_prefixed() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
@@ -827,11 +924,15 @@ mod tests {
     #[tokio::test]
     async fn skill_shell_tool_reports_invalid_docker_workspace_root() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
+        let read_only = tempfile::tempdir().expect("read-only root tempdir should be created");
+        let read_path = read_only.path().join("data.txt");
+        std::fs::write(&read_path, b"read-only").unwrap();
         let missing_root = workspace.path().join("missing-root");
         let missing_root_text = missing_root.to_string_lossy().into_owned();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_read_only: vec![read_only.path().to_path_buf()],
             allowed_commands: vec!["*".into()],
             block_high_risk_commands: false,
             ..SecurityPolicy::default()
@@ -843,15 +944,22 @@ mod tests {
         let tool =
             SkillShellTool::new_with_runtime("test", &sample_skill_tool(), security, runtime);
 
-        let result = tool
-            .execute(serde_json::json!({"file": "src/main.rs", "format": "text"}))
-            .await
-            .expect("invalid Docker root should return a tool result");
-
-        assert!(!result.success);
-        let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("Failed to canonicalize Docker workspace root"));
-        assert!(error.contains(missing_root_text.as_str()));
+        for path in [
+            "src/main.rs".to_owned(),
+            read_path.to_string_lossy().into_owned(),
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"file": path, "format": "text"}))
+                .await
+                .expect("invalid Docker root should return a tool result");
+            assert!(!result.success);
+            let error = result.error.as_deref().unwrap_or("");
+            assert!(
+                error.contains("Failed to canonicalize Docker workspace root"),
+                "{error}"
+            );
+            assert!(error.contains(missing_root_text.as_str()));
+        }
     }
 
     #[test]

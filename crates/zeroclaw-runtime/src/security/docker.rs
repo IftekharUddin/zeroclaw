@@ -165,6 +165,10 @@ impl Sandbox for DockerSandbox {
         self.wrap_command_with_program(cmd, shell_program)
     }
 
+    fn enforces_read_only_paths(&self) -> bool {
+        true
+    }
+
     fn is_available(&self) -> bool {
         let launcher = match self.resolve_launcher() {
             Ok(launcher) => launcher,
