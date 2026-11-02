@@ -810,7 +810,7 @@ A turn started by `session/prompt` emits `session/update` notifications **to the
 | `turn_complete` | `session_id`, `outcome` (`completed`\|`cancelled`\|`failed`), `content`, `client_turn_generation?`, `message_count?`, `turn_id?` `[proposed]` |
 | `history_trimmed` | `session_id`, `dropped_messages`, `dropped_turns`, `kept_turns`, `reason`, `token_budget?`, `tokens_before?`, `tokens_after?`, `tokens_before_source?`, `tokens_after_source?`, `unsatisfiable_floor?` |
 
-**Turn identity `[proposed]` (DEC-22).** Master has no event that names a turn: `client_turn_generation` is chosen by each client (zerocode counts from 1, `zc/chat.rs:3505`), so two clients can use the same value, and `session/state.turn_id` is only readable by polling (`rt/rpc/dispatch.rs:7071-7130`). The core assigns every turn a `turn_id` that is a random UUID (version 4 or 7), never a counter, so an id from one daemon incarnation can never name a turn of another; it announces it in `turn_started` before any other event of that turn, repeats it on `turn_complete`, and returns the same value from `session/state` while the turn runs. Today `session/state.turn_id` is the live session's turn-generation counter rendered as a string (`rt/rpc/dispatch.rs:7094`); it becomes that UUID, which clients already treat as opaque. `initialize` also reports `daemon_instance_id` `[proposed]`, a random UUID fixed for the life of the daemon process, so a client can tell a daemon restart from a reconnect to the same process (§10.2). `turn_started` is a new event type, which clients that follow V-3 ignore, and `turn_complete.turn_id` is an added field, so both are additive under V-1.
+**Turn identity `[proposed]` (DEC-22).** Master has no event that names a turn: `client_turn_generation` is chosen by each client (zerocode counts from 1, `zc/chat.rs:3505`), so two clients can use the same value, and `session/state.turn_id` is only readable by polling (`rt/rpc/dispatch.rs:7071-7130`). The core assigns every turn a `turn_id` that is a random UUID (version 4 or 7), never a counter, so an id from one daemon incarnation can never name a turn of another; it announces it in `turn_started` before any other event of that turn, repeats it on `turn_complete`, and returns the same value from `session/state` while the turn runs. Today `session/state.turn_id` is the live session's turn-generation counter rendered as a string (`rt/rpc/dispatch.rs:7094`); it becomes that UUID, which clients already treat as opaque. `initialize` also reports `daemon_instance_id` `[proposed]`, a random UUID fixed for the life of the daemon process, so a client can tell a daemon restart from a reconnect to the same process (§10.2). `turn_started` is a new event type, which clients that follow V-1 ignore, and `turn_complete.turn_id` is an added field, so both are additive under V-1.
 
 Open PRs change this surface additively (V-1 holds; no new `SessionUpdateEvent` variant in any PR):
 
@@ -1595,14 +1595,16 @@ Each is listed in ADR-019 with the same number. None has a default in this contr
 
 Settled here, pending ADR acceptance, because they decide whether keys must move at config V4: webhook idempotency is core-owned (§12.6) and `gateway.webhook_secret` is verified in the core (§12.7). Consequence for config: none. The keys keep their names; §13.1 records the core as their canonical owner and only reader.
 
-### 17.2 What fits the v0.9.0 window
+### 17.2 Historical v0.9.0 window assessment
 
-The v0.9.0 window is days, not weeks. Stated plainly, from the dependency chain above:
+**Current release context.** The [accepted 2026-10-21 release allocation](https://github.com/zeroclaw-labs/zeroclaw/issues/7432#issuecomment-6315726171) moves standalone gateway separation, full IPC parity and two-process desktop packaging to later v0.9.x. [G1 (#11000)](https://github.com/zeroclaw-labs/zeroclaw/issues/11000) and [G5 (#11004)](https://github.com/zeroclaw-labs/zeroclaw/issues/11004) now track that work in the Parking Lot with release TBD. This supersedes the v0.9.0 schedule assumptions in this contract, including D9. It does not accept any proposed DEC or resolve the technical D1–D13 choices; their acceptance criteria remain open.
+
+The original assessment below is preserved as historical context. It assumed a v0.9.0 window of days rather than weeks, based on the dependency chain above:
 
 - **Fits** (reviewable now and needing no D1–D13 choice; each item still needs its own DEC accepted before an implementation relies on it, per §17.0): this contract and ADR as a draft docs PR; the parity PRs already open (#11132, #11149, #11176, #11169, #11172, #11185, #11182) once reviewed; #11165/#11186 with the SCH fixes; the generation fence (§12.4, DEC-11, #11271) and the core-owned idempotency move (§12.6, DEC-12 and DEC-24) in process; the discovery fix and Windows pipe naming (§4.2, DEC-07); rpc-socket.md errata; version-mismatch and pipe conformance tests.
 - **Does not fit without rulings and several more days**: the service identity (D1) and endpoint verification; `webhook/deliver` and `ingress/*` across processes; porting the gateway's routes off in-process state; the `zeroclaw-gw` binary; removing the gateway from the core artifact; desktop two-process supervision (#11004 depends on #11002).
 
-ADR-007 and ADR-019 stay proposed until their acceptance gates ship; a v0.9.0 that ships only the first bullet completes G1 and part of G2, not the gateway split. That is D9.
+In that historical assessment, a v0.9.0 shipping only the first bullet would complete G1 and part of G2, not the gateway split (D9). ADR-007 and ADR-019 remain proposed until their acceptance gates ship.
 
 ## Appendix A. Errata this contract records against current docs
 
@@ -1707,7 +1709,7 @@ AppliedAgent = {
 }
 
 // rt/sop/approval/decision.rs:11
-ApprovalDecision = 
+ApprovalDecision =
   | "approve"
   | {"deny": {reason?: string | null}}
   | {"amend": {text: string}}
@@ -1745,7 +1747,7 @@ ChannelTriggerKind = {
 }
 
 // rt/rpc/types.rs:238
-ChatMode = 
+ChatMode =
   | "chat"
   | "acp"
 
@@ -1773,7 +1775,7 @@ ConditionOpSpec = {
 }
 
 // rt/sop/trigger_registry.rs:118
-ConditionValueType = 
+ConditionValueType =
   | "string"
   | "number"
   | "bool"
@@ -1868,7 +1870,7 @@ CronRunsResult = {
 }
 
 // cfg/schema.rs:15478
-CronShellOutputFormat = 
+CronShellOutputFormat =
   | "wrapped"
   | "raw"
 
@@ -1923,20 +1925,20 @@ FieldDescriptor = {
 }
 
 // rt/quickstart/mod.rs:680
-FieldSection = 
+FieldSection =
   | "model_provider"
   | "channel"
   | "peer_group"
 
 // rt/sop/types.rs:86
-FilesystemEventKind = 
+FilesystemEventKind =
   | "created"
   | "modified"
   | "deleted"
   | "renamed"
 
 // crates/zeroclaw-sop-graph/src/lib.rs:32
-FlowRole = 
+FlowRole =
   | "sequence"
   | "dependency"
   | "failure"
@@ -1966,7 +1968,7 @@ FsListDirResponse = {
 }
 
 // rt/sop/decision.rs:47
-GateOnError = 
+GateOnError =
   | "run_strict"
   | "skip"
 
@@ -1979,17 +1981,17 @@ HealthSnapshot = {
 }
 
 // rt/agent/prompt.rs:17
-InteractionSurface = 
+InteractionSurface =
   | "zerocode_code"
 
 // api/ingress.rs:66
-InternalPrincipal = 
+InternalPrincipal =
   | {"cron": {job_id: string, job_name: string | null}}
   | {"peer_agent": {sender_alias: string}}
   | {"daemon": {task: string}}
 
 // rt/cron/types.rs:28
-JobType = 
+JobType =
   | "shell"
   | "agent"
 
@@ -2037,7 +2039,7 @@ NodeRunOverlay = {
 }
 
 // crates/zeroclaw-sop-graph/src/lib.rs:275
-NodeRunState = 
+NodeRunState =
   | "pending"
   | "active"
   | "completed"
@@ -2045,7 +2047,7 @@ NodeRunState =
   | "skipped"
 
 // api/tool.rs:274
-OptionDomain = 
+OptionDomain =
   | "channel_refs"
   | "peer_targets"
   | "peer_groups"
@@ -2083,7 +2085,7 @@ ProcessStats = {
 }
 
 // cfg/traits.rs:72
-PropKind = 
+PropKind =
   | "string"
   | "bool"
   | "integer"
@@ -2095,7 +2097,7 @@ PropKind =
   | "object"
 
 // rt/rpc/types.rs:1806
-QuickstartApplyResult = 
+QuickstartApplyResult =
   | {kind: "applied", agent: AppliedAgent, daemon_restarted: boolean}
   | {kind: "errors", errors: QuickstartError[]}
 
@@ -2125,7 +2127,7 @@ QuickstartFieldsResult = {
 }
 
 // rt/quickstart/mod.rs:89
-QuickstartStep = 
+QuickstartStep =
   | "model_provider"
   | "risk_profile"
   | "runtime_profile"
@@ -2135,7 +2137,7 @@ QuickstartStep =
   | "agent"
 
 // rt/rpc/types.rs:1792
-QuickstartValidateResult = 
+QuickstartValidateResult =
   | {kind: "ok"}
   | {kind: "errors", errors: QuickstartError[]}
 
@@ -2159,7 +2161,7 @@ RunOverlay = {
 }
 
 // rt/cron/types.rs:101
-Schedule = 
+Schedule =
   | {kind: "cron", expr: string, tz: string | null /* input optional */}
   | {kind: "at", at: string (RFC 3339)}
   | {kind: "every", every_ms: integer}
@@ -2186,12 +2188,12 @@ SessionNewParams = {
 }
 
 // rt/cron/types.rs:60
-SessionTarget = 
+SessionTarget =
   | "isolated"
   | "main"
 
 // rt/doctor/mod.rs:31
-Severity = 
+Severity =
   | "ok"
   | "warn"
   | "error"
@@ -2277,7 +2279,7 @@ Sop = {
 }
 
 // rt/sop/types.rs:567
-SopAdmissionPolicy = 
+SopAdmissionPolicy =
   | "parallel"
   | "hold"
   | "coalesce"
@@ -2303,7 +2305,7 @@ SopDecisionSpec = {
 }
 
 // rt/sop/types.rs:40
-SopExecutionMode = 
+SopExecutionMode =
   | "auto"
   | "supervised"
   | "step_by_step"
@@ -2311,7 +2313,7 @@ SopExecutionMode =
   | "deterministic"
 
 // rt/sop/types.rs:15
-SopPriority = 
+SopPriority =
   | "low"
   | "normal"
   | "high"
@@ -2369,7 +2371,7 @@ SopRunsRequest = {
 }
 
 // rt/sop/types.rs:732
-SopRunStatus = 
+SopRunStatus =
   | "pending"
   | "running"
   | "cancel_requested"
@@ -2440,13 +2442,13 @@ SopStepDetail = {
 }
 
 // rt/sop/types.rs:260
-SopStepKind = 
+SopStepKind =
   | "execute"
   | "checkpoint"
   | "capability"
 
 // rt/sop/types.rs:765
-SopStepStatus = 
+SopStepStatus =
   | "completed"
   | "failed"
   | "skipped"
@@ -2463,7 +2465,7 @@ SopToolCallDetail = {
 }
 
 // rt/sop/types.rs:142
-SopTrigger = 
+SopTrigger =
   | {type: "mqtt", topic: string, condition: string | null /* input optional */}
   | {type: "webhook", path: string}
   | {type: "cron", expression: string}
@@ -2481,7 +2483,7 @@ SopValidation = {
 }
 
 // rt/sop/step_contract.rs:54
-StepFailure = 
+StepFailure =
   | "fail"
   | {"retry": {max: integer}}
   | {"goto": {step: integer}}
@@ -2526,7 +2528,7 @@ StepToolScope = {
 }
 
 // rt/quickstart/mod.rs:18
-Surface = 
+Surface =
   | "web"
   | "tui"
   | "cli"
@@ -2548,7 +2550,7 @@ TriggerField = {
 }
 
 // rt/sop/trigger_registry.rs:42
-TriggerFieldKind = 
+TriggerFieldKind =
   | "text"
   | "list"
   | "expression"
@@ -2582,7 +2584,7 @@ WireEdit = {
 }
 
 // rt/sop/wire.rs:16
-WireOp = 
+WireOp =
   | "connect"
   | "disconnect"
 ```
@@ -3582,18 +3584,18 @@ ChannelReadiness = {
 }
 
 // ch/control.rs:36 @b0ad81bfd2
-ChannelReadinessState = 
+ChannelReadinessState =
   | "ready"
   | "missing"
   | "unknown"
 
 // ch/control.rs:331, :339 @b0ad81bfd2 (json! in relink)
-ChannelsRelinkResult = 
+ChannelsRelinkResult =
   | {channel: string, outcome: "cleared", removed: string[], restart_required: true, note: string}
   | {channel: string, outcome: "nothing_to_clear", removed: string[] /* always [] */, restart_required: false, note: string}
 
 // ch/control.rs:487, :531 @b0ad81bfd2 (json! in prepare_bind AlreadyBound, commit_bind)
-ChannelsBindResult = 
+ChannelsBindResult =
   | {saved: false, already_bound: true, group: string | null, channel: string, restart_required: false}
   | {saved: true, already_bound: false, group: string, channel: string, restart_required: true, note: string}
   // channel = "<trimmed type>.<trimmed alias>"; group = the peer_groups key written, or (already bound) the key that authorizes the identity, else the channel's group key, else null
@@ -3630,7 +3632,7 @@ UpgradeStatusResponse = {
   // state "idle" (no upgrade has run) => only {state}. Otherwise handoff_id, phase, log_tail, previous_version, restart_mode, restart_hint are always present; target_version only when the request named a version; error only after a failure.
 
 // rt/self_upgrade.rs:265 @b0ad81bfd2
-UpgradeStatusState = 
+UpgradeStatusState =
   | "idle"
   | "running"
   | "done"
