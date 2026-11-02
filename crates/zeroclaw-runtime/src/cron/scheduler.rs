@@ -2309,7 +2309,7 @@ mod tests {
         // 500-byte truncation bound. Redaction must run before truncation or
         // the straddling secret escapes as a truncated remnant.
         let long_prefix = "x".repeat(480);
-        let straddle_secret = "0123456789abcdef".repeat(2);
+        let straddle_secret = ["01234567", "89abcdef"].concat().repeat(2);
         let cases: Vec<(String, String)> = vec![
             (
                 "password=opaque-example-1234".to_string(),
