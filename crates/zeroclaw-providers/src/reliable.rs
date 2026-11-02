@@ -8839,7 +8839,7 @@ mod tests {
         );
     }
 
-    /// OpenCode Zen's exhausted free-quota response, as reported in #10779.
+    /// OpenCode Zen's exhausted free-quota response.
     const OPENCODE_FREE_USAGE_LIMIT_429: &str = "OpenCode Zen API error (429 Too Many Requests): {\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Error from provider (Console): Rate limit exceeded. Please try again later.\"}}";
 
     #[test]
