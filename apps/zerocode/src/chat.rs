@@ -22242,7 +22242,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
-        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+        for idx in 2..=chat.max_tracked_sessions_per_pane {
             let session_id = format!("sess-{idx}");
             chat.session_order.push(session_id.clone());
             chat.background.push(state_for(&session_id, "alpha"));
@@ -22269,7 +22269,7 @@ mod tests {
             active_info_notice(&chat),
             crate::i18n::t_args(
                 "zc-chat-session-cap",
-                &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
+                &[("max", &chat.max_tracked_sessions_per_pane.to_string())]
             )
         );
     }
