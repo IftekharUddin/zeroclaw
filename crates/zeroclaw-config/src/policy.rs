@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroclaw_api::runtime_traits::ShellDialect;
 
+type ReadOnlyArgumentProtection<'a> = &'a dyn Fn(&str, &Path) -> bool;
+
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
 
@@ -4801,7 +4803,7 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
         resolve_workspace: bool,
-        protects_read_only: Option<&dyn Fn(&str, &Path) -> bool>,
+        protects_read_only: Option<ReadOnlyArgumentProtection<'_>>,
     ) -> Option<String> {
         if split_unquoted_segments_checked(command, dialect).is_err() {
             // Name the opener rather than a path. The shell wrapper refuses
