@@ -2,13 +2,17 @@ use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{
+    Tool, ToolExecutionContext, ToolOutput, ToolResult, WebFetchSpillAccess, WebFetchSpillFile,
+    WebFetchSpillReaders,
+};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{FirecrawlConfig, ProxyConfig, ProxyScope};
 
@@ -37,6 +41,7 @@ const SPILL_THRESHOLD_BYTES: usize = 50_000;
 /// Directory, relative to the workspace root, that oversized responses are
 /// spilled into. Kept as components rather than a `"tmp/web_fetch"` literal
 /// so the join is separator-correct on every platform.
+#[cfg(test)]
 const SPILL_DIR_COMPONENTS: [&str; 2] = ["tmp", "web_fetch"];
 
 /// Longest single line, in bytes, a spilled file may contain.
@@ -50,18 +55,6 @@ const SPILL_DIR_COMPONENTS: [&str; 2] = ["tmp", "web_fetch"];
 /// of the document, large enough that ordinary prose paragraphs and formatted
 /// JSON lines are never touched.
 const SPILL_MAX_LINE_BYTES: usize = 4_000;
-
-/// The tool whose permission decides whether `web_fetch` may spill to disk.
-///
-/// Spilling is a durable filesystem write, but `web_fetch` is auto-approved by
-/// default and is not classified as a writing tool, so nothing upstream asks
-/// the operator about it. Rather than mint a second answer to "may this agent
-/// write files" — the drift AGENTS.md bans — the spill defers to the policy's
-/// existing answer for `file_write` via `SecurityPolicy::is_tool_allowed`,
-/// which resolves the profile's `allowed_tools`/`excluded_tools` exactly as
-/// the agent loop does when it decides whether to offer `file_write` at all.
-/// A profile that denies file writes gets the inline truncation instead.
-const SPILL_WRITE_TOOL: &str = "file_write";
 
 /// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
 ///
@@ -192,9 +185,17 @@ impl WebFetchTool {
     /// under identical rules. Below the threshold, or when spilling is not
     /// permitted or does not succeed, the pre-existing inline behaviour —
     /// `truncate_response` over the raw converted text — applies unchanged.
-    async fn deliver(&self, url: &str, content: FetchedContent) -> ToolResult {
+    async fn deliver(
+        &self,
+        url: &str,
+        content: FetchedContent,
+        context: &ToolExecutionContext,
+        access: Option<&dyn WebFetchSpillAccess>,
+    ) -> ToolResult {
         if content.text.len() > SPILL_THRESHOLD_BYTES
-            && let Some(message) = self.spill_to_workspace(url, &content).await
+            && let Some(message) = self
+                .spill_to_workspace(url, &content, context, access)
+                .await
         {
             return ToolResult {
                 success: true,
@@ -225,107 +226,56 @@ impl WebFetchTool {
     /// unresolvable workspace, a destination that is not ours to write, or an
     /// I/O error. Callers fall back to the pre-existing inline truncation,
     /// which is degraded but never wrong.
-    async fn spill_to_workspace(&self, url: &str, content: &FetchedContent) -> Option<String> {
-        // A spill is a durable filesystem write performed by a tool the
-        // operator auto-approved as a fetch. Ask the policy the same question
-        // the agent loop asks before offering `file_write`, and stay inline
-        // when the answer is no.
-        if !self.security.is_tool_allowed(SPILL_WRITE_TOOL) {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "phase": "spill_to_workspace",
-                        "gate": SPILL_WRITE_TOOL,
-                    })),
-                "web_fetch: security policy does not permit file writes, returning the \
-                 oversized response inline instead of spilling it"
-            );
-            return None;
-        }
-
-        match self.try_spill_to_workspace(url, content).await {
-            Ok((relative_path, format)) => Some(spill_message(
+    async fn spill_to_workspace(
+        &self,
+        url: &str,
+        content: &FetchedContent,
+        context: &ToolExecutionContext,
+        access: Option<&dyn WebFetchSpillAccess>,
+    ) -> Option<String> {
+        let access = access?;
+        let result: anyhow::Result<Option<String>> = async {
+            // The producer still owns formatting and naming, but neither its
+            // policy nor the presence of a tool name grants a durable write.
+            let workspace = tokio::fs::canonicalize(&self.security.workspace_dir).await?;
+            let (body, format) = prepare_spill_body(&content.text, content.extension);
+            let file_name = spill_file_name(url, &body, content.extension);
+            let relative = format!("tmp/web_fetch/{file_name}");
+            let resolved_target = workspace.join(&relative);
+            let file = WebFetchSpillFile {
+                relative_path: &relative,
+                resolved_target: &resolved_target,
+                text: &body,
+            };
+            let Some(readers) = access.persist(file, context).await? else {
+                return Ok(None);
+            };
+            Ok(Some(spill_message(
                 url,
                 content.title.as_deref(),
                 content.text.len(),
-                &relative_path,
+                &relative,
                 content.cap_hit,
                 &format,
-            )),
-            Err(e) => {
+                readers,
+            )))
+        }
+        .await;
+        match result {
+            Ok(message) => message,
+            Err(error) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
-                            "phase": "spill_to_workspace",
-                            "error": format!("{}", e),
+                            "phase": "spill_to_workspace", "error": error.to_string(),
                         })),
-                    "web_fetch: could not spill oversized response to the workspace, \
-                     falling back to inline truncation"
+                    "web_fetch: could not spill oversized response; returning it inline"
                 );
                 None
             }
         }
-    }
-
-    /// Reshape the body, name it after its own bytes, and write it.
-    ///
-    /// Returns the workspace-*relative* path (what `file_read` and
-    /// `content_search` expect) plus how the body was reshaped.
-    async fn try_spill_to_workspace(
-        &self,
-        url: &str,
-        content: &FetchedContent,
-    ) -> anyhow::Result<(PathBuf, SpillFormat)> {
-        // The workspace root has exactly one source of truth in this
-        // codebase: `SecurityPolicy::workspace_dir`
-        // (crates/zeroclaw-config/src/policy.rs). It is the same field
-        // `SecurityPolicy::resolve_tool_path` and
-        // `SecurityPolicy::is_resolved_path_allowed` use to root `file_read`
-        // and `file_write`, and `WebFetchTool` already holds the policy. Do
-        // not introduce a second resolution path here (no env var, no
-        // `std::env::temp_dir()`, no constructor-threaded copy) — a divergent
-        // second answer is exactly the drift bug AGENTS.md bans.
-        let workspace = self.security.workspace_dir.clone();
-        if workspace.as_os_str().is_empty() {
-            anyhow::bail!("workspace_dir is empty");
-        }
-
-        let (body, format) = prepare_spill_body(&content.text, content.extension);
-        let file_name = spill_file_name(url, &body, content.extension);
-
-        // `spill_file_name` sanitizes to a single component, but prove it
-        // rather than trust it. The write below is confined to a directory
-        // handle regardless, so this is the second line of defence, not the
-        // first.
-        let mut components = Path::new(&file_name).components();
-        let single_normal_component = matches!(components.next(), Some(Component::Normal(_)))
-            && components.next().is_none()
-            && !file_name.contains(['/', '\\']);
-        if !single_normal_component {
-            anyhow::bail!("spill file name is not a single path component");
-        }
-
-        let mut relative = PathBuf::new();
-        for component in SPILL_DIR_COMPONENTS {
-            relative.push(component);
-        }
-        relative.push(&file_name);
-
-        // Blocking filesystem work off the async runtime. The handle-bound
-        // write is synchronous by nature: its safety comes from never
-        // re-resolving a pathname, which an async open/write pair cannot offer.
-        let workspace_for_write = workspace.clone();
-        let body_for_write = body;
-        tokio::task::spawn_blocking(move || {
-            write_spill_file(&workspace_for_write, &file_name, &body_for_write)
-        })
-        .await
-        .map_err(|e| anyhow::Error::msg(format!("spill write task did not complete: {e}")))??;
-
-        Ok((relative, format))
     }
 
     /// Build the standard-fetch client, wiring the redirect policy that keeps
@@ -515,15 +465,21 @@ impl WebFetchTool {
             ));
         }
 
-        // Handed back unshaped: delivery decides inline-vs-spill for Firecrawl
-        // markdown on exactly the same terms as a standard fetch. Firecrawl
-        // reads a parsed JSON field rather than the size-capped stream, so
-        // `max_response_size` never cut it short.
+        // Bound the extracted field before delivery can persist it. Parsing
+        // Firecrawl's JSON envelope still buffers the response as before.
+        let mut end = if self.max_response_size == 0 {
+            markdown.len()
+        } else {
+            markdown.len().min(self.max_response_size)
+        };
+        while !markdown.is_char_boundary(end) {
+            end -= 1;
+        }
         Ok(FetchAttempt::Content(FetchedContent {
-            text: markdown.to_string(),
+            text: markdown[..end].to_string(),
             extension: "md",
             title: None,
-            cap_hit: false,
+            cap_hit: end < markdown.len(),
         }))
     }
 
@@ -618,8 +574,8 @@ impl Tool for WebFetchTool {
          Only GET requests; follows same-host redirects and rejects cross-host redirects. \
          Falls back to Firecrawl for JS-heavy/bot-blocked sites (if enabled). \
          Oversized responses are saved to a file in the agent workspace and the \
-         path is returned instead of the text, when the security policy permits \
-         file writes. \
+         path is returned when file_write is already approved and an available \
+         file_read or content_search tool can read it; otherwise content stays inline. \
          Security: allowlist-only domains, no local/private hosts."
     }
 
@@ -637,6 +593,33 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.fetch_and_deliver(
+            args,
+            &ToolExecutionContext::current().unwrap_or_default(),
+            None,
+        )
+        .await
+    }
+
+    async fn execute_with_web_fetch_spill(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+        access: Option<&dyn WebFetchSpillAccess>,
+    ) -> anyhow::Result<ToolResult> {
+        context
+            .run(self.fetch_and_deliver(args, context, access))
+            .await
+    }
+}
+
+impl WebFetchTool {
+    async fn fetch_and_deliver(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+        access: Option<&dyn WebFetchSpillAccess>,
+    ) -> anyhow::Result<ToolResult> {
         let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -783,7 +766,9 @@ impl Tool for WebFetchTool {
         // oversized body spills under the same rules and a small one comes
         // back inline.
         match attempt {
-            FetchAttempt::Content(content) => Ok(self.deliver(&url, content).await),
+            FetchAttempt::Content(content) => {
+                Ok(self.deliver(&url, content, context, access).await)
+            }
             FetchAttempt::Failure(failure) => Ok(failure),
         }
     }
@@ -929,99 +914,6 @@ fn hard_wrap_long_lines(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Write `body` as `file_name` under `<workspace>/tmp/web_fetch/` without ever
-/// following a symlink, and without ever re-resolving a pathname.
-///
-/// Mirrors the hardened write in [`crate::embedded_resource`]: every operation
-/// goes through a [`cap_std::fs::Dir`] handle opened once on the workspace root
-/// and narrowed one component at a time, so a directory or symlink swapped in
-/// at any component after the handle is opened cannot redirect the write out of
-/// the workspace — closing a check/act window that a post-write `canonicalize`
-/// could only detect after the bytes had already landed.
-///
-/// The destination is published atomically. The bytes go to a uniquely named
-/// temp file opened `create_new` (which refuses rather than follows whatever is
-/// already sitting at that name), are synced, and are then renamed over
-/// `file_name` in one step. A file at the content-addressed name is therefore
-/// always whole: a concurrent identical fetch observes either no file or the
-/// complete file, and a crash mid-write leaves a stray temp, never a partial
-/// destination that a later fetch would reuse as complete.
-///
-/// Because `file_name` is the full digest of `body`, an existing regular file
-/// that holds exactly these bytes is reused as-is; the bytes are verified
-/// rather than trusted, so an incomplete or foreign file at that name is
-/// replaced by the rename instead. A symlink, directory, or special file at
-/// the destination is not ours to write and the spill is abandoned so the
-/// caller falls back to returning the response inline.
-fn write_spill_file(workspace_dir: &Path, file_name: &str, body: &str) -> anyhow::Result<()> {
-    use cap_std::ambient_authority;
-    use cap_std::fs::{Dir, OpenOptions};
-    use std::io::Write;
-
-    let mut dir = Dir::open_ambient_dir(workspace_dir, ambient_authority())
-        .map_err(|e| anyhow::Error::msg(format!("workspace root is not openable: {e}")))?;
-
-    for component in SPILL_DIR_COMPONENTS {
-        // `create_dir_all` and `open_dir` both resolve within the handle, but a
-        // symlink that stays inside the workspace would still relocate the
-        // spill somewhere the operator did not ask for. Refuse it outright.
-        if dir
-            .symlink_metadata(component)
-            .is_ok_and(|meta| meta.is_symlink())
-        {
-            anyhow::bail!("spill directory component '{component}' is a symlink");
-        }
-        dir.create_dir_all(component)
-            .map_err(|e| anyhow::Error::msg(format!("failed to create spill directory: {e}")))?;
-        dir = dir
-            .open_dir(component)
-            .map_err(|e| anyhow::Error::msg(format!("failed to open spill directory: {e}")))?;
-    }
-
-    match dir.symlink_metadata(file_name) {
-        Ok(meta) if meta.is_file() => {
-            // Content-addressed: this exact name means these exact bytes. Verify
-            // rather than trust it, so a partial or planted file at the name is
-            // replaced below instead of being handed back as complete.
-            if meta.len() == body.len() as u64
-                && dir
-                    .read(file_name)
-                    .is_ok_and(|existing| existing == body.as_bytes())
-            {
-                return Ok(());
-            }
-        }
-        Ok(_) => anyhow::bail!("refusing to write spill file: destination is not a regular file"),
-        Err(_) => {}
-    }
-
-    // Unique per process and per call, so two concurrent identical fetches
-    // never share a temp file; whichever renames last installs the same bytes.
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = format!(".{file_name}.tmp-{}-{seq}", std::process::id());
-
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = dir
-        .open_with(&tmp, &options)
-        .map_err(|e| anyhow::Error::msg(format!("failed to create spill temp file: {e}")))?;
-    let written = file
-        .write_all(body.as_bytes())
-        .and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(e) = written {
-        let _ = dir.remove_file(&tmp);
-        anyhow::bail!("failed to write spill file: {e}");
-    }
-
-    if let Err(e) = dir.rename(&tmp, &dir, file_name) {
-        let _ = dir.remove_file(&tmp);
-        anyhow::bail!("failed to publish spill file: {e}");
-    }
-    Ok(())
-}
-
 /// File extension for a spilled body.
 ///
 /// Derived from the content type the caller already classified — this is a
@@ -1052,7 +944,7 @@ fn spill_extension(content_type: &str, body_mode: &str) -> &'static str {
 /// unchanged content resolves to the same file instead of accumulating copies.
 /// Content-addressed over the *written* bytes, not the fetched ones: a file
 /// already present at this name should hold exactly this body, which is what
-/// lets [`write_spill_file`] reuse it (after verifying the bytes) instead of
+/// lets the canonical writer reuse it (after verifying the bytes) instead of
 /// publishing a second copy.
 fn spill_file_name(url: &str, body: &str, extension: &str) -> String {
     let host = extract_host(url)
@@ -1131,40 +1023,51 @@ fn spill_message(
     url: &str,
     title: Option<&str>,
     byte_count: usize,
-    relative_path: &Path,
+    relative_path: &str,
     cap_hit: bool,
     format: &SpillFormat,
+    readers: WebFetchSpillReaders,
 ) -> String {
-    let path = relative_path.display();
-    let mut message = format!("Fetched {url}\n");
+    let text = crate::i18n::get_required_tool_string;
+    let text_args = crate::i18n::get_required_tool_string_with_args;
+    let mut message = text_args("tool-web-fetch-spill-source", &[("url", url)]);
+    message.push('\n');
     if let Some(title) = title {
-        message.push_str(&format!("Title: {title}\n"));
+        message.push_str(&text_args(
+            "tool-web-fetch-spill-title",
+            &[("title", title)],
+        ));
+        message.push('\n');
     }
-    message.push_str(&format!(
-        "Size: {byte_count} bytes of converted text — too large to return inline, so the \
-         full text was written to a file in the agent workspace.\n\n\
-         Saved to: {path}\n\n\
-         Read it with the file_read tool (path=\"{path}\", using its offset and limit \
-         parameters to page through), or search it with the content_search tool \
-         (path=\"{path}\" plus a pattern). That path is relative to the workspace root.\n"
+    message.push_str(&text_args(
+        "tool-web-fetch-spill-saved",
+        &[("bytes", &byte_count.to_string()), ("path", relative_path)],
     ));
+    message.push_str("\n\n");
+    let reader_key = match readers {
+        WebFetchSpillReaders::FileRead => "tool-web-fetch-spill-read",
+        WebFetchSpillReaders::ContentSearch => "tool-web-fetch-spill-search",
+        WebFetchSpillReaders::Both => "tool-web-fetch-spill-read-or-search",
+    };
+    message.push_str(&text_args(reader_key, &[("path", relative_path)]));
+    message.push('\n');
     if format.pretty_printed {
-        message.push_str(
-            "\nNote: the response was valid JSON and was saved pretty-printed, so the file is \
-             indented rather than byte-identical to what the server served.\n",
-        );
+        message.push('\n');
+        message.push_str(&text("tool-web-fetch-spill-pretty"));
+        message.push('\n');
     }
     if format.wrapped {
-        message.push_str(&format!(
-            "\nNote: lines longer than {SPILL_MAX_LINE_BYTES} bytes were hard-wrapped so the file \
-             can be paged by line. Line breaks that the source did not contain were added.\n"
+        message.push('\n');
+        message.push_str(&text_args(
+            "tool-web-fetch-spill-wrapped",
+            &[("bytes", &SPILL_MAX_LINE_BYTES.to_string())],
         ));
+        message.push('\n');
     }
     if cap_hit {
-        message.push_str(
-            "\nNote: the response hit web_fetch's max_response_size stream cap, so the saved \
-             content is the truncated head of the page, not the whole page.\n",
-        );
+        message.push('\n');
+        message.push_str(&text("tool-web-fetch-spill-truncated"));
+        message.push('\n');
     }
     message
 }
@@ -2032,7 +1935,7 @@ mod tests {
         let FetchAttempt::Content(content) = standard_attempt else {
             panic!("expected fetched content");
         };
-        let delivered = tool.deliver(&url, content).await;
+        let delivered = deliver_with_approved_file_tools(&tool, &url, content).await;
         assert!(delivered.success, "error={:?}", delivered.error);
         assert!(
             !delivered.output.contains("[Response truncated"),
@@ -2117,7 +2020,9 @@ mod tests {
             .build()
             .expect("reqwest client");
         match tool.standard_fetch(&client, &url).await {
-            FetchAttempt::Content(content) => tool.deliver(&url, content).await,
+            FetchAttempt::Content(content) => {
+                deliver_with_approved_file_tools(&tool, &url, content).await
+            }
             FetchAttempt::Failure(result) => result,
         }
     }
@@ -2466,7 +2371,9 @@ mod tests {
             .build()
             .expect("reqwest client");
         let result = match tool.standard_fetch(&client, &url).await {
-            FetchAttempt::Content(content) => tool.deliver(&url, content).await,
+            FetchAttempt::Content(content) => {
+                deliver_with_approved_file_tools(&tool, &url, content).await
+            }
             FetchAttempt::Failure(result) => result,
         };
 
@@ -3558,6 +3465,54 @@ mod tests {
     // read → convert → spill path is exercised, and root the tool at a
     // throwaway workspace so no test can write into the repo.
 
+    /// Delivery fixtures explicitly provide approved file tools. Approval and
+    /// caller-registry admission are covered by the real runtime dispatcher tests.
+    struct ApprovedFileTools<'a>(&'a WebFetchTool);
+
+    #[async_trait]
+    impl WebFetchSpillAccess for ApprovedFileTools<'_> {
+        async fn persist(
+            &self,
+            file: WebFetchSpillFile<'_>,
+            context: &ToolExecutionContext,
+        ) -> anyhow::Result<Option<WebFetchSpillReaders>> {
+            let policy = &self.0.security;
+            if !policy.is_tool_allowed("file_write") || !policy.is_tool_allowed("content_search") {
+                return Ok(None);
+            }
+            let reader = crate::content_search::ContentSearchTool::new(policy.clone());
+            if !reader.check_web_fetch_spill_read(&file).await? {
+                return Ok(None);
+            }
+            let writer = crate::wrappers::RateLimitedTool::new(
+                crate::wrappers::PathGuardedTool::new(
+                    crate::file_write::FileWriteTool::new(policy.clone()),
+                    policy.clone(),
+                ),
+                policy.clone(),
+            );
+            Ok(writer
+                .write_web_fetch_spill(&file, context)
+                .await?
+                .filter(|result| result.success)
+                .map(|_| WebFetchSpillReaders::ContentSearch))
+        }
+    }
+
+    async fn deliver_with_approved_file_tools(
+        tool: &WebFetchTool,
+        url: &str,
+        content: FetchedContent,
+    ) -> ToolResult {
+        tool.deliver(
+            url,
+            content,
+            &ToolExecutionContext::default(),
+            Some(&ApprovedFileTools(tool)),
+        )
+        .await
+    }
+
     /// A tool whose `SecurityPolicy.workspace_dir` — the canonical
     /// workspace root, same field `file_read`/`file_write` resolve
     /// against — points at a throwaway directory.
@@ -3604,7 +3559,9 @@ mod tests {
             .build()
             .expect("reqwest client");
         match tool.standard_fetch(&client, &url).await {
-            FetchAttempt::Content(content) => tool.deliver(&url, content).await,
+            FetchAttempt::Content(content) => {
+                deliver_with_approved_file_tools(tool, &url, content).await
+            }
             FetchAttempt::Failure(result) => result,
         }
     }
@@ -3699,7 +3656,7 @@ mod tests {
             "message must state the byte count, got:\n{message}"
         );
         assert!(
-            message.contains("file_read") && message.contains("content_search"),
+            !message.contains("file_read") && message.contains("content_search"),
             "message must point at the workspace file tools, got:\n{message}"
         );
         assert!(
@@ -4024,7 +3981,7 @@ mod tests {
         let FetchAttempt::Content(content) = attempt else {
             panic!("expected fetched content");
         };
-        let result = tool.deliver(&url, content).await;
+        let result = deliver_with_approved_file_tools(&tool, &url, content).await;
         assert!(result.success, "error={:?}", result.error);
         assert!(
             result.output.as_str().contains("Saved to: "),
@@ -4296,12 +4253,16 @@ mod tests {
     /// still spills. Without this the test above would pass even if spilling
     /// were broken outright.
     #[tokio::test]
-    async fn spill_happens_when_file_write_is_permitted() {
+    async fn spill_happens_with_approved_writer_and_available_reader() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let tool = spill_tool_with_policy(
             workspace.path(),
             500_000,
-            Some(vec!["web_fetch".into(), "file_write".into()]),
+            Some(vec![
+                "web_fetch".into(),
+                "file_write".into(),
+                "content_search".into(),
+            ]),
             None,
         );
         let body = "q".repeat(60_000);
@@ -4311,7 +4272,7 @@ mod tests {
         assert!(result.success, "error={:?}", result.error);
         assert!(
             result.output.as_str().contains("Saved to: "),
-            "an allowlist containing file_write must still spill, got:\n{}",
+            "an approved writer and available reader must still spill, got:\n{}",
             result.output.as_str()
         );
     }
@@ -4503,7 +4464,7 @@ mod tests {
         let FetchAttempt::Content(content) = attempt else {
             panic!("expected firecrawl content");
         };
-        let result = tool.deliver(url, content).await;
+        let result = deliver_with_approved_file_tools(&tool, url, content).await;
 
         // SAFETY: test-only, and the variable name is unique to this test.
         unsafe { std::env::remove_var("FIRECRAWL_SPILL_TEST_KEY") };
@@ -4531,6 +4492,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn firecrawl_cap_applies_before_inline_or_spill_with_utf8_and_unlimited_controls() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let markdown = "é".repeat(60_000);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"markdown": markdown}
+            })))
+            .mount(&server)
+            .await;
+        // SAFETY: this uniquely named fixture variable is used only by this
+        // test; the focused web_fetch suite runs with one test thread.
+        unsafe { std::env::set_var("FIRECRAWL_CAP_BEFORE_SPILL_TEST_KEY", "fixture-key") };
+        let mut fetched = Vec::new();
+        for cap in [31, 55_001, 0] {
+            let root = tempfile::tempdir().unwrap();
+            let mut tool = spill_test_tool(root.path(), cap);
+            tool.firecrawl = FirecrawlConfig {
+                enabled: true,
+                api_key_env: "FIRECRAWL_CAP_BEFORE_SPILL_TEST_KEY".into(),
+                api_url: server.uri(),
+                ..FirecrawlConfig::default()
+            };
+            let attempt = tool.fetch_via_firecrawl("https://example.com/page").await;
+            fetched.push((cap, root, tool, attempt));
+        }
+        // SAFETY: remove the same test-owned variable before assertions.
+        unsafe { std::env::remove_var("FIRECRAWL_CAP_BEFORE_SPILL_TEST_KEY") };
+        for (cap, root, tool, attempt) in fetched {
+            let FetchAttempt::Content(content) = attempt.unwrap() else {
+                panic!("fixture fetch failed")
+            };
+            let expected_len = if cap == 0 {
+                markdown.len()
+            } else {
+                cap / 2 * 2
+            };
+            assert_eq!(
+                content.text.len(),
+                expected_len,
+                "Firecrawl must honor the configured byte cap before delivery"
+            );
+            assert_eq!(content.cap_hit, cap != 0);
+            let result =
+                deliver_with_approved_file_tools(&tool, "https://example.com/page", content).await;
+            assert!(result.success);
+            if cap == 31 {
+                assert_eq!(
+                    result.output.as_str(),
+                    format!("{}{}", &markdown[..expected_len], TRUNCATION_MARKER)
+                );
+                assert!(!root.path().join("tmp").exists());
+            } else {
+                let relative = saved_path(result.output.as_str());
+                let written = std::fs::read_to_string(root.path().join(relative)).unwrap();
+                assert_eq!(written.replace('\n', ""), markdown[..expected_len]);
+                assert_eq!(result.output.contains("max_response_size cap"), cap != 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_delivery_without_explicit_access_stays_inline_in_nested_contexts() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = spill_test_tool(root.path(), 500_000);
+        let body = "x".repeat(60_000);
+        let context = ToolExecutionContext::default();
+        let result = context
+            .run(async {
+                Ok(tool
+                    .deliver(
+                        "https://example.com/page",
+                        FetchedContent {
+                            text: body.clone(),
+                            extension: "txt",
+                            title: None,
+                            cap_hit: false,
+                        },
+                        &ToolExecutionContext::default(),
+                        None,
+                    )
+                    .await)
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.output.as_str(), body);
+        assert!(!root.path().join("tmp").exists());
+    }
+
+    #[tokio::test]
     async fn firecrawl_content_below_the_threshold_stays_inline() {
         let tool = test_tool_with_firecrawl(FirecrawlConfig::default());
         let content = FetchedContent {
@@ -4540,7 +4592,8 @@ mod tests {
             cap_hit: false,
         };
 
-        let result = tool.deliver("https://example.com/page", content).await;
+        let result =
+            deliver_with_approved_file_tools(&tool, "https://example.com/page", content).await;
 
         assert!(result.success, "error={:?}", result.error);
         assert_eq!(result.output.as_str(), "# Small\n\nA short page.");

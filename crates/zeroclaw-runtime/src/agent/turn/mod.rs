@@ -3308,6 +3308,7 @@ async fn run_tool_call_loop_impl<'a>(
         if let Some(warned_call) = warned_call {
             let mut recovery_admitted = false;
             let dispatch = ToolDispatchContext {
+                approval,
                 tools_registry,
                 activated_tools,
                 excluded_tools,
@@ -3386,6 +3387,7 @@ async fn run_tool_call_loop_impl<'a>(
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
                     let dispatch = ToolDispatchContext {
+                        approval,
                         tools_registry,
                         activated_tools,
                         excluded_tools,
@@ -3404,6 +3406,7 @@ async fn run_tool_call_loop_impl<'a>(
                 } else {
                     let meta = ctx.meta();
                     let dispatch = ToolDispatchContext {
+                        approval,
                         tools_registry,
                         activated_tools,
                         excluded_tools,

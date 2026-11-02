@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::approval::ApprovalManager;
+use crate::approval::{ApprovalManager, ApprovalRequirement};
 use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
-use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
+use zeroclaw_api::tool::{
+    ToolExecutionCancelled, ToolExecutionContext, WebFetchSpillAccess, WebFetchSpillFile,
+    WebFetchSpillReaders,
+};
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -93,6 +96,7 @@ pub(crate) fn resolved_tool_provenance(
 
 #[derive(Clone, Copy)]
 pub(crate) struct ToolDispatchContext<'a> {
+    pub approval: Option<&'a ApprovalManager>,
     pub tools_registry: &'a [Box<dyn Tool>],
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub excluded_tools: &'a [String],
@@ -131,6 +135,58 @@ fn resolve_dispatch_tool<'a>(
         }
         Some(resolved) => DispatchResolution::Available(resolved),
         None => DispatchResolution::Unknown,
+    }
+}
+
+/// Consult the live turn owners only when web_fetch has an oversized result.
+/// Nothing is retained in a tool instance, context, session, or spawned task.
+struct TurnWebFetchSpillAccess<'a> {
+    dispatch: ToolDispatchContext<'a>,
+}
+
+#[async_trait::async_trait]
+impl WebFetchSpillAccess for TurnWebFetchSpillAccess<'_> {
+    async fn persist(
+        &self,
+        file: WebFetchSpillFile<'_>,
+        context: &ToolExecutionContext,
+    ) -> Result<Option<WebFetchSpillReaders>> {
+        let Some(approval) = self.dispatch.approval else {
+            return Ok(None);
+        };
+        if approval.approval_requirement("file_write") != ApprovalRequirement::Approved {
+            return Ok(None);
+        }
+        let DispatchResolution::Available(writer) =
+            resolve_dispatch_tool("file_write", self.dispatch, None)
+        else {
+            return Ok(None);
+        };
+        let mut file_read = false;
+        let mut content_search = false;
+        for (name, readable) in [
+            ("file_read", &mut file_read),
+            ("content_search", &mut content_search),
+        ] {
+            if let DispatchResolution::Available(reader) =
+                resolve_dispatch_tool(name, self.dispatch, None)
+            {
+                *readable = reader.tool().check_web_fetch_spill_read(&file).await?;
+            }
+        }
+        let readers = match (file_read, content_search) {
+            (true, true) => WebFetchSpillReaders::Both,
+            (true, false) => WebFetchSpillReaders::FileRead,
+            (false, true) => WebFetchSpillReaders::ContentSearch,
+            (false, false) => return Ok(None),
+        };
+        // Reader checks may await: require the same owner's approval again at
+        // the mutation boundary, including always_ask and this turn's grants.
+        if approval.approval_requirement("file_write") != ApprovalRequirement::Approved {
+            return Ok(None);
+        }
+        let result = writer.tool().write_web_fetch_spill(&file, context).await?;
+        Ok(result.filter(|result| result.success).map(|_| readers))
     }
 }
 
@@ -353,8 +409,21 @@ async fn execute_one_tool_with_provenance(
     }
 
     let context = ToolExecutionContext::new(cancellation_token.cloned());
+    let spill_access = TurnWebFetchSpillAccess { dispatch };
     let execute = context
-        .run(tool.execute_with_context(call_arguments.clone(), &context))
+        .run(async {
+            if tool.name() == "web_fetch" {
+                tool.execute_with_web_fetch_spill(
+                    call_arguments.clone(),
+                    &context,
+                    Some(&spill_access),
+                )
+                .await
+            } else {
+                tool.execute_with_context(call_arguments.clone(), &context)
+                    .await
+            }
+        })
         .instrument(tool_span.clone());
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
@@ -695,6 +764,7 @@ pub(crate) async fn execute_tools_sequential(
                 merged
             });
         let call_dispatch = ToolDispatchContext {
+            approval: dispatch.approval,
             tools_registry: dispatch.tools_registry,
             activated_tools: dispatch.activated_tools,
             excluded_tools: rescoped_exclusions
@@ -851,6 +921,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
                 ), // no static tools - force activated-tools path
@@ -971,6 +1042,7 @@ mod tests {
             super::execute_tools_sequential(
                 &calls,
                 ToolDispatchContext {
+                    approval: None,
                     tools_registry: &registry,
                     activated_tools: Some(&activated),
                     excluded_tools: &excluded,
@@ -1029,6 +1101,7 @@ mod tests {
             serde_json::json!({}),
             Some("call-1"),
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
                 ),
@@ -1171,6 +1244,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -1221,6 +1295,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -1315,6 +1390,7 @@ mod tests {
                 }),
                 None,
                 ToolDispatchContext {
+                    approval: None,
                     tools_registry: &tools,
                     activated_tools: None,
                     excluded_tools: &[],
@@ -1410,6 +1486,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -1495,6 +1572,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -1568,6 +1646,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -1693,6 +1772,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -1875,6 +1955,7 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 ToolDispatchContext {
+                    approval: None,
                     tools_registry: &tools,
                     activated_tools: None,
                     excluded_tools: &[],
@@ -1993,6 +2074,7 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 ToolDispatchContext {
+                    approval: None,
                     tools_registry: &tools,
                     activated_tools: None,
                     excluded_tools: &[],
@@ -2108,6 +2190,7 @@ mod tests {
                 }),
                 None,
                 ToolDispatchContext {
+                    approval: None,
                     tools_registry: &tools,
                     activated_tools: None,
                     excluded_tools: &[],
@@ -2176,6 +2259,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -2222,6 +2306,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -2274,6 +2359,7 @@ mod tests {
             serde_json::json!({}),
             Some("call-1"),
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -2709,6 +2795,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &registry,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -2756,6 +2843,7 @@ mod tests {
             args,
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &registry,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -2941,5 +3029,536 @@ mod tests {
         })
         .await
         .expect("cancelled shell child stopped");
+    }
+}
+
+#[cfg(test)]
+mod web_fetch_spill_tests {
+    use super::*;
+    use crate::approval::ApprovalResponse;
+    use crate::observability::noop::NoopObserver;
+    use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+    use crate::tools::{
+        AllToolsResult, FileReadTool, FileWriteTool, PathGuardedTool, RateLimitedTool, WebFetchTool,
+    };
+    use zeroclaw_api::tool::ToolResult;
+    use zeroclaw_config::autonomy::AutonomyLevel;
+    use zeroclaw_config::policy::SecurityPolicy;
+    use zeroclaw_config::schema::{Config, FirecrawlConfig, RiskProfileConfig};
+
+    fn policy(workspace: &std::path::Path) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.to_path_buf(),
+            max_actions_per_hour: 1_000,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn approval(level: AutonomyLevel, auto: &[&str], ask: &[&str]) -> ApprovalManager {
+        ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level,
+            auto_approve: auto.iter().map(|s| s.to_string()).collect(),
+            always_ask: ask.iter().map(|s| s.to_string()).collect(),
+            ..RiskProfileConfig::default()
+        })
+    }
+
+    fn built_tools(policy: &Arc<SecurityPolicy>, persistent: bool) -> Vec<Box<dyn Tool>> {
+        let mut tools = crate::tools::default_tools(policy.clone());
+        tools.retain(|tool| matches!(tool.name(), "file_read" | "content_search"));
+        tools.push(Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(
+                FileWriteTool::new_with_persistence(policy.clone(), persistent),
+                policy.clone(),
+            ),
+            policy.clone(),
+        )));
+        tools.push(Box::new(RateLimitedTool::new(
+            WebFetchTool::new(
+                policy.clone(),
+                vec!["127.0.0.1".into()],
+                vec![],
+                0,
+                5,
+                FirecrawlConfig::default(),
+                vec!["127.0.0.1".into()],
+                vec![],
+            )
+            .unwrap(),
+            policy.clone(),
+        )));
+        tools
+    }
+
+    async fn assemble(
+        policy: &Arc<SecurityPolicy>,
+        tools: Vec<Box<dyn Tool>>,
+        caller_allowed: Option<&[String]>,
+    ) -> ScopedToolRegistry {
+        let config = Config {
+            data_dir: policy.workspace_dir.clone(),
+            config_path: policy.workspace_dir.join("config.toml"),
+            ..Config::default()
+        };
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: policy,
+            built: AllToolsResult::from_prebuilt_tools(tools),
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+        .registry
+    }
+
+    async fn server(body: &str) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/plain"))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn dispatch<'a>(
+        registry: &'a [Box<dyn Tool>],
+        approval: Option<&'a ApprovalManager>,
+        excluded: &'a [String],
+    ) -> ToolDispatchContext<'a> {
+        ToolDispatchContext {
+            approval,
+            tools_registry: registry,
+            activated_tools: None,
+            excluded_tools: excluded,
+            model_switch_callback: None,
+        }
+    }
+
+    async fn fetch(dispatch: ToolDispatchContext<'_>, url: &str) -> ToolExecutionOutcome {
+        execute_one_tool(
+            "web_fetch",
+            serde_json::json!({"url": url}),
+            None,
+            dispatch,
+            &TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "spill-test",
+                channel_name: "test",
+            },
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn body() -> String {
+        "needle in a readable page\n".repeat(3_000)
+    }
+
+    fn saved_path(output: &str) -> String {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("Saved to: "))
+            .expect("successful spill identifies its artifact")
+            .trim_matches(['\u{2068}', '\u{2069}'])
+            .to_owned()
+    }
+
+    fn assert_inline(result: &ToolExecutionOutcome, workspace: &std::path::Path, body: &str) {
+        assert!(result.success, "{:?}", result.error_reason);
+        assert_eq!(result.output, body);
+        assert!(
+            !workspace.join("tmp").exists(),
+            "denied spill must not create directories"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_requires_actual_approved_write_in_this_turn() {
+        let body = body();
+        let server = server(&body).await;
+        for case in ["absent", "prompt", "always-ask-full", "read-only"] {
+            let root = tempfile::tempdir().unwrap();
+            let policy = policy(root.path());
+            let registry = assemble(&policy, built_tools(&policy, true), None).await;
+            let manager = match case {
+                "always-ask-full" => approval(AutonomyLevel::Full, &[], &["file_write"]),
+                "read-only" => approval(AutonomyLevel::ReadOnly, &["file_write"], &[]),
+                _ => approval(AutonomyLevel::Supervised, &["web_fetch"], &[]),
+            };
+            let manager = (case != "absent").then_some(&manager);
+            assert_inline(
+                &fetch(dispatch(&registry, manager, &[]), &server.uri()).await,
+                root.path(),
+                &body,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_requires_final_writer_and_reader_registry_admission() {
+        let body = body();
+        let server = server(&body).await;
+        let manager = approval(AutonomyLevel::Full, &[], &[]);
+        for allowed in [
+            vec!["web_fetch", "file_read"],
+            vec!["web_fetch", "file_write"],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let policy = policy(root.path());
+            let caller: Vec<String> = allowed.into_iter().map(str::to_owned).collect();
+            let registry = assemble(&policy, built_tools(&policy, true), Some(&caller)).await;
+            assert_eq!(registry.len(), caller.len());
+            assert_inline(
+                &fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await,
+                root.path(),
+                &body,
+            );
+        }
+        for excluded in [
+            vec!["file_write".into()],
+            vec!["file_read".into(), "content_search".into()],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let policy = policy(root.path());
+            let registry = assemble(&policy, built_tools(&policy, true), None).await;
+            assert_inline(
+                &fetch(
+                    dispatch(&registry, Some(&manager), &excluded),
+                    &server.uri(),
+                )
+                .await,
+                root.path(),
+                &body,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_preserves_persistence_and_forbidden_path_denials() {
+        let body = body();
+        let server = server(&body).await;
+        let manager = approval(AutonomyLevel::Full, &[], &[]);
+        for persistent in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut policy = policy(root.path());
+            if persistent {
+                Arc::get_mut(&mut policy).unwrap().forbidden_paths.push(
+                    root.path()
+                        .join("tmp/web_fetch")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            let registry = assemble(&policy, built_tools(&policy, persistent), None).await;
+            assert_inline(
+                &fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await,
+                root.path(),
+                &body,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_saved_artifact_is_readable_by_each_actual_available_reader() {
+        let body = body();
+        let server = server(&body).await;
+        for readers in [
+            vec!["file_read"],
+            vec!["content_search"],
+            vec!["file_read", "content_search"],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let policy = policy(root.path());
+            let mut caller: Vec<String> = readers.iter().map(|name| name.to_string()).collect();
+            caller.extend(["web_fetch".into(), "file_write".into()]);
+            let registry = assemble(&policy, built_tools(&policy, true), Some(&caller)).await;
+            let manager = approval(AutonomyLevel::Supervised, &["web_fetch", "file_write"], &[]);
+            let result = fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await;
+            assert!(result.success);
+            let relative = saved_path(&result.output);
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(&relative)).unwrap(),
+                body
+            );
+            for name in ["file_read", "content_search"] {
+                assert_eq!(result.output.contains(name), readers.contains(&name));
+                if readers.contains(&name) {
+                    let args = if name == "file_read" {
+                        serde_json::json!({"path": relative, "offset": 2, "limit": 1})
+                    } else {
+                        serde_json::json!({"path": relative, "pattern": "needle", "max_results": 1})
+                    };
+                    let read = find_tool(&registry, name)
+                        .unwrap()
+                        .execute(args)
+                        .await
+                        .unwrap();
+                    assert!(read.success, "{:?}", read.error);
+                    assert!(read.output.contains("needle"), "{}", read.output);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_turn_grants_do_not_survive_new_turn_or_ordinary_context_calls() {
+        let body = body();
+        let server = server(&body).await;
+        let root = tempfile::tempdir().unwrap();
+        let policy = policy(root.path());
+        let registry = assemble(&policy, built_tools(&policy, true), None).await;
+        let manager = approval(AutonomyLevel::Supervised, &["web_fetch"], &[]);
+        manager.record_decision(
+            "file_write",
+            &serde_json::json!({}),
+            &ApprovalResponse::Always,
+            "test",
+        );
+        let result = fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await;
+        let relative = saved_path(&result.output);
+        assert!(root.path().join(relative).is_file());
+        std::fs::remove_dir_all(root.path().join("tmp")).unwrap();
+        let fresh = manager.for_new_turn();
+        assert_inline(
+            &fetch(dispatch(&registry, Some(&fresh), &[]), &server.uri()).await,
+            root.path(),
+            &body,
+        );
+        let fetch_tool = find_tool(&registry, "web_fetch").unwrap();
+        for ordinary_context in [false, true] {
+            let args = serde_json::json!({"url": server.uri()});
+            let result = if ordinary_context {
+                fetch_tool
+                    .execute_with_context(args, &ToolExecutionContext::default())
+                    .await
+                    .unwrap()
+            } else {
+                fetch_tool.execute(args).await.unwrap()
+            };
+            assert!(result.success);
+            assert_eq!(result.output.as_str(), body);
+            assert!(!root.path().join("tmp").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_honors_actual_file_read_size_limit_and_workspace() {
+        let body = "x".repeat(10 * 1024 * 1024 + 1);
+        let server = server(&body).await;
+        let manager = approval(AutonomyLevel::Full, &[], &[]);
+        let root = tempfile::tempdir().unwrap();
+        let policy = policy(root.path());
+        let caller = ["web_fetch", "file_write", "file_read"].map(str::to_owned);
+        let registry = assemble(&policy, built_tools(&policy, true), Some(&caller)).await;
+        assert_inline(
+            &fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await,
+            root.path(),
+            &body,
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let reader_policy = Arc::new(SecurityPolicy {
+            workspace_dir: other.path().to_path_buf(),
+            ..(*policy).clone()
+        });
+        let mut tools = built_tools(&policy, true);
+        tools.retain(|tool| tool.name() != "file_read");
+        tools.push(Box::new(FileReadTool::new(reader_policy)));
+        let registry = assemble(&policy, tools, Some(&caller)).await;
+        let small_body = self::body();
+        let small_server = self::server(&small_body).await;
+        assert_inline(
+            &fetch(
+                dispatch(&registry, Some(&manager), &[]),
+                &small_server.uri(),
+            )
+            .await,
+            root.path(),
+            &small_body,
+        );
+        assert!(!other.path().join("tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_write_keeps_its_action_reservation() {
+        let body = body();
+        let server = server(&body).await;
+        let manager = approval(AutonomyLevel::Full, &[], &[]);
+        for budget in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let mut policy = policy(root.path());
+            Arc::get_mut(&mut policy).unwrap().max_actions_per_hour = budget;
+            let registry = assemble(&policy, built_tools(&policy, true), None).await;
+            let result = fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await;
+            if budget == 1 {
+                assert_inline(&result, root.path(), &body);
+            } else {
+                assert!(root.path().join(saved_path(&result.output)).is_file());
+            }
+            assert!(
+                policy.reserve_action().is_none(),
+                "fetch and successful implicit write consume their ordinary slots"
+            );
+        }
+    }
+
+    struct NestedFetch {
+        inner: Arc<dyn Tool>,
+        spawn: bool,
+    }
+    zeroclaw_api::mock_tool_attribution!(NestedFetch);
+    #[async_trait::async_trait]
+    impl Tool for NestedFetch {
+        fn name(&self) -> &str {
+            if self.spawn {
+                "spawned_fetch"
+            } else {
+                "nested_fetch"
+            }
+        }
+        fn description(&self) -> &str {
+            "ordinary nested fetch fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+            let inner = self.inner.clone();
+            if self.spawn {
+                zeroclaw_spawn::spawn!(async move {
+                    inner
+                        .execute_with_context(args, &ToolExecutionContext::default())
+                        .await
+                })
+                .await?
+            } else {
+                inner
+                    .execute_with_context(args, &ToolExecutionContext::default())
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_access_is_not_inherited_by_sequential_parallel_or_spawned_calls() {
+        let body = body();
+        let server = server(&body).await;
+        let manager = approval(AutonomyLevel::Full, &[], &[]);
+        for parallel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let policy = policy(root.path());
+            let mut tools = built_tools(&policy, true);
+            let inner: Arc<dyn Tool> = Arc::new(
+                WebFetchTool::new(
+                    policy.clone(),
+                    vec!["127.0.0.1".into()],
+                    vec![],
+                    0,
+                    5,
+                    FirecrawlConfig::default(),
+                    vec!["127.0.0.1".into()],
+                    vec![],
+                )
+                .unwrap(),
+            );
+            tools.push(Box::new(NestedFetch {
+                inner: inner.clone(),
+                spawn: false,
+            }));
+            tools.push(Box::new(NestedFetch { inner, spawn: true }));
+            let registry = assemble(&policy, tools, None).await;
+            let calls: Vec<ParsedToolCall> = ["web_fetch", "nested_fetch", "spawned_fetch"]
+                .into_iter()
+                .map(|name| ParsedToolCall {
+                    name: name.into(),
+                    arguments: serde_json::json!({"url": server.uri()}),
+                    tool_call_id: None,
+                })
+                .collect();
+            let meta = TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "spill-siblings",
+                channel_name: "test",
+            };
+            let dispatch = dispatch(&registry, Some(&manager), &[]);
+            let results = if parallel {
+                execute_tools_parallel(&calls, dispatch, &meta, &NoopObserver, None, None, None)
+                    .await
+            } else {
+                execute_tools_sequential(&calls, dispatch, &meta, &NoopObserver, None, None, None)
+                    .await
+            }
+            .unwrap();
+            assert!(
+                results[0]
+                    .as_ref()
+                    .unwrap()
+                    .outcome
+                    .output
+                    .contains("Saved to: ")
+            );
+            for result in &results[1..] {
+                let outcome = &result.as_ref().unwrap().outcome;
+                assert!(outcome.success);
+                assert_eq!(
+                    outcome.output, body,
+                    "ordinary nested calls cannot borrow sibling spill authority"
+                );
+            }
+        }
+    }
+
+    struct NamedOnly(&'static str);
+    zeroclaw_api::mock_tool_attribution!(NamedOnly);
+    #[async_trait::async_trait]
+    impl Tool for NamedOnly {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "name-only fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<ToolResult> {
+            panic!("spill eligibility must not execute unrelated tools")
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_names_alone_do_not_grant_write_or_read_support() {
+        let body = body();
+        let server = server(&body).await;
+        let manager = approval(AutonomyLevel::Full, &[], &[]);
+        for replacement in ["file_write", "file_read"] {
+            let root = tempfile::tempdir().unwrap();
+            let policy = policy(root.path());
+            let mut tools = built_tools(&policy, true);
+            tools.retain(|tool| tool.name() != replacement && tool.name() != "content_search");
+            tools.push(Box::new(NamedOnly(replacement)));
+            let registry = assemble(&policy, tools, None).await;
+            assert_inline(
+                &fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await,
+                root.path(),
+                &body,
+            );
+        }
     }
 }

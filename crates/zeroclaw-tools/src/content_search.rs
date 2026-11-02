@@ -116,6 +116,24 @@ impl Tool for ContentSearchTool {
         })
     }
 
+    async fn check_web_fetch_spill_read(
+        &self,
+        file: &zeroclaw_api::tool::WebFetchSpillFile<'_>,
+    ) -> anyhow::Result<bool> {
+        let path = file.relative_path;
+        if path.contains("../") || path.contains("..\\") || path == ".." {
+            return Ok(false);
+        }
+        let candidate = self.security.resolve_tool_path(path);
+        Ok(self
+            .security
+            .resolve_policy_target(&candidate)
+            .is_some_and(|resolved| {
+                resolved == file.resolved_target
+                    && self.security.is_resolved_path_readable(&resolved)
+            }))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // --- Parse parameters ---
         let pattern = args

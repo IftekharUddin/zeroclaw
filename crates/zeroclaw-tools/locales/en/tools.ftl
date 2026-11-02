@@ -241,7 +241,19 @@ tool-sop-status = Query SOP execution status. Provide run_id for a specific run,
 
 tool-tool-search = Fetch full schema definitions for deferred MCP tools so they can be called. Use "select:name1,name2" for exact match or keywords to search.
 
-tool-web-fetch = Fetch a web page and return its content as clean plain text. HTML pages are automatically converted to readable text. JSON and plain text responses are returned as-is. Only GET requests; follows redirects. Security: allowlist-only domains, no local/private hosts.
+tool-web-fetch = Fetch a web page and return its content as clean plain text. HTML pages are automatically converted to readable text. JSON and plain text responses are returned as-is. Only GET requests; follows same-host redirects and rejects cross-host redirects. Falls back to Firecrawl for JS-heavy/bot-blocked sites (if enabled). Oversized responses are saved to a file in the agent workspace and the path is returned when file_write is already approved and an available file_read or content_search tool can read it; otherwise content stays inline. Security: allowlist-only domains, no local/private hosts.
+tool-web-fetch-spill-source = Fetched { $url }
+tool-web-fetch-spill-title = Title: { $title }
+tool-web-fetch-spill-saved =
+    Size: { $bytes } bytes of converted text — too large to return inline, so the full text was written to a file in the agent workspace.
+
+    Saved to: { $path }
+tool-web-fetch-spill-read = Read it with the file_read tool (path="{ $path }", using its offset and limit parameters to page through). That path is relative to the workspace root.
+tool-web-fetch-spill-search = Search it with the content_search tool (path="{ $path }" plus a pattern). That path is relative to the workspace root.
+tool-web-fetch-spill-read-or-search = Read it with the file_read tool (path="{ $path }", using its offset and limit parameters to page through), or search it with the content_search tool (path="{ $path }" plus a pattern). That path is relative to the workspace root.
+tool-web-fetch-spill-pretty = Note: the response was valid JSON and was saved pretty-printed, so the file is indented rather than byte-identical to what the server served.
+tool-web-fetch-spill-wrapped = Note: lines longer than { $bytes } bytes were hard-wrapped so the file can be paged by line. Line breaks that the source did not contain were added.
+tool-web-fetch-spill-truncated = Note: the response hit web_fetch's max_response_size cap, so the saved content is the truncated head of the page, not the whole page.
 
 tool-web-search-tool = Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics.
 tool-web-search-tool-error-duckduckgo-blocked = DuckDuckGo is rate-limiting this machine. Do not retry or rephrase the search; wait a few minutes, fetch known URLs directly with web_fetch, or configure SearXNG, Brave, or Tavily as the web_search provider.

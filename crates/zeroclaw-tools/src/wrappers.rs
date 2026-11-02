@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
-use zeroclaw_api::tool::{Tool, ToolExecutionContext, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{
+    Tool, ToolExecutionContext, ToolOutput, ToolResult, WebFetchSpillAccess, WebFetchSpillFile,
+};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Type alias for a path-extraction closure used by [`PathGuardedTool`].
@@ -70,6 +72,15 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         args: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> anyhow::Result<ToolResult> {
+        self.execute_with_web_fetch_spill(args, context, None).await
+    }
+
+    async fn execute_with_web_fetch_spill(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+        access: Option<&dyn WebFetchSpillAccess>,
+    ) -> anyhow::Result<ToolResult> {
         let reservation = match self.security.reserve_action() {
             Some(reservation) => reservation,
             None => {
@@ -81,12 +92,37 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
             }
         };
 
-        let result = self.inner.execute_with_context(args, context).await?;
+        let result = self
+            .inner
+            .execute_with_web_fetch_spill(args, context, access)
+            .await?;
 
         if result.success {
             reservation.commit();
         }
 
+        Ok(result)
+    }
+
+    async fn check_web_fetch_spill_read(
+        &self,
+        file: &WebFetchSpillFile<'_>,
+    ) -> anyhow::Result<bool> {
+        self.inner.check_web_fetch_spill_read(file).await
+    }
+
+    async fn write_web_fetch_spill(
+        &self,
+        file: &WebFetchSpillFile<'_>,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        let Some(reservation) = self.security.reserve_action() else {
+            return Ok(None);
+        };
+        let result = self.inner.write_web_fetch_spill(file, context).await?;
+        if result.as_ref().is_some_and(|result| result.success) {
+            reservation.commit();
+        }
         Ok(result)
     }
 }
@@ -180,6 +216,15 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
         args: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> anyhow::Result<ToolResult> {
+        self.execute_with_web_fetch_spill(args, context, None).await
+    }
+
+    async fn execute_with_web_fetch_spill(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+        access: Option<&dyn WebFetchSpillAccess>,
+    ) -> anyhow::Result<ToolResult> {
         if let Some(arg) = self.extract_path_string(&args) {
             // For shell command arguments, use the full token-aware scanner.
             // For plain path values (e.g. "path" or custom extractor), fall back
@@ -203,7 +248,32 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
             }
         }
 
-        self.inner.execute_with_context(args, context).await
+        self.inner
+            .execute_with_web_fetch_spill(args, context, access)
+            .await
+    }
+
+    async fn check_web_fetch_spill_read(
+        &self,
+        file: &WebFetchSpillFile<'_>,
+    ) -> anyhow::Result<bool> {
+        // A custom extractor can constrain a different argument or require
+        // fields absent from this typed operation; never silently bypass it.
+        if self.extractor.is_some() || !self.security.is_path_allowed(file.relative_path) {
+            return Ok(false);
+        }
+        self.inner.check_web_fetch_spill_read(file).await
+    }
+
+    async fn write_web_fetch_spill(
+        &self,
+        file: &WebFetchSpillFile<'_>,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        if self.extractor.is_some() || !self.security.is_path_allowed(file.relative_path) {
+            return Ok(None);
+        }
+        self.inner.write_web_fetch_spill(file, context).await
     }
 }
 
@@ -276,6 +346,75 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_spill_custom_path_extractor_cannot_be_bypassed() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: root.path().to_path_buf(),
+            autonomy: AutonomyLevel::Full,
+            ..SecurityPolicy::default()
+        });
+        let body = "artifact body";
+        let path = format!(
+            "tmp/web_fetch/example-{:x}.txt",
+            Sha256::digest(body.as_bytes())
+        );
+        let target = std::fs::canonicalize(root.path()).unwrap().join(&path);
+        let file = WebFetchSpillFile {
+            relative_path: &path,
+            resolved_target: &target,
+            text: body,
+        };
+        let writer = PathGuardedTool::new(
+            crate::file_write::FileWriteTool::new(security.clone()),
+            security.clone(),
+        )
+        .with_extractor(|_| Some("/private/custom-restriction".into()));
+        let reader = PathGuardedTool::new(
+            crate::content_search::ContentSearchTool::new(security.clone()),
+            security.clone(),
+        )
+        .with_extractor(|_| Some("/private/custom-restriction".into()));
+        assert!(!reader.check_web_fetch_spill_read(&file).await.unwrap());
+        assert!(
+            writer
+                .write_web_fetch_spill(&file, &ToolExecutionContext::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!root.path().join("tmp").exists());
+        let ordinary_reader = PathGuardedTool::new(
+            crate::content_search::ContentSearchTool::new(security.clone()),
+            security.clone(),
+        );
+        let ordinary_writer = PathGuardedTool::new(
+            crate::file_write::FileWriteTool::new(security.clone()),
+            security,
+        );
+        assert!(
+            ordinary_reader
+                .check_web_fetch_spill_read(&file)
+                .await
+                .unwrap()
+        );
+        assert!(
+            ordinary_writer
+                .write_web_fetch_spill(&file, &ToolExecutionContext::default())
+                .await
+                .unwrap()
+                .unwrap()
+                .success
+        );
+        let read = ordinary_reader
+            .execute(serde_json::json!({"path": path, "pattern": "artifact"}))
+            .await
+            .unwrap();
+        assert!(read.success, "{:?}", read.error);
+        assert!(read.output.contains(body));
     }
 
     // ── RateLimitedTool tests ─────────────────────────────────────────────────

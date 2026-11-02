@@ -2230,6 +2230,7 @@ impl Agent {
             args,
             Some("principal-test-call"),
             super::tool_execution::ToolDispatchContext {
+                approval: None,
                 tools_registry: &self.tools,
                 activated_tools: self.activated_tools.as_ref(),
                 excluded_tools: &[],

@@ -1,13 +1,13 @@
 use crate::helpers::filesystem_boundary::{
     FilesystemBoundaryError, create_dir_path_nofollow, open_absolute_dir_nofollow,
-    write_file_atomic,
+    open_file_nofollow, write_file_atomic,
 };
 use async_trait::async_trait;
 use cap_std::fs::Dir;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolExecutionContext, ToolOutput, ToolResult, WebFetchSpillFile};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Write file contents with path sandboxing
@@ -101,6 +101,32 @@ impl Tool for FileWriteTool {
             .and_then(|v| v.as_str())
             .unwrap_or("utf8");
 
+        self.write_content(path, content, encoding, None).await
+    }
+
+    async fn write_web_fetch_spill(
+        &self,
+        file: &WebFetchSpillFile<'_>,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        if !is_web_fetch_artifact(file) {
+            return Ok(None);
+        }
+        context
+            .run(self.write_content(file.relative_path, file.text, "utf8", Some(file)))
+            .await
+            .map(Some)
+    }
+}
+
+impl FileWriteTool {
+    async fn write_content(
+        &self,
+        path: &str,
+        content: &str,
+        encoding: &str,
+        spill: Option<&WebFetchSpillFile<'_>>,
+    ) -> anyhow::Result<ToolResult> {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
@@ -266,7 +292,20 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let capability_relative = match prospective_parent.strip_prefix(&canonical_ancestor) {
+        let capability_root = if let Some(file) = spill {
+            let workspace = tokio::fs::canonicalize(&self.security.workspace_dir).await?;
+            if workspace.join(file.relative_path) != prospective_target
+                || prospective_target != file.resolved_target
+            {
+                return Ok(ToolResult::err(tool_text(
+                    "tool-file-write-error-capability-binding",
+                )));
+            }
+            workspace
+        } else {
+            canonical_ancestor
+        };
+        let capability_relative = match prospective_parent.strip_prefix(&capability_root) {
             Ok(relative) => relative,
             Err(_) => {
                 return Ok(ToolResult {
@@ -276,10 +315,10 @@ impl Tool for FileWriteTool {
                 });
             }
         };
-        let capability_root = canonical_ancestor;
         let capability_relative = capability_relative.to_path_buf();
         let file_name = file_name.to_os_string();
         let display_path = path.to_owned();
+        let reuse_identical = spill.is_some();
         tokio::task::spawn_blocking(move || {
             let parent_dir = match create_dir_beneath(&capability_root, &capability_relative) {
                 Ok(dir) => dir,
@@ -314,7 +353,38 @@ impl Tool for FileWriteTool {
                 Err(error) => return Err(error.into()),
             }
 
-            if let Err(error) = write_file_atomic(&parent_dir, Path::new(&file_name), &bytes) {
+            // Verified reuse is subject to all the same approval, reader and
+            // writer checks as a new artifact. Open through the bound handle;
+            // do not follow a leaf swapped after metadata inspection.
+            let identical = if reuse_identical {
+                match open_file_nofollow(&parent_dir, Path::new(&file_name)) {
+                    Ok(mut file) if file.metadata()?.len() == bytes.len() as u64 => {
+                        use std::io::Read;
+                        let mut existing = Vec::with_capacity(bytes.len());
+                        file.by_ref()
+                            .take(bytes.len() as u64 + 1)
+                            .read_to_end(&mut existing)?;
+                        existing == bytes
+                    }
+                    Ok(_) => false,
+                    Err(FilesystemBoundaryError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        false
+                    }
+                    Err(error) => {
+                        if error.is_denied() {
+                            return Ok(ToolResult::err(localize_filesystem_boundary(&error)));
+                        }
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                false
+            };
+            if !identical
+                && let Err(error) = write_file_atomic(&parent_dir, Path::new(&file_name), &bytes)
+            {
                 if error.is_denied() {
                     return Ok(ToolResult {
                         success: false,
@@ -332,6 +402,32 @@ impl Tool for FileWriteTool {
         })
         .await?
     }
+}
+
+/// The internal spill interface cannot be used as an arbitrary file writer.
+/// Match the producer's canonical directory, safe host, full digest and format.
+fn is_web_fetch_artifact(file: &WebFetchSpillFile<'_>) -> bool {
+    use sha2::{Digest, Sha256};
+    let Some(name) = file.relative_path.strip_prefix("tmp/web_fetch/") else {
+        return false;
+    };
+    if name.contains(['/', '\\']) {
+        return false;
+    }
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let Some((host, digest)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    !host.is_empty()
+        && host.len() <= 60
+        && host.trim_matches('.') == host
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && matches!(extension, "md" | "txt" | "json")
+        && digest == format!("{:x}", Sha256::digest(file.text.as_bytes()))
 }
 
 fn create_dir_beneath(root: &Path, relative: &Path) -> anyhow::Result<Dir> {
@@ -453,6 +549,66 @@ mod tests {
                 .is_fifo()
         );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_artifact_writer_rejects_arbitrary_or_mismatched_targets_before_mutation() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+        let body = "artifact body";
+        let name = format!("example.com-{:x}.txt", Sha256::digest(body.as_bytes()));
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        for path in [
+            format!("other/{name}"),
+            format!("tmp/web_fetch/../{name}"),
+            format!("tmp/web_fetch/{name}/child"),
+            format!("tmp/web_fetch/example.com-{}.txt", "0".repeat(64)),
+            format!("tmp/web_fetch/{name}.exe"),
+        ] {
+            let target = canonical.join(&path);
+            let file = WebFetchSpillFile {
+                relative_path: &path,
+                resolved_target: &target,
+                text: body,
+            };
+            assert!(
+                tool.write_web_fetch_spill(&file, &ToolExecutionContext::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+        let path = format!("tmp/web_fetch/{name}");
+        let wrong_target = canonical.join("other").join(&name);
+        let file = WebFetchSpillFile {
+            relative_path: &path,
+            resolved_target: &wrong_target,
+            text: body,
+        };
+        let refused = tool
+            .write_web_fetch_spill(&file, &ToolExecutionContext::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!refused.success);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        let target = canonical.join(&path);
+        let file = WebFetchSpillFile {
+            relative_path: &path,
+            resolved_target: &target,
+            text: body,
+        };
+        assert!(
+            tool.write_web_fetch_spill(&file, &ToolExecutionContext::default())
+                .await
+                .unwrap()
+                .unwrap()
+                .success
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), body);
     }
 
     #[test]

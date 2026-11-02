@@ -81,6 +81,23 @@ impl Tool for FileReadTool {
         })
     }
 
+    async fn check_web_fetch_spill_read(
+        &self,
+        file: &zeroclaw_api::tool::WebFetchSpillFile<'_>,
+    ) -> anyhow::Result<bool> {
+        if file.text.len() as u64 > MAX_FILE_SIZE_BYTES {
+            return Ok(false);
+        }
+        let candidate = self.resolve_candidate(file.relative_path)?;
+        Ok(self
+            .security
+            .resolve_policy_target(&candidate)
+            .is_some_and(|resolved| {
+                resolved == file.resolved_target
+                    && self.security.is_resolved_path_readable(&resolved)
+            }))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Base64 reads return a verbatim payload the caller decodes, so they
         // must NOT be annotated — a prepended banner would corrupt decoding.

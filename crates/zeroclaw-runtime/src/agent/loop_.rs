@@ -4962,6 +4962,7 @@ mod tests {
             call_arguments,
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
                 ),
@@ -5008,6 +5009,7 @@ mod tests {
             serde_json::json!({ "value": "ok" }),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
                 ),
@@ -5060,6 +5062,7 @@ mod tests {
             serde_json::json!({ "value": "ok" }),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
                 ),
@@ -5097,6 +5100,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
@@ -5156,6 +5160,7 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
+                approval: None,
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],

@@ -268,6 +268,32 @@ impl Tool for ArcToolRef {
     ) -> anyhow::Result<ToolResult> {
         self.0.execute_with_context(args, context).await
     }
+
+    async fn execute_with_web_fetch_spill(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+        access: Option<&dyn zeroclaw_api::tool::WebFetchSpillAccess>,
+    ) -> anyhow::Result<ToolResult> {
+        self.0
+            .execute_with_web_fetch_spill(args, context, access)
+            .await
+    }
+
+    async fn check_web_fetch_spill_read(
+        &self,
+        file: &zeroclaw_api::tool::WebFetchSpillFile<'_>,
+    ) -> anyhow::Result<bool> {
+        self.0.check_web_fetch_spill_read(file).await
+    }
+
+    async fn write_web_fetch_spill(
+        &self,
+        file: &zeroclaw_api::tool::WebFetchSpillFile<'_>,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        self.0.write_web_fetch_spill(file, context).await
+    }
 }
 
 /// Serply credential override state for `WebSearchTool`.
@@ -405,6 +431,32 @@ impl Tool for ArcDelegatingTool {
         context: &zeroclaw_api::tool::ToolExecutionContext,
     ) -> anyhow::Result<ToolResult> {
         self.inner.execute_with_context(args, context).await
+    }
+
+    async fn execute_with_web_fetch_spill(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+        access: Option<&dyn zeroclaw_api::tool::WebFetchSpillAccess>,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner
+            .execute_with_web_fetch_spill(args, context, access)
+            .await
+    }
+
+    async fn check_web_fetch_spill_read(
+        &self,
+        file: &zeroclaw_api::tool::WebFetchSpillFile<'_>,
+    ) -> anyhow::Result<bool> {
+        self.inner.check_web_fetch_spill_read(file).await
+    }
+
+    async fn write_web_fetch_spill(
+        &self,
+        file: &zeroclaw_api::tool::WebFetchSpillFile<'_>,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        self.inner.write_web_fetch_spill(file, context).await
     }
 }
 

@@ -506,6 +506,32 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
     false
 }
 
+/// One content-addressed web-fetch artifact. These borrowed values are data,
+/// not permission; the current turn and concrete file tools authorize effects.
+pub struct WebFetchSpillFile<'a> {
+    pub relative_path: &'a str,
+    pub resolved_target: &'a std::path::Path,
+    pub text: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebFetchSpillReaders {
+    FileRead,
+    ContentSearch,
+    Both,
+}
+
+/// Borrowed only for the resolved web_fetch invocation. Implementations consult
+/// the current approval owner and actual caller-filtered file-tool registry.
+#[async_trait]
+pub trait WebFetchSpillAccess: Send + Sync {
+    async fn persist(
+        &self,
+        file: WebFetchSpillFile<'_>,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<Option<WebFetchSpillReaders>>;
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// True when this tool starts nested execution without carrying the RPC
@@ -577,6 +603,37 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         context: &ToolExecutionContext,
     ) -> anyhow::Result<ToolResult> {
         context.run(self.execute(args)).await
+    }
+
+    /// Explicit, one-call delivery support for web_fetch. Ordinary contexts do
+    /// not carry this adapter; unsupported tools keep their usual execution.
+    async fn execute_with_web_fetch_spill(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+        _access: Option<&dyn WebFetchSpillAccess>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(args, context).await
+    }
+
+    /// Whether this concrete reader can consume the prospective artifact under
+    /// its existing policy and format/size limits. Does not perform a read.
+    async fn check_web_fetch_spill_read(
+        &self,
+        _file: &WebFetchSpillFile<'_>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Persist only a canonical tmp/web_fetch content-addressed artifact,
+    /// retaining the concrete writer's ordinary policy and filesystem checks.
+    /// None means unsupported; a refusal must never be reported as saved.
+    async fn write_web_fetch_spill(
+        &self,
+        _file: &WebFetchSpillFile<'_>,
+        _context: &ToolExecutionContext,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        Ok(None)
     }
 
     /// Assemble this tool's spec. The default recomposes it from
