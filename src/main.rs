@@ -845,12 +845,16 @@ fn agent_shell_refusal(marker: Option<std::ffi::OsString>) -> Option<String> {
     if marker.is_empty() {
         return None;
     }
-    Some(format!(
-        "refusing to run: the `zeroclaw` CLI carries operator authority and was invoked from an \
+    Some(ta(
+        "cli-agent-shell-refusal",
+        &[("variable", zeroclaw_api::AGENT_SHELL_ENV_VAR)],
+        format!(
+            "refusing to run: the `zeroclaw` CLI carries operator authority and was invoked from an \
          agent's shell ({} is set).\n\nAn agent cannot reconfigure ZeroClaw through this command — \
          doing so would run with your privileges, not the agent's. Run the command yourself in \
          your own terminal.",
-        zeroclaw_api::AGENT_SHELL_ENV_VAR
+            zeroclaw_api::AGENT_SHELL_ENV_VAR
+        ),
     ))
 }
 

@@ -1715,3 +1715,9 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+# Preserve the variable name supplied by the CLI; it identifies the caller marker.
+cli-agent-shell-refusal =
+    refusing to run: the `zeroclaw` CLI carries operator authority and was invoked from an agent's shell ({$variable} is set).
+
+    An agent cannot reconfigure ZeroClaw through this command — doing so would run with your privileges, not the agent's. Run the command yourself in your own terminal.

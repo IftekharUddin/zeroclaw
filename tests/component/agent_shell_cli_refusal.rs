@@ -16,19 +16,51 @@
 
 use std::process::{Command, Output, Stdio};
 
+fn cli_fixture() -> (tempfile::TempDir, String) {
+    let install = tempfile::tempdir().unwrap();
+    let config = format!(
+        "schema_version = {}\nlocale = \"en\"\n\n[gateway]\nport = 48123\n",
+        zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+    );
+    std::fs::write(install.path().join("config.toml"), &config).unwrap();
+    (install, config)
+}
+
+fn assert_fixture_untouched(install: &std::path::Path, config: &str) {
+    assert_eq!(
+        std::fs::read_to_string(install.join("config.toml")).unwrap(),
+        config,
+        "a refused command must not rewrite operator configuration"
+    );
+    assert_eq!(
+        std::fs::read_dir(install).unwrap().count(),
+        1,
+        "a refused command must not initialize data or shared directories"
+    );
+}
+
 fn run_cli(args: &[&str], agent_marker: Option<&str>) -> Output {
-    let bin = env!("CARGO_BIN_EXE_zeroclaw");
-    let mut cmd = Command::new(bin);
-    cmd.args(args)
+    let (install, config) = cli_fixture();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zeroclaw"));
+    cmd.env_clear()
+        .env("ZEROCLAW_CONFIG_DIR", install.path())
+        .env("ZEROCLAW_DATA_DIR", install.path().join("data"))
         .env("RUST_LOG", "off")
-        .env_remove(zeroclaw_api::AGENT_SHELL_ENV_VAR)
+        .current_dir(install.path())
+        .arg("--config-dir")
+        .arg(install.path())
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(marker) = agent_marker {
         cmd.env(zeroclaw_api::AGENT_SHELL_ENV_VAR, marker);
     }
-    cmd.output().expect("zeroclaw binary should spawn")
+    let output = cmd.output().expect("zeroclaw binary should spawn");
+    if agent_marker.is_some_and(|marker| !marker.is_empty()) {
+        assert_fixture_untouched(install.path(), &config);
+    }
+    output
 }
 
 fn stderr_of(output: &Output) -> String {
@@ -79,10 +111,10 @@ fn every_subcommand_is_refused_not_just_the_mutating_ones() {
 
 #[test]
 fn an_operator_terminal_is_unaffected() {
-    // The same command without the marker must not hit the guard. It may still
-    // fail for its own reasons (no config in this environment), so assert on
-    // the absence of the refusal rather than on success.
-    let output = run_cli(&["config", "get", "agents.helper.model_provider"], None);
+    // The same read without the marker must reach the isolated configuration.
+    let output = run_cli(&["config", "get", "gateway.port"], None);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "48123");
 
     assert!(
         !stderr_of(&output).contains("operator authority"),
@@ -94,7 +126,9 @@ fn an_operator_terminal_is_unaffected() {
 #[test]
 fn an_empty_marker_reads_as_absent() {
     // A stray `export ZEROCLAW_AGENT_SHELL=` must not lock an operator out.
-    let output = run_cli(&["config", "get", "agents.helper.model_provider"], Some(""));
+    let output = run_cli(&["config", "get", "gateway.port"], Some(""));
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "48123");
 
     assert!(
         !stderr_of(&output).contains("operator authority"),
