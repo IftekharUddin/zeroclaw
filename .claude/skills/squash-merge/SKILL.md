@@ -35,9 +35,11 @@ older green checks are still current. The queue does not check release-line
 holds, milestones, review state, or attribution, so the skill does that before
 it enqueues.
 
-The squash commit is title-only. The repository's squash settings use the PR
-title (GitHub appends ` (#N)`) and a blank body, so the PR title is the whole
-commit message on `master`, and commit bodies and trailers do not land.
+The repository's squash settings use the PR title for the subject (GitHub
+appends ` (#N)`) and a blank configured body. GitHub can still append co-author
+trailers. These settings do not prove that the landed commit has an empty body;
+verify its actual message after the queue merges it. Preserve permitted human
+attribution under the contributing and privacy rules.
 
 ## Prerequisites
 
@@ -211,14 +213,14 @@ PR_TITLE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title --jq 
 SUBJECT="${PR_TITLE} (#${NUMBER})"
 ```
 
-Then check that neither the title nor the PR's commits carry bot or AI
-attribution. Commit bodies do not land on `master` under the current squash
-settings, but the rule against AI attribution applies to the PR's history as
-well, and the check keeps it true if those settings change:
+Then check the actual title and commit messages for bot or AI attribution.
+The rule applies to the PR's history as well as its final squash message.
+Primary author metadata is not a `Co-authored-by` trailer; do not manufacture
+trailers from it. Permitted human co-author trailers remain valid:
 
 ```bash
 gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title,commits \
-  --jq '.title, (.commits[] | .messageHeadline, .messageBody, (.authors[] | "Co-authored-by: \(.login) <\(.email)>"))' \
+  --jq '.title, (.commits[] | .messageHeadline, .messageBody)' \
   | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
 ```
 
@@ -244,7 +246,7 @@ gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash --auto \
 - Issues referenced with closing keywords will auto-close on merge
 - PR head SHA: `$HEAD_SHA`
 - Release-line disposition: `$RELEASE_LINE_DISPOSITION`
-- Squash commit: `$SUBJECT` with an empty body
+- Squash commit subject: `$SUBJECT`; the configured body is blank, but GitHub may append co-author trailers
 - The title and the PR's commits carry no bot or AI attribution
 
 Run this command? (yes/no)
@@ -306,7 +308,7 @@ query($n: Int!) {
   repository(owner: "zeroclaw-labs", name: "zeroclaw") {
     pullRequest(number: $n) {
       state
-      mergeCommit { oid }
+      mergeCommit { oid message }
       isInMergeQueue
       mergeQueueEntry { state position }
       autoMergeRequest { enabledAt }
@@ -318,7 +320,12 @@ query($n: Int!) {
 }' --jq '.data.repository.pullRequest'
 ```
 
-- `state` is `MERGED`: report the merge commit SHA and PR URL.
+- `state` is `MERGED`: read `mergeCommit.message`, verify its subject matches
+  the confirmed `$SUBJECT`, and check its actual text with Step 2's attribution
+  pattern. Permitted human co-author trailers are not a failure. Report the
+  merge commit SHA and PR URL, plus any message discrepancy. If the message
+  cannot be retrieved, report message verification as incomplete. Do not
+  rewrite the landed commit or initiate a revert automatically.
 - `isInMergeQueue` is true, or `autoMergeRequest` is set while checks run:
   still pending. Report the queue position and check again later. Do not
   enqueue it again.
@@ -369,7 +376,7 @@ leaving a known public tracker stale.
 
 - **Require a PR number or explicit squash-merge context before triggering** — do not invoke on vague phrases without a clear target.
 - **Never push squash commits directly to `upstream/master`** — always use `gh pr merge`. Direct push produces "Closed" not "Merged", breaks issue auto-close, and loses PR association.
-- **Enqueue through the merge queue** with `gh pr merge --squash --auto --match-head-commit`. The PR title is the squash commit message, so it must be conventional before enqueuing.
+- **Enqueue through the merge queue** with `gh pr merge --squash --auto --match-head-commit`. The PR title supplies the squash commit subject, so it must be conventional before enqueuing. Verify the landed message, including any trailers.
 - **Refuse bot or AI attribution** in the PR title or commits before enqueuing.
 - **Never bypass the queue unless the user explicitly asks** for that PR, and state the stale risk when they do.
 - **Always run pre-flight checks** (merge conflicts, review decision, labels, milestone, release-line placement, and CI status) before confirming — do not skip them even if the user says "just merge it."
