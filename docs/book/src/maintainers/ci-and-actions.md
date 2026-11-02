@@ -89,7 +89,7 @@ The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are po
 
 ### Desktop App Check (`desktop-check.yml`)
 
-Runs `cargo clippy -p zeroclaw-desktop --all-targets -- -D warnings` and then `cargo test --locked -p zeroclaw-desktop` on `macos-14`, `ubuntu-22.04`, and `windows-latest`. The workspace lint and nextest jobs exclude `zeroclaw-desktop` because it needs the platform GUI toolchains, so this workflow is the only place the desktop app's tests run, including the Unix supervisor process-tree and readiness tests in `apps/tauri/src/daemon.rs` and the webview capability test. It runs on pull requests that change `apps/tauri/**` or the workflow itself, weekly, and on manual dispatch. It does not feed `CI Required Gate`.
+Runs `cargo clippy -p zeroclaw-desktop --all-targets -- -D warnings` and then `cargo test --locked -p zeroclaw-desktop` on `macos-15`, `ubuntu-22.04`, and `windows-latest`. The workspace lint and nextest jobs exclude `zeroclaw-desktop` because it needs the platform GUI toolchains, so this workflow is the only place the desktop app's tests run, including the Unix supervisor process-tree and readiness tests in `apps/tauri/src/daemon.rs` and the webview capability test. It runs on pull requests that change `apps/tauri/**` or the workflow itself, weekly, and on manual dispatch. It does not feed `CI Required Gate`.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 

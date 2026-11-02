@@ -117,7 +117,7 @@ fn desktop_app_check_runs_the_desktop_unit_tests() {
         "desktop app check must run on pull requests that change the desktop app"
     );
     assert!(
-        jobs.contains("os: [macos-14, ubuntu-22.04, windows-latest]"),
+        jobs.contains("os: [macos-15, ubuntu-22.04, windows-latest]"),
         "desktop unit tests must run on macOS, Linux, and Windows"
     );
     assert!(
