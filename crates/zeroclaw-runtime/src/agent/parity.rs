@@ -166,6 +166,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 activated_tools: None,
                 model_switch_callback: None,
                 receipt_generator: None,
+                security: None,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,
@@ -253,6 +254,7 @@ fn a4_policy() -> Arc<SecurityPolicy> {
 fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
     AllToolsResult {
         tools,
+        reserved_host_names: std::collections::HashSet::new(),
         delegate_handle: None,
         ask_user_handle: None,
         reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -383,6 +385,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
     // The live-SOP path: re-assemble the step agent's own execution context.
     let owned = crate::agent::turn::assemble_owned_execution(
         &config,
+        None,
         "restricted",
         Arc::clone(&engine),
         None,
