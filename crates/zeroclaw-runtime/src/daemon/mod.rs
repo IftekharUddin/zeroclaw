@@ -2722,31 +2722,13 @@ async fn run_heartbeat_worker(
                         duration_ms,
                         config.heartbeat.max_run_history,
                     );
-                    // Consolidate heartbeat output to memory for cross-session awareness.
-                    if config.memory.auto_save
-                        && output.chars().count() >= 50
-                        && let Some(ref mem) = heartbeat_memory
-                    {
-                        let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
-                        let summary = if output.len() > 500 {
-                            // Find a valid UTF-8 char boundary at or before 500.
-                            let mut end = 500;
-                            while end > 0 && !output.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            &output[..end]
-                        } else {
-                            &output
-                        };
-                        let _ = mem
-                            .store(
-                                &key,
-                                &format!("Heartbeat task '{}': {}", task.text, summary),
-                                zeroclaw_memory::MemoryCategory::Daily,
-                                None,
-                            )
-                            .await;
-                    }
+                    consolidate_heartbeat_output(
+                        config.memory.auto_save,
+                        heartbeat_memory.as_deref(),
+                        &task.text,
+                        &output,
+                    )
+                    .await;
 
                     let announcement = if output.trim().is_empty() {
                         format!("💓 heartbeat task completed: {}", task.text)
@@ -2874,20 +2856,53 @@ async fn run_heartbeat_worker(
     }
 }
 
+/// Preserve the worker's best-effort Daily summary after successful execution,
+/// independently of whether final-message delivery is configured or succeeds.
+async fn consolidate_heartbeat_output(
+    auto_save: bool,
+    memory: Option<&dyn zeroclaw_memory::Memory>,
+    task_text: &str,
+    output: &str,
+) {
+    if auto_save
+        && output.chars().count() >= 50
+        && let Some(mem) = memory
+    {
+        let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
+        let summary = if output.len() > 500 {
+            // Find a valid UTF-8 char boundary at or before 500.
+            let mut end = 500;
+            while end > 0 && !output.is_char_boundary(end) {
+                end -= 1;
+            }
+            &output[..end]
+        } else {
+            output
+        };
+        let _ = mem
+            .store(
+                &key,
+                &format!("Heartbeat task '{task_text}': {summary}"),
+                zeroclaw_memory::MemoryCategory::Daily,
+                None,
+            )
+            .await;
+    }
+}
+
 /// The full prompt an autonomous heartbeat turn receives: the optional session
 /// context, the origin-marked task, then the delivery contract.
 ///
 /// The contract is **appended, never prepended**. Heartbeat delivery is
 /// resolved from config (auto-detecting a channel when unset), so unlike cron
-/// this turn usually IS broadcast, and the model has to know that before it
-/// writes an internal-sounding worklog. Prepending would also move the
-/// `[Heartbeat Task` marker off the front of the string, which
-/// `zeroclaw_memory::should_skip_autosave_content` tests position-dependently.
+/// delivery can be attempted automatically, and the model has to know that
+/// before it writes an internal-sounding worklog. Appending preserves the
+/// existing session-context and task layout.
 ///
 /// `delivery` is the *same* resolved `Option<(channel, target)>` that gates the
-/// real `deliver_announcement` call in the worker, so the contract cannot
-/// promise a send the worker will not perform. Passing it in rather than
-/// re-deriving it is what makes that impossible rather than merely true today;
+/// real `deliver_announcement` call in the worker, so the contract describes
+/// whether an attempt is configured without guaranteeing its success. Passing
+/// the resolved value keeps routing eligibility and prompt wording aligned;
 /// `heartbeat_contract_tracks_the_value_that_gates_the_real_send` pins it.
 #[must_use]
 fn heartbeat_turn_prompt(
@@ -4251,9 +4266,8 @@ mod tests {
         assert!(has_supervised_channels(&config));
     }
 
-    /// The heartbeat prompt must carry three things at once: the origin marker
-    /// autosave filtering keys on, the operator's task, and the delivery
-    /// contract — with the marker still at the front of the string.
+    /// The heartbeat prompt preserves the task's origin marker and operator
+    /// text while appending the delivery contract.
     #[test]
     fn heartbeat_turn_prompt_states_the_contract_without_displacing_the_origin_marker() {
         let task_prompt = "[Heartbeat Task | high] check the build";
@@ -4263,8 +4277,7 @@ mod tests {
 
         assert!(
             prompt.starts_with("[Heartbeat Task |"),
-            "origin marker must stay at the front: should_skip_autosave_content \
-             is a position-dependent prefix test, got: {prompt}"
+            "appending the contract must preserve the task's origin marker, got: {prompt}"
         );
         assert!(prompt.contains("check the build"), "the task survives");
         assert!(
@@ -4291,12 +4304,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn heartbeat_contract_matches_optional_daily_consolidation() {
+        use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+
+        let task_text = "check the build";
+        let output =
+            "The build finished successfully and the scheduled checks found no new failures.";
+        for auto_save in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let memory = SqliteMemory::new("heartbeat-contract", tmp.path()).unwrap();
+            let mut config = Config::default();
+            config.memory.auto_save = auto_save;
+            let delivery = resolve_heartbeat_delivery(&config).unwrap();
+            assert!(delivery.is_none());
+            let prompt = heartbeat_turn_prompt(
+                None,
+                "[Heartbeat Task | high] check the build",
+                delivery.as_ref(),
+            );
+
+            consolidate_heartbeat_output(config.memory.auto_save, Some(&memory), task_text, output)
+                .await;
+
+            let entries = memory.list(None, None).await.unwrap();
+            assert_eq!(entries.len(), usize::from(auto_save));
+            if let Some(entry) = entries.first() {
+                assert_eq!(entry.category, MemoryCategory::Daily);
+                assert_eq!(
+                    entry.content,
+                    format!("Heartbeat task '{task_text}': {output}")
+                );
+                assert!(entry.key.starts_with("heartbeat_"));
+                assert!(entry.session_id.is_none());
+            }
+            assert!(prompt.contains("not delivered to anyone"));
+            assert!(
+                prompt.contains("may still be recorded in run history and, where enabled, memory"),
+                "no-delivery wording must permit the observed optional Daily record: {prompt}"
+            );
+            assert!(!prompt.contains("history only"));
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_consolidation_keeps_character_threshold_and_utf8_summary_limit() {
+        use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("heartbeat-summary", tmp.path()).unwrap();
+        consolidate_heartbeat_output(true, Some(&memory), "short", &"é".repeat(49)).await;
+        assert!(memory.list(None, None).await.unwrap().is_empty());
+
+        consolidate_heartbeat_output(true, Some(&memory), "threshold", &"é".repeat(50)).await;
+        let long_output = format!("{}étail", "x".repeat(499));
+        consolidate_heartbeat_output(true, Some(&memory), "long", &long_output).await;
+        let entries = memory.list(None, None).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.category == MemoryCategory::Daily)
+        );
+        assert!(entries.iter().any(|entry| {
+            entry.content == format!("Heartbeat task 'threshold': {}", "é".repeat(50))
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.content == format!("Heartbeat task 'long': {}", "x".repeat(499))
+        }));
+    }
+
     /// Session context is prepended by the worker before the contract is
-    /// appended. Only the append is this function's contract; the context
-    /// displacing the `[Heartbeat Task` marker is pre-existing behavior of the
-    /// `load_session_context` path (and the reason autosave suppression misses
-    /// those turns) — deliberately not pinned here, so fixing it does not have
-    /// to fight a test asserting the broken shape is correct.
+    /// appended. Daemon-origin input autosave is suppressed independently of
+    /// this text's position; successful output consolidation is separate.
     #[test]
     fn heartbeat_turn_prompt_keeps_session_context_and_still_appends_the_contract() {
         let delivery = ("slack".to_string(), "C123".to_string());
@@ -4331,8 +4411,8 @@ mod tests {
         let gating: Option<(String, String)> = Some(("discord".to_string(), "99".to_string()));
         let prompt = heartbeat_turn_prompt(None, "[Heartbeat Task | high] t", gating.as_ref());
         assert!(
-            prompt.contains("is sent to the discord channel"),
-            "a gating value that WILL deliver must promise delivery, got: {prompt}"
+            prompt.contains("attempts to deliver your final message to the discord channel"),
+            "a configured destination must describe a delivery attempt, got: {prompt}"
         );
         assert!(
             !prompt.contains("not delivered to anyone"),
@@ -4343,7 +4423,7 @@ mod tests {
         let prompt = heartbeat_turn_prompt(None, "[Heartbeat Task | high] t", gating.as_ref());
         assert!(
             prompt.contains("not delivered to anyone"),
-            "a gating value that will NOT deliver must not promise delivery, got: {prompt}"
+            "without a destination the prompt must state no automatic delivery, got: {prompt}"
         );
 
         // And the real config path yields that non-delivering value when
@@ -4373,13 +4453,13 @@ mod tests {
         assert!(prompt.contains("NO_REPLY[FAIL]"));
         assert!(
             announce_delivery_decision("NO_REPLY[FAIL]: disk full").should_deliver(),
-            "the prompt promises FAIL reaches an operator"
+            "the prompt keeps FAIL eligible for delivery"
         );
 
         assert!(prompt.contains("NO_REPLY[REFUSE]"));
         assert!(
             announce_delivery_decision("NO_REPLY[REFUSE]: not permitted").should_deliver(),
-            "the prompt promises REFUSE reaches an operator"
+            "the prompt keeps REFUSE eligible for delivery"
         );
     }
 
