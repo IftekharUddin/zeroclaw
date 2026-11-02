@@ -7651,6 +7651,19 @@ fn spawn_supervised_listener(
     )
 }
 
+#[cfg(all(test, feature = "whatsapp-web"))]
+pub(crate) fn supervise_passkey_retirement_fixture(
+    channel: Arc<dyn Channel>,
+    cancel: CancellationToken,
+) -> (tokio::task::JoinHandle<()>, Duration) {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    prepare_supervised_channel(&channel, &cancel);
+    (
+        spawn_supervised_listener(channel, None, tx, 1, 1, cancel),
+        CHANNEL_GENERATION_SHUTDOWN_GRACE,
+    )
+}
+
 fn prepare_supervised_channel(ch: &Arc<dyn Channel>, cancel: &CancellationToken) {
     ch.set_cancel_token(cancel.clone());
 }

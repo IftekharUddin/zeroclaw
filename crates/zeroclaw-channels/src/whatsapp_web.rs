@@ -1464,19 +1464,29 @@ impl WhatsAppWebChannel {
     /// live connection until it is restarted; callers own scheduling that
     /// restart (e.g. a daemon reload).
     pub fn clear_persisted_session(session_path: &str) -> std::io::Result<Vec<String>> {
-        let mut removed = Vec::new();
         if session_path.is_empty() {
-            return Ok(removed);
+            return Ok(Vec::new());
         }
         let expanded = Self::expand_session_path(session_path);
-        for path in Self::session_file_paths(&expanded) {
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed.push(path),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+        crate::whatsapp_passkey::clear_session_files(&expanded, Self::session_file_paths(&expanded))
+    }
+
+    /// Wait on the actual supervisor-token bridge or the SDK logout signal.
+    pub(crate) async fn wait_for_session_end(
+        &self,
+        logout_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    ) -> bool {
+        select! {
+            res = logout_rx.recv() => {
+                // Both Ok(()) and Err (sender dropped) mean the session ended.
+                let _ = res;
+                true
+            }
+            () = self.cancel_notify.notified() => {
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel received shutdown signal");
+                false
             }
         }
-        Ok(removed)
     }
 
     /// Attempt to download and transcribe a WhatsApp voice note.
@@ -3947,6 +3957,8 @@ impl Channel for WhatsAppWebChannel {
                     .with_cancellation(passkey_closed.clone())
                     .with_confirmation(Arc::clone(&passkey_confirmation)),
             );
+            // Both brokers share this one claim before any detached callback can run.
+            passkey_confirmation.claim_files().await?;
             let inbound_context = WhatsAppInboundContext {
                 tx: tx.clone(),
                 alias: Arc::clone(&alias),
@@ -4337,17 +4349,7 @@ impl Channel for WhatsAppWebChannel {
             // injected via set_cancel_token — a bridge task notifies
             // so the single SIGINT consumer in main.rs deterministically
             // reaches this listener.
-            let should_reconnect = select! {
-                res = logout_rx.recv() => {
-                    // Both Ok(()) and Err (sender dropped) mean the session ended.
-                    let _ = res;
-                    true
-                }
-                () = self.cancel_notify.notified() => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel received shutdown signal");
-                    false
-                }
-            };
+            let should_reconnect = self.wait_for_session_end(&mut logout_rx).await;
 
             // Stop admitting pairing writes before shutdown or reconnect awaits.
             drop(persistence_guard);
@@ -4393,21 +4395,9 @@ impl Channel for WhatsAppWebChannel {
                 // Only purge session files when LoggedOut was explicitly observed.
                 // A transient task crash (Err from recv) should not wipe a valid session.
                 if Self::should_purge_session(&session_revoked) {
-                    for path in Self::session_file_paths(&expanded_session_path) {
-                        match tokio::fs::remove_file(&path).await {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!("failed to remove session file {}: {e}", path)
-                            ),
-                        }
-                    }
+                    passkey_confirmation
+                        .purge_session_files(Self::session_file_paths(&expanded_session_path))
+                        .await?;
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),

@@ -51,8 +51,10 @@
 
 #![cfg(feature = "whatsapp-web")]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -71,6 +73,244 @@ const DEFAULT_WAIT: Duration = Duration::from_secs(300);
 
 /// How often to look for the assertion file while waiting.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+// Detached SDK callbacks can outlive the listener's bounded shutdown. Each
+// listener shares one claim across both brokers, and every complete filesystem
+// transaction holds the same process-local gate until the blocking work returns.
+// This deliberately does not coordinate another process or the operator's writer.
+struct SessionGate {
+    current: Mutex<Option<Arc<CancellationToken>>>,
+}
+
+static SESSION_GATES: LazyLock<Mutex<HashMap<PathBuf, Weak<SessionGate>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn canonical_session_path(path: &std::path::Path, links_left: u8) -> std::io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => return Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "session has no parent")
+    })?;
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink()) {
+        if links_left == 0 {
+            return Err(std::io::Error::other("too many session path symlinks"));
+        }
+        let target = std::fs::read_link(path)?;
+        return canonical_session_path(&parent.join(target), links_left - 1);
+    }
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "session has no filename")
+    })?;
+    Ok(canonical_session_path(parent, links_left)?.join(leaf))
+}
+
+fn session_gate(session_path: &str) -> std::io::Result<Arc<SessionGate>> {
+    let absolute = std::path::absolute(session_path)?;
+    let canonical = canonical_session_path(&absolute, 40)?;
+    // Resolve paths before taking the registry lock; never hold it through I/O
+    // or a per-session lock. Weak aliases survive unlink/recreate only while a
+    // broker or admitted worker still holds the gate alive.
+    let mut gates = SESSION_GATES
+        .lock()
+        .map_err(|_| std::io::Error::other("passkey session registry poisoned"))?;
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    let lexical_gate = gates.get(&absolute).and_then(Weak::upgrade);
+    let canonical_gate = gates.get(&canonical).and_then(Weak::upgrade);
+    if let (Some(left), Some(right)) = (&lexical_gate, &canonical_gate)
+        && !Arc::ptr_eq(left, right)
+    {
+        return Err(std::io::Error::other(
+            "ambiguous passkey session path alias",
+        ));
+    }
+    let gate = lexical_gate.or(canonical_gate).unwrap_or_else(|| {
+        Arc::new(SessionGate {
+            current: Mutex::new(None),
+        })
+    });
+    gates.insert(absolute, Arc::downgrade(&gate));
+    gates.insert(canonical, Arc::downgrade(&gate));
+    Ok(gate)
+}
+
+struct FileClaim {
+    gate: Arc<SessionGate>,
+    retired: Arc<CancellationToken>,
+}
+
+struct SessionFiles {
+    session_path: String,
+    retired: Arc<CancellationToken>,
+    claim: tokio::sync::OnceCell<Arc<FileClaim>>,
+}
+
+impl SessionFiles {
+    fn new(session_path: &str) -> Self {
+        Self {
+            session_path: session_path.to_string(),
+            retired: Arc::new(CancellationToken::new()),
+            claim: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn claim(&self, closed: &CancellationToken) -> std::io::Result<Arc<FileClaim>> {
+        self.claim
+            .get_or_try_init(|| async {
+                let path = self.session_path.clone();
+                let retired = Arc::clone(&self.retired);
+                let closed = closed.clone();
+                tokio::task::spawn_blocking(move || {
+                    let gate = session_gate(&path)?;
+                    let mut current = gate
+                        .current
+                        .lock()
+                        .map_err(|_| std::io::Error::other("passkey session file gate poisoned"))?;
+                    if closed.is_cancelled() || retired.is_cancelled() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "passkey session closed before file claim",
+                        ));
+                    }
+                    // A dropped initializer can leave its admitted claim behind.
+                    // Retrying that same identity must not cancel itself.
+                    if let Some(previous) = current.as_ref()
+                        && !Arc::ptr_eq(previous, &retired)
+                    {
+                        previous.cancel();
+                    }
+                    *current = Some(Arc::clone(&retired));
+                    drop(current);
+                    Ok(Arc::new(FileClaim { gate, retired }))
+                })
+                .await
+                .map_err(std::io::Error::other)?
+            })
+            .await
+            .cloned()
+    }
+
+    async fn transaction<T, F>(
+        &self,
+        session_path: &str,
+        closed: &CancellationToken,
+        cleanup: bool,
+        operation: F,
+    ) -> std::io::Result<Option<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    {
+        if self.retired.is_cancelled() || (!cleanup && closed.is_cancelled()) {
+            return Ok(None);
+        }
+        let claim = if closed.is_cancelled() {
+            // Shutdown may clean its own claim, but must never acquire a new
+            // generation and displace the replacement it is supposed to retire.
+            let Some(claim) = self.claim.get() else {
+                return Ok(None);
+            };
+            Arc::clone(claim)
+        } else {
+            match self.claim(closed).await {
+                Ok(claim) => claim,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        };
+        let path = session_path.to_string();
+        let same_spelling = path == self.session_path;
+        let closed = closed.clone();
+        // The worker owns the claim. Cancelling/dropping its async waiter does
+        // not release this gate while an admitted filesystem operation runs.
+        tokio::task::spawn_blocking(move || {
+            if !same_spelling && !Arc::ptr_eq(&session_gate(&path)?, &claim.gate) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "passkey brokers refer to different sessions",
+                ));
+            }
+            let current = claim
+                .gate
+                .current
+                .lock()
+                .map_err(|_| std::io::Error::other("passkey session file gate poisoned"))?;
+            if current
+                .as_ref()
+                .is_none_or(|owner| !Arc::ptr_eq(owner, &claim.retired))
+                || claim.retired.is_cancelled()
+                || (!cleanup && closed.is_cancelled())
+            {
+                return Ok(None);
+            }
+            operation().map(Some)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+}
+
+/// Disk-only relink shares the listener's file gate and revokes its authority.
+/// The live network connection still belongs to the caller's restart policy.
+pub(crate) fn clear_session_files(
+    session_path: &str,
+    paths: Vec<String>,
+) -> std::io::Result<Vec<String>> {
+    let gate = session_gate(session_path)?;
+    let mut current = gate
+        .current
+        .lock()
+        .map_err(|_| std::io::Error::other("passkey session file gate poisoned"))?;
+    if let Some(previous) = current.take() {
+        previous.cancel();
+    }
+    let mut removed = Vec::new();
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+struct FilePause {
+    entered: tokio::sync::Notify,
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+static FILE_PAUSES: LazyLock<Mutex<HashMap<String, Weak<FilePause>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn pause_file_operation(path: &str) {
+    let pause = FILE_PAUSES
+        .lock()
+        .unwrap()
+        .remove(path)
+        .and_then(|pause| pause.upgrade());
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        let (released, timeout) = pause
+            .wake
+            .wait_timeout_while(
+                pause.released.lock().unwrap(),
+                Duration::from_secs(30),
+                |released| !*released,
+            )
+            .unwrap();
+        assert!(
+            *released && !timeout.timed_out(),
+            "filesystem pause was not released"
+        );
+    }
+}
 
 /// Path the request options are written to, derived from the session path.
 #[must_use]
@@ -113,8 +353,8 @@ fn publication_path(path: &str) -> String {
     format!("{path}.tmp")
 }
 
-async fn remove_if_present(path: &str) -> std::io::Result<()> {
-    match tokio::fs::remove_file(path).await {
+fn remove_if_present(path: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -146,8 +386,7 @@ struct PasskeyConfirmationAck {
 /// * **Atomic.** A plain write leaves a window where a reader sees a truncated
 ///   JSON document. Writing to a sibling temp file and renaming is atomic
 ///   within a directory, so a reader observes either the previous contents or
-///   the complete new ones, never a partial document. Tokio delegates to
-///   `std::fs::rename`, which replaces an existing file on Windows too (using
+///   the complete new ones, never a partial document. `std::fs::rename` replaces an existing file on Windows too (using
 ///   `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`). Do not unlink the request
 ///   first: that would introduce a gap in which no request is visible.
 /// * **Owner-only.** The mode is applied at creation rather than after the
@@ -155,30 +394,33 @@ struct PasskeyConfirmationAck {
 ///   temp file is created with `create_new`, so a pre-existing path (a stale
 ///   temp, or something planted) is an error rather than something to clobber
 ///   or follow.
-async fn publish_private(path: &str, contents: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
+fn publish_private(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let tmp = publication_path(path);
     // A previous run that died between create and rename would otherwise make
     // `create_new` fail forever.
-    let _ = tokio::fs::remove_file(&tmp).await;
+    let _ = std::fs::remove_file(&tmp);
 
-    let mut options = tokio::fs::OpenOptions::new();
+    let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    // tokio's OpenOptions exposes `mode` inherently on Unix, so no extension
-    // trait is needed. Set at creation, not after: a later `set_permissions`
+    // Set at creation, not after: a later `set_permissions`
     // would leave a window where the challenge is readable at the umask.
     #[cfg(unix)]
     options.mode(0o600);
 
-    let mut file = options.open(&tmp).await?;
-    file.write_all(contents).await?;
+    let mut file = options.open(&tmp)?;
+    file.write_all(contents)?;
     // Flush before the rename so the published name never points at a file
     // whose contents have not reached disk.
-    file.sync_all().await?;
+    file.sync_all()?;
     drop(file);
 
-    tokio::fs::rename(&tmp, path).await
+    #[cfg(test)]
+    pause_file_operation(path);
+    std::fs::rename(&tmp, path)
 }
 
 /// Read the pending verification-code prompt for `session_path`, if any.
@@ -200,9 +442,23 @@ pub fn pending_confirmation(
     }
 }
 
+fn remove_confirmation_artifacts(session_path: &str) -> std::io::Result<()> {
+    let prompt = confirmation_path(session_path);
+    for path in [
+        confirmation_ack_path(session_path),
+        publication_path(&prompt),
+        prompt,
+    ] {
+        remove_if_present(&path)?;
+    }
+    Ok(())
+}
+
 /// File-backed operator acknowledgement shared by every event in one client session.
 pub struct FilePasskeyConfirmation {
     session_path: String,
+    files: Arc<SessionFiles>,
+    revision: Arc<AtomicU64>,
     wait: Duration,
     closed: CancellationToken,
     // This is the authority for the current attempt, not a copy of client state.
@@ -230,6 +486,7 @@ impl ConfirmationAttempt {
 /// session shutdown revoke this even after the acknowledgement was consumed.
 pub struct PasskeyConfirmationPermit {
     attempt: Arc<ConfirmationAttempt>,
+    files: Arc<SessionFiles>,
 }
 
 impl PasskeyConfirmationPermit {
@@ -242,6 +499,7 @@ impl PasskeyConfirmationPermit {
         tokio::select! {
             biased;
             _ = self.attempt.cancelled.cancelled() => Err(PasskeyError::Cancelled),
+            _ = self.files.retired.cancelled() => Err(PasskeyError::Cancelled),
             // Keep construction inside the selected future: a revoked permit
             // must not invoke the callback, even if it has synchronous effects.
             result = async { confirm().await } => result,
@@ -252,8 +510,11 @@ impl PasskeyConfirmationPermit {
 impl FilePasskeyConfirmation {
     #[must_use]
     pub fn new(session_path: impl Into<String>) -> Self {
+        let session_path = session_path.into();
         Self {
-            session_path: session_path.into(),
+            files: Arc::new(SessionFiles::new(&session_path)),
+            revision: Arc::new(AtomicU64::new(0)),
+            session_path,
             wait: DEFAULT_WAIT,
             closed: CancellationToken::new(),
             current: tokio::sync::Mutex::new(None),
@@ -293,6 +554,7 @@ impl FilePasskeyConfirmation {
         &self,
         current: &mut Option<Arc<ConfirmationAttempt>>,
     ) -> std::io::Result<()> {
+        self.revision.fetch_add(1, Ordering::AcqRel);
         if let Some(attempt) = current.take() {
             attempt.cancel_and_drain().await;
         }
@@ -300,14 +562,50 @@ impl FilePasskeyConfirmation {
     }
 
     async fn remove_artifacts(&self) -> std::io::Result<()> {
-        let prompt = confirmation_path(&self.session_path);
-        for path in [
-            confirmation_ack_path(&self.session_path),
-            publication_path(&prompt),
-            prompt,
-        ] {
-            remove_if_present(&path).await?;
-        }
+        let session = self.session_path.clone();
+        let revision = Arc::clone(&self.revision);
+        let expected = revision.load(Ordering::Acquire);
+        self.files
+            .transaction(&self.session_path, &self.closed, true, move || {
+                if revision.load(Ordering::Acquire) != expected {
+                    return Ok(());
+                }
+                remove_confirmation_artifacts(&session)
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Claim once before the listener admits detached SDK callbacks.
+    pub(crate) async fn claim_files(&self) -> std::io::Result<()> {
+        self.files
+            .transaction(&self.session_path, &self.closed, false, || Ok(()))
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "passkey session retired")
+            })
+    }
+
+    /// Logout cleanup is admitted by the same owner as publication/consumption.
+    pub(crate) async fn purge_session_files(&self, paths: Vec<String>) -> std::io::Result<()> {
+        self.files
+            .transaction(&self.session_path, &self.closed, true, move || {
+                for path in paths {
+                    if let Err(error) = remove_if_present(&path) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!("failed to remove session file {path}: {error}")
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -340,15 +638,30 @@ impl FilePasskeyConfirmation {
             if let Some(previous) = current.take() {
                 previous.cancel_and_drain().await;
             }
-            self.remove_artifacts()
-                .await
-                .map_err(|e| PasskeyError::Backend(e.to_string()))?;
             *current = Some(Arc::clone(&attempt));
-            if let Err(error) = publish_private(&prompt_file, &prompt_bytes).await {
-                cancelled.cancel();
-                return Err(PasskeyError::Backend(format!(
-                    "could not write {prompt_file}: {error}"
-                )));
+            let revision = Arc::clone(&self.revision);
+            let expected = revision.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            let session = self.session_path.clone();
+            let publication = self
+                .files
+                .transaction(&self.session_path, &self.closed, false, move || {
+                    if revision.load(Ordering::Acquire) != expected {
+                        return Ok(false);
+                    }
+                    remove_confirmation_artifacts(&session)?;
+                    publish_private(&confirmation_path(&session), &prompt_bytes)?;
+                    Ok(true)
+                })
+                .await;
+            match publication {
+                Ok(Some(true)) => {}
+                Ok(None | Some(false)) => return Err(PasskeyError::Cancelled),
+                Err(error) => {
+                    cancelled.cancel();
+                    return Err(PasskeyError::Backend(format!(
+                        "could not write {prompt_file}: {error}"
+                    )));
+                }
             }
         }
 
@@ -376,26 +689,52 @@ impl FilePasskeyConfirmation {
                 {
                     return Err(PasskeyError::Cancelled);
                 }
-                let owns_prompt = pending_confirmation(&self.session_path)
-                    .map_err(|e| PasskeyError::Backend(e.to_string()))?
-                    .is_some_and(|prompt| prompt.attempt_id == attempt_id);
-                if !owns_prompt {
-                    // A disk-only relink can remove the prompt while this client
-                    // still runs. Its acknowledgement must then fail closed.
-                    cancelled.cancel();
-                    return Err(PasskeyError::Cancelled);
-                }
-                let acknowledged = match tokio::fs::read(&ack_file).await {
-                    Ok(bytes) => serde_json::from_slice::<PasskeyConfirmationAck>(&bytes)
-                        .is_ok_and(|ack| ack.attempt_id == attempt_id),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(error) => return Err(PasskeyError::Backend(error.to_string())),
-                };
-                if acknowledged {
-                    self.remove_artifacts()
-                        .await
-                        .map_err(|e| PasskeyError::Backend(e.to_string()))?;
-                    return Ok(PasskeyConfirmationPermit { attempt });
+                let session = self.session_path.clone();
+                let expected = attempt_id.clone();
+                let revision = Arc::clone(&self.revision);
+                let expected_revision = revision.load(Ordering::Acquire);
+                let acknowledged = self
+                    .files
+                    .transaction(&self.session_path, &self.closed, false, move || {
+                        if revision.load(Ordering::Acquire) != expected_revision {
+                            return Ok(None);
+                        }
+                        let owns_prompt = pending_confirmation(&session)?
+                            .is_some_and(|prompt| prompt.attempt_id == expected);
+                        if !owns_prompt {
+                            return Ok(None);
+                        }
+                        let acknowledged = match std::fs::read(confirmation_ack_path(&session)) {
+                            Ok(bytes) => serde_json::from_slice::<PasskeyConfirmationAck>(&bytes)
+                                .is_ok_and(|ack| ack.attempt_id == expected),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                            Err(error) => return Err(error),
+                        };
+                        if acknowledged {
+                            #[cfg(test)]
+                            pause_file_operation(&confirmation_ack_path(&session));
+                            remove_confirmation_artifacts(&session)?;
+                        }
+                        Ok(Some(acknowledged))
+                    })
+                    .await
+                    .map_err(|e| PasskeyError::Backend(e.to_string()))?;
+                match acknowledged {
+                    Some(Some(true))
+                        if !cancelled.is_cancelled() && !self.files.retired.is_cancelled() =>
+                    {
+                        return Ok(PasskeyConfirmationPermit {
+                            attempt,
+                            files: Arc::clone(&self.files),
+                        });
+                    }
+                    Some(Some(false)) => {}
+                    _ => {
+                        // A relink, replacement, or removed prompt revokes even
+                        // an acknowledgement read before listener retirement.
+                        cancelled.cancel();
+                        return Err(PasskeyError::Cancelled);
+                    }
                 }
                 if tokio::time::Instant::now() >= deadline {
                     cancelled.cancel();
@@ -408,6 +747,7 @@ impl FilePasskeyConfirmation {
             tokio::select! {
                 biased;
                 _ = cancelled.cancelled() => return Err(PasskeyError::Cancelled),
+                _ = self.files.retired.cancelled() => return Err(PasskeyError::Cancelled),
                 _ = tokio::time::sleep_until(std::cmp::min(deadline, tokio::time::Instant::now() + POLL_INTERVAL)) => {},
             }
         }
@@ -418,8 +758,9 @@ impl FilePasskeyConfirmation {
 /// beside the session database.
 pub struct FilePasskeyAuthenticator {
     session_path: String,
+    files: Arc<SessionFiles>,
     wait: Duration,
-    generation: AtomicU64,
+    generation: Arc<AtomicU64>,
     closed: CancellationToken,
     file_ops: tokio::sync::Mutex<()>,
     confirmation: Option<Arc<FilePasskeyConfirmation>>,
@@ -428,10 +769,12 @@ pub struct FilePasskeyAuthenticator {
 impl FilePasskeyAuthenticator {
     #[must_use]
     pub fn new(session_path: impl Into<String>) -> Self {
+        let session_path = session_path.into();
         Self {
-            session_path: session_path.into(),
+            files: Arc::new(SessionFiles::new(&session_path)),
+            session_path,
             wait: DEFAULT_WAIT,
-            generation: AtomicU64::new(0),
+            generation: Arc::new(AtomicU64::new(0)),
             closed: CancellationToken::new(),
             file_ops: tokio::sync::Mutex::new(()),
             confirmation: None,
@@ -457,6 +800,7 @@ impl FilePasskeyAuthenticator {
     /// so revoking here fences an old confirmation before that replacement exists.
     #[must_use]
     pub fn with_confirmation(mut self, confirmation: Arc<FilePasskeyConfirmation>) -> Self {
+        self.files = Arc::clone(&confirmation.files);
         self.confirmation = Some(confirmation);
         self
     }
@@ -466,13 +810,19 @@ impl FilePasskeyAuthenticator {
         self.closed.cancel();
         let _file_guard = self.file_ops.lock().await;
         self.begin_attempt();
-        for path in [
-            request_path(&self.session_path),
-            assertion_path(&self.session_path),
-            publication_path(&request_path(&self.session_path)),
-        ] {
-            remove_if_present(&path).await?;
-        }
+        let session = self.session_path.clone();
+        self.files
+            .transaction(&self.session_path, &self.closed, true, move || {
+                for path in [
+                    request_path(&session),
+                    assertion_path(&session),
+                    publication_path(&request_path(&session)),
+                ] {
+                    remove_if_present(&path)?;
+                }
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -483,14 +833,28 @@ impl FilePasskeyAuthenticator {
     }
 
     fn owns_attempt(&self, generation: u64) -> bool {
-        !self.closed.is_cancelled() && self.generation.load(Ordering::Acquire) == generation
+        !self.closed.is_cancelled()
+            && !self.files.retired.is_cancelled()
+            && self.generation.load(Ordering::Acquire) == generation
     }
 
     async fn cleanup_attempt(&self, generation: u64, request_file: &str, assertion_file: &str) {
         let _file_guard = self.file_ops.lock().await;
         if self.owns_attempt(generation) {
-            let _ = tokio::fs::remove_file(assertion_file).await;
-            let _ = tokio::fs::remove_file(request_file).await;
+            let assertion_file = assertion_file.to_string();
+            let request_file = request_file.to_string();
+            let attempts = Arc::clone(&self.generation);
+            let _ = self
+                .files
+                .transaction(&self.session_path, &self.closed, true, move || {
+                    if attempts.load(Ordering::Acquire) != generation {
+                        return Ok(());
+                    }
+                    let _ = std::fs::remove_file(assertion_file);
+                    let _ = std::fs::remove_file(request_file);
+                    Ok(())
+                })
+                .await;
         }
     }
 }
@@ -613,18 +977,35 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
             }
             generation = self.begin_attempt();
 
-            // Clear any assertion left by a previous attempt before
-            // advertising a new challenge. A stale file answers the wrong
-            // challenge, so the server would reject it and burn this attempt.
-            let _ = tokio::fs::remove_file(&assertion_file).await;
-            if let Err(error) =
-                publish_private(&request_file, request.raw_options_json.as_bytes()).await
+            // Clear and publish in one owned transaction. The worker retains
+            // the gate even if the listener's shutdown grace expires meanwhile.
+            let session = self.session_path.clone();
+            let contents = request.raw_options_json.clone();
+            let attempts = Arc::clone(&self.generation);
+            match self
+                .files
+                .transaction(&self.session_path, &self.closed, false, move || {
+                    if attempts.load(Ordering::Acquire) != generation {
+                        return Ok(false);
+                    }
+                    let request_file = request_path(&session);
+                    let _ = std::fs::remove_file(assertion_path(&session));
+                    if let Err(error) = publish_private(&request_file, contents.as_bytes()) {
+                        let _ = std::fs::remove_file(&request_file);
+                        let _ = std::fs::remove_file(publication_path(&request_file));
+                        return Err(error);
+                    }
+                    Ok(true)
+                })
+                .await
             {
-                let _ = tokio::fs::remove_file(&request_file).await;
-                let _ = tokio::fs::remove_file(format!("{request_file}.tmp")).await;
-                return Err(PasskeyError::Backend(format!(
-                    "could not write {request_file}: {error}"
-                )));
+                Ok(Some(true)) => {}
+                Ok(None | Some(false)) => return Err(PasskeyError::Cancelled),
+                Err(error) => {
+                    return Err(PasskeyError::Backend(format!(
+                        "could not write {request_file}: {error}"
+                    )));
+                }
             }
         }
 
@@ -650,34 +1031,48 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
                     return Err(PasskeyError::Cancelled);
                 }
 
-                match tokio::fs::read(&assertion_file).await {
-                    Ok(bytes) if !bytes.is_empty() => {
-                        match parse_assertion_for_request(bytes, request) {
-                            Ok(assertion) => {
-                                let _ = tokio::fs::remove_file(&assertion_file).await;
-                                let _ = tokio::fs::remove_file(&request_file).await;
-                                ::zeroclaw_log::record!(
-                                    INFO,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    ),
-                                    "WhatsApp passkey assertion accepted; resuming device linking"
-                                );
-                                return Ok(assertion);
-                            }
-                            Err(error) => {
-                                // A manual writer may still be appending JSON,
-                                // or this may be a late response to the request
-                                // this generation replaced. Leave it available
-                                // to be completed or overwritten until the
-                                // deadline rather than destroying the response.
-                                last_invalid = Some(error);
-                            }
+                let session = self.session_path.clone();
+                let request = request.clone();
+                let attempts = Arc::clone(&self.generation);
+                let result = self
+                    .files
+                    .transaction(&self.session_path, &self.closed, false, move || {
+                        if attempts.load(Ordering::Acquire) != generation {
+                            return Ok(None);
                         }
+                        let bytes = match std::fs::read(assertion_path(&session)) {
+                            Ok(bytes) if !bytes.is_empty() => bytes,
+                            // Preserve the operator poller's absent/in-progress behavior.
+                            _ => return Ok(None),
+                        };
+                        let assertion = parse_assertion_for_request(bytes, &request);
+                        if assertion.is_ok() {
+                            let _ = std::fs::remove_file(assertion_path(&session));
+                            let _ = std::fs::remove_file(request_path(&session));
+                        }
+                        Ok(Some(assertion))
+                    })
+                    .await
+                    .map_err(|e| PasskeyError::Backend(e.to_string()))?;
+                if !self.owns_attempt(generation) {
+                    return Err(PasskeyError::Cancelled);
+                }
+                match result {
+                    Some(Some(Ok(assertion))) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "WhatsApp passkey assertion accepted; resuming device linking"
+                        );
+                        return Ok(assertion);
                     }
-                    // Absent or empty: keep waiting.
-                    _ => {}
+                    // Preserve partial/stale input until it is completed or replaced.
+                    Some(Some(Err(error))) => last_invalid = Some(error),
+                    Some(None) => {}
+                    None => return Err(PasskeyError::Cancelled),
                 }
             }
 
@@ -690,6 +1085,7 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
             tokio::select! {
                 biased;
                 _ = self.closed.cancelled() => return Err(PasskeyError::Cancelled),
+                _ = self.files.retired.cancelled() => return Err(PasskeyError::Cancelled),
                 _ = tokio::time::sleep(POLL_INTERVAL) => {},
             }
         }
@@ -699,6 +1095,387 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::channel::Channel as _;
+
+    struct InstalledPause {
+        path: String,
+        pause: Arc<FilePause>,
+    }
+
+    impl InstalledPause {
+        fn new(path: String) -> Self {
+            let pause = Arc::new(FilePause {
+                entered: tokio::sync::Notify::new(),
+                released: Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+            });
+            FILE_PAUSES
+                .lock()
+                .unwrap()
+                .insert(path.clone(), Arc::downgrade(&pause));
+            Self { path, pause }
+        }
+
+        fn release(&self) {
+            *self.pause.released.lock().unwrap() = true;
+            self.pause.wake.notify_all();
+        }
+
+        async fn entered(&self) {
+            tokio::time::timeout(Duration::from_secs(5), self.pause.entered.notified())
+                .await
+                .expect("actual filesystem transaction must reach the pause");
+        }
+    }
+
+    impl Drop for InstalledPause {
+        fn drop(&mut self) {
+            self.release();
+            FILE_PAUSES.lock().unwrap().remove(&self.path);
+        }
+    }
+
+    // The SDK network setup is excluded. Cancellation goes through the actual
+    // WhatsApp token bridge and wait seam, then the real broker shutdowns, under
+    // the production supervisor and its bounded listener drain.
+    struct RetirementChannel {
+        inner: crate::whatsapp_web::WhatsAppWebChannel,
+        confirmation: Arc<FilePasskeyConfirmation>,
+        authenticator: Arc<FilePasskeyAuthenticator>,
+        closed: CancellationToken,
+        started: tokio::sync::Notify,
+        cleanup: tokio::sync::Notify,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RetirementChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Attributable::role(&self.inner)
+        }
+        fn alias(&self) -> &str {
+            zeroclaw_api::attribution::Attributable::alias(&self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::channel::Channel for RetirementChannel {
+        fn name(&self) -> &str {
+            "passkey-retirement-fixture"
+        }
+        fn set_cancel_token(&self, token: CancellationToken) {
+            self.inner.set_cancel_token(token);
+        }
+        fn uses_cancel_token(&self) -> bool {
+            self.inner.uses_cancel_token()
+        }
+        async fn send(&self, _: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let _dropped = Dropped(Arc::clone(&self.dropped));
+            let _closed = self.closed.clone().drop_guard();
+            self.confirmation.claim_files().await?;
+            let (_logout, mut logout_rx) = tokio::sync::broadcast::channel(1);
+            self.started.notify_one();
+            assert!(!self.inner.wait_for_session_end(&mut logout_rx).await);
+            self.closed.cancel();
+            self.cleanup.notify_one();
+            self.confirmation.shutdown().await?;
+            self.authenticator.shutdown().await?;
+            Ok(())
+        }
+    }
+
+    fn retirement_channel(session: &str) -> Arc<RetirementChannel> {
+        let closed = CancellationToken::new();
+        let confirmation =
+            Arc::new(FilePasskeyConfirmation::new(session).with_cancellation(closed.clone()));
+        let authenticator = Arc::new(
+            FilePasskeyAuthenticator::new(session)
+                .with_cancellation(closed.clone())
+                .with_confirmation(Arc::clone(&confirmation)),
+        );
+        assert!(Arc::ptr_eq(&confirmation.files, &authenticator.files));
+        Arc::new(RetirementChannel {
+            inner: crate::whatsapp_web::WhatsAppWebChannel::new(
+                &zeroclaw_config::schema::WhatsAppConfig::default(),
+                uuid::Uuid::new_v4().to_string(),
+                Arc::new(Vec::new),
+                Arc::new(Vec::new),
+            ),
+            confirmation,
+            authenticator,
+            closed,
+            started: tokio::sync::Notify::new(),
+            cleanup: tokio::sync::Notify::new(),
+            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    async fn retire_past_grace(
+        channel: &RetirementChannel,
+        cancel: &CancellationToken,
+        handle: tokio::task::JoinHandle<()>,
+        grace: Duration,
+    ) {
+        let started = tokio::time::Instant::now();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), channel.cleanup.notified())
+            .await
+            .expect("actual cancel_notify must enter broker cleanup");
+        tokio::time::timeout(grace + Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor must apply its shutdown grace")
+            .unwrap();
+        assert!(
+            started.elapsed() >= grace,
+            "admitted file work must outlast the actual grace"
+        );
+        assert!(
+            channel.dropped.load(Ordering::Acquire),
+            "listener was not dropped"
+        );
+        assert!(channel.closed.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_grace_cannot_release_stalled_passkey_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let old = retirement_channel(&session);
+        let cancel = CancellationToken::new();
+        let (handle, grace) =
+            crate::orchestrator::supervise_passkey_retirement_fixture(old.clone(), cancel.clone());
+        old.started.notified().await;
+        let pause = InstalledPause::new(request_path(&session));
+        let auth = Arc::clone(&old.authenticator);
+        let callback =
+            zeroclaw_spawn::spawn!(
+                async move { auth.get_assertion(&assertion_request(b"old")).await }
+            );
+        pause.entered().await;
+        retire_past_grace(&old, &cancel, handle, grace).await;
+
+        let replacement = Arc::new(FilePasskeyAuthenticator::new(&session));
+        let auth = Arc::clone(&replacement);
+        let request = assertion_request(b"replacement");
+        let contents = request.raw_options_json.clone();
+        let next = zeroclaw_spawn::spawn!(async move { auth.get_assertion(&request).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let published = std::fs::read_to_string(request_path(&session)).unwrap_or_default();
+        assert_ne!(
+            published, contents,
+            "replacement published while an old filesystem worker still owned the path"
+        );
+        assert!(
+            !callback.is_finished(),
+            "detached callback should survive listener retirement"
+        );
+        pause.release();
+        wait_for_contents(&request_path(&session), &contents).await;
+        assert!(matches!(
+            callback.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
+        old.confirmation.shutdown().await.unwrap();
+        old.authenticator.shutdown().await.unwrap();
+        old.confirmation
+            .purge_session_files(artifact_paths(&session).to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(request_path(&session)).unwrap(),
+            contents,
+            "late old shutdown/logout removed replacement files"
+        );
+        tokio::fs::write(
+            assertion_path(&session),
+            credential_json_for_challenge("Y3JlZA", "c2ln", b"replacement"),
+        )
+        .await
+        .unwrap();
+        assert!(next.await.unwrap().is_ok());
+        replacement.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_grace_cannot_release_stalled_passkey_ack_consumption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let old = retirement_channel(&session);
+        let cancel = CancellationToken::new();
+        let (handle, grace) =
+            crate::orchestrator::supervise_passkey_retirement_fixture(old.clone(), cancel.clone());
+        old.started.notified().await;
+        let callback = confirmation_waiter(&old.confirmation, "OLD-CODE");
+        let prompt = wait_for_confirmation(&session, "OLD-CODE").await;
+        let pause = InstalledPause::new(confirmation_ack_path(&session));
+        acknowledge(&session, &prompt).await;
+        pause.entered().await;
+        retire_past_grace(&old, &cancel, handle, grace).await;
+
+        let replacement = Arc::new(FilePasskeyConfirmation::new(&session));
+        let next = confirmation_waiter(&replacement, "NEW-CODE");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            pending_confirmation(&session).unwrap(),
+            Some(prompt),
+            "replacement published while old acknowledgement consumption still owned the path"
+        );
+        assert!(!callback.is_finished());
+        pause.release();
+        let next_prompt = wait_for_confirmation(&session, "NEW-CODE").await;
+        assert!(matches!(
+            callback.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
+        old.confirmation.shutdown().await.unwrap();
+        old.authenticator.shutdown().await.unwrap();
+        old.confirmation
+            .purge_session_files(artifact_paths(&session).to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_confirmation(&session).unwrap(),
+            Some(next_prompt.clone())
+        );
+        acknowledge(&session, &next_prompt).await;
+        let permit = next.await.unwrap().unwrap();
+        let confirmations = AtomicU64::new(0);
+        permit
+            .confirm(|| async {
+                confirmations.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(confirmations.load(Ordering::Relaxed), 1);
+        replacement.shutdown().await.unwrap();
+    }
+
+    async fn replacement_and_relink_through_alias(session: &str, alias: &str) {
+        let old = Arc::new(FilePasskeyConfirmation::new(session));
+        let first = confirmation_waiter(&old, "OLD");
+        let prompt = wait_for_confirmation(session, "OLD").await;
+        acknowledge(session, &prompt).await;
+        let old_permit = first.await.unwrap().unwrap();
+        let original_gate = Arc::downgrade(&old.files.claim.get().unwrap().gate);
+
+        let replacement = Arc::new(FilePasskeyConfirmation::new(alias));
+        let next = confirmation_waiter(&replacement, "NEW");
+        let prompt = wait_for_confirmation(alias, "NEW").await;
+        assert!(Arc::ptr_eq(
+            &original_gate.upgrade().unwrap(),
+            &replacement.files.claim.get().unwrap().gate
+        ));
+        let calls = AtomicU64::new(0);
+        assert!(matches!(
+            old_permit
+                .confirm(|| async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+                .await,
+            Err(PasskeyError::Cancelled)
+        ));
+        old.shutdown().await.unwrap();
+        old.purge_session_files(artifact_paths(session).to_vec())
+            .await
+            .unwrap();
+        assert_eq!(pending_confirmation(alias).unwrap(), Some(prompt.clone()));
+        acknowledge(alias, &prompt).await;
+        let new_permit = next.await.unwrap().unwrap();
+        let mut paths = artifact_paths(alias).to_vec();
+        paths.push(alias.to_string());
+        clear_session_files(alias, paths).unwrap();
+        assert!(matches!(
+            new_permit
+                .confirm(|| async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+                .await,
+            Err(PasskeyError::Cancelled)
+        ));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "retired permits invoked upstream"
+        );
+        assert!(matches!(
+            replacement.wait_for_acknowledgement("LATE").await,
+            Err(PasskeyError::Cancelled)
+        ));
+        assert!(pending_confirmation(alias).unwrap().is_none());
+        // Remember the alias after relink removes a session symlink: an old
+        // worker still retaining the gate must not get a second file gate.
+        assert!(Arc::ptr_eq(
+            &original_gate.upgrade().unwrap(),
+            &session_gate(alias).unwrap()
+        ));
+        drop(old);
+        drop(replacement);
+        assert!(
+            original_gate.upgrade().is_none(),
+            "weak registry retained a dead session"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_and_dot_aliases_share_retirement_and_relink_authority() {
+        let tmp = tempfile::tempdir_in(".").unwrap();
+        let session = tmp.path().join("session.db");
+        std::fs::write(&session, b"session fixture").unwrap();
+        let alias = std::path::absolute(tmp.path())
+            .unwrap()
+            .join(".")
+            .join("session.db");
+        replacement_and_relink_through_alias(session.to_str().unwrap(), alias.to_str().unwrap())
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_session_alias_shares_retirement_even_after_relink_unlinks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db");
+        let alias = tmp.path().join("alias.db");
+        std::fs::write(&session, b"session fixture").unwrap();
+        std::os::unix::fs::symlink(&session, &alias).unwrap();
+        replacement_and_relink_through_alias(session.to_str().unwrap(), alias.to_str().unwrap())
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_session_and_parent_symlinks_do_not_split_file_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let parent_alias = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &parent_alias).unwrap();
+        let session = real.join("not-created.db");
+        let leaf_alias = tmp.path().join("alias.db");
+        std::os::unix::fs::symlink(&session, &leaf_alias).unwrap();
+        let gate = session_gate(session.to_str().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(
+            &gate,
+            &session_gate(parent_alias.join("not-created.db").to_str().unwrap()).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &gate,
+            &session_gate(leaf_alias.to_str().unwrap()).unwrap()
+        ));
+    }
 
     fn assertion_request(challenge: &[u8]) -> AssertionRequest {
         AssertionRequest {
@@ -1059,9 +1836,7 @@ mod tests {
             .await
             .unwrap();
 
-        publish_private(&target, br#"{"challenge":"AQID"}"#)
-            .await
-            .unwrap();
+        publish_private(&target, br#"{"challenge":"AQID"}"#).unwrap();
 
         assert_eq!(
             tokio::fs::read(&target).await.unwrap(),
@@ -1104,7 +1879,7 @@ mod tests {
             .await
             .unwrap();
 
-        publish_private(&target, b"fresh").await.unwrap();
+        publish_private(&target, b"fresh").unwrap();
 
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"fresh".to_vec());
     }
@@ -1329,10 +2104,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session = tmp.path().join("session.db").to_string_lossy().into_owned();
         let closed = CancellationToken::new();
-        let auth =
-            Arc::new(FilePasskeyAuthenticator::new(&session).with_cancellation(closed.clone()));
         let confirmation =
             Arc::new(FilePasskeyConfirmation::new(&session).with_cancellation(closed.clone()));
+        let auth = Arc::new(
+            FilePasskeyAuthenticator::new(&session)
+                .with_cancellation(closed.clone())
+                .with_confirmation(Arc::clone(&confirmation)),
+        );
         let request = assertion_request(&[1]);
         let auth_waiter = {
             let auth = Arc::clone(&auth);
