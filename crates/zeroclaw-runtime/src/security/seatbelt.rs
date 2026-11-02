@@ -8,12 +8,57 @@ use std::process::Command;
 
 pub(super) const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
+// These canonical inputs create the profile, rather than snapshotting the
+// caller's live policy. Capability checks compare that profile with the current
+// policy supplied by the execution owner.
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
+struct ProfileRoots {
+    workspace: PathBuf,
+    read_write: Vec<PathBuf>,
+    read_only: Vec<PathBuf>,
+    write_only: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum GenericWriteRegion {
+    Subpath(&'static str),
+    Descendants(&'static str),
+}
+
+impl GenericWriteRegion {
+    fn root(self) -> &'static str {
+        match self {
+            Self::Subpath(root) | Self::Descendants(root) => root,
+        }
+    }
+
+    fn policy_rule(self) -> String {
+        match self {
+            Self::Subpath(root) => format!("(allow file-write* (subpath \"{root}\"))\n"),
+            Self::Descendants(root) => {
+                format!("(allow file-write* (regex #\"^{root}/\"))\n")
+            }
+        }
+    }
+}
+
+// One source for both generated generic writes and their capability check.
+const GENERIC_WRITE_REGIONS: [GenericWriteRegion; 5] = [
+    GenericWriteRegion::Subpath("/tmp"),
+    GenericWriteRegion::Subpath("/private/tmp"),
+    GenericWriteRegion::Descendants("/private/var/folders"),
+    GenericWriteRegion::Subpath("/dev/null"),
+    GenericWriteRegion::Subpath("/dev/tty"),
+];
+
 #[derive(Debug, Clone)]
 pub struct SeatbeltSandbox {
     /// Directory where per-session policy files are stored.
     policy_dir: PathBuf,
     /// Path to the generated policy file for this session.
     policy_path: PathBuf,
+    profile_roots: ProfileRoots,
 }
 
 impl SeatbeltSandbox {
@@ -74,7 +119,18 @@ impl SeatbeltSandbox {
         let read_write = resolve_roots(read_write)?;
         let read_only = resolve_roots(read_only)?;
         let write_only = resolve_roots(write_only)?;
-        let mut policy = generate_policy(&workspace, &read_write, &read_only, &write_only);
+        let profile_roots = ProfileRoots {
+            workspace,
+            read_write,
+            read_only,
+            write_only,
+        };
+        let mut policy = generate_policy(
+            &profile_roots.workspace,
+            &profile_roots.read_write,
+            &profile_roots.read_only,
+            &profile_roots.write_only,
+        );
         // Traversal must survive tier denials, without granting the contents of
         // a regular file that replaces a configured symlink after construction.
         policy.push_str(&ancestor_metadata_rules(
@@ -96,6 +152,7 @@ impl SeatbeltSandbox {
         Ok(Self {
             policy_dir,
             policy_path,
+            profile_roots,
         })
     }
 
@@ -162,8 +219,42 @@ impl Sandbox for SeatbeltSandbox {
         self.wrap_invocation(cmd, &invocation)
     }
 
-    fn enforces_read_only_paths(&self) -> bool {
-        true
+    fn protects_read_only_argument(
+        &self,
+        resolved_argument: &Path,
+        write_subtree_allowed: &dyn Fn(&Path) -> bool,
+    ) -> bool {
+        let roots = &self.profile_roots;
+        let preserves = |grant: &Path| {
+            super::traits::write_grant_preserves_argument(
+                resolved_argument,
+                grant,
+                write_subtree_allowed,
+            )
+        };
+        // These grants follow the RO denies to preserve intentional tier unions.
+        // A broad workspace/RW grant can still expose a deeper forbidden hole.
+        if !std::iter::once(&roots.workspace)
+            .chain(roots.read_write.iter())
+            .chain(roots.write_only.iter())
+            .all(|grant| preserves(grant))
+        {
+            return false;
+        }
+        // An actual RO deny masks earlier generic writes throughout this
+        // argument. It does not subtract any of the later grants checked above.
+        if roots
+            .read_only
+            .iter()
+            .any(|root| resolved_argument.starts_with(root))
+        {
+            return true;
+        }
+        GENERIC_WRITE_REGIONS.iter().all(|region| {
+            resolve_policy_root(Path::new(region.root()), &mut BTreeSet::new()).is_ok_and(|grant| {
+                roots.read_only.iter().any(|root| grant.starts_with(root)) || preserves(&grant)
+            })
+        })
     }
 
     fn is_available(&self) -> bool {
@@ -350,14 +441,7 @@ fn generate_policy(
 ;; Only allow writes to workspace and temp directories
 (allow file-write*
     (subpath "{workspace}"))
-(allow file-write*
-    (subpath "/tmp")
-    (subpath "/private/tmp"))
-(allow file-write*
-    (regex #"^/private/var/folders/"))
-(allow file-write* (subpath "/dev/null"))
-(allow file-write* (subpath "/dev/tty"))
-
+{generic_write_rules}
 ;; ── Configured extra roots ─────────────────────────────────
 ;; Tiered grants mirroring SecurityPolicy's resolved allowed-roots tiers:
 ;; read-write roots receive file-read* and file-write*, read-only roots
@@ -397,6 +481,10 @@ fn generate_policy(
 (allow mach-task-name)
 "#,
         workspace = workspace_str,
+        generic_write_rules = GENERIC_WRITE_REGIONS
+            .iter()
+            .map(|region| region.policy_rule())
+            .collect::<String>(),
     )
 }
 
@@ -409,6 +497,7 @@ mod tests {
     fn seatbelt_shell_identity_survives_replacing_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: dir.path().to_path_buf(),
             policy_path: dir.path().join("test.sb"),
         };
@@ -527,6 +616,7 @@ mod tests {
     #[test]
     fn seatbelt_sandbox_name() {
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: PathBuf::from("/tmp/test-seatbelt"),
             policy_path: PathBuf::from("/tmp/test-seatbelt/test.sb"),
         };
@@ -536,6 +626,7 @@ mod tests {
     #[test]
     fn seatbelt_description_mentions_macos() {
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: PathBuf::from("/tmp/test-seatbelt"),
             policy_path: PathBuf::from("/tmp/test-seatbelt/test.sb"),
         };
@@ -620,6 +711,7 @@ mod tests {
         std::fs::write(&policy_path, "(version 1)\n(deny default)").unwrap();
 
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: dir.path().to_path_buf(),
             policy_path: policy_path.clone(),
         };
@@ -646,6 +738,7 @@ mod tests {
         std::fs::write(&policy_path, "(version 1)").unwrap();
 
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: dir.path().to_path_buf(),
             policy_path,
         };
@@ -681,6 +774,7 @@ mod tests {
         std::fs::write(&policy_path, "(version 1)").unwrap();
 
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: dir.path().to_path_buf(),
             policy_path,
         };
@@ -706,6 +800,7 @@ mod tests {
         std::fs::set_permissions(&fake_launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: dir.path().to_path_buf(),
             policy_path,
         };
@@ -755,6 +850,7 @@ mod tests {
 
         {
             let _sandbox = SeatbeltSandbox {
+                profile_roots: ProfileRoots::default(),
                 policy_dir: dir.path().to_path_buf(),
                 policy_path: policy_path.clone(),
             };
@@ -789,6 +885,7 @@ mod tests {
         let policy_path = dir.path().join("test.sb");
 
         let sandbox = SeatbeltSandbox {
+            profile_roots: ProfileRoots::default(),
             policy_dir: dir.path().to_path_buf(),
             policy_path: policy_path.clone(),
         };
@@ -1065,6 +1162,225 @@ mod tests {
         assert!(write.success, "{:?}", write.error);
         assert_eq!(
             std::fs::read(workspace.join("copied.txt")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn seatbelt_shell_denies_read_only_arguments_under_forbidden_write_grant() {
+        use crate::platform::NativeRuntime;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        use crate::tools::shell::ShellTool;
+        use std::sync::Arc;
+        use zeroclaw_api::tool::Tool;
+
+        let fixture = HomeFixture::new("shell-forbidden-write");
+        let workspace = fixture.child("workspace");
+        let forbidden = workspace.join("shared");
+        let readable = forbidden.join("docs");
+        let safe = fixture.child("safe");
+        std::fs::create_dir_all(&readable).unwrap();
+        std::fs::write(readable.join("existing.txt"), b"original").unwrap();
+        std::fs::write(safe.join("read.txt"), b"safe").unwrap();
+        std::fs::write(workspace.join("input.txt"), b"replacement").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![readable.clone(), safe.clone()],
+            forbidden_paths: vec![forbidden.to_string_lossy().into()],
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        assert!(security.is_resolved_path_readable(&readable.join("existing.txt")));
+        assert!(!security.is_resolved_path_allowed(&readable.join("existing.txt")));
+        let sandbox = SeatbeltSandbox::with_roots(
+            Some(&workspace),
+            &[],
+            &security.allowed_roots_read_only,
+            &[],
+        )
+        .unwrap();
+        let tool = ShellTool::new_with_sandbox(
+            Arc::clone(&security),
+            Arc::new(NativeRuntime::with_shell("/bin/sh".into())),
+            Arc::new(sandbox),
+        );
+        let mut results = Vec::new();
+        for target in [readable.join("existing.txt"), readable.join("new.txt")] {
+            let result = tool
+                .execute(serde_json::json!({
+                    "command": format!("cp ./input.txt '{}'", target.display()),
+                }))
+                .await
+                .unwrap();
+            results.push((target, result.success, result.error));
+        }
+        assert!(
+            results.iter().all(|(_, success, error)| !success
+                && error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Path blocked"))),
+            "the old unconditional capability permits both real native writes: {results:?}"
+        );
+        assert_eq!(
+            std::fs::read(readable.join("existing.txt")).unwrap(),
+            b"original"
+        );
+        assert!(!readable.join("new.txt").exists());
+        let read = crate::tools::FileReadTool::new(Arc::clone(&security))
+            .execute(serde_json::json!({"path": readable.join("existing.txt")}))
+            .await
+            .unwrap();
+        assert!(read.success, "{:?}", read.error);
+        assert!(read.output.contains("original"));
+        let read = tool
+            .execute(serde_json::json!({
+                "command": format!("cat '{}'", safe.join("read.txt").display()),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            read.success,
+            "an unrelated protected argument must remain usable: {:?}",
+            read.error
+        );
+        assert_eq!(read.output.trim(), "safe");
+        let write = tool
+            .execute(serde_json::json!({"command": "cp ./input.txt ./copied.txt"}))
+            .await
+            .unwrap();
+        assert!(write.success, "{:?}", write.error);
+        assert_eq!(
+            std::fs::read(workspace.join("copied.txt")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn seatbelt_shell_preserves_writable_children_but_checks_forbidden_holes() {
+        use crate::platform::NativeRuntime;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        use crate::tools::shell::ShellTool;
+        use std::sync::Arc;
+        use zeroclaw_api::tool::Tool;
+
+        let fixture = HomeFixture::new("shell-writable-children");
+        let workspace = fixture.child("workspace");
+        let shared = fixture.child("shared");
+        let cache = shared.join("cache");
+        let drop = shared.join("drop");
+        let forbidden = cache.join("private");
+        let readable = forbidden.join("docs");
+        for path in [&readable, &drop] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(workspace.join("input.txt"), b"replacement").unwrap();
+        std::fs::write(shared.join("safe.txt"), b"safe").unwrap();
+        std::fs::write(readable.join("existing.txt"), b"original").unwrap();
+        let mut security = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![shared.clone(), readable.clone()],
+            allowed_roots: vec![cache.clone()],
+            allowed_roots_write_only: vec![drop.clone()],
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let sandbox = Arc::new(
+            SeatbeltSandbox::with_roots(
+                Some(&workspace),
+                &security.allowed_roots,
+                &security.allowed_roots_read_only,
+                &security.allowed_roots_write_only,
+            )
+            .unwrap(),
+        );
+        let tool = ShellTool::new_with_sandbox(
+            Arc::new(security.clone()),
+            Arc::new(NativeRuntime::with_shell("/bin/sh".into())),
+            sandbox.clone(),
+        );
+        let listing = tool
+            .execute(serde_json::json!({
+                "command": format!("ls '{}'", shared.display()),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            listing.success,
+            "authorized writable children must not poison the RO directory: {:?}",
+            listing.error
+        );
+        assert!(listing.output.contains("safe.txt"));
+        for target in [cache.join("allowed.txt"), drop.join("allowed.txt")] {
+            let write = tool
+                .execute(serde_json::json!({
+                    "command": format!("cp ./input.txt '{}'", target.display()),
+                }))
+                .await
+                .unwrap();
+            assert!(write.success, "{:?}", write.error);
+            assert_eq!(std::fs::read(target).unwrap(), b"replacement");
+        }
+        // The same generated profile must now be compared with the caller's
+        // narrower policy, not a policy snapshot cached in the sandbox handle.
+        security
+            .forbidden_paths
+            .push(forbidden.to_string_lossy().into());
+        let tool = ShellTool::new_with_sandbox(
+            Arc::new(security),
+            Arc::new(NativeRuntime::with_shell("/bin/sh".into())),
+            sandbox,
+        );
+        let mut results = Vec::new();
+        for command in [
+            format!("ls '{}'", shared.display()),
+            format!(
+                "cp ./input.txt '{}'",
+                readable.join("existing.txt").display()
+            ),
+            format!("cp ./input.txt '{}'", readable.join("new.txt").display()),
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"command": command.clone()}))
+                .await
+                .unwrap();
+            results.push((command, result.success, result.error));
+        }
+        assert!(
+            results.iter().all(|(_, success, error)| !success
+                && error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Path blocked"))),
+            "a newly admitted RO argument must not expose a forbidden write hole: {results:?}"
+        );
+        assert_eq!(
+            std::fs::read(readable.join("existing.txt")).unwrap(),
+            b"original"
+        );
+        assert!(!readable.join("new.txt").exists());
+        let read = tool
+            .execute(serde_json::json!({
+                "command": format!("cat '{}'", shared.join("safe.txt").display()),
+            }))
+            .await
+            .unwrap();
+        assert!(read.success, "{:?}", read.error);
+        assert_eq!(read.output.trim(), "safe");
+        let write = tool.execute(serde_json::json!({
+            "command": format!("cp ./input.txt '{}'", cache.join("still-allowed.txt").display()),
+        })).await.unwrap();
+        assert!(
+            write.success,
+            "ordinary authorized writes retain their existing admission: {:?}",
+            write.error
+        );
+        assert_eq!(
+            std::fs::read(cache.join("still-allowed.txt")).unwrap(),
             b"replacement"
         );
     }

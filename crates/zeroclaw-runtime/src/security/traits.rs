@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use std::ffi::OsStr;
+use std::path::Path;
 use std::process::Command;
 
 #[async_trait]
@@ -27,12 +28,16 @@ pub trait Sandbox: Send + Sync {
         Ok(())
     }
 
-    /// Whether successful wrapping enforces the caller's read-only path grants.
+    /// Whether successful wrapping protects this read-only ordinary argument.
     ///
-    /// Backends that consume the policy's tiers, or isolate host paths outside
-    /// the workspace entirely, may opt in. Pass-through and generic wrappers
-    /// default to false; availability and a backend name do not prove this.
-    fn enforces_read_only_paths(&self) -> bool {
+    /// Only actual grants overlapping this target matter. A writable descendant
+    /// remains valid when the caller's current policy authorizes that subtree.
+    /// Pass-through wrappers default closed; a backend name is not proof.
+    fn protects_read_only_argument(
+        &self,
+        _resolved_argument: &Path,
+        _write_subtree_allowed: &dyn Fn(&Path) -> bool,
+    ) -> bool {
         false
     }
 
@@ -56,6 +61,27 @@ pub trait Sandbox: Send + Sync {
     /// instead of spawning a misleading partial sandbox.
     fn coding_cli_unsupported_reason(&self) -> Option<&'static str> {
         None
+    }
+}
+
+/// Check only the writable intersection with the newly admitted argument.
+/// Disjoint grants do not affect it; authorized writable children remain valid.
+#[cfg(any(
+    test,
+    target_os = "macos",
+    all(target_os = "linux", feature = "sandbox-landlock")
+))]
+pub(super) fn write_grant_preserves_argument(
+    argument: &Path,
+    grant: &Path,
+    write_subtree_allowed: &dyn Fn(&Path) -> bool,
+) -> bool {
+    if argument.starts_with(grant) {
+        write_subtree_allowed(argument)
+    } else if grant.starts_with(argument) {
+        write_subtree_allowed(grant)
+    } else {
+        true
     }
 }
 
@@ -86,6 +112,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_grants_are_checked_only_at_the_argument_intersection() {
+        let writable = Path::new("/shared/cache");
+        let allowed = |root: &Path| root.starts_with(writable);
+        assert!(write_grant_preserves_argument(
+            Path::new("/shared"),
+            writable,
+            &allowed
+        ));
+        assert!(write_grant_preserves_argument(
+            Path::new("/protected/file"),
+            Path::new("/tmp"),
+            &|_| false
+        ));
+        assert!(!write_grant_preserves_argument(
+            Path::new("/tmp/shared/file"),
+            Path::new("/tmp"),
+            &|_| false
+        ));
+        assert!(!write_grant_preserves_argument(
+            Path::new("/data/shared/docs/file"),
+            Path::new("/data"),
+            &|_| false
+        ));
+    }
+
+    #[test]
     fn noop_sandbox_name() {
         assert_eq!(NoopSandbox.name(), "none");
     }
@@ -93,7 +145,7 @@ mod tests {
     #[test]
     fn noop_sandbox_is_always_available() {
         assert!(NoopSandbox.is_available());
-        assert!(!NoopSandbox.enforces_read_only_paths());
+        assert!(!NoopSandbox.protects_read_only_argument(Path::new("/shared"), &|_| true));
         assert!(NoopSandbox.check_initialization().is_ok());
     }
 

@@ -4,8 +4,8 @@
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use landlock::{
-    AccessFs, BitFlags, Errno, PathBeneath, PathFd, PathFdError, Ruleset, RulesetAttr,
-    RulesetCreated, RulesetCreatedAttr,
+    AccessFs, BitFlags, CompatLevel, Compatible, Errno, PathBeneath, PathFd, PathFdError, Ruleset,
+    RulesetAttr, RulesetCreated, RulesetCreatedAttr,
 };
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use std::os::unix::process::CommandExt;
@@ -337,6 +337,15 @@ impl LandlockSandbox {
     /// child process via `pre_exec` (see `wrap_command`), so only the
     /// child is restricted — the daemon (parent) process is never affected.
     fn build_ruleset(&self) -> std::io::Result<RulesetCreated> {
+        self.build_ruleset_observing_grants(|_, _| {})
+    }
+
+    // Observe the same successfully installed rules without changing selection,
+    // best-effort compatibility or the handling of optional roots.
+    fn build_ruleset_observing_grants(
+        &self,
+        mut observe: impl FnMut(&Path, BitFlags<AccessFs>),
+    ) -> std::io::Result<RulesetCreated> {
         let mut ruleset = Ruleset::default()
             .handle_access(handled_access())
             .and_then(|ruleset| ruleset.create())
@@ -351,6 +360,7 @@ impl LandlockSandbox {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(workspace_fd, read_write_access()))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+            observe(workspace, read_write_access());
         }
 
         // The extra `SecurityPolicy` root tiers (cross-agent grants,
@@ -479,6 +489,7 @@ impl LandlockSandbox {
                         ruleset = ruleset
                             .add_rule(PathBeneath::new(root_fd, perm))
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        observe(root, perm);
                     }
                     Err(e) => {
                         let absent = matches!(
@@ -527,6 +538,7 @@ impl LandlockSandbox {
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(path_fd, perm))
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    observe(Path::new(allow_path), perm);
                 }
                 Err(PathFdError::OpenCall { source, .. }) => {
                     if source.kind() == std::io::ErrorKind::NotFound {
@@ -653,8 +665,41 @@ impl Sandbox for LandlockSandbox {
         Ok(())
     }
 
-    fn enforces_read_only_paths(&self) -> bool {
-        true
+    fn protects_read_only_argument(
+        &self,
+        resolved_argument: &Path,
+        write_subtree_allowed: &dyn Fn(&Path) -> bool,
+    ) -> bool {
+        // BestEffort may return NotEnforced or omit Truncate. Probe the exact
+        // handled rights strictly for this opt-in only; never restrict the
+        // parent or change the existing backend selection/wrapping policy.
+        if Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(handled_access())
+            .and_then(|ruleset| ruleset.create())
+            .is_err()
+        {
+            return false;
+        }
+
+        let mutations =
+            handled_access() & !(AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir);
+        let mut protected = true;
+        let ruleset = self.build_ruleset_observing_grants(|root, permissions| {
+            if (permissions & mutations).is_empty() {
+                return;
+            }
+            protected &= root.canonicalize().is_ok_and(|grant| {
+                super::traits::write_grant_preserves_argument(
+                    resolved_argument,
+                    &grant,
+                    write_subtree_allowed,
+                )
+            });
+        });
+        // Dropping this ruleset only closes its fd. The actual child must still
+        // pass the normal wrapper and restriction syscall before it can exec.
+        ruleset.is_ok() && protected
     }
 
     fn is_available(&self) -> bool {
@@ -740,6 +785,115 @@ impl Sandbox for LandlockSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn landlock_argument_proof_is_per_path_and_preserves_policy_children() {
+        use crate::security::SecurityPolicy;
+        let home = std::env::var_os("HOME").expect("native Landlock fixture requires HOME");
+        let fixture = tempfile::Builder::new()
+            .prefix("zeroclaw-landlock-arguments-")
+            .tempdir_in(home)
+            .unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let safe = root.join("safe");
+        let cache = safe.join("cache");
+        let private = cache.join("private");
+        let docs = private.join("docs");
+        for path in [&workspace, &docs] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let temp_root = temp.path().canonicalize().unwrap();
+        let mut policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![safe.clone(), docs, temp_root.clone()],
+            allowed_roots: vec![cache],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let sandbox = LandlockSandbox::with_roots(
+            Some(workspace),
+            policy.allowed_roots.clone(),
+            policy.allowed_roots_read_only.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        let strict = Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(handled_access())
+            .and_then(|ruleset| ruleset.create());
+        if strict.is_err() {
+            assert!(!sandbox.protects_read_only_argument(&safe, &|_| true));
+            eprintln!(
+                "full-ABI native positive unavailable; conservative capability refusal verified"
+            );
+            return;
+        }
+        let protects = |policy: &SecurityPolicy, path: &Path| {
+            sandbox.protects_read_only_argument(path, &|root| {
+                policy.shell_write_subtree_is_authorized(root)
+            })
+        };
+        assert!(
+            protects(&policy, &safe),
+            "authorized writable child stays valid"
+        );
+        assert!(
+            !protects(&policy, &temp_root.join("existing.txt")),
+            "generic /tmp still permits overwrite/truncate"
+        );
+        assert!(
+            protects(&policy, &safe.join("file")),
+            "an unrelated unsafe root must not poison this argument"
+        );
+        policy
+            .forbidden_paths
+            .push(private.to_string_lossy().into());
+        assert!(
+            !protects(&policy, &safe),
+            "writable child now contains a forbidden hole"
+        );
+        assert!(
+            protects(&policy, &safe.join("file")),
+            "this file does not overlap that grant"
+        );
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn landlock_grant_observer_excludes_skipped_tiers_and_execute_only_conflicts() {
+        let sandbox = LandlockSandbox::with_roots(
+            None,
+            Vec::new(),
+            vec![PathBuf::from("/usr")],
+            vec![PathBuf::from("/usr/lib")],
+        )
+        .unwrap();
+        let mutations =
+            handled_access() & !(AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir);
+        let mut writes = Vec::new();
+        sandbox
+            .build_ruleset_observing_grants(|path, access| {
+                if !(access & mutations).is_empty() {
+                    writes.push(path.to_path_buf());
+                }
+            })
+            .unwrap();
+        assert!(
+            !writes.contains(&PathBuf::from("/usr/lib")),
+            "generic read/execute overlap skips this WO tier"
+        );
+        assert!(writes.contains(&PathBuf::from("/tmp")));
+        let strict = Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(handled_access())
+            .and_then(|ruleset| ruleset.create());
+        if strict.is_ok() {
+            assert!(sandbox.protects_read_only_argument(Path::new("/usr"), &|_| false));
+        }
+    }
 
     /// The overlap predicate that decides whether a tier stays authoritative.
     ///

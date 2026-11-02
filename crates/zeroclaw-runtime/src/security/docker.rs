@@ -165,7 +165,12 @@ impl Sandbox for DockerSandbox {
         self.wrap_command_with_program(cmd, shell_program)
     }
 
-    fn enforces_read_only_paths(&self) -> bool {
+    fn protects_read_only_argument(
+        &self,
+        _resolved_argument: &std::path::Path,
+        _write_subtree_allowed: &dyn Fn(&std::path::Path) -> bool,
+    ) -> bool {
+        // The only host mount this wrapper installs is read-only.
         true
     }
 

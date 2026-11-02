@@ -249,18 +249,24 @@ impl Tool for ShellTool {
         // rather than relying on an outer generic path guard that defaults to
         // POSIX. This keeps symlink-escape hardening while allowing cmd.exe's
         // null device only on the native Windows execution path.
-        let blocked_path = if self.runtime.enforces_shell_read_only_paths()
-            || self.sandbox.enforces_read_only_paths()
-        {
-            self.security
-                .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
-        } else {
-            self.security
-                .forbidden_unsandboxed_workspace_path_argument_for_shell(
-                    command,
-                    self.runtime.shell_dialect(),
-                )
-        };
+        let write_subtree_allowed =
+            |root: &std::path::Path| self.security.shell_write_subtree_is_authorized(root);
+        let blocked_path = self
+            .security
+            .forbidden_workspace_path_argument_with_protection(
+                command,
+                self.runtime.shell_dialect(),
+                &|argument, resolved| {
+                    self.runtime.protects_shell_read_only_argument(
+                        argument,
+                        resolved,
+                        &self.security.workspace_dir,
+                        &write_subtree_allowed,
+                    ) || self
+                        .sandbox
+                        .protects_read_only_argument(resolved, &write_subtree_allowed)
+                },
+            );
         if let Some(path) = blocked_path {
             return Ok(ToolResult {
                 success: false,

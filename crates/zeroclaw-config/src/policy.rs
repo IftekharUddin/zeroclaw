@@ -826,7 +826,7 @@ fn expand_user_path(path: &str) -> PathBuf {
 /// resolve"), and callers fail closed by BLOCKING the path - a crafted cycle
 /// never falls back to the literal input. An unreadable link is kept as a
 /// literal component while resolution continues on its ancestors.
-fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     let mut current = path.to_path_buf();
     // Bounds the number of `..`-style retries plus symlink hops so a symlink
@@ -4731,7 +4731,7 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, false, true)
+        self.forbidden_path_argument_impl(command, dialect, false, None)
     }
 
     /// Like [`SecurityPolicy::forbidden_workspace_path_argument`], but against
@@ -4744,7 +4744,7 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, true, true)
+        self.forbidden_path_argument_impl(command, dialect, true, None)
     }
 
     /// Workspace-resolving scan for execution without a read-only filesystem boundary.
@@ -4757,7 +4757,43 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, true, false)
+        self.forbidden_workspace_path_argument_with_protection(command, dialect, &|_, _| false)
+    }
+
+    /// Scan an executing shell command using its actual read-only boundary.
+    ///
+    /// Writable arguments retain their existing admission. An argument admitted
+    /// solely for reading must also be protected by the execution boundary.
+    /// The predicate receives the scanned spelling and canonical policy target;
+    /// redirects retain their existing direction-specific checks.
+    pub fn forbidden_workspace_path_argument_with_protection(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+        protects_read_only: &dyn Fn(&str, &Path) -> bool,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, dialect, true, Some(protects_read_only))
+    }
+
+    /// Whether the existing write policy authorizes an entire exposed subtree.
+    ///
+    /// Used only when an execution backend exposes writes beneath an otherwise
+    /// read-only ordinary shell argument. More-specific allow roots can only add
+    /// authority; canonical forbidden boundaries are the places where an
+    /// authorized subtree can acquire a non-writable hole. This does not change
+    /// ordinary writable-argument admission or recursively inspect files.
+    pub fn shell_write_subtree_is_authorized(&self, root: &Path) -> bool {
+        let Some(root) = self.resolve_policy_target(root) else {
+            return false;
+        };
+        self.is_resolved_path_allowed(&root)
+            && self.forbidden_paths.iter().all(|forbidden| {
+                let Some(forbidden) = resolve_symlinked_path(&expand_user_path(forbidden)) else {
+                    // Match the canonical policy owner's effective prefixes.
+                    return true;
+                };
+                !forbidden.starts_with(&root) || self.is_resolved_path_allowed(&forbidden)
+            })
     }
 
     fn forbidden_path_argument_impl(
@@ -4765,14 +4801,14 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
         resolve_workspace: bool,
-        read_only_arguments_enforced: bool,
+        protects_read_only: Option<&dyn Fn(&str, &Path) -> bool>,
     ) -> Option<String> {
         if split_unquoted_segments_checked(command, dialect).is_err() {
             // Name the opener rather than a path. The shell wrapper refuses
             // any `Some`, and guessing which later command runs is the bypass.
             return Some("unreadable heredoc delimiter".into());
         }
-        let forbidden_candidate = |raw: &str| {
+        let forbidden_candidate = |raw: &str, ordinary_argument: bool| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
@@ -4806,11 +4842,22 @@ impl SecurityPolicy {
             // cycle exhausting the hop budget) - `None` means "unresolvable", not
             // "allowed" - so a crafted chain cannot dodge the check.
             if resolve_workspace {
-                match self.resolve_command_path_argument(candidate, dialect) {
-                    Some(resolved)
-                        if self.is_resolved_path_allowed(&resolved)
-                            || self.is_resolved_path_readable(&resolved) => {}
-                    _ => return Some(candidate.to_string()),
+                let Some(resolved) = self.resolve_command_path_argument(candidate, dialect) else {
+                    return Some(candidate.to_string());
+                };
+                let write_allowed = self.is_resolved_path_allowed(&resolved)
+                    && (!ordinary_argument
+                        || protects_read_only.is_none()
+                        || self.is_write_target_allowed_for_shell(candidate, dialect));
+                if write_allowed {
+                    return None;
+                }
+                let read_allowed = self.is_resolved_path_readable(&resolved)
+                    && (!ordinary_argument
+                        || protects_read_only
+                            .is_none_or(|protects| protects(candidate, &resolved)));
+                if !read_allowed {
+                    return Some(candidate.to_string());
                 }
             }
             None
@@ -4850,15 +4897,9 @@ impl SecurityPolicy {
         let forbidden_redirect_target =
             |target: &str, direction: RedirectionDirection| match direction {
                 RedirectionDirection::Write => forbidden_write_candidate(target),
-                RedirectionDirection::Read => forbidden_candidate(target),
+                RedirectionDirection::Read => forbidden_candidate(target, false),
             };
-        let forbidden_argument_candidate = |raw: &str| {
-            if read_only_arguments_enforced {
-                forbidden_candidate(raw)
-            } else {
-                forbidden_write_candidate(raw)
-            }
-        };
+        let forbidden_argument_candidate = |raw: &str| forbidden_candidate(raw, true);
         let forbidden_non_redirect_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -11802,6 +11843,119 @@ mod tests {
                 .is_some(),
             "PowerShell's relative separator must reach canonical RO checking"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_read_only_protection_is_per_argument_and_skips_writes() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let safe = root.join("safe");
+        let unsafe_root = root.join("unsafe");
+        for path in [&workspace, &safe, &unsafe_root] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        symlink(&safe, workspace.join("alias")).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            allowed_roots_read_only: vec![safe.clone(), unsafe_root.clone()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let queries = Cell::new(0);
+        let protects = |_: &str, resolved: &Path| {
+            queries.set(queries.get() + 1);
+            assert!(!policy.is_resolved_path_allowed(resolved));
+            resolved.starts_with(&safe)
+        };
+        for command in [
+            format!("cat '{}/existing.txt'", safe.display()),
+            "cat alias/missing/leaf.txt".into(),
+            format!("tool --file={}/existing.txt", safe.display()),
+        ] {
+            assert!(
+                policy
+                    .forbidden_workspace_path_argument_with_protection(
+                        &command,
+                        ShellDialect::Posix,
+                        &protects,
+                    )
+                    .is_none(),
+                "{command}"
+            );
+        }
+        assert_eq!(queries.get(), 3);
+        assert!(
+            policy
+                .forbidden_workspace_path_argument_with_protection(
+                    &format!("cat '{}/existing.txt'", unsafe_root.display()),
+                    ShellDialect::Posix,
+                    &protects,
+                )
+                .is_some()
+        );
+        assert_eq!(queries.get(), 4);
+        for command in [
+            "cp ./input.txt ./new.txt".into(),
+            format!("cat < '{}/existing.txt'", unsafe_root.display()),
+        ] {
+            assert!(
+                policy
+                    .forbidden_workspace_path_argument_with_protection(
+                        &command,
+                        ShellDialect::Posix,
+                        &|_, _| panic!("writable arguments and input redirects need no proof"),
+                    )
+                    .is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_write_subtree_preserves_writable_children_and_canonical_denials() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let shared = root.join("shared");
+        let cache = shared.join("cache");
+        let drop = shared.join("drop");
+        let private = cache.join("private");
+        let readable = private.join("docs");
+        for path in [&workspace, &readable, &drop] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let alias = root.join("private-alias");
+        symlink(&private, &alias).unwrap();
+        let mut policy = SecurityPolicy {
+            workspace_dir: workspace,
+            allowed_roots_read_only: vec![shared.clone(), readable.clone()],
+            allowed_roots: vec![cache.clone()],
+            allowed_roots_write_only: vec![drop.clone()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(!policy.shell_write_subtree_is_authorized(&shared));
+        assert!(policy.shell_write_subtree_is_authorized(&cache));
+        assert!(policy.shell_write_subtree_is_authorized(&drop));
+        policy.forbidden_paths.push(alias.to_string_lossy().into());
+        assert!(policy.is_resolved_path_readable(&readable.join("new.txt")));
+        assert!(!policy.is_resolved_path_allowed(&readable.join("new.txt")));
+        assert!(!policy.shell_write_subtree_is_authorized(&cache));
+        assert!(!policy.shell_write_subtree_is_authorized(&readable));
+        assert!(policy.shell_write_subtree_is_authorized(&cache.join("ordinary")));
+        assert!(policy.shell_write_subtree_is_authorized(&drop));
+        // A deeper explicit write grant authorizes only that child, not the
+        // still-forbidden remainder of its parent.
+        let public = private.join("public");
+        policy.allowed_roots.push(public.clone());
+        assert!(policy.shell_write_subtree_is_authorized(&public));
+        assert!(!policy.shell_write_subtree_is_authorized(&cache));
     }
 
     /// A read-only root grants READS. A shell redirect WRITES, so the target

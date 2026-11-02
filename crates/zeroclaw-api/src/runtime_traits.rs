@@ -263,13 +263,19 @@ pub trait RuntimeAdapter: Send + Sync {
         None
     }
 
-    /// Whether the command builder protects host read-only paths from writes.
+    /// Whether this command builder protects a read-only ordinary argument.
     ///
-    /// Return true only when the actual execution boundary enforces those paths
-    /// or excludes host paths outside the writable workspace from the child.
-    /// The default is conservative for native and third-party adapters. This is
-    /// not an availability probe or a claim derived from a configured name.
-    fn enforces_shell_read_only_paths(&self) -> bool {
+    /// The spelling and resolved host target let a container adapter account for
+    /// its actual backing mount. Any exposed writable overlap must be authorized
+    /// by `write_subtree_allowed`. Successful command construction and execution
+    /// through this adapter remain required; availability alone proves nothing.
+    fn protects_shell_read_only_argument(
+        &self,
+        _argument: &str,
+        _resolved_argument: &Path,
+        _workspace_dir: &Path,
+        _write_subtree_allowed: &dyn Fn(&Path) -> bool,
+    ) -> bool {
         false
     }
 

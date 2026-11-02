@@ -268,10 +268,64 @@ impl RuntimeAdapter for DockerRuntime {
         ShellDialect::Posix
     }
 
-    fn enforces_shell_read_only_paths(&self) -> bool {
-        // The builder mounts only the validated workspace, at /workspace. Host
-        // read-only roots outside it are not exposed to the container at all.
-        true
+    fn protects_shell_read_only_argument(
+        &self,
+        argument: &str,
+        resolved_argument: &Path,
+        workspace_dir: &Path,
+        write_subtree_allowed: &dyn Fn(&Path) -> bool,
+    ) -> bool {
+        let Ok(mount) = self.validated_workspace_mount(workspace_dir) else {
+            return false;
+        };
+        let Some(mount) = mount else {
+            return true;
+        };
+        let argument = Path::new(argument);
+        let relative = if argument.is_absolute() {
+            argument.strip_prefix("/workspace").ok()
+        } else {
+            // The image's HOME is not the host's HOME.
+            if argument.as_os_str().to_string_lossy().starts_with('~') {
+                return false;
+            }
+            Some(argument)
+        };
+        let mapped;
+        let target = if let Some(relative) = relative {
+            let mut backing = mount.clone();
+            for component in relative.components() {
+                match component {
+                    std::path::Component::CurDir => continue,
+                    std::path::Component::Normal(part) => backing.push(part),
+                    _ => return false,
+                }
+                match std::fs::symlink_metadata(&backing) {
+                    // A host symlink can resolve differently in the image.
+                    // Do not invent a container resolver to prove this opt-in.
+                    Ok(metadata) if metadata.is_symlink() => return false,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return false,
+                }
+            }
+            let Some(resolved) = crate::policy::resolve_symlinked_path(&backing) else {
+                return false;
+            };
+            mapped = resolved;
+            mapped.as_path()
+        } else {
+            resolved_argument
+        };
+        // Only this validated host root is mounted, read-write, at /workspace.
+        // Compare the actual backing target, not the container alias spelling.
+        if target.starts_with(&mount) {
+            write_subtree_allowed(target)
+        } else if mount.starts_with(target) {
+            write_subtree_allowed(&mount)
+        } else {
+            true
+        }
     }
 
     fn build_shell_command(
@@ -348,7 +402,96 @@ mod tests {
     fn docker_reports_posix_shell_dialect() {
         let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
-        assert!(runtime.enforces_shell_read_only_paths());
+    }
+
+    #[test]
+    fn docker_read_only_argument_proof_uses_the_actual_backing_mount() {
+        use crate::policy::SecurityPolicy;
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().canonicalize().unwrap();
+        let forbidden = workspace.join("private");
+        let readable = forbidden.join("docs");
+        std::fs::create_dir_all(&readable).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![readable.clone()],
+            forbidden_paths: vec![forbidden.to_string_lossy().into()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        let allows = |path: &Path| policy.shell_write_subtree_is_authorized(path);
+        let command = runtime
+            .build_shell_command_for_test("true", &workspace)
+            .unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--volume",
+                &format!("{}:/workspace:rw", workspace.display())
+            ]));
+        assert!(policy.is_resolved_path_readable(&readable.join("new.txt")));
+        assert!(!policy.is_resolved_path_allowed(&readable.join("new.txt")));
+        for (spelling, target) in [
+            ("private/docs/new.txt", readable.join("new.txt")),
+            (
+                "/workspace/private/docs/new.txt",
+                PathBuf::from("/workspace/private/docs/new.txt"),
+            ),
+        ] {
+            assert!(
+                !runtime.protects_shell_read_only_argument(spelling, &target, &workspace, &allows)
+            );
+        }
+        assert!(runtime.protects_shell_read_only_argument(
+            "/unmounted/shared/file",
+            Path::new("/unmounted/shared/file"),
+            &workspace,
+            &allows
+        ));
+        assert!(runtime.protects_shell_read_only_argument(
+            "ordinary/new.txt",
+            &workspace.join("ordinary/new.txt"),
+            &workspace,
+            &allows
+        ));
+        let no_mount = DockerRuntime::new(DockerRuntimeConfig {
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        });
+        assert!(no_mount.protects_shell_read_only_argument(
+            "/workspace/private/docs/new.txt",
+            &readable.join("new.txt"),
+            &workspace,
+            &|_| false
+        ));
+        let command = no_mount
+            .build_shell_command_for_test("true", &workspace)
+            .unwrap();
+        assert!(!command.as_std().get_args().any(|arg| arg == "--volume"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_read_only_argument_proof_does_not_assume_host_alias_semantics() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().canonicalize().unwrap();
+        let target = workspace.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink("target", workspace.join("alias")).unwrap();
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        for spelling in ["alias/file", "/workspace/alias/file", "~/file"] {
+            assert!(!runtime.protects_shell_read_only_argument(
+                spelling,
+                &target.join("file"),
+                &workspace,
+                &|_| true
+            ));
+        }
     }
 
     #[test]
