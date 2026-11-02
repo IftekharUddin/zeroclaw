@@ -21,7 +21,7 @@ fn get_paircode_exits_nonzero_when_gateway_fetch_fails() {
     let config_dir = tempfile::tempdir().expect("temporary config directory");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        "schema_version = 3\n",
+        "schema_version = 3\nlocale = \"en\"\n",
     )
     .expect("seed config");
 
