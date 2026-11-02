@@ -36,7 +36,7 @@ holds, milestones, review state, or attribution, so the skill does that before
 it enqueues.
 
 The repository's squash settings use the PR title for the subject (GitHub
-appends ` (#N)`) and a blank configured body. GitHub can still append co-author
+appends a space and `(#N)`) and a blank configured body. GitHub can still append co-author
 trailers. These settings do not prove that the landed commit has an empty body;
 verify its actual message after the queue merges it. Preserve permitted human
 attribution under the contributing and privacy rules.
@@ -204,7 +204,7 @@ Failed or cancelled required checks must be resolved before merging.
 
 The PR title becomes the squash commit subject, so it must be in conventional
 commit format, e.g. `feat(scope): description` or `fix: short message`, without
-a ` (#N)` suffix (GitHub adds it). If it is not, flag it, suggest a corrected
+a `(#N)` suffix (GitHub adds it with a preceding space). If it is not, flag it, suggest a corrected
 title, and do not continue until the title is fixed. Editing the title is a
 separate public change that needs the user's approval.
 
