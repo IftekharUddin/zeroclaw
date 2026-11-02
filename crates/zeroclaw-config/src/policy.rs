@@ -10592,8 +10592,8 @@ mod tests {
         ] {
             assert_eq!(bash(command), None, "{command:?}");
         }
-        // The same boundary must expose the following command to a strict
-        // allowlist, while a quoted delimiter leaves that text as body data.
+        // Strict allowlists still refuse every line continuation, including
+        // quoted delimiters. A plain quoted heredoc remains admissible.
         let strict = SecurityPolicy {
             allowed_commands: vec!["cat".into()],
             ..SecurityPolicy::default()
@@ -10602,8 +10602,12 @@ mod tests {
             "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd",
             bash_grammar(),
         ));
-        assert!(strict.is_command_allowed_for_grammar(
+        assert!(!strict.is_command_allowed_for_grammar(
             "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            bash_grammar(),
+        ));
+        assert!(strict.is_command_allowed_for_grammar(
+            "cat <<'EOF'\nwc -l /etc/passwd\nEOF",
             bash_grammar(),
         ));
     }
