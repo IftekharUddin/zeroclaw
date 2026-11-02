@@ -3524,6 +3524,51 @@ mod web_fetch_spill_tests {
         }
     }
 
+    #[tokio::test]
+    async fn web_fetch_spill_requires_a_reader_for_nul_containing_text() {
+        let body = format!(
+            "first line\nneedle\0still utf8\n{}",
+            "readable tail\n".repeat(5_000)
+        );
+        let server = server(&body).await;
+        let manager = approval(AutonomyLevel::Full, &[], &[]);
+        for readers in [
+            vec!["content_search"],
+            vec!["file_read"],
+            vec!["file_read", "content_search"],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let policy = policy(root.path());
+            let mut caller: Vec<String> = readers.iter().map(|name| name.to_string()).collect();
+            caller.extend(["web_fetch".into(), "file_write".into()]);
+            let registry = assemble(&policy, built_tools(&policy, true), Some(&caller)).await;
+            let result = fetch(dispatch(&registry, Some(&manager), &[]), &server.uri()).await;
+            assert!(result.success);
+            if !readers.contains(&"file_read") {
+                assert!(
+                    !result.output.contains("Saved to: "),
+                    "content_search skips NUL-containing files; it cannot be the sole spill reader"
+                );
+                assert_inline(&result, root.path(), &body);
+                continue;
+            }
+            let relative = saved_path(&result.output);
+            assert!(result.output.contains("file_read"));
+            assert!(!result.output.contains("content_search"));
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(&relative)).unwrap(),
+                body
+            );
+            let read = find_tool(&registry, "file_read")
+                .unwrap()
+                .execute(serde_json::json!({"path": relative, "offset": 2, "limit": 1}))
+                .await
+                .unwrap();
+            assert!(read.success, "{:?}", read.error);
+            assert!(read.output.contains("needle\0still utf8"));
+        }
+    }
+
     struct NamedOnly(&'static str);
     zeroclaw_api::mock_tool_attribution!(NamedOnly);
     #[async_trait::async_trait]

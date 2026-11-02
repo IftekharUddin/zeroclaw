@@ -120,6 +120,10 @@ impl Tool for ContentSearchTool {
         &self,
         file: &zeroclaw_api::tool::WebFetchSpillFile<'_>,
     ) -> anyhow::Result<bool> {
+        // Search backends treat NUL-containing files as binary and skip their text.
+        if file.text.as_bytes().contains(&0) {
+            return Ok(false);
+        }
         let path = file.relative_path;
         if path.contains("../") || path.contains("..\\") || path == ".." {
             return Ok(false);
