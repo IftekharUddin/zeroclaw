@@ -145,6 +145,8 @@ struct SessionFiles {
     session_path: String,
     retired: Arc<CancellationToken>,
     claim: tokio::sync::OnceCell<Arc<FileClaim>>,
+    #[cfg(test)]
+    claiming: Arc<tokio::sync::Notify>,
 }
 
 impl SessionFiles {
@@ -153,6 +155,8 @@ impl SessionFiles {
             session_path: session_path.to_string(),
             retired: Arc::new(CancellationToken::new()),
             claim: tokio::sync::OnceCell::new(),
+            #[cfg(test)]
+            claiming: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -162,8 +166,12 @@ impl SessionFiles {
                 let path = self.session_path.clone();
                 let retired = Arc::clone(&self.retired);
                 let closed = closed.clone();
+                #[cfg(test)]
+                let claiming = Arc::clone(&self.claiming);
                 tokio::task::spawn_blocking(move || {
                     let gate = session_gate(&path)?;
+                    #[cfg(test)]
+                    claiming.notify_one();
                     let mut current = gate
                         .current
                         .lock()
@@ -458,6 +466,7 @@ fn remove_confirmation_artifacts(session_path: &str) -> std::io::Result<()> {
 pub struct FilePasskeyConfirmation {
     session_path: String,
     files: Arc<SessionFiles>,
+    // Queued work from an aborted waiter must not clean a reissued attempt.
     revision: Arc<AtomicU64>,
     wait: Duration,
     closed: CancellationToken,
@@ -1264,28 +1273,34 @@ mod tests {
             );
         pause.entered().await;
         retire_past_grace(&old, &cancel, handle, grace).await;
+        assert!(
+            !callback.is_finished(),
+            "detached callback survived listener retirement"
+        );
+        // Even dropping the async filesystem waiter must not release the
+        // blocking worker's admitted ownership before the rename finishes.
+        callback.abort();
+        assert!(callback.await.unwrap_err().is_cancelled());
 
         let replacement = Arc::new(FilePasskeyAuthenticator::new(&session));
         let auth = Arc::clone(&replacement);
         let request = assertion_request(b"replacement");
         let contents = request.raw_options_json.clone();
         let next = zeroclaw_spawn::spawn!(async move { auth.get_assertion(&request).await });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            replacement.files.claiming.notified(),
+        )
+        .await
+        .expect("replacement must actually reach the shared gate");
         tokio::time::sleep(Duration::from_millis(150)).await;
         let published = std::fs::read_to_string(request_path(&session)).unwrap_or_default();
         assert_ne!(
             published, contents,
             "replacement published while an old filesystem worker still owned the path"
         );
-        assert!(
-            !callback.is_finished(),
-            "detached callback should survive listener retirement"
-        );
         pause.release();
         wait_for_contents(&request_path(&session), &contents).await;
-        assert!(matches!(
-            callback.await.unwrap(),
-            Err(PasskeyError::Cancelled)
-        ));
         old.confirmation.shutdown().await.unwrap();
         old.authenticator.shutdown().await.unwrap();
         old.confirmation
@@ -1325,6 +1340,12 @@ mod tests {
 
         let replacement = Arc::new(FilePasskeyConfirmation::new(&session));
         let next = confirmation_waiter(&replacement, "NEW-CODE");
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            replacement.files.claiming.notified(),
+        )
+        .await
+        .expect("replacement must actually reach the shared gate");
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(
             pending_confirmation(&session).unwrap(),
