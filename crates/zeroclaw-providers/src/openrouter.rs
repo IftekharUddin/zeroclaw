@@ -1331,7 +1331,7 @@ data: [DONE]
     #[tokio::test]
     async fn streaming_client_times_out_when_response_body_is_silent() {
         use futures_util::StreamExt as _;
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
@@ -1346,6 +1346,12 @@ data: [DONE]
                 .accept()
                 .await
                 .expect("accept OpenRouter idle-timeout test request");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192, "test request headers exceed 8 KiB");
+                request.push(socket.read_u8().await.expect("read test request headers"));
+            }
+            assert!(request.starts_with(b"GET "));
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n7\r\ninitial\r\n",

@@ -58,6 +58,14 @@ deny = [
 name = "async-channel"
 version = "=1.9.0"
 
+# reqwest 0.12 and the workspace still require base64 0.22, while
+# hyper-util 0.1.21 and lettre 0.11.23 require 0.23. Remove after these
+# consumers converge on the same compatible base64 release.
+[[bans.skip]]
+name = "base64"
+version = "=0.22.1"
+reason = "reqwest 0.12 and workspace require base64 0.22; hyper-util and lettre require 0.23"
+
 [[bans.skip]]
 name = "bitflags"
 version = "=1.3.2"
@@ -122,6 +130,13 @@ version = "=0.16.1"
 [[bans.skip]]
 name = "inout"
 version = "=0.1.4"
+
+# png 0.18.1 still requires miniz_oxide 0.8; flate2 1.1.10 requires 0.9.
+# Remove when png moves to the same generation as flate2.
+[[bans.skip]]
+name = "miniz_oxide"
+version = "=0.8.9"
+reason = "png 0.18.1 requires miniz_oxide 0.8; flate2 1.1.10 requires 0.9"
 
 [[bans.skip]]
 name = "mio"
@@ -221,6 +236,24 @@ version = "=0.48.5"
 [[bans.skip]]
 name = "windows_i686_msvc"
 version = "=0.52.6"
+
+# The workspace and process-wrap =9.0.0 retain windows 0.61, while
+# cpal 0.18.2 and tauri 2.12.5 require windows 0.62. Remove these older
+# support-crate skips when the remaining 0.61 consumers migrate together.
+[[bans.skip]]
+name = "windows-core"
+version = "=0.61.2"
+reason = "workspace and process-wrap =9.0.0 retain windows 0.61; cpal and tauri require 0.62"
+
+[[bans.skip]]
+name = "windows-result"
+version = "=0.3.4"
+reason = "windows-core 0.61.2 requires windows-result 0.3; windows-core 0.62.2 requires 0.4"
+
+[[bans.skip]]
+name = "windows-strings"
+version = "=0.4.2"
+reason = "windows-core 0.61.2 requires windows-strings 0.4; windows-core 0.62.2 requires 0.5"
 
 [[bans.skip]]
 name = "windows-link"
