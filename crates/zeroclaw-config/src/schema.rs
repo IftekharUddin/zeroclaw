@@ -6868,8 +6868,8 @@ pub struct PacingConfig {
     #[serde(default = "default_loop_detection_enabled")]
     pub loop_detection_enabled: bool,
 
-    /// Sliding window size for the pattern-based loop detector.
-    /// Defaults to 20.
+    /// Recent-call lookback for exact-repeat and no-progress loop detection.
+    /// Defaults to 20. Ping-pong detection may retain more calls for escalation.
     #[serde(default = "default_loop_detection_window_size")]
     pub loop_detection_window_size: usize,
 
@@ -6887,8 +6887,8 @@ pub struct PacingConfig {
     /// Full A↔B tool-name cycles before the first ping-pong Warning. Block
     /// escalates at `min + 1`, Break at `min + 2`. Defaults to 8 so ordinary
     /// multi-file read/write workflows are not aborted at six cycles.
-    /// Runtime raises `loop_detection_window_size` to at least
-    /// `2 * (min + 2)` when needed so Break stays reachable.
+    /// Runtime retains at least `2 * (min + 2)` calls so Break stays reachable,
+    /// without widening the other detectors' `loop_detection_window_size`.
     #[serde(default = "default_loop_detection_ping_pong_min_cycles")]
     pub loop_detection_ping_pong_min_cycles: usize,
 }

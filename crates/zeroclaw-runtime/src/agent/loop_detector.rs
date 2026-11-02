@@ -12,7 +12,8 @@ use std::hash::{Hash, Hasher};
 pub struct LoopDetectorConfig {
     /// Master switch. When `false`, `record` always returns `Ok`.
     pub enabled: bool,
-    /// Number of recent calls retained for pattern analysis.
+    /// Recent-call lookback for exact-repeat and no-progress analysis.
+    /// Ping-pong analysis may retain more calls to reach its Break threshold.
     pub window_size: usize,
     /// How many consecutive exact-repeat calls before escalation starts.
     pub max_repeats: usize,
@@ -163,6 +164,7 @@ fn hash_str(s: &str) -> u64 {
 pub struct LoopDetector {
     config: LoopDetectorConfig,
     window: VecDeque<ToolCallRecord>,
+    retained_window_size: usize,
 }
 
 /// Calls that must remain in the sliding window for ping-pong Break.
@@ -173,17 +175,14 @@ fn ping_pong_break_window_calls(min_cycles: usize) -> usize {
 
 impl LoopDetector {
     pub fn new(config: LoopDetectorConfig) -> Self {
-        // Raise the window when a high ping-pong threshold would otherwise
-        // make Warning/Block/Break unreachable (history too short to see
-        // `2 * (min_cycles + 2)` alternating calls).
+        // Retain enough ping-pong history without widening the configured
+        // lookback used by the other detectors.
         let min_window = ping_pong_break_window_calls(config.ping_pong_min_cycles);
         let window_size = config.window_size.max(min_window).max(1);
         Self {
             window: VecDeque::with_capacity(window_size),
-            config: LoopDetectorConfig {
-                window_size,
-                ..config
-            },
+            retained_window_size: window_size,
+            config,
         }
     }
 
@@ -204,7 +203,7 @@ impl LoopDetector {
         };
 
         // Maintain sliding window.
-        if self.window.len() >= self.config.window_size {
+        if self.window.len() >= self.retained_window_size {
             self.window.pop_front();
         }
         self.window.push_back(record);
@@ -234,6 +233,7 @@ impl LoopDetector {
             .window
             .iter()
             .rev()
+            .take(self.config.window_size.max(1))
             .take_while(|r| r.name == last.name && r.args_hash == last.args_hash)
             .count();
 
@@ -324,8 +324,8 @@ impl LoopDetector {
 
     /// Pattern 3: Same tool called `no_progress_min_calls`+ times (with
     /// different args each time) but producing the exact same result hash every
-    /// time, counted across the whole window so interleaved unrelated calls do
-    /// not reset the streak.
+    /// time, counted across the configured lookback so interleaved unrelated
+    /// calls do not reset the streak.
     ///
     /// Unlike exact-repeat and ping-pong this pattern caps at `Block`: identical
     /// bytes from *different* arguments is ambiguous (empty search results,
@@ -347,6 +347,8 @@ impl LoopDetector {
         let same_tool_same_result: Vec<&ToolCallRecord> = self
             .window
             .iter()
+            .rev()
+            .take(self.config.window_size.max(1))
             .filter(|r| r.name == last.name && r.result_hash == last.result_hash)
             .collect();
 
@@ -506,8 +508,7 @@ mod tests {
 
     #[test]
     fn ping_pong_default_allows_six_cycles_without_break() {
-        // Regression for #11777: the previous hardcoded threshold aborted at
-        // six A↔B cycles, which blocked ordinary multi-file workflows.
+        // Ordinary multi-file workflows must tolerate six A↔B cycles.
         let mut det = LoopDetector::new(default_config());
         let args = json!({});
         for i in 0..(6 * 2) {
@@ -762,24 +763,75 @@ mod tests {
     }
 
     #[test]
-    fn window_size_limits_memory() {
-        let config = LoopDetectorConfig {
-            window_size: 5,
-            ..Default::default()
-        };
-        let mut det = LoopDetector::new(config);
-        let args = json!({"x": 1});
+    fn window_size_limits_memory_at_effective_ping_pong_capacity() {
+        for (requested, effective) in [(5, 20), (30, 30)] {
+            let mut det = LoopDetector::new(LoopDetectorConfig {
+                window_size: requested,
+                ..Default::default()
+            });
+            let args = json!({"x": 1});
+            for i in 0..effective {
+                det.record(&format!("tool_{i}"), &args, "result");
+            }
+            assert_eq!(det.config.window_size, requested);
+            assert_eq!(det.window.len(), effective);
 
-        // Fill window with 5 different tools.
-        for i in 0..5 {
-            det.record(&format!("tool_{i}"), &args, "result");
+            det.record("one_more", &args, "result");
+            assert_eq!(det.window.len(), effective);
+            assert_eq!(det.window.front().unwrap().name, "tool_1");
         }
-        assert_eq!(det.window.len(), 5);
+    }
 
-        // Adding one more evicts the oldest.
-        det.record("tool_5", &args, "result");
-        assert_eq!(det.window.len(), 5);
-        assert_eq!(det.window.front().unwrap().name, "tool_1");
+    #[test]
+    fn ping_pong_retention_does_not_widen_exact_repeat_lookback() {
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            window_size: 3,
+            max_repeats: 3,
+            ..Default::default()
+        });
+        for i in 0..8 {
+            let result = det.record("read", &json!({"path": "notes.txt"}), "same");
+            if i < 2 {
+                assert_eq!(result, LoopDetectionResult::Ok);
+            } else {
+                assert!(
+                    matches!(result, LoopDetectionResult::Warning(_)),
+                    "{result:?}"
+                );
+            }
+        }
+        assert_eq!(det.window.len(), 8);
+    }
+
+    #[test]
+    fn ping_pong_retention_does_not_widen_no_progress_lookback() {
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            window_size: 5,
+            no_progress_min_calls: 5,
+            ..Default::default()
+        });
+        for i in 0..5 {
+            if i != 0 {
+                assert_eq!(
+                    det.record(&format!("other_{i}"), &json!({}), "different"),
+                    LoopDetectionResult::Ok
+                );
+            }
+            assert_eq!(
+                det.record("search", &json!({"query": i}), "no matches"),
+                LoopDetectionResult::Ok
+            );
+        }
+        assert_eq!(det.window.len(), 9);
+
+        // Matching results inside the configured tail still escalate normally.
+        det.record("search", &json!({"query": 5}), "no matches");
+        det.record("search", &json!({"query": 6}), "no matches");
+        det.record("search", &json!({"query": 7}), "no matches");
+        assert!(matches!(
+            det.record("search", &json!({"query": 8}), "no matches"),
+            LoopDetectionResult::Warning(_)
+        ));
     }
 
     // ── Ping-pong with varying args ─────────────────────────────
@@ -824,11 +876,13 @@ mod tests {
         det.record("tool_a", &args, "r");
         det.record("tool_a", &args, "r");
 
-        // Fill the rest of the window with different tools (evicting the
-        // first "tool_a" calls as the window is only 6).
-        for i in 0..5 {
+        // Fill the effective retained history to evict both old records.
+        for i in 0..20 {
             det.record(&format!("other_{i}"), &json!({}), "ok");
         }
+        assert_eq!(det.window.len(), 20);
+        assert!(det.window.iter().all(|record| record.name != "tool_a"));
+        assert_eq!(det.window.front().unwrap().name, "other_0");
 
         // Now "tool_a" again — only 1 consecutive, not 3.
         let r = det.record("tool_a", &args, "r");
@@ -837,6 +891,7 @@ mod tests {
             LoopDetectionResult::Ok,
             "stale entries should be evicted"
         );
+        assert_eq!(det.window.front().unwrap().name, "other_1");
     }
 
     // ── hash_value key-order independence ────────────────────────
