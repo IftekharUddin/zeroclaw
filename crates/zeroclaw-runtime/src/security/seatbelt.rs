@@ -237,7 +237,7 @@ impl Sandbox for SeatbeltSandbox {
         if !std::iter::once(&roots.workspace)
             .chain(roots.read_write.iter())
             .chain(roots.write_only.iter())
-            .all(preserves)
+            .all(|grant| preserves(grant))
         {
             return false;
         }
