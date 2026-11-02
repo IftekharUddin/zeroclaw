@@ -1104,7 +1104,6 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_api::channel::Channel as _;
 
     struct InstalledPause {
         path: String,
