@@ -75,6 +75,9 @@ export class HttpError extends Error {
  * the behaviour that depends on the code.
  */
 export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntry"];
+export type PluginCatalogIssue = components["schemas"]["PluginCatalogIssue"];
+export type PluginsResponse = components["schemas"]["PluginsResponse"];
 export const ConfigApiCodes = {
   configChangedExternally: "config_changed_externally",
 } as const satisfies Record<string, ConfigApiCode>;
@@ -290,8 +293,10 @@ export async function getAdminPairCode(): Promise<{
   pairing_code: string | null;
   pairing_required: boolean;
 }> {
-  // Use the public /pair/code endpoint which works in Docker and remote environments
-  // (no localhost restriction). Falls back to the admin endpoint for backward compat.
+  // /pair/code reports whether pairing is required but never returns the code:
+  // no HTTP caller can prove it is on the gateway host. The operator reads the
+  // code from the gateway log or `zeroclaw gateway get-paircode` and types it in.
+  // The admin fallback only answers callers holding the gateway admin token.
   const publicResp = await fetch(`${basePath}/pair/code`);
   if (publicResp.ok) {
     return publicResp.json() as Promise<{
@@ -853,7 +858,12 @@ export interface SkillDocument {
 }
 
 /** Where a skill in an agent's effective set was loaded from. */
-export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
+export type AgentSkillOrigin =
+  | "built-in"
+  | "workspace"
+  | "open-skills"
+  | "plugin"
+  | "bundle";
 
 /**
  * A lower-precedence same-name skill that a winning skill shadowed (it did
@@ -939,7 +949,8 @@ export function listSkillsInBundle(
 
 /**
  * The agent's EFFECTIVE skill set — every skill the runtime actually loads
- * for `alias`, across workspace / open-skills / plugin / bundle origins.
+ * for `alias`, across built-in / workspace / open-skills / plugin / bundle
+ * origins.
  * Unlike {@link listSkillsInBundle} (which only sees configured bundles),
  * this reflects what the agent can really use.
  */
@@ -2035,6 +2046,11 @@ export function getIntegrations(): Promise<Integration[]> {
     const result = unwrapField(data, "integrations");
     return Array.isArray(result) ? result : [];
   });
+}
+
+/** Read-only plugin packages from installed and cached-registry sources. */
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>("/api/plugins");
 }
 
 // ---------------------------------------------------------------------------
