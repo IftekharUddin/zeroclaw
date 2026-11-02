@@ -618,6 +618,8 @@ cli-quickstart-model-field-missing-warning = AVERTISSEMENT : le schéma n'a prod
 cli-quickstart-model-id-for = ID de modèle pour {$name}
 cli-quickstart-model-type-id = Saisir un ID de modèle…
 cli-quickstart-risk-profile-prompt = Profil de risque
+cli-quickstart-risk-locked-down-help = Paramètres les plus stricts. Accès au système de fichiers limité à l’espace de travail, approbation requise pour le risque moyen, commandes à haut risque bloquées même si elles sont autorisées dans la liste, sans transmission de variables d’environnement au shell.
+cli-quickstart-risk-balanced-help = Configuration de confiance pour un usage quotidien sur un poste de développement personnel. Supervisée, limitée à l’espace de travail, avec les chemins sensibles bloqués et le bac à sable activé. Toutes les commandes peuvent s’exécuter sans liste d’autorisation, mais celles à haut risque restent bloquées même si elles y figurent ; définissez block_high_risk_commands = false pour les permettre sous approbation. Recommandée pour la plupart des utilisateurs.
 cli-quickstart-memory-backend-prompt = Backend mémoire
 cli-quickstart-add-channel = + Ajouter un canal
 cli-quickstart-channels-done = Terminé (le sélecteur de canaux compte comme visité)

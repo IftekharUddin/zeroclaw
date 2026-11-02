@@ -756,6 +756,8 @@ cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` fi
 cli-quickstart-model-id-for = Model id for {$name}
 cli-quickstart-model-type-id = Type a model ID…
 cli-quickstart-risk-profile-prompt = Risk profile
+cli-quickstart-risk-locked-down-help = Tightest defaults. Workspace-only filesystem access, approval required for medium risk, high-risk commands blocked outright even when allowlisted, no shell environment passthrough.
+cli-quickstart-risk-balanced-help = Trusted daily driver for a personal dev box. Supervised, workspace-scoped with sensitive paths blocked and the sandbox on. Any command runs without an allowlist, but high-risk commands stay blocked even when allowlisted; set block_high_risk_commands = false to allow them under approval. Recommended for most users.
 cli-quickstart-memory-backend-prompt = Memory backend
 cli-quickstart-add-channel = + Add a channel
 cli-quickstart-channels-done = Done (channels selector counts as visited)

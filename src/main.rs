@@ -2365,7 +2365,14 @@ async fn run_quickstart_cli(
                     &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
                         .iter()
-                        .map(|p| (p.preset_name, p.label, p.help))
+                        .map(|p| {
+                            let help = match p.preset_name {
+                                "locked_down" => qta("cli-quickstart-risk-locked-down-help", &[]),
+                                "balanced" => qta("cli-quickstart-risk-balanced-help", &[]),
+                                _ => p.help.to_string(),
+                            };
+                            (p.preset_name, p.label, help)
+                        })
                         .collect(),
                     &state.risk_profiles,
                 )?;
@@ -3395,7 +3402,7 @@ fn prompt_for_catalog_model(
 #[cfg(feature = "agent-runtime")]
 fn pick_preset(
     prompt: &str,
-    presets: Vec<(&'static str, &'static str, &'static str)>,
+    presets: Vec<(&'static str, &'static str, String)>,
     existing: &[String],
 ) -> anyhow::Result<Option<Result<&'static str, String>>> {
     use dialoguer::FuzzySelect;

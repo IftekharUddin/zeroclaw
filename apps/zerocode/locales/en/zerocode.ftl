@@ -422,9 +422,9 @@ zc-quickstart-new-provider-heading = Create new provider
 zc-quickstart-provider-alias-exists = Alias `{ $alias }` already exists. Pick another alias or use the existing provider.
 
 zc-quickstart-risk-locked-down = Locked Down
-zc-quickstart-risk-locked-down-desc = Tight defaults. Workspace-only fs, approval on med/high risk.
+zc-quickstart-risk-locked-down-desc = Tight defaults. Workspace-only files; medium risk needs approval, high-risk commands stay blocked even when allowlisted.
 zc-quickstart-risk-balanced = Balanced
-zc-quickstart-risk-balanced-desc = Day-to-day defaults. Approval on risky ops. Recommended.
+zc-quickstart-risk-balanced-desc = Day-to-day defaults. Workspace-scoped and sandboxed; high-risk commands stay blocked even when allowlisted. Recommended.
 zc-quickstart-risk-yolo = YOLO
 zc-quickstart-risk-yolo-desc = Full autonomy. No approval gates. Use on disposable machines only.
 

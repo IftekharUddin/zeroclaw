@@ -615,6 +615,8 @@ cli-quickstart-model-field-missing-warning = ADVERTENCIA: el esquema no produjo 
 cli-quickstart-model-id-for = ID de modelo para {$name}
 cli-quickstart-model-type-id = Escribir un ID de modelo…
 cli-quickstart-risk-profile-prompt = Perfil de riesgo
+cli-quickstart-risk-locked-down-help = Configuración más restrictiva. Acceso al sistema de archivos limitado al espacio de trabajo, aprobación obligatoria para riesgo medio, comandos de alto riesgo bloqueados incluso si están en la lista de permitidos y sin transferencia de variables de entorno al shell.
+cli-quickstart-risk-balanced-help = Opción de confianza para el uso diario en un equipo de desarrollo personal. Supervisada, limitada al espacio de trabajo, con rutas sensibles bloqueadas y sandbox activado. Cualquier comando puede ejecutarse sin lista de permitidos, pero los comandos de alto riesgo siguen bloqueados aunque estén en ella; establece block_high_risk_commands = false para permitirlos con aprobación. Recomendada para la mayoría de los usuarios.
 cli-quickstart-memory-backend-prompt = Backend de memoria
 cli-quickstart-add-channel = + Agregar canal
 cli-quickstart-channels-done = Listo (el selector de canales cuenta como visitado)

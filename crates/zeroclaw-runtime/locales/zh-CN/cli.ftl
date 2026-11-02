@@ -614,6 +614,8 @@ cli-quickstart-model-field-missing-warning = 警告：架构没有为 `{$provide
 cli-quickstart-model-id-for = {$name} 的模型 ID
 cli-quickstart-model-type-id = 输入模型 ID…
 cli-quickstart-risk-profile-prompt = 风险配置文件
+cli-quickstart-risk-locked-down-help = 最严格的默认设置。文件系统访问仅限工作区，中风险操作需审批，高风险命令即使列入允许列表也会直接阻止，不向 shell 传递环境变量。
+cli-quickstart-risk-balanced-help = 适合个人开发设备的日常可信配置。采用受监督模式，限制在工作区内，阻止敏感路径并启用沙箱。无需命令允许列表，但高风险命令即使列入允许列表仍会被阻止；设置 block_high_risk_commands = false，可在审批后允许执行这些命令。推荐大多数用户使用。
 cli-quickstart-memory-backend-prompt = 记忆后端
 cli-quickstart-add-channel = + 添加通道
 cli-quickstart-channels-done = 完成（通道选择器会记为已访问）

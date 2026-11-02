@@ -613,6 +613,8 @@ cli-quickstart-model-field-missing-warning = 警告: スキーマが `{$provider
 cli-quickstart-model-id-for = {$name} のモデルID
 cli-quickstart-model-type-id = モデルIDを入力…
 cli-quickstart-risk-profile-prompt = リスクプロファイル
+cli-quickstart-risk-locked-down-help = 最も厳格なデフォルト設定。ファイルシステムへのアクセスはワークスペース内のみ。中リスクには承認が必要で、高リスクのコマンドは許可リストに含まれていてもブロックされます。シェルへの環境変数の引き継ぎはありません。
+cli-quickstart-risk-balanced-help = 個人の開発環境で日常的に使うための信頼型設定。監督付きで、ワークスペース内に限定し、機密パスをブロックしてサンドボックスを有効にします。コマンドの許可リストは不要ですが、高リスクのコマンドは許可リストに含まれていてもブロックされます。承認のもとで許可するには block_high_risk_commands = false を設定してください。ほとんどのユーザーに推奨。
 cli-quickstart-memory-backend-prompt = メモリバックエンド
 cli-quickstart-add-channel = + チャンネルを追加
 cli-quickstart-channels-done = 完了 (チャンネルセレクターを訪問済みにします)
