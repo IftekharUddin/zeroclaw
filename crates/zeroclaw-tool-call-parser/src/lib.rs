@@ -473,16 +473,26 @@ pub fn looks_like_tool_protocol_example(text: &str) -> bool {
         return false;
     }
 
+    // Display text can retain rejected declarations and their example-shaped
+    // data. DSML extraction already separates those payloads from prose; use
+    // that same structural context for the consumer's example decision.
+    let dsml_has_example_prose = trimmed.contains("DSML").then(|| {
+        let response = strip_think_tags(trimmed);
+        extract_dsml_blocks_with_example_prose(&response).2
+    });
+
     if let Some((body, visible_text)) = leading_json_fence_body_and_trailing_text(trimmed)
         && classify_tool_protocol_envelope(body).is_some()
-        && has_example_context(visible_text)
+        && dsml_has_example_prose.unwrap_or_else(|| has_example_context(visible_text))
     {
         return true;
     }
 
     if starts_with_tool_protocol_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed) {
         let (visible_text, calls) = parse_tool_calls(trimmed);
-        if !calls.is_empty() && has_example_context(&visible_text) {
+        if !calls.is_empty()
+            && dsml_has_example_prose.unwrap_or_else(|| has_example_context(&visible_text))
+        {
             return true;
         }
     }
@@ -2225,8 +2235,16 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
         return (input.to_string(), Vec::new());
     }
 
+    let (cleaned, calls, _) = extract_dsml_blocks_with_example_prose(input);
+    (cleaned, calls)
+}
+
+/// Check the whole response's prose for the outer example guard, using the
+/// same payload boundaries as extraction rather than reparsing display text.
+fn extract_dsml_blocks_with_example_prose(input: &str) -> (String, Vec<ParsedToolCall>, bool) {
     let mut cleaned = String::new();
     let mut calls = Vec::new();
+    let mut has_example_prose = false;
     // Only prose supplies example cues; skipped payloads remain opaque.
     let mut example_context = String::new();
     let mut last_end = 0;
@@ -2306,9 +2324,11 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
             };
             let before = &input[last_end..cursor];
             cleaned.push_str(before);
-            if !has_example_context(&example_context) {
+            let is_example = has_example_context(&example_context);
+            if !is_example {
                 calls.extend(parsed);
             }
+            has_example_prose |= is_example;
             example_context.clear();
             cursor += consumed;
             last_end = cursor;
@@ -2322,8 +2342,9 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
 
     // Add remaining text after last DSML block
     cleaned.push_str(&input[last_end..]);
+    has_example_prose |= has_example_context(&example_context);
 
-    (cleaned, calls)
+    (cleaned, calls, has_example_prose)
 }
 
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
@@ -6184,6 +6205,53 @@ That's how you call it."#;
             assert_eq!(calls[0].arguments["path"], "REQUESTED.md");
             assert_eq!(text, format!("ex{payload}ample\n"));
         }
+    }
+
+    #[test]
+    fn dsml_outer_example_guard_ignores_opaque_declarations() {
+        let invocation = "<|DSML| calls><|DSML| invoke name='file_read'><|DSML| parameter name='path' string='true'>REQUESTED.md</|DSML| parameter></|DSML| invoke></|DSML| calls>";
+        for declaration in [
+            r#"<tools>{"name":"file_read","description":"Usage example","parameters":{"type":"object"}}</tools>"#,
+            r#"<tools>{"name":"file_read","description":"Sample usage","parameters":{"type":"object"}}</tools>"#,
+            "<tools>Example tool declaration</tools>",
+            r#"<tools>{"description":"Example closing tag </tools>","usage":"<|DSML| calls><|DSML| invoke name='file_read'><|DSML| parameter name='path' string='true'>DECLARATION.md</|DSML| parameter></|DSML| invoke></|DSML| calls>"}</tools>"#,
+            r#"{"description":"Usage example"}"#,
+            r#"[{"description":"Sample usage"}]"#,
+        ] {
+            let input = format!("{declaration}\n{invocation}");
+            let (_, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "only the following call may run: {input}");
+            assert_eq!(calls[0].name, "file_read");
+            assert_eq!(calls[0].arguments["path"], "REQUESTED.md");
+            assert!(
+                !looks_like_tool_protocol_example(&input),
+                "opaque declaration data must not veto the following call: {input}"
+            );
+
+            assert!(looks_like_tool_protocol_example(&format!(
+                "{input}\nThis is an example."
+            )));
+        }
+    }
+
+    #[test]
+    fn dsml_outer_example_guard_preserves_argument_data_and_prose_boundaries() {
+        let invocation = "<｜DSML｜ calls><｜DSML｜ invoke name='file_read'><｜DSML｜ parameter name='path' string='true'>Sample usage.md</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let declaration = r#"<tools>{"name":"file_read","description":"Usage example"}</tools>"#;
+        let input = format!("ex{declaration}ample\n{invocation}");
+        let (_, calls) = parse_tool_calls(&input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "Sample usage.md");
+        assert!(!looks_like_tool_protocol_example(&input));
+        let reasoning = format!("<think>For example, Sample usage.</think>\n{input}");
+        let reasoning_calls = parse_tool_calls(&reasoning).1;
+        assert_eq!(reasoning_calls.len(), 1);
+        assert_eq!(reasoning_calls[0].name, calls[0].name);
+        assert_eq!(reasoning_calls[0].arguments, calls[0].arguments);
+        assert!(!looks_like_tool_protocol_example(&reasoning));
+        assert!(looks_like_tool_protocol_example(&format!(
+            "{input}\nHere is an example."
+        )));
     }
 
     /// BLOCKER 2: DSML string="true" parameters must preserve raw value.

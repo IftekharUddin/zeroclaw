@@ -570,6 +570,122 @@ mod tests {
 }
 
 #[cfg(test)]
+mod dsml_example_guard_tests {
+    use super::*;
+    use crate::tools::ToolSpec;
+    use std::collections::HashSet;
+
+    const CALL: &str = "<|DSML| calls><|DSML| invoke name='file_read'><|DSML| parameter name='path' string='true'>REQUESTED.md</|DSML| parameter></|DSML| invoke></|DSML| calls>";
+    const DECLARATION: &str = r#"<tools>{"name":"file_read","description":"Usage example","parameters":{"type":"object"}}</tools>"#;
+
+    async fn interpret(
+        text: &str,
+        strict_tool_parsing: bool,
+        known_tool: bool,
+    ) -> InterpretedResponse {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "test.provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "dsml-example-guard",
+            serving_provider_name: None,
+            serving_model: None,
+        };
+        let specs = IterationToolSpecs {
+            known_tool_names: if known_tool {
+                HashSet::from(["file_read".to_string()])
+            } else {
+                HashSet::new()
+            },
+            tool_specs: vec![ToolSpec::new(
+                "file_read",
+                "read a file",
+                serde_json::json!({"type":"object", "properties":{"path":{"type":"string"}}}),
+            )],
+            exposed_tool_specs: None,
+            use_native_tools: false,
+        };
+        interpret_chat_response(
+            &ctx,
+            "test.provider",
+            "test-model",
+            ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            &[],
+            &specs,
+            false,
+            0,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn declaration_example_cues_do_not_veto_runtime_fallback() {
+        for declaration in [
+            DECLARATION,
+            r#"<tools>{"name":"file_read","description":"Sample usage","parameters":{"type":"object"}}</tools>"#,
+            "<tools>Example tool declaration</tools>",
+            r#"<tools>{"description":"Usage example </tools>","usage":"<|DSML| calls><|DSML| invoke name='file_read'><|DSML| parameter name='path' string='true'>DECLARATION.md</|DSML| parameter></|DSML| invoke></|DSML| calls>"}</tools>"#,
+        ] {
+            let input = format!("{declaration}\n{CALL}");
+            let parsed = interpret(&input, false, true).await;
+            assert!(!parsed.parse_issue_detected, "{input}");
+            assert_eq!(parsed.tool_calls.len(), 1, "{input}");
+            assert_eq!(parsed.tool_calls[0].name, "file_read");
+            assert_eq!(parsed.tool_calls[0].arguments["path"], "REQUESTED.md");
+            assert_eq!(parsed.assistant_history_content, input);
+        }
+    }
+
+    #[tokio::test]
+    async fn dsml_fallback_retains_teaching_prose_and_admission_guards() {
+        let input = format!("{DECLARATION}\n{CALL}");
+        for teaching in [
+            format!("Here is an example:\n{input}"),
+            format!("{DECLARATION}\nHere is an example:\n{CALL}"),
+            format!("{input}\nThis is an example."),
+        ] {
+            assert!(
+                interpret(&teaching, false, true)
+                    .await
+                    .tool_calls
+                    .is_empty()
+            );
+        }
+        assert!(interpret(&input, true, true).await.tool_calls.is_empty());
+        assert!(interpret(&input, false, false).await.tool_calls.is_empty());
+        assert!(
+            interpret(DECLARATION, false, true)
+                .await
+                .tool_calls
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
 mod argument_preservation_tests {
     use super::*;
     use crate::tools::{FileWriteTool, ModelRoutingConfigTool, Tool, ToolSpec};
