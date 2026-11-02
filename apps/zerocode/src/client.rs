@@ -88,6 +88,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const CONFIG_LIST: &str = "config/list";
     pub const CONFIG_SET: &str = "config/set";
+    pub const CONFIG_STATUS: &str = "config/status";
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
@@ -244,9 +245,12 @@ pub struct RpcInboundRequest {
 ///
 /// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
 /// background sessions live): chunk volume multiplies between draw-loop
-/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
-/// session's status dot in "running" forever.
-pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+/// drains, and a `Lagged` receiver forces a durable transcript reload of
+/// every tracked session, during which their live stream is gated. The draw
+/// loop wakes early to drain pending notifications; this capacity is the
+/// headroom for draw stalls (resize storms, full transcript rebuilds, the
+/// process being descheduled) on top of that.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 4096;
 
 // ── Typed session updates ────────────────────────────────────────
 
@@ -282,9 +286,12 @@ pub enum SessionUpdate {
     /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
     /// `model_context_window` is the model's full capacity, used as the bar
     /// denominator when present so the trim budget can be drawn as a marker.
+    /// `input_tokens_source` is the provenance of `input_tokens` ("provider" or
+    /// "estimate"); an estimated count must be rendered as approximate.
     ContextUsage {
         session_id: String,
         input_tokens: Option<u64>,
+        input_tokens_source: Option<String>,
         max_context_tokens: Option<u64>,
         model_context_window: Option<u64>,
     },
@@ -292,6 +299,7 @@ pub enum SessionUpdate {
     HistoryTrimmed {
         session_id: String,
         dropped_messages: u64,
+        dropped_turns: Option<u64>,
         kept_turns: u64,
         reason: String,
         /// Configured context token budget, when the trim was token-budget
@@ -321,6 +329,15 @@ pub enum SessionUpdate {
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
     },
+    /// Recorded spend reached `cost.warn_at_percent` of the daily or monthly
+    /// limit. The turn continues; this is a heads-up only.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        /// `"day"` or `"month"`.
+        period: String,
+    },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
     /// list. An empty vec clears the tracker.
@@ -343,7 +360,8 @@ impl SessionUpdate {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::BudgetWarning { session_id, .. } => session_id,
         }
     }
 }
@@ -400,12 +418,17 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         "context_usage" => Some(SessionUpdate::ContextUsage {
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
+            input_tokens_source: params
+                .get("input_tokens_source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
             model_context_window: params.get("model_context_window").and_then(|v| v.as_u64()),
         }),
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,
             dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            dropped_turns: params.get("dropped_turns").and_then(|v| v.as_u64()),
             kept_turns: params.get("kept_turns")?.as_u64()?,
             reason: params.get("reason")?.as_str()?.to_string(),
             token_budget: params.get("token_budget").and_then(|v| v.as_u64()),
@@ -420,6 +443,12 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             unsatisfiable_floor: params.get("unsatisfiable_floor").and_then(|v| v.as_bool()),
+        }),
+        "budget_warning" => Some(SessionUpdate::BudgetWarning {
+            session_id: sid,
+            current_usd: params.get("current_usd")?.as_f64()?,
+            limit_usd: params.get("limit_usd")?.as_f64()?,
+            period: params.get("period")?.as_str()?.to_string(),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -582,6 +611,35 @@ impl fmt::Display for DaemonInitializeTimeout {
 }
 
 impl std::error::Error for DaemonInitializeTimeout {}
+
+/// A single RPC did not get a reply within its client-side deadline. The
+/// connection is still up; the daemon is busy or wedged on this method.
+/// Callers that own a UI surface should report this and stay alive — a
+/// stalled `config/list` is not a reason to exit the TUI.
+#[derive(Debug)]
+pub struct DaemonRpcTimeout {
+    pub method: String,
+    pub timeout: Duration,
+}
+
+impl DaemonRpcTimeout {
+    pub fn from_anyhow(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+}
+
+impl fmt::Display for DaemonRpcTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RPC {}: timed out after {}s",
+            self.method,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DaemonRpcTimeout {}
 
 #[derive(Debug)]
 pub(crate) struct InitializeResponse {
@@ -2103,7 +2161,10 @@ impl RpcClient {
     /// Build a rustls `ClientConfig` from a [`ClientTls`]: server verification via
     /// the configured CA (or `NoVerify` when `skip_verify`), presenting the client
     /// certificate for mutual TLS when one is configured.
-    fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    ///
+    /// Crate-visible because the gateway enrollment leg that precedes the WSS
+    /// connection must be given exactly the same trust material.
+    pub(crate) fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
         use std::sync::Arc;
 
         let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -2167,12 +2228,15 @@ impl RpcClient {
         let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
             .await
             .map_err(|_| {
-                anyhow::Error::msg(format!(
-                    "RPC {method}: timed out after {}s",
-                    timeout.as_secs()
-                ))
+                anyhow::Error::new(DaemonRpcTimeout {
+                    method: method.to_string(),
+                    timeout,
+                })
             })?
-            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+            .map_err(|e| {
+                let message = format!("RPC {method}: {} ({})", e.message, e.code);
+                anyhow::Error::new(e).context(message)
+            })?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -2307,21 +2371,37 @@ impl RpcClient {
         Ok(result.entries)
     }
 
-    pub async fn config_set(&self, prop: &str, value: Value) -> Result<()> {
-        let _: ConfigSetResult = self
+    pub async fn config_set(
+        &self,
+        prop: &str,
+        value: Value,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigSetResult = self
             .call(
                 method::CONFIG_SET,
                 serde_json::json!({ "prop": prop, "value": value }),
             )
             .await?;
-        Ok(())
+        Ok(result.revision)
     }
 
-    pub async fn config_delete(&self, prop: &str) -> Result<()> {
-        let _: ConfigDeleteResult = self
+    pub async fn config_delete(
+        &self,
+        prop: &str,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigDeleteResult = self
             .call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
             .await?;
-        Ok(())
+        Ok(result.revision)
+    }
+
+    pub async fn config_status(&self) -> Result<crate::wire::ConfigStatusResult> {
+        self.call_with_timeout(
+            method::CONFIG_STATUS,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(3),
+        )
+        .await
     }
 
     /// Signal the daemon to reload in place. Mirrors `POST /admin/reload`.
@@ -2380,24 +2460,32 @@ impl RpcClient {
         Ok(result.values)
     }
 
-    pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_create(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_CREATE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
-    pub async fn config_map_key_delete(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_delete(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_DELETE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
     pub async fn config_map_key_rename(
@@ -3156,7 +3244,18 @@ pub struct ConfigListResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigSetResult {}
+pub struct ConfigSetResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigMapKeyMutationResult {
+    #[serde(default, alias = "created", alias = "deleted")]
+    pub changed: bool,
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[cfg(test)]
 mod initialize_version_tests {
@@ -3274,7 +3373,10 @@ mod initialize_timeout_tests {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigDeleteResult {}
+pub struct ConfigDeleteResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4281,6 +4383,8 @@ pub struct LogsQueryParams {
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sop_run_id: Option<String>,
     #[serde(default)]
     pub hide_internal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4529,6 +4633,9 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
+    /// Daemon-configured profile, not in-flight session telemetry.
+    #[serde(default)]
+    pub runtime_profile: Option<String>,
     #[serde(default)]
     pub live_sessions: usize,
     #[serde(default)]
@@ -4541,6 +4648,26 @@ pub struct AgentStatusEntry {
 #[serde(rename_all = "snake_case")]
 pub struct AgentsStatusResult {
     pub agents: Vec<AgentStatusEntry>,
+}
+
+#[cfg(test)]
+mod runtime_profile_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_profile_accepts_legacy_and_current_agent_status() {
+        let legacy: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true
+        }))
+        .unwrap();
+        assert!(legacy.runtime_profile.is_none());
+
+        let current: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true, "runtime_profile": "coding"
+        }))
+        .unwrap();
+        assert_eq!(current.runtime_profile.as_deref(), Some("coding"));
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -6301,10 +6428,52 @@ mod notification_tests {
             parse_session_update(&params),
             Some(SessionUpdate::ContextUsage {
                 session_id,
+                input_tokens_source: None,
                 input_tokens: Some(100_000),
                 max_context_tokens: Some(180_000),
                 model_context_window: Some(200_000),
             }) if session_id == "s-context"
+        ));
+    }
+
+    #[test]
+    fn parse_context_usage_decodes_the_estimate_provenance_marker() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 4_200,
+            "input_tokens_source": "estimate",
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                input_tokens: Some(4_200),
+                ref input_tokens_source,
+                ..
+            }) if input_tokens_source.as_deref() == Some("estimate")
+        ));
+    }
+
+    #[test]
+    fn parse_context_usage_decodes_the_provider_provenance_marker() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 100_000,
+            "input_tokens_source": "provider",
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                ref input_tokens_source,
+                ..
+            }) if input_tokens_source.as_deref() == Some("provider")
         ));
     }
 
@@ -6528,7 +6697,61 @@ mod plan_parse_tests {
     }
 
     #[test]
+    fn parses_budget_warning_update() {
+        let params = serde_json::json!({
+            "type": "budget_warning",
+            "session_id": "s1",
+            "current_usd": 8.25,
+            "limit_usd": 10.0,
+            "period": "day",
+        });
+        match parse_session_update(&params) {
+            Some(SessionUpdate::BudgetWarning {
+                session_id,
+                current_usd,
+                limit_usd,
+                period,
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(current_usd, 8.25);
+                assert_eq!(limit_usd, 10.0);
+                assert_eq!(period, "day");
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_history_trimmed_update() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "dropped_turns": 4,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                session_id,
+                dropped_messages: 12,
+                dropped_turns: Some(4),
+                kept_turns: 3,
+                reason,
+                token_budget: None,
+                tokens_before: None,
+                tokens_after: None,
+                tokens_before_source: None,
+                tokens_after_source: None,
+                unsatisfiable_floor: None,
+            }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn parses_legacy_history_trimmed_update_without_dropped_turns() {
         let params = serde_json::json!({
             "type": "history_trimmed",
             "session_id": "sess-3",
@@ -6540,17 +6763,9 @@ mod plan_parse_tests {
         assert!(matches!(
             parse_session_update(&params),
             Some(SessionUpdate::HistoryTrimmed {
-                session_id,
-                dropped_messages: 12,
-                kept_turns: 3,
-                reason,
-                token_budget: None,
-                tokens_before: None,
-                tokens_after: None,
-                tokens_before_source: None,
-                tokens_after_source: None,
-                unsatisfiable_floor: None,
-            }) if session_id == "sess-3" && reason == "history message limit exceeded"
+                dropped_turns: None,
+                ..
+            })
         ));
     }
 
@@ -6574,6 +6789,7 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: None,
                 kept_turns: 33,
                 reason,
                 token_budget: Some(500000),

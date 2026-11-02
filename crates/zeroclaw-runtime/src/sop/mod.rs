@@ -4,6 +4,7 @@ pub mod audit;
 pub mod binding;
 pub mod capability;
 pub mod condition;
+pub mod decision;
 pub mod dispatch;
 pub mod engine;
 pub mod executor;
@@ -31,6 +32,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
+pub use decision::{DecisionModel, SopDecision, SopDecisionSpec, SystemOneClient};
 pub use engine::{
     CancelOutcome, MaintenanceSummary, OrphanedRunSettlement, SopEngine,
     err_is_cancellation_persistence_retained, err_is_resume_at_capacity,
@@ -38,8 +40,10 @@ pub use engine::{
 };
 pub use executor::{
     RegisteredSopDriver, SopDriverHandles, SopDriverRegistry, SopDriverSink, admit_sop_driver,
-    admit_sop_driver_for_run, drive_resumed_broker_action, spawn_and_register_sop_driver,
-    spawn_headless_run_driver,
+    admit_sop_driver_for_run, drive_resumed_broker_action,
+    drive_resumed_broker_action_with_capability, spawn_and_register_sop_driver,
+    spawn_and_register_sop_driver_with_capability, spawn_headless_run_driver,
+    spawn_headless_run_driver_with_capability,
 };
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
@@ -110,6 +114,9 @@ pub struct SopEngineAdapters {
     pub forge: Option<Arc<dyn capability::ForgeCommentAdapter>>,
     /// Runs one bounded model call as a pipeline step (`llm.generate`).
     pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
+    /// Extra decision models by alias, added to (and overriding) the ones built
+    /// from `[decision_models]`. Used by tests and embedders.
+    pub decision: std::collections::HashMap<String, Arc<dyn decision::DecisionModel>>,
 }
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
@@ -130,15 +137,48 @@ pub struct SopEngineAdapters {
 ///   matching manual trigger".
 pub fn build_sop_engine(
     config: SopConfig,
+    decision_models: &std::collections::HashMap<
+        String,
+        zeroclaw_config::schema::SopDecisionModelConfig,
+    >,
     data_dir: &Path,
     install_root: &Path,
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    build_sop_engine_with_capability(
+        config,
+        decision_models,
+        data_dir,
+        install_root,
+        audit_memory,
+        adapters,
+        None,
+    )
+}
+
+/// Build a SOP engine with the daemon-owned execution capability already
+/// attached. Managed startup must use this constructor before maintenance or
+/// any producer can create an action; `None` remains for unmanaged source and
+/// test callers only.
+pub fn build_sop_engine_with_capability(
+    config: SopConfig,
+    decision_models: &std::collections::HashMap<
+        String,
+        zeroclaw_config::schema::SopDecisionModelConfig,
+    >,
+    data_dir: &Path,
+    install_root: &Path,
+    audit_memory: Arc<dyn Memory>,
+    adapters: SopEngineAdapters,
+    execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    let mut decision_models = decision::models_from_config(decision_models);
     let SopEngineAdapters {
         route: route_adapter,
         forge: forge_adapter,
         llm: llm_adapter,
+        decision: decision_model_overrides,
     } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
@@ -177,7 +217,14 @@ pub fn build_sop_engine(
         .with_metrics(SopMetricsCollector::shared())
         .with_run_notifier(run_tx)
         .with_approval_broker(approval_broker)
-        .with_capabilities(Arc::new(capabilities));
+        .with_capabilities(Arc::new(capabilities))
+        .with_decision_models({
+            decision_models.extend(decision_model_overrides);
+            decision_models
+        });
+    if let Some(execution_capability) = execution_capability {
+        engine = engine.with_execution_capability(execution_capability);
+    }
     engine.reload(install_root);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -672,7 +719,8 @@ fn manifest_with_name(manifest_src: &str, new_name: &str) -> Result<String> {
 
 /// Replace a file's contents atomically: stage a sibling temp file, flush it
 /// to disk, then rename it over the target. Readers see either the old
-/// contents or the new ones, never a half-written file.
+/// contents or the new ones, never a half-written file, and a reader holding
+/// the target open does not stop the replace on any platform.
 ///
 /// The staging file is created fresh and exclusively under a name nothing can
 /// predict. A fixed name like `.SOP.toml.tmp` would be wrong twice over: two
@@ -718,7 +766,7 @@ fn write_file_atomic_detailed(path: &Path, contents: &str) -> Result<(), AtomicW
     };
 
     let stage = || -> Result<tempfile::NamedTempFile> {
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        let mut tmp = tempfile::Builder::new().make_in(dir, create_staging_file)?;
         tmp.write_all(contents.as_bytes())?;
         tmp.as_file().sync_all()?;
         if let Ok(existing) = std::fs::metadata(path) {
@@ -726,14 +774,37 @@ fn write_file_atomic_detailed(path: &Path, contents: &str) -> Result<(), AtomicW
         }
         Ok(tmp)
     };
-    let tmp = stage().map_err(AtomicWriteError::NotPublished)?;
-    tmp.persist(path)
-        .map_err(|e| AtomicWriteError::NotPublished(anyhow::Error::new(e.error)))?;
+    let mut staged = stage()
+        .map_err(AtomicWriteError::NotPublished)?
+        .into_temp_path();
+    // `std::fs::rename`, not `persist`: on Windows `persist` is a bare
+    // `MoveFileExW`, which cannot replace a file that any reader holds open.
+    // `rename` retries that refusal with POSIX semantics, which swap the name
+    // while open readers keep the old contents, as long as they opened it with
+    // delete sharing (std's own opens do). On Unix both are rename(2).
+    std::fs::rename(&staged, path)
+        .map_err(|e| AtomicWriteError::NotPublished(anyhow::Error::new(e)))?;
+    // The staging name no longer exists, so there is nothing left to clean up.
+    staged.disable_cleanup(true);
     // Flushing the file is only half of it: until the directory entry that
     // names it is on disk too, a power loss can take the rename back. But the
     // rename has already happened and is visible, so a failure here must not
     // be reported as though the file were unchanged.
     sync_dir(dir).map_err(AtomicWriteError::PublishedNotFlushed)
+}
+
+/// Create a staging file the way `NamedTempFile::new_in` does (exclusively,
+/// owner-only on Unix) but without the Windows temporary attribute: `persist`
+/// would clear that attribute, and the plain rename that publishes the file
+/// would carry it onto the target.
+fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -886,14 +957,29 @@ pub fn load_sops_from_directory(
     sops_dir: &Path,
     default_execution_mode: SopExecutionMode,
 ) -> Vec<Sop> {
-    if !sops_dir.exists() {
-        return Vec::new();
-    }
+    load_sops_from_directory_report(sops_dir, default_execution_mode).0
+}
 
+/// Load all SOPs from the configured directory and also return the ones that
+/// failed to load, as `(directory name, error)`, for `zeroclaw sop validate`.
+pub fn load_sops_report(
+    install_root: &Path,
+    config_dir: Option<&str>,
+    default_execution_mode: SopExecutionMode,
+) -> (Vec<Sop>, Vec<(String, String)>) {
+    let dir = resolve_sops_dir(install_root, config_dir);
+    load_sops_from_directory_report(&dir, default_execution_mode)
+}
+
+fn load_sops_from_directory_report(
+    sops_dir: &Path,
+    default_execution_mode: SopExecutionMode,
+) -> (Vec<Sop>, Vec<(String, String)>) {
     let mut sops = Vec::new();
+    let mut failures = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(sops_dir) else {
-        return sops;
+        return (sops, failures);
     };
 
     for entry in entries.flatten() {
@@ -917,12 +1003,15 @@ pub fn load_sops_from_directory(
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     &format!("Failed to load SOP from {}", path.display().to_string())
                 );
+                let name = entry.file_name().to_string_lossy().into_owned();
+                failures.push((name, format!("{e:#}")));
             }
         }
     }
 
     sops.sort_by(|a, b| a.name.cmp(&b.name));
-    sops
+    failures.sort();
+    (sops, failures)
 }
 
 /// Load a single SOP from a directory containing SOP.toml and optionally SOP.md.
@@ -982,7 +1071,16 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         admission_policy,
         max_pending_approvals,
         agent,
+        decision: manifest.decision,
     };
+    if let Some(spec) = &sop.decision {
+        spec.validate(
+            &sop.name,
+            sop.deterministic,
+            !decision::part_steps(&sop).is_empty(),
+        )?;
+    }
+    decision::validate_parts(&sop)?;
     capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
     Ok(sop)
 }
@@ -1036,6 +1134,8 @@ pub enum SopStepSyntaxKey {
     Prompt,
     Policy,
     Edit,
+    Decide,
+    UnlessDecided,
     ContinuationBody,
 }
 
@@ -1063,6 +1163,8 @@ impl SopStepSyntaxKey {
             Self::Prompt => &["prompt:"],
             Self::Policy => &["policy:"],
             Self::Edit => &["edit:"],
+            Self::Decide => &["decide:"],
+            Self::UnlessDecided => &["unless_decided:", "unless-decided:"],
             Self::StepsSection | Self::NumberedItem | Self::BoldTitle | Self::ContinuationBody => {
                 &[]
             }
@@ -1176,6 +1278,14 @@ pub const SOP_STEP_SYNTAX_CATALOG: &[SopStepSyntaxSpec] = &[
     SopStepSyntaxSpec {
         key: SopStepSyntaxKey::Edit,
         description: "`- edit:` opts a checkpoint into editing the named field before resume.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Decide,
+        description: "`- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, the step runs.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::UnlessDecided,
+        description: "`- unless_decided: N` skips the step when step N's `decide` question was answered yes, so one decision can switch between alternative sets of steps.",
     },
     SopStepSyntaxSpec {
         key: SopStepSyntaxKey::ContinuationBody,
@@ -1317,6 +1427,15 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                             current.gate_prompt = Some(val.to_string());
                         }
                     }
+                    SopStepSyntaxKey::Decide => {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            current.decide = Some(val.to_string());
+                        }
+                    }
+                    SopStepSyntaxKey::UnlessDecided => {
+                        current.unless_decided = val.trim().parse::<u32>().ok();
+                    }
                     SopStepSyntaxKey::Policy => {
                         let val = val.trim();
                         current.policy = if val.is_empty() {
@@ -1387,6 +1506,8 @@ struct StepParseState {
     policy: Option<String>,
     gate_prompt: Option<String>,
     edit: Option<String>,
+    decide: Option<String>,
+    unless_decided: Option<u32>,
 }
 
 impl StepParseState {
@@ -1421,6 +1542,8 @@ impl StepParseState {
             policy: self.policy.take(),
             gate_prompt: self.gate_prompt.take(),
             edit: self.edit.take(),
+            decide: self.decide.take(),
+            unless_decided: self.unless_decided.take(),
         });
         *self = Self::default();
     }
@@ -1627,6 +1750,12 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     }
     if let Some(agent) = &step.agent {
         bullets.push(format!("agent: {agent}"));
+    }
+    if let Some(question) = &step.decide {
+        bullets.push(format!("decide: {question}"));
+    }
+    if let Some(n) = step.unless_decided {
+        bullets.push(format!("unless_decided: {n}"));
     }
     for call in &step.calls {
         if let Ok(rendered) = serde_json::to_string(call) {
@@ -1949,6 +2078,21 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
         }
     }
 
+    // The loader rejects an invalid `[decision]` table, so saving one would
+    // make the SOP disappear on the next reload.
+    if let Some(spec) = &sop.decision
+        && let Err(e) = spec.validate(
+            &sop.name,
+            sop.deterministic,
+            !decision::part_steps(sop).is_empty(),
+        )
+    {
+        blocking.push(e.to_string());
+    }
+    if let Err(e) = decision::validate_parts(sop) {
+        blocking.push(e.to_string());
+    }
+
     let mut warnings = Vec::new();
     validate_headless_ownership(sop, &mut blocking, &mut warnings);
     validate_planned_call_bindings(sop, &mut blocking, &mut warnings);
@@ -2008,6 +2152,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -2187,6 +2332,7 @@ mod tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -2515,12 +2661,35 @@ mod tests {
                 reads
             })
         };
-        for i in 0..300 {
-            save_sop(root.path(), &named_sop("busy", revisions[i % 2])).unwrap();
-        }
+        let saved =
+            (0..300).try_for_each(|i| save_sop(root.path(), &named_sop("busy", revisions[i % 2])));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let reads = reader.join().expect("the reader never saw a partial file");
+        // Checked once the reader has stopped, so a refused save reports
+        // itself instead of the reader losing the directory as the test unwinds.
+        saved.expect("a save must not fail while a reader has the files open");
         assert!(reads > 0, "the reader actually raced the saves");
+    }
+
+    /// A reader holding the SOP files open must not stop a save from replacing
+    /// them, and keeps reading the revision it opened. Windows refuses a plain
+    /// replace of an open file, so this pins the replace itself rather than
+    /// leaving it to a race.
+    #[test]
+    fn a_save_replaces_files_a_reader_holds_open() {
+        let root = tempfile::tempdir().unwrap();
+        save_sop(root.path(), &named_sop("held", "Old step")).unwrap();
+        let sop_dir = root.path().join("held");
+        let _held_manifest = std::fs::File::open(sop_dir.join("SOP.toml")).unwrap();
+        let mut held_steps = std::fs::File::open(sop_dir.join("SOP.md")).unwrap();
+
+        save_sop(root.path(), &named_sop("held", "New step"))
+            .expect("an open reader must not stop the save");
+
+        let old_steps = std::io::read_to_string(&mut held_steps).unwrap();
+        assert!(old_steps.contains("Old step"), "{old_steps}");
+        let loaded = load_sop(&sop_dir, SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.steps[0].title, "New step");
     }
 
     /// An edit-save names the SOP it was loaded from. After that SOP is
@@ -3261,6 +3430,74 @@ mod tests {
             "non-execute steps should not require an owner, got {:?}",
             validation.blocking
         );
+    }
+
+    #[test]
+    fn strict_validation_blocks_an_invalid_decision_table() {
+        let mut sop = authoring_sop(vec![titled_step(1, "a")]);
+        sop.decision = Some(decision::SopDecisionSpec {
+            model: "jev".into(),
+            gate: Some("Is this a refund?".into()),
+            gate_threshold: 1.5,
+            gate_on_error: decision::GateOnError::RunStrict,
+            modes: vec![],
+            mode_instructions: None,
+            min_confidence: 0.7,
+            part_threshold: 0.5,
+        });
+        let v = validate_sop_strict(&sop);
+        assert!(
+            v.blocking.iter().any(|b| b.contains("gate_threshold")),
+            "{:?}",
+            v.blocking
+        );
+        sop.decision.as_mut().unwrap().gate_threshold = 0.7;
+        assert!(validate_sop_strict(&sop).is_ok());
+    }
+
+    #[test]
+    fn load_report_names_sops_that_fail_to_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (dir, decision) in [
+            ("good", "model = \"jev\"\ngate = \"x\""),
+            ("bad", "gate = \"x\""),
+        ] {
+            let d = tmp.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SOP.toml"),
+                format!("[sop]\nname = \"{dir}\"\ndescription = \"t\"\n\n[decision]\n{decision}\n"),
+            )
+            .unwrap();
+            std::fs::write(d.join("SOP.md"), "## Steps\n\n1. **Do it** - do it.\n").unwrap();
+        }
+        let (sops, failures) =
+            load_sops_from_directory_report(tmp.path(), SopExecutionMode::Supervised);
+        assert_eq!(
+            sops.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "bad");
+        assert!(failures[0].1.contains("model"), "{}", failures[0].1);
+    }
+    #[test]
+    fn parse_steps_reads_decision_part_bullets_and_round_trips() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Hold** - Draft a scope comment.
+   - decide: Does this add a feature outside the roadmap?
+2. **Review** - Review the change.
+   - unless-decided: 1
+"#,
+        );
+        assert_eq!(
+            steps[0].decide.as_deref(),
+            Some("Does this add a feature outside the roadmap?")
+        );
+        assert_eq!(steps[1].unless_decided, Some(1));
+        assert_eq!(parse_steps(&render_steps(&steps)), steps);
     }
 
     #[test]
