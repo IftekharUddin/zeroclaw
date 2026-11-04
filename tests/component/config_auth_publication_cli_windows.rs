@@ -244,6 +244,8 @@ impl Daemon {
 
     /// Wait until the gateway answers `/health`, the heartbeat names this
     /// daemon, and the pipe answers `initialize` as `expected` says.
+    /// A build without the gateway (the CLI-only build) runs no gateway, so
+    /// there the heartbeat and the pipe are all there is to wait for.
     fn wait_until_serving(&mut self, fixture: &Fixture, expected: Handshake) {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
@@ -253,7 +255,7 @@ impl Daemon {
                     self.output()
                 );
             }
-            if health_ok(fixture.port)
+            if (!cfg!(feature = "gateway") || health_ok(fixture.port))
                 && fixture.heartbeat_names(self.child.id())
                 && let Ok(mut probe) = RpcProbe::connect(&self.pipe)
             {
@@ -266,7 +268,12 @@ impl Daemon {
             }
             assert!(
                 Instant::now() < deadline,
-                "the daemon did not serve /health, its heartbeat and {} within {STARTUP_TIMEOUT:?}\n{}",
+                "the daemon did not serve {}its heartbeat and {} within {STARTUP_TIMEOUT:?}\n{}",
+                if cfg!(feature = "gateway") {
+                    "/health, "
+                } else {
+                    ""
+                },
                 self.pipe.display(),
                 self.output()
             );
