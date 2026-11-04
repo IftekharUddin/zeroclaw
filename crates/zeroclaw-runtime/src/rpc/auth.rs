@@ -147,6 +147,10 @@ impl AuthDenied {
 /// registry, resolver, roster and flags consistent.
 pub struct AcceptedAuthState {
     registry: ProviderRegistry,
+    /// Each OIDC provider's issuer and client, by provider name, compiled
+    /// with `registry` so a bound credential is checked against the same
+    /// state that would send it.
+    oidc_bindings: std::collections::HashMap<String, OidcBinding>,
     resolver: PrincipalResolver,
     uid_roster: Arc<UidRoster>,
     local_roster_configured: bool,
@@ -156,6 +160,25 @@ pub struct AcceptedAuthState {
     /// The configuration this state was compiled from (see [`auth_inputs`]),
     /// or `None` for the deny-all state, which was compiled from nothing.
     auth_inputs: Option<serde_json::Value>,
+}
+
+/// The issuer and client an OIDC provider verifies tokens against. A token
+/// issued under one of them is bound to it: see
+/// [`RpcInboundAuth::authenticate_bound`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OidcBinding {
+    pub issuer: String,
+    pub client_id: String,
+}
+
+impl OidcBinding {
+    #[must_use]
+    pub fn of(entry: &zeroclaw_config::schema::OidcConfig) -> Self {
+        Self {
+            issuer: entry.issuer.clone(),
+            client_id: entry.effective_client_id().to_string(),
+        }
+    }
 }
 
 /// The parts of a configuration an accepted authorization state is compiled
@@ -172,20 +195,6 @@ pub fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
         serde_json::to_value(&config.permission_profiles)?,
         serde_json::Value::Bool(config.security.trust_daemon_uid),
     ]))
-}
-
-/// Whether the dotted property `path` writes one of the [`auth_inputs`]: the
-/// `oidc`, `users` or `permission_profiles` section or anything under it, or
-/// `security.trust_daemon_uid`.
-///
-/// A surface that edits configuration outside the daemon uses this where
-/// comparing [`auth_inputs`] before and after the edit is not enough: a write
-/// that re-asserts the value already in the file changes nothing there, yet
-/// the running daemon may still enforce another one.
-pub fn is_auth_input_path(path: &str) -> bool {
-    let section = path.split_once('.').map_or(path, |(section, _)| section);
-    matches!(section, "oidc" | "users" | "permission_profiles")
-        || path == "security.trust_daemon_uid"
 }
 
 impl AcceptedAuthState {
@@ -212,8 +221,14 @@ impl AcceptedAuthState {
                 config.oidc[alias].clone(),
             )?))?;
         }
+        let oidc_bindings = config
+            .oidc
+            .iter()
+            .map(|(alias, entry)| (format!("oidc.{alias}"), OidcBinding::of(entry)))
+            .collect();
         Ok(Self {
             registry,
+            oidc_bindings,
             resolver: PrincipalResolver::with_generation(
                 ResolverPolicy::from_config(config)?,
                 generation,
@@ -246,6 +261,7 @@ impl AcceptedAuthState {
             .expect("unique peercred provider");
         Self {
             registry,
+            oidc_bindings: std::collections::HashMap::new(),
             resolver: PrincipalResolver::with_generation(ResolverPolicy::default(), generation),
             uid_roster,
             local_roster_configured: true,
@@ -690,6 +706,45 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            transport_credential,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::authenticate`] for a bearer bound to one OIDC provider as it
+    /// was configured when the bearer was issued. Refused before the bearer
+    /// is sent anywhere when, in the accepted state this verification uses,
+    /// the provider by that name names another issuer or client, or is gone.
+    pub async fn authenticate_bound(
+        &self,
+        transport: TransportKind,
+        auth_token: &str,
+        auth_provider: &str,
+        binding: &OidcBinding,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            Credential::None,
+            Some(auth_token),
+            Some(auth_provider),
+            Some(binding),
+        )
+        .await
+    }
+
+    async fn authenticate_checked(
+        &self,
+        transport: TransportKind,
+        transport_credential: Credential,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
+        binding: Option<&OidcBinding>,
+    ) -> Result<ConnectionAuth, AuthDenied> {
         #[cfg(test)]
         {
             let pause = self.authenticate_pause.lock().unwrap().take();
@@ -699,6 +754,14 @@ impl RpcInboundAuth {
             }
         }
         let state = self.state();
+        // Checked against the same state whose registry would send the
+        // bearer: a provider repointed or removed since it was issued never
+        // receives it.
+        if let Some(binding) = binding
+            && state.oidc_bindings.get(auth_provider.unwrap_or_default()) != Some(binding)
+        {
+            return Err(AuthDenied::from_deny_reason(DenyReason::UnknownProvider));
+        }
         // The generation the provider is about to verify against. Provider
         // verification below may await an IdP round trip; a trusted config
         // write can install a new generation during that await. Captured
@@ -1576,204 +1639,6 @@ mod tests {
         }
     }
 
-    /// `auth_inputs` is what a client compares to decide whether an edit must
-    /// reach the running daemon, and `is_auth_input_path` is how it tells a
-    /// write to those inputs by its path, so both have to cover every
-    /// authorization section and nothing else.
-    #[test]
-    fn auth_inputs_change_only_with_the_authorization_sections() {
-        let base = base_config();
-        let inputs = auth_inputs(&base).expect("the default config encodes");
-
-        let mut unrelated = base.clone();
-        unrelated.gateway.host = "0.0.0.0".into();
-        assert_eq!(
-            auth_inputs(&unrelated).expect("the edited config encodes"),
-            inputs,
-            "a gateway edit is not an authorization input"
-        );
-        assert!(!is_auth_input_path("gateway.host"));
-
-        type Mutation = fn(&mut Config);
-        let mutations: [(&str, Mutation); 4] = [
-            ("security.trust_daemon_uid", |config| {
-                config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
-            }),
-            ("users.alice.uid", |config| {
-                config.users.insert(
-                    "alice".into(),
-                    UserConfig {
-                        principal_id: None,
-                        uid: Some(4242),
-                        permission_profiles: vec!["operator".into()],
-                    },
-                );
-            }),
-            ("permission_profiles.operator", |config| {
-                config
-                    .permission_profiles
-                    .insert("operator".into(), PermissionProfileConfig::default());
-            }),
-            ("oidc.corp", |config| {
-                config.oidc.insert("corp".into(), OidcConfig::default());
-            }),
-        ];
-        for (path, mutate) in mutations {
-            let mut changed = base.clone();
-            mutate(&mut changed);
-            assert_ne!(
-                auth_inputs(&changed).expect("the edited config encodes"),
-                inputs,
-                "a write to {path} must change the authorization inputs"
-            );
-            assert!(
-                is_auth_input_path(path),
-                "{path} must name an authorization input"
-            );
-        }
-    }
-
-    /// Every path that writes a section `auth_inputs` reads is an
-    /// authorization input path, and nothing else is, however close its name.
-    #[test]
-    fn is_auth_input_path_names_exactly_the_authorization_sections() {
-        for path in [
-            "oidc",
-            "oidc.corp",
-            "oidc.corp.client_secret",
-            "users",
-            "users.me.uid",
-            "users.me.permission_profiles",
-            "permission_profiles",
-            "permission_profiles.admin.admin",
-            "security.trust_daemon_uid",
-        ] {
-            assert!(is_auth_input_path(path), "{path} is an authorization input");
-        }
-        for path in [
-            "",
-            "gateway.host",
-            "security",
-            "security.trust_daemon_uid_extra",
-            "security.sandbox.enabled",
-            "usersx.me.uid",
-            "oidc_providers.corp",
-            "permission_profiles_extra",
-            "agents.users.model",
-            "trust_daemon_uid",
-        ] {
-            assert!(
-                !is_auth_input_path(path),
-                "{path} is not an authorization input"
-            );
-        }
-    }
-
-    /// A value for `field` that differs from its current one, derived from
-    /// its kind, or `None` where `set_prop` takes no plain value for it.
-    fn changed_value(field: &zeroclaw_config::traits::PropFieldInfo) -> Option<String> {
-        use zeroclaw_config::traits::{PropKind, UNSET_DISPLAY};
-        let current = field.display_value.as_str();
-        let unset = current == UNSET_DISPLAY;
-        match field.kind {
-            PropKind::Bool => Some((current != "true").to_string()),
-            PropKind::Integer if unset => Some("1".to_owned()),
-            PropKind::Integer => Some(current.parse::<i64>().ok()?.checked_add(1)?.to_string()),
-            PropKind::Float if unset => Some("1.0".to_owned()),
-            PropKind::Float => Some((current.parse::<f64>().ok()? + 1.0).to_string()),
-            PropKind::String | PropKind::AliasRef if unset => Some("drift-guard".to_owned()),
-            PropKind::String | PropKind::AliasRef => Some(format!("{current}-drift-guard")),
-            PropKind::Enum => (field.enum_variants?)()
-                .into_iter()
-                .find(|variant| variant != current),
-            PropKind::StringArray => {
-                let mut items: Vec<String> = if unset {
-                    Vec::new()
-                } else {
-                    serde_json::from_str(current).ok()?
-                };
-                items.push("drift-guard".to_owned());
-                serde_json::to_string(&items).ok()
-            }
-            PropKind::Object | PropKind::ObjectArray | PropKind::SecretMap => None,
-        }
-    }
-
-    /// The drift guard for `is_auth_input_path`: a property whose write
-    /// changes the authorization inputs but which the predicate does not
-    /// name would let an edit bypass the running daemon's policy. Every
-    /// property the configuration exposes, with one entry in each
-    /// authorization section so their fields are exposed too, is changed on
-    /// its own and the inputs compared before and after.
-    #[test]
-    fn is_auth_input_path_names_every_property_that_changes_the_authorization_inputs() {
-        let mut config = base_config();
-        config.users.insert(
-            "alice".into(),
-            UserConfig {
-                principal_id: None,
-                uid: Some(4242),
-                permission_profiles: vec!["operator".into()],
-            },
-        );
-        config
-            .permission_profiles
-            .insert("operator".into(), PermissionProfileConfig::default());
-        config.oidc.insert("corp".into(), OidcConfig::default());
-        let inputs = auth_inputs(&config).expect("the fixture encodes");
-        let serialized = |config: &Config| toml::to_string(config).expect("the config encodes");
-        let unedited = serialized(&config);
-
-        let mut exercised: Vec<String> = Vec::new();
-        for field in config.prop_fields() {
-            let Some(value) = changed_value(&field) else {
-                continue;
-            };
-            let mut staged = config.clone();
-            if staged.set_prop(&field.name, &value).is_err() {
-                continue;
-            }
-            // `get_prop` masks a secret whatever its value, so a write to one
-            // is seen in the serialized configuration instead.
-            let took_effect = staged.get_prop(&field.name).ok()
-                != config.get_prop(&field.name).ok()
-                || (field.is_secret && serialized(&staged) != unedited);
-            if !took_effect {
-                continue;
-            }
-            let changed = auth_inputs(&staged).expect("the edited config encodes") != inputs;
-            if changed {
-                assert!(
-                    is_auth_input_path(&field.name),
-                    "a write to {} changes the authorization inputs, but is_auth_input_path does not name it",
-                    field.name
-                );
-            } else {
-                // No property under the authorization sections takes a write
-                // that serialization does not show, so none is exempt here.
-                assert!(
-                    !is_auth_input_path(&field.name),
-                    "is_auth_input_path names {}, but a write to it leaves the authorization inputs unchanged",
-                    field.name
-                );
-            }
-            exercised.push(field.name);
-        }
-
-        for section in ["users.", "permission_profiles.", "oidc."] {
-            assert!(
-                exercised.iter().any(|name| name.starts_with(section)),
-                "no property under {section} was exercised: {exercised:?}"
-            );
-        }
-        assert!(
-            exercised
-                .iter()
-                .any(|name| name == "security.trust_daemon_uid"),
-            "security.trust_daemon_uid was not exercised: {exercised:?}"
-        );
-    }
-
     #[test]
     fn publish_accepted_replaces_a_deny_all_state_with_the_repaired_policy() {
         let mut dangling = base_config();
@@ -1897,6 +1762,61 @@ mod tests {
             interactive_clients: vec!["daemon-client".into()],
             ..zeroclaw_config::schema::OidcConfig::default()
         }
+    }
+
+    /// A bearer bound to one OIDC provider is verified only by it: when the
+    /// accepted state's provider by that name names another issuer or
+    /// client, or there is none, the bearer is refused before it is sent
+    /// anywhere.
+    #[tokio::test]
+    async fn a_bound_bearer_never_reaches_another_provider() {
+        let corp = introspection_idp("alice", &["ops"]).await;
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&corp.uri(), "ops", "operator"));
+        let auth = auth_for(&config, &[]);
+        let bound = OidcBinding::of(&config.oidc["corp"]);
+        let introspections = || async {
+            corp.received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path() == "/introspect")
+                .count()
+        };
+        auth.authenticate_bound(TransportKind::Wss, "corp-at", "oidc.corp", &bound)
+            .await
+            .expect("the provider it is bound to verifies it");
+        let sent = introspections().await;
+        let elsewhere = OidcBinding {
+            issuer: "https://elsewhere.example".into(),
+            ..bound.clone()
+        };
+        let other_client = OidcBinding {
+            client_id: "another-client".into(),
+            ..bound.clone()
+        };
+        for (case, binding, provider) in [
+            ("another issuer", &elsewhere, "oidc.corp"),
+            ("another client", &other_client, "oidc.corp"),
+            ("no such provider", &bound, "oidc.gone"),
+        ] {
+            assert!(
+                auth.authenticate_bound(TransportKind::Wss, "corp-at", provider, binding)
+                    .await
+                    .is_err(),
+                "{case}: a bound bearer was admitted"
+            );
+        }
+        assert_eq!(introspections().await, sent, "a bound bearer was sent");
     }
 
     /// Two independent issuers verify side by side, resolve to distinct

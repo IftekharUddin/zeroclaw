@@ -121,6 +121,56 @@ use std::sync::Arc;
 #[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
+/// Localized, operator-facing text for one config migration notice about the
+/// config file at `path`. Printed on stderr: the matching WARN record is
+/// hidden without `-v`, and these report config the operator wrote being
+/// dropped, moved, or read under an assumed schema version.
+fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, path: &str) -> String {
+    use crate::config::migration::MigrationNotice;
+    match notice {
+        MigrationNotice::AssumedV1 => ta(
+            "cli-config-migration-assumed-v1",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
+            ),
+        ),
+        MigrationNotice::InferredV3 => ta(
+            "cli-config-migration-inferred-v3",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file."
+            ),
+        ),
+        MigrationNotice::Removed { path: key, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-retired-key-removed",
+                &[("key", key), ("path", path), ("reason", &reason)],
+                format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
+            )
+        }
+        MigrationNotice::IgnoredEnvOverride { variable, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-env-override-retired",
+                &[("variable", variable), ("reason", &reason)],
+                format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
+            )
+        }
+    }
+}
+
+/// A retirement reason in the operator's locale. Notices carry the English
+/// reason, which logs keep; the CLI catalogue holds each one under the Fluent
+/// id its `RETIRED_KEYS` entry names.
+fn retirement_reason_text(reason: &str) -> String {
+    match crate::config::migration::retirement_reason_id(reason) {
+        Some(id) => t(id, reason),
+        None => reason.to_string(),
+    }
+}
+
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
 /// i18n catalogue under `agent-runtime` (default + CI/release); without that
 /// feature the runtime crate is absent, so the English `fallback` is used.
@@ -1659,12 +1709,15 @@ and smoke test. Automatic rollback on failure.
 Use --check to only check for updates without installing.
 Use --force to skip the confirmation prompt.
 Use --version to target a specific release instead of latest.
+Use --standard in a CLI-only build to switch it to the standard build, \
+which adds the dashboard and web gateway.
 
 Examples:
   zeroclaw update                      # download and install latest
   zeroclaw update --check              # check only, don't install
   zeroclaw update --force              # install without confirmation
-  zeroclaw update --version 0.6.0      # install specific version")]
+  zeroclaw update --version 0.6.0      # install specific version
+  zeroclaw update --standard           # CLI-only build: switch to the standard build")]
     Update {
         /// Only check for updates, don't install
         #[arg(long)]
@@ -1678,6 +1731,10 @@ Examples:
         /// With --check, emit machine-readable JSON instead of human text
         #[arg(long)]
         json: bool,
+        /// In a CLI-only build, install the standard build, which adds the
+        /// dashboard and web gateway. No effect in a standard build
+        #[arg(long)]
+        standard: bool,
     },
 
     /// Run diagnostic self-tests
@@ -3745,7 +3802,9 @@ fn with_update_pointer(
 /// This is the verdict that separates the two, and it comes from the same
 /// `verify_component_loads` check `plugin install` gates on: a plugin that
 /// predates that gate, was installed with `--no-verify`, or outlived a host
-/// upgrade is exactly the case the install gate cannot cover.
+/// upgrade is exactly the case the install gate cannot cover. For a tool, the
+/// runtime also refuses an instance whose configuration does not resolve, so
+/// the verdict asks the runtime's own config check as well.
 #[cfg(feature = "plugins-wasm")]
 #[derive(Debug)]
 enum PluginLoadStatus {
@@ -3754,6 +3813,14 @@ enum PluginLoadStatus {
     /// It does not. Carries the full wasmtime cause chain, including the
     /// WIT-drift rebuild hint when instantiation was what failed.
     Fails(String),
+    /// The component instantiates, but the runtime refuses the configuration
+    /// of the package's tool instance and skips the tool.
+    ConfigRefused {
+        /// The `[[plugins.entries]]` row the configuration is read from.
+        instance_key: String,
+        /// The runtime's reason, escaped for the terminal.
+        reason: String,
+    },
     /// A skill-only package ships no component, so there is nothing to load.
     NoComponent,
 }
@@ -3764,17 +3831,22 @@ impl PluginLoadStatus {
     /// it. Only a real load failure qualifies: a skill-only package has
     /// nothing to instantiate, which is not evidence that anything is broken.
     const fn is_load_failure(&self) -> bool {
-        matches!(self, Self::Fails(_))
+        matches!(self, Self::Fails(_) | Self::ConfigRefused { .. })
     }
 }
 
-/// Run the load-check for one installed plugin.
+/// Run the load-check for one installed plugin: the component against this
+/// host's WIT world, then, for a component that instantiates, the runtime's
+/// check of the tool instance's configuration in `config`.
 #[cfg(feature = "plugins-wasm")]
 async fn installed_plugin_load_status(
     host: &zeroclaw::plugins::host::PluginHost,
     info: &zeroclaw::plugins::PluginInfo,
     limits: zeroclaw::plugins::component::PluginLimits,
+    config: &crate::config::schema::Config,
 ) -> Result<PluginLoadStatus> {
+    use zeroclaw_runtime::plugin_runtime::ToolConfigVerdict;
+
     // The host's admitted bytes, not a reread of `wasm_path`: these are what
     // the daemon compiles, so the verdict describes what will actually run.
     let Some(component) = host.admitted_component(&info.name) else {
@@ -3783,10 +3855,31 @@ async fn installed_plugin_load_status(
     let manifest = host
         .manifest(&info.name)
         .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
-        Ok(()) => Ok(PluginLoadStatus::Loads),
-        Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
+    if let Err(error) =
+        zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await
+    {
+        return Ok(PluginLoadStatus::Fails(format!("{error:#}")));
     }
+    // An admitted manifest always forms its instance key, so the verdict
+    // cannot fail in practice. If it ever does, that is this plugin's load
+    // failure, never the whole command's.
+    Ok(
+        match zeroclaw_runtime::plugin_runtime::tool_instance_config_verdict(config, manifest) {
+            Ok(ToolConfigVerdict::Accepted | ToolConfigVerdict::NotATool) => {
+                PluginLoadStatus::Loads
+            }
+            Ok(ToolConfigVerdict::Refused {
+                instance_key,
+                error,
+            }) => PluginLoadStatus::ConfigRefused {
+                instance_key,
+                // The resolver's message can quote publisher text, such as a
+                // schema property name.
+                reason: crate::plugins::channel_instance::escape_unprintable(&error.to_string()),
+            },
+            Err(error) => PluginLoadStatus::Fails(format!("{error:#}")),
+        },
+    )
 }
 
 /// The first line of a diagnostic. A list row annotates each plugin with just
@@ -3833,7 +3926,8 @@ fn plugin_list_lines(
                 &args,
                 format!("{identity} [loads]"),
             ),
-            PluginLoadStatus::Fails(error) => {
+            PluginLoadStatus::Fails(error)
+            | PluginLoadStatus::ConfigRefused { reason: error, .. } => {
                 let cause = first_line(error);
                 let mut args = args.to_vec();
                 args.push(("error", cause));
@@ -3954,6 +4048,16 @@ fn plugin_info_lines(
             &[("error", error)],
             format!(
                 "Loads: no. {error}\nRebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it."
+            ),
+        ),
+        PluginLoadStatus::ConfigRefused {
+            instance_key,
+            reason,
+        } => ta(
+            "cli-plugin-info-load-config-refused",
+            &[("error", reason), ("key", instance_key)],
+            format!(
+                "Loads: no. The component instantiates against this host's WIT world, but the runtime refuses its configuration: {reason}\nThe configuration is the `config` map of the [[plugins.entries]] row named '{instance_key}'. Make it match the installed package's config_schema, or remove its values if the package declares none."
             ),
         ),
         PluginLoadStatus::NoComponent => t(
@@ -9859,33 +9963,6 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             config.data_dir.display()
         );
     }
-    #[cfg(feature = "agent-runtime")]
-    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
-        anyhow::ensure!(
-            config.data_dir == *expected_data_dir,
-            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
-            expected_data_dir.display(),
-            config.data_dir.display()
-        );
-        let ownership = standalone_ownership.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": expected_data_dir.display().to_string(),
-                    })),
-                "standalone config ownership invariant failed"
-            );
-            anyhow::Error::msg("standalone ownership was not acquired")
-        })?;
-        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
-            config.clone(),
-            ownership,
-        ))
-    } else {
-        None
-    };
     let running_executable =
         running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
@@ -9920,27 +9997,36 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         };
         eprintln!("{warning}");
     }
-    for section in &config.retired_wati_config_sections {
-        let fallback = format!(
-            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
-        );
-        eprintln!(
-            "{}",
-            ta(
-                "cli-config-section-retired-wati",
-                &[("section", section)],
-                &fallback,
-            )
-        );
-    }
-    if config.retired_node_transport_config {
-        eprintln!(
-            "{}",
-            t(
-                "cli-config-section-retired-node-transport",
-                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
-            )
-        );
+    // `config migrate` reports the same notices itself, as changes it wrote.
+    let reports_own_migration = matches!(
+        &cli.command,
+        Commands::Config {
+            config_command: ConfigCommands::Migrate { .. }
+        }
+    );
+    if !reports_own_migration && !config.migration_notices.is_empty() {
+        let path = config.config_path.display().to_string();
+        for notice in &config.migration_notices {
+            eprintln!("{}", migration_notice_text(notice, &path));
+        }
+        // Only a change to the file can be written; an ignored environment
+        // variable or a kept reference is for the operator to fix.
+        if config
+            .migration_notices
+            .iter()
+            .any(crate::config::migration::MigrationNotice::changes_file)
+        {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-config-migration-pending",
+                    &[("path", &path)],
+                    format!(
+                        "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
+                    ),
+                )
+            );
+        }
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
@@ -9948,6 +10034,43 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // This process has just become the data directory's only owner and has
+    // admitted nothing yet: any session turn still marked running belongs to
+    // a process that is gone. It happens once per process, so a reload does
+    // not repeat it. It follows the trace sink init above so that what it
+    // settles, or fails to, is on record.
+    #[cfg(feature = "agent-runtime")]
+    if let Some((_, ownership)) = daemon_ownership.as_ref() {
+        ownership.recover_abandoned_turns_or_log();
+    }
+    #[cfg(feature = "agent-runtime")]
+    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+        let ownership = standalone_ownership.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": expected_data_dir.display().to_string(),
+                    })),
+                "standalone config ownership invariant failed"
+            );
+            anyhow::Error::msg("standalone ownership was not acquired")
+        })?;
+        ownership.recover_abandoned_turns_or_log();
+        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+            config.clone(),
+            ownership,
+        ))
+    } else {
+        None
+    };
     // Enrollment's contract is that stdout carries exactly the token and
     // nothing else, so the `oidc` commands are dispatched before any
     // startup prelude that may print: the OTP prelude below discloses a
@@ -10277,6 +10400,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         }
 
         Commands::Gateway { gateway_command } => {
+            if !cfg!(feature = "gateway") {
+                bail!("{}", no_dashboard_in_build_message());
+            }
             match gateway_command {
                 Some(zeroclaw::GatewayCommands::Restart {
                     port,
@@ -11288,12 +11414,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         // One-time pairing code gates enrollment. Print it AND the
                         // CA-bound short-auth-string so the operator reads both to
                         // the client out of band (no blind trust-on-first-use).
-                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
-                            true,
-                            &[],
-                            startup_pairing_code_policy,
-                        ));
-                        if let Some(code) = pairing.pairing_code() {
+                        // The code lives in the enrollment slot of the daemon's
+                        // canonical pairing authority: it enrolls but never
+                        // pairs a bearer, and it leaves the gateway's pending
+                        // code alone. Enrollment always requires a code, even
+                        // with gateway pairing disabled.
+                        let pairing = std::sync::Arc::clone(ctx.auth.pairing());
+                        {
+                            let code = pairing.enrollment_code(startup_pairing_code_policy);
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
                             let enroll_bind = enroll_cfg.bind.to_string();
                             let enroll_port = enroll_cfg.port.to_string();
@@ -11691,6 +11819,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     }
                 }
             }
+            #[cfg(not(feature = "gateway"))]
+            println!(
+                "{}",
+                t(
+                    "cli-status-web-ui-not-in-build",
+                    "🌐 Web UI:        not included in this build (CLI-only)"
+                )
+            );
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
@@ -12366,6 +12502,10 @@ Add pricing to the active provider profile or supply a catalog entry."
         Commands::Desktop {
             install: do_install,
         } => {
+            // The companion app needs the gateway this build does not have.
+            if !cfg!(feature = "gateway") {
+                bail!("{}", no_dashboard_in_build_message());
+            }
             // The marketing download page is not live; point at the GitHub
             // releases page, which hosts the desktop download assets (.deb /
             // .AppImage / .dmg) for the latest release.
@@ -12566,9 +12706,10 @@ Add pricing to the active provider profile or supply a catalog entry."
             force,
             version,
             json,
+            standard,
         } => {
             if check {
-                let info = commands::update::check(version.as_deref()).await?;
+                let info = commands::update::check(version.as_deref(), standard).await?;
                 if json {
                     // Machine-readable shape consumed by the gateway's
                     // `GET /api/version/check`. Keep field names stable.
@@ -12607,7 +12748,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref(), force).await
+                commands::update::run(version.as_deref(), force, standard).await
             }
         }
 
@@ -13014,7 +13155,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // ownership lock, which no daemon can hold meanwhile.
                 let holds_config_ownership = offline_ownership.is_some();
                 let publication = if daemon_replays_write(&config, &path, &selected_value) {
-                    let publication = Box::pin(config_publication::commit_set(
+                    Box::pin(config_publication::commit_set(
                         &before,
                         &config,
                         &path,
@@ -13022,27 +13163,20 @@ Add pricing to the active provider profile or supply a catalog entry."
                         comment.as_deref(),
                         holds_config_ownership,
                     ))
-                    .await?;
-                    // A daemon that applied the edit has already saved
-                    // config.toml.
-                    if !matches!(publication, config_publication::Publication::Applied) {
-                        Box::pin(config.save_dirty()).await?;
-                    }
-                    publication
+                    .await?
                 } else {
-                    // Classified before the save: while a daemon runs, an
-                    // edit that breaks a policy that compiles saves nothing.
-                    let publication = config_publication::classify_local_save(
+                    config_publication::classify_local_save(
                         &before,
                         &config,
                         std::slice::from_ref(&path),
                         config_publication::PendingReason::NotReplayable,
                         true,
                         holds_config_ownership,
-                    )?;
-                    Box::pin(config.save_dirty()).await?;
-                    publication
+                    )?
                 };
+                // The daemon-applied path is already saved. Pending local
+                // writes validate the final persisted policy at the writer.
+                Box::pin(publication.save_local(&mut config, true)).await?;
                 // Reported before the comment is written: the edit's outcome is
                 // settled, and a failed annotation must not hide it.
                 publication.report(json);
@@ -13146,10 +13280,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 // `config init` has no daemon path for a roster, profile or
                 // OIDC entry: one it creates waits for the running daemon's
-                // next reload. It is classified before the save, so while a
-                // daemon runs an entry that breaks a policy that compiles
-                // saves nothing. An offline agent route already holds the
-                // configuration's ownership lock.
+                // next reload. Check its effective policy here and the final
+                // persisted policy at the local save. An offline agent route
+                // already holds the configuration's ownership lock.
                 let publication = config_publication::classify_local_save(
                     &before,
                     &config,
@@ -13159,7 +13292,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     offline_ownership.is_some(),
                 )?;
                 if !initialized.is_empty() {
-                    Box::pin(config.save_dirty()).await?;
+                    Box::pin(publication.save_local(&mut config, true)).await?;
                 }
                 publication.report(json);
                 if json {
@@ -13206,7 +13339,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                             let envelope = serde_json::json!({
                                 "migrated": true,
                                 "backup_path": report.backup_path.display().to_string(),
+                                "version_backup_path": report
+                                    .version_backup_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
                                 "schema_version": to,
+                                "notices": report.notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
@@ -13218,10 +13356,26 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     "Backed up to"
                                 )
                             );
+                            if let Some(kept) = &report.version_backup_path {
+                                let kept = kept.display().to_string();
+                                let from = report.from_version.to_string();
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-kept-original",
+                                        &[("version", &from), ("path", &kept)],
+                                        "Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw."
+                                    )
+                                );
+                            }
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
                             );
+                            let path = config.config_path.display().to_string();
+                            for notice in &report.notices {
+                                eprintln!("{}", migration_notice_text(notice, &path));
+                            }
                         }
                     }
                     None => {
@@ -13660,7 +13814,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // ownership lock, which no daemon can hold meanwhile.
                 let holds_config_ownership = offline_ownership.is_some();
                 let publication = if patch_batch_is_delegatable(sets.len(), replayable) {
-                    let publication = match Box::pin(config_publication::commit_set_many(
+                    match Box::pin(config_publication::commit_set_many(
                         &before,
                         &config,
                         &sets,
@@ -13679,19 +13833,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                             daemon_commit_api_error(&err),
                             err.to_string(),
                         )?,
-                    };
-                    // A daemon that applied the batch has already saved
-                    // config.toml.
-                    if !matches!(publication, config_publication::Publication::Applied) {
-                        Box::pin(config.save_dirty()).await?;
                     }
-                    publication
                 } else {
                     let touched: Vec<String> = sets.iter().map(|(path, _)| path.clone()).collect();
-                    // Classified before the save: while a daemon runs, a patch
-                    // that breaks a policy that compiles fails whole, in the
-                    // envelope the delegated branch's verdict uses.
-                    let publication = match config_publication::classify_local_save(
+                    match config_publication::classify_local_save(
                         &before,
                         &config,
                         &touched,
@@ -13705,10 +13850,21 @@ Add pricing to the active provider profile or supply a catalog entry."
                             daemon_commit_api_error(&err),
                             err.to_string(),
                         )?,
-                    };
-                    Box::pin(config.save_dirty()).await?;
-                    publication
+                    }
                 };
+                if let Err(err) = Box::pin(publication.save_local(&mut config, false)).await {
+                    if err
+                        .downcast_ref::<config_publication::CommitFailure>()
+                        .is_some()
+                    {
+                        config_patch_fail_json_or_human(
+                            json,
+                            daemon_commit_api_error(&err),
+                            err.to_string(),
+                        )?;
+                    }
+                    return Err(err);
+                }
 
                 // Report only a new enable transition: startup already recorded
                 // an enabled section. Drain this post-save notice before the
@@ -13829,7 +13985,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     for info in &plugins {
                         entries.push((
                             info.clone(),
-                            Some(installed_plugin_load_status(&host, info, limits).await?),
+                            Some(installed_plugin_load_status(&host, info, limits, &config).await?),
                         ));
                     }
                     for line in plugin_list_lines(&entries) {
@@ -14102,7 +14258,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                         // The load-check always runs here. "Why does my plugin
                         // not show up?" is the question this command is reached
                         // for, and discovery metadata cannot answer it.
-                        let status = installed_plugin_load_status(&host, &info, limits).await?;
+                        let status =
+                            installed_plugin_load_status(&host, &info, limits, &config).await?;
                         for line in plugin_info_lines(
                             &info,
                             &instance_rows,
@@ -16706,10 +16863,20 @@ async fn run_gateway_if_enabled(
     _config: zeroclaw::config::Config,
     _event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
+    anyhow::bail!("{}", no_dashboard_in_build_message())
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+/// The answer a build without the gateway gives for the gateway commands and
+/// the desktop companion: they need the standard build, which has the dashboard.
+#[cfg(feature = "agent-runtime")]
+fn no_dashboard_in_build_message() -> String {
+    t(
+        "cli-no-dashboard-in-build",
+        "This ZeroClaw build has no dashboard or web gateway (CLI-only build). To use them, install the standard build: curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh",
+    )
+}
+
+#[cfg(any(feature = "gateway", test))]
 fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -16718,7 +16885,7 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
     host == default_host && port == default_port
 }
@@ -16732,7 +16899,7 @@ fn gateway_browser_host(host: &str) -> &str {
     }
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -16776,7 +16943,7 @@ fn gateway_addr_in_use_message(
     lines.join("\n")
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
     let mut command = format!("    zeroclaw gateway start --port {port}");
     if host != default_host {
@@ -16785,7 +16952,7 @@ fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -
     command
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_paircode_recovery_command(
     host: &str,
     port: u16,
@@ -16803,7 +16970,7 @@ fn gateway_paircode_recovery_command(
     command
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     const SCAN_LIMIT: u16 = 20;
 
@@ -17692,6 +17859,45 @@ mod tests {
         }
     }
 
+    /// Every retirement reason a migration notice can show has its text in
+    /// every locale the CLI ships.
+    #[test]
+    fn every_retirement_reason_is_in_every_cli_locale() {
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+        for key in crate::config::migration::RETIRED_KEYS {
+            for (locale, cli_ftl) in locales {
+                let entry = format!("{} = ", key.reason_id);
+                assert!(
+                    cli_ftl.lines().any(|line| line.starts_with(&entry)),
+                    "{locale}: missing `{}` for {:?}",
+                    key.reason_id,
+                    key.path
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selector_rejects_widths_that_erase_action_labels() {
@@ -18495,6 +18701,29 @@ mod tests {
                     json: true,
                 }
             } if run_id == "run-123-0001"
+        ));
+    }
+
+    #[test]
+    fn update_cli_parses_standard_with_version_and_force() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "update",
+            "--standard",
+            "--version",
+            "0.9.0",
+            "--force",
+        ])
+        .expect("update --standard should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Update {
+                check: false,
+                force: true,
+                version: Some(version),
+                json: false,
+                standard: true,
+            } if version == "0.9.0"
         ));
     }
 
@@ -22458,9 +22687,14 @@ type = "string"
             )
             .unwrap();
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::Loads),
                 "the in-tree tool fixture must load against this host; got {status:?}"
@@ -22506,6 +22740,7 @@ type = "string"
                 &host,
                 &info,
                 zeroclaw_runtime::plugin_runtime::plugin_limits(&constrained),
+                &constrained,
             )
             .await
             .expect("the load verdict is reported, not raised");
@@ -22514,9 +22749,14 @@ type = "string"
                 "a limit below the component's required instances must not report loads: {constrained_status:?}"
             );
 
-            let default_status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .expect("the load verdict is reported, not raised");
+            let default_status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .expect("the load verdict is reported, not raised");
             assert!(
                 matches!(default_status, PluginLoadStatus::Loads),
                 "the same component must load under the default runtime limits: {default_status:?}"
@@ -22554,9 +22794,14 @@ type = "string"
                 "discovery still calls the package loaded, which is why the check is needed"
             );
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             let PluginLoadStatus::Fails(cause) = &status else {
                 panic!("a non-component artifact must not report as loading; got {status:?}");
             };
@@ -22675,9 +22920,14 @@ type = "string"
                 .expect("the skill bundle is discovered");
             assert!(info.wasm_path.is_none(), "the fixture ships no component");
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::NoComponent),
                 "a component-less package is not applicable, not broken; got {status:?}"
@@ -22685,11 +22935,190 @@ type = "string"
             assert!(!status.is_load_failure(), "and must not fail the exit code");
         }
 
+        /// The fixture as a release that stopped reading config ships it: no
+        /// permission and no `config_schema`.
+        const FIXTURE_MANIFEST_WITHOUT_CONFIG: &str = r#"name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = []
+"#;
+
+        /// The runtime's reason for refusing values handed to a package without
+        /// a `config_schema`. Like a load failure's cause, it is not translated.
+        const NO_SCHEMA_REFUSAL: &str = "has configured values but declares no config_schema";
+
+        /// Install the fixture under `manifest` through `plugin install`'s own
+        /// path: the load check, the publish and the row seeding.
+        async fn install_fixture_with(
+            host: &mut PluginHost,
+            config: &mut crate::config::schema::Config,
+            source: &Path,
+            manifest: &str,
+        ) {
+            std::fs::create_dir_all(source).unwrap();
+            std::fs::copy(
+                super::tool_component_fixture::wasm(),
+                source.join("tool-fixture.wasm"),
+            )
+            .unwrap();
+            std::fs::write(source.join("manifest.toml"), manifest).unwrap();
+            let admitted = host
+                .admit_source(source.to_str().expect("utf-8 temp path"))
+                .expect("admit the fixture");
+            Box::pin(install_admitted_source(
+                host,
+                config,
+                admitted,
+                None,
+                verifier_limits(),
+                false,
+                |_| {},
+            ))
+            .await
+            .expect("install the fixture");
+        }
+
+        /// In the order an operator meets it: a value set for the package that
+        /// reads config stays on its row after `plugin remove`, and a
+        /// reinstall without a `config_schema` meets it. The runtime refuses
+        /// that tool instance, so `plugin info` and `plugin list --verify` say
+        /// it does not load. With the value removed it loads.
+        #[tokio::test]
+        async fn values_left_for_a_reinstall_without_a_config_schema_do_not_load() {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut config = super::config_in_dir(workspace.path());
+            let mut host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+
+            install_fixture_with(
+                &mut host,
+                &mut config,
+                &workspace.path().join("source/with-config"),
+                FIXTURE_MANIFEST,
+            )
+            .await;
+            let key = installed_instance_rows(&config, &host, "tool-fixture")
+                .unwrap()
+                .into_iter()
+                .find(|row| !row.is_channel())
+                .expect("install seeds the tool row")
+                .key;
+            // `config set plugins.entries.<key>.config.label masked`
+            config
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .expect("the seeded row")
+                .config
+                .insert("label".to_string(), "masked".to_string());
+            let info = host.get_plugin("tool-fixture").unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "the package whose schema declares the value loads with it: {status:?}"
+            );
+
+            host.remove_with_report("tool-fixture")
+                .expect("remove the package");
+            install_fixture_with(
+                &mut host,
+                &mut config,
+                &workspace.path().join("source/without-config"),
+                FIXTURE_MANIFEST_WITHOUT_CONFIG,
+            )
+            .await;
+
+            let info = host.get_plugin("tool-fixture").unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            let PluginLoadStatus::ConfigRefused {
+                instance_key,
+                reason,
+            } = &status
+            else {
+                panic!("the runtime skips this tool, so it must not report as loading: {status:?}");
+            };
+            assert_eq!(instance_key, &key, "the verdict names the row it read");
+            assert!(reason.contains(NO_SCHEMA_REFUSAL), "{reason}");
+            assert!(status.is_load_failure(), "plugin info exits non-zero");
+
+            let rows = installed_instance_rows(&config, &host, &info.name).unwrap();
+            let info_lines = plugin_info_lines(&info, &rows, &[], &[], &status);
+            let verdict = info_lines.last().unwrap();
+            assert!(
+                verdict.contains(&key) && verdict.contains(NO_SCHEMA_REFUSAL),
+                "the info verdict carries the row and the reason: {info_lines:#?}"
+            );
+            let listed = plugin_list_lines(&[(info.clone(), Some(status))]);
+            let loads = plugin_list_lines(&[(info.clone(), Some(PluginLoadStatus::Loads))]);
+            assert!(
+                listed[1].contains("tool-fixture") && listed[1].contains(NO_SCHEMA_REFUSAL),
+                "the verified row names the refusal: {listed:#?}"
+            );
+            assert_ne!(listed[1], loads[1], "and is not the [loads] row");
+
+            // The remedy the verdict names: remove the values from the row.
+            config
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .unwrap()
+                .config
+                .clear();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "with the values removed the reinstalled package loads: {status:?}"
+            );
+        }
+
+        /// The issue's other shape, `config_read` without a `config_schema`, is
+        /// refused when the package is admitted, so neither `plugin install`
+        /// nor the runtime ever meets it.
+        #[test]
+        fn a_package_requesting_config_read_without_a_schema_is_refused_at_install() {
+            let workspace = tempfile::tempdir().unwrap();
+            let source = workspace.path().join("source/readless");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(
+                source.join("manifest.toml"),
+                FIXTURE_MANIFEST_WITHOUT_CONFIG
+                    .replace("permissions = []", "permissions = [\"config_read\"]"),
+            )
+            .unwrap();
+            std::fs::write(source.join("tool-fixture.wasm"), b"\0asm").unwrap();
+            let host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+
+            let Err(error) = host.admit_source(source.to_str().expect("utf-8 temp path")) else {
+                panic!("a config_read package without a schema must not be admitted");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("requests config_read but declares no config_schema"),
+                "{error}"
+            );
+        }
+
         #[test]
         fn only_a_real_load_failure_makes_plugin_info_exit_non_zero() {
             // The exit code is the scriptable part of the contract. A package
             // with no component must not be reported as broken.
             assert!(PluginLoadStatus::Fails("boom".to_string()).is_load_failure());
+            assert!(
+                PluginLoadStatus::ConfigRefused {
+                    instance_key: "zpi1_key".to_string(),
+                    reason: "refused".to_string(),
+                }
+                .is_load_failure()
+            );
             assert!(!PluginLoadStatus::Loads.is_load_failure());
             assert!(!PluginLoadStatus::NoComponent.is_load_failure());
         }

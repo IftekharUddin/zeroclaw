@@ -41,16 +41,24 @@
 //! compiles into one that does not is refused and nothing is saved: the
 //! daemon could never take it, and would install a deny-all policy in its
 //! place at its next reload. An edit to a policy that already does not
-//! compile is saved, so a lockout can be repaired one field at a time.
+//! compile is saved, so a lockout can be repaired one field at a time. While
+//! `ZEROCLAW_*` overrides set authorization inputs, the policy config.toml
+//! holds once saved, which keeps the values those overrides replaced, is
+//! checked the same way as the one the command sees: a daemon started
+//! without the overrides compiles the file's. The persisted check runs on
+//! the writer's actual masked and merged document, including non-dirty file
+//! edits made while the command waited for the daemon.
 
 use std::cell::OnceCell;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::Utc;
 use serde_json::Value;
+use zeroclaw_runtime::daemon::{STATUS_FLUSH_SECONDS, state_file_path};
 use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
-use zeroclaw_runtime::rpc::auth::{auth_inputs, is_auth_input_path, validate_accepted_auth_config};
+use zeroclaw_runtime::rpc::auth::{auth_inputs, validate_accepted_auth_config};
 use zeroclaw_runtime::rpc::types::{ConfigSetManyParams, ConfigSetParams};
 
 use crate::config::Config;
@@ -61,6 +69,20 @@ use crate::daemon_rpc::{self, DaemonCallError};
 /// connections.
 const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether the dotted property `path` writes one of the [`auth_inputs`]: the
+/// `oidc`, `users` or `permission_profiles` section or anything under it, or
+/// `security.trust_daemon_uid`.
+///
+/// A surface that edits configuration outside the daemon uses this where
+/// comparing [`auth_inputs`] before and after the edit is not enough: a write
+/// that re-asserts the value already in the file changes nothing there, yet
+/// the running daemon may still enforce another one.
+fn is_auth_input_path(path: &str) -> bool {
+    let section = path.split_once('.').map_or(path, |(section, _)| section);
+    matches!(section, "oidc" | "users" | "permission_profiles")
+        || path == "security.trust_daemon_uid"
+}
 
 /// The authorization inputs as they stood before a command staged its edit,
 /// and the configuration they came from, which tells whether the policy they
@@ -101,17 +123,65 @@ impl AuthSnapshot {
     /// not. A policy that did not compile before the edit may still not
     /// compile after it: a daemon enforcing deny-all in its place can then be
     /// repaired one field at a time.
-    fn refuse_breaking(&self, staged: &Config, suggest_patch: bool) -> Result<(), CommitFailure> {
-        if !self.compiles() {
-            return Ok(());
+    ///
+    /// This protects the effective policy, which a daemon sharing the CLI's
+    /// environment would see. The persisted policy is checked separately
+    /// against the writer's actual documents at the local save boundary.
+    fn refuse_breaking(&self, staged: &Config, suggest_patch: bool) -> anyhow::Result<()> {
+        let refuse = |error: anyhow::Error| CommitFailure::PolicyWouldNotCompile {
+            error: error.to_string(),
+            suggest_patch,
+        };
+        if self.compiles() {
+            validate_accepted_auth_config(staged).map_err(refuse)?;
         }
-        validate_accepted_auth_config(staged).map_err(|error| {
-            CommitFailure::PolicyWouldNotCompile {
-                error: error.to_string(),
-                suggest_patch,
-            }
-        })
+        Ok(())
     }
+}
+
+/// Compile what the file stores, using the load-time migration/parser but
+/// without reapplying this CLI process's environment. Non-auth salvage keeps
+/// the same semantics as normal loading; malformed auth sections must not
+/// masquerade as a valid policy made from their substituted defaults.
+fn validate_persisted_auth(document: Option<&str>) -> anyhow::Result<()> {
+    let config = if let Some(document) = document {
+        let loaded = zeroclaw_config::migration::migrate_to_current_salvaged(document);
+        if loaded.dropped_security.iter().any(|section| {
+            is_auth_input_path(section)
+                || section == "security"
+                || section == zeroclaw_config::migration::WHOLE_CONFIG_SENTINEL
+        }) {
+            // Reuse the strict parser's original error instead of treating a
+            // dropped authorization section as a compiling empty roster.
+            zeroclaw_config::migration::migrate_to_current(document)?
+        } else {
+            loaded.config
+        }
+    } else {
+        // Creating a missing file starts from the valid default policy;
+        // absence is not an already-invalid policy eligible for repair.
+        Config::default()
+    };
+    validate_accepted_auth_config(&config)
+}
+
+fn refuse_breaking_persisted(
+    before: Option<&str>,
+    candidate: &str,
+    suggest_patch: bool,
+) -> anyhow::Result<()> {
+    // Preserve the lockout-repair path, judged from the saved baseline,
+    // which may differ from the CLI's env-overridden configuration.
+    if validate_persisted_auth(before).is_err() {
+        return Ok(());
+    }
+    validate_persisted_auth(Some(candidate)).map_err(|error| {
+        CommitFailure::PolicyWouldNotCompile {
+            error: error.to_string(),
+            suggest_patch,
+        }
+        .into()
+    })
 }
 
 /// Why an authorization edit was saved without reaching the running daemon.
@@ -197,6 +267,27 @@ pub(crate) enum Publication {
 }
 
 impl Publication {
+    /// Save only an edit the daemon did not apply. Pending saves validate
+    /// the exact original and candidate documents materialized by the config
+    /// writer, before its first atomic-write effect. Other local writes keep
+    /// their existing behavior.
+    pub(crate) async fn save_local(
+        &self,
+        config: &mut Config,
+        suggest_patch: bool,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Applied => Ok(()),
+            Self::Pending { .. } => {
+                Box::pin(config.save_dirty_with_validation(|before, candidate| {
+                    refuse_breaking_persisted(before, candidate, suggest_patch)
+                }))
+                .await
+            }
+            Self::NotAuthorizationEdit | Self::NoDaemon => Box::pin(config.save_dirty()).await,
+        }
+    }
+
     /// `Some(json!({"applied": true}))`, `Some(json!({"applied": false,
     /// "pending_reload": true, "reason": code}))`, or `None` when the daemon
     /// has nothing to apply.
@@ -318,10 +409,10 @@ pub(crate) enum CommitFailure {
     /// or may not have been applied. `path` is a property to check.
     Unknown { path: String },
     /// A `config patch` batch the running daemon would have committed
-    /// carries a `test` op on the authorization input `path`. The op was
-    /// checked against the CLI's copy of config.toml, while the batch's
-    /// writes would land on the daemon's live configuration, so the daemon
-    /// was not contacted and nothing was saved.
+    /// carries a `test` op on `path`. The op was checked against the CLI's
+    /// copy of config.toml, while the batch's writes would land on the
+    /// daemon's live configuration, so the daemon was not contacted and
+    /// nothing was saved.
     UncheckableTest { path: String },
 }
 
@@ -436,9 +527,8 @@ pub(crate) async fn commit_set(
 /// `{"sets":[{"prop","value"}...]}` (values are JSON strings). `tested` are
 /// the properties the patch's `test` ops checked on `staged`: a running
 /// daemon that would take the batch applies its writes to its live
-/// configuration instead, so a `test` op on an authorization input then
-/// fails the batch with `CommitFailure::UncheckableTest` before the daemon is
-/// contacted.
+/// configuration instead, so any `test` op then fails the batch with
+/// `CommitFailure::UncheckableTest` before the daemon is contacted.
 pub(crate) async fn commit_set_many(
     before: &AuthSnapshot,
     staged: &Config,
@@ -459,10 +549,10 @@ pub(crate) async fn commit_set_many(
             })
             .collect(),
     })?;
-    let uncheckable_test = tested
-        .iter()
-        .map(String::as_str)
-        .find(|path| is_auth_input_path(path));
+    // Every write in the batch lands on the daemon's live configuration, so
+    // a `test` op on any property, not only an authorization input, would
+    // have been checked against a different copy than the one it guards.
+    let uncheckable_test = tested.first().map(String::as_str);
     commit(
         before,
         staged,
@@ -572,6 +662,75 @@ fn daemon_presence(config: &Config, holds_config_ownership: bool) -> DaemonPrese
     }
 }
 
+/// How many of the heartbeat writer's intervals may pass without a new stamp
+/// before the daemon that wrote the last one counts as gone.
+const HEARTBEAT_MISSED_WRITES: u64 = 3;
+
+/// How long a reader waits before it reads the heartbeat again when the file
+/// is there but did not parse.
+const HEARTBEAT_REREAD_DELAY: Duration = Duration::from_millis(20);
+
+/// What the daemon heartbeat at [`state_file_path`] last recorded. The daemon
+/// rewrites the file on a fixed interval while it runs and leaves the last
+/// one behind when it stops, so a record alone does not show that a daemon
+/// runs: [`RecordedDaemon::is_recent`] says whether it still may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedDaemon {
+    /// The daemon's process id, when the file records one.
+    pid: Option<u32>,
+    /// When the daemon wrote the file.
+    written_at: chrono::DateTime<Utc>,
+}
+
+impl RecordedDaemon {
+    /// Whether the heartbeat is recent as of `now`: written within three of
+    /// the writer's intervals, so the daemon that wrote it has not missed
+    /// three writes in a row. A stamp ahead of `now` by as much counts as
+    /// recent too: the daemon and its readers share a clock, so a stamp in
+    /// the future only means the clock was stepped.
+    fn is_recent(&self, now: chrono::DateTime<Utc>) -> bool {
+        let stale_after = Duration::from_secs(STATUS_FLUSH_SECONDS * HEARTBEAT_MISSED_WRITES);
+        now.signed_duration_since(self.written_at)
+            .abs()
+            .to_std()
+            .is_ok_and(|age| age <= stale_after)
+    }
+}
+
+/// The heartbeat the daemon serving `config`'s directory last wrote, or
+/// `None` when there is none or it does not parse.
+///
+/// The writer truncates the file before it writes the new stamp, so a read
+/// can land between the two and find it empty or partial. A file that is
+/// there but does not parse is read once more before it counts as
+/// unreadable. On such a torn read this blocks the calling thread for a
+/// short re-read delay, so a caller on an async runtime worker should call it
+/// through `tokio::task::spawn_blocking`.
+fn recorded_daemon(config: &Config) -> Option<RecordedDaemon> {
+    let path = state_file_path(config);
+    let raw = std::fs::read(&path).ok()?;
+    parse_recorded_daemon(&raw).or_else(|| {
+        std::thread::sleep(HEARTBEAT_REREAD_DELAY);
+        parse_recorded_daemon(&std::fs::read(&path).ok()?)
+    })
+}
+
+/// The pid and stamp in one heartbeat file's contents, as the writer records
+/// them: `pid` from the health snapshot and `written_at` in RFC 3339.
+fn parse_recorded_daemon(raw: &[u8]) -> Option<RecordedDaemon> {
+    let state: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let written_at =
+        chrono::DateTime::parse_from_rfc3339(state.get("written_at")?.as_str()?).ok()?;
+    let pid = state
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    Some(RecordedDaemon {
+        pid,
+        written_at: written_at.with_timezone(&Utc),
+    })
+}
+
 /// The pid of the daemon serving `config`'s directory, when one is running:
 /// the heartbeat beside config.toml is recent and the process it names is
 /// alive. A daemon that stops leaves its last heartbeat behind, so the stamp
@@ -582,7 +741,7 @@ fn daemon_presence(config: &Config, holds_config_ownership: bool) -> DaemonPrese
 /// on the thread that drives its runtime, not on a worker, so the wait holds
 /// up only the command itself.
 fn running_daemon(config: &Config) -> Option<u32> {
-    let recorded = zeroclaw_runtime::daemon::recorded_daemon(config)?;
+    let recorded = recorded_daemon(config)?;
     if !recorded.is_recent(chrono::Utc::now()) {
         return None;
     }
@@ -673,8 +832,8 @@ fn nothing_listening(error: &DaemonCallError) -> bool {
 /// Send an authorization edit to the daemon and classify the outcome.
 /// `config` is the CLI's config with the edit staged; `check_path` is the
 /// property a caller should inspect when the outcome is unknown;
-/// `uncheckable_test` is the authorization input a batch's `test` op checked
-/// on `config`, if any.
+/// `uncheckable_test` is the property a batch's first `test` op checked on
+/// `config`, if any.
 async fn commit(
     before: &AuthSnapshot,
     config: &Config,
@@ -768,7 +927,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS;
-    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+    use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig, UserConfig};
 
     /// A config whose heartbeat and endpoint live in a fresh, empty directory.
     /// On Unix the directory sits under /tmp because macOS caps a socket path
@@ -792,14 +951,291 @@ mod tests {
         (dir, config)
     }
 
+    /// `auth_inputs` is what a client compares to decide whether an edit must
+    /// reach the running daemon, and `is_auth_input_path` is how it tells a
+    /// write to those inputs by its path, so both have to cover every
+    /// authorization section and nothing else.
+    #[test]
+    fn auth_inputs_change_only_with_the_authorization_sections() {
+        let base = Config::default();
+        let inputs = auth_inputs(&base).expect("the default config encodes");
+
+        let mut unrelated = base.clone();
+        unrelated.gateway.host = "0.0.0.0".into();
+        assert_eq!(
+            auth_inputs(&unrelated).expect("the edited config encodes"),
+            inputs,
+            "a gateway edit is not an authorization input"
+        );
+        assert!(!is_auth_input_path("gateway.host"));
+
+        type Mutation = fn(&mut Config);
+        let mutations: [(&str, Mutation); 4] = [
+            ("security.trust_daemon_uid", |config| {
+                config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
+            }),
+            ("users.alice.uid", |config| {
+                config.users.insert(
+                    "alice".into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(4242),
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }),
+            ("permission_profiles.operator", |config| {
+                config
+                    .permission_profiles
+                    .insert("operator".into(), PermissionProfileConfig::default());
+            }),
+            ("oidc.corp", |config| {
+                config.oidc.insert("corp".into(), OidcConfig::default());
+            }),
+        ];
+        for (path, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                auth_inputs(&changed).expect("the edited config encodes"),
+                inputs,
+                "a write to {path} must change the authorization inputs"
+            );
+            assert!(
+                is_auth_input_path(path),
+                "{path} must name an authorization input"
+            );
+        }
+    }
+
+    /// Every path that writes a section `auth_inputs` reads is an
+    /// authorization input path, and nothing else is, however close its name.
+    #[test]
+    fn is_auth_input_path_names_exactly_the_authorization_sections() {
+        for path in [
+            "oidc",
+            "oidc.corp",
+            "oidc.corp.client_secret",
+            "users",
+            "users.me.uid",
+            "users.me.permission_profiles",
+            "permission_profiles",
+            "permission_profiles.admin.admin",
+            "security.trust_daemon_uid",
+        ] {
+            assert!(is_auth_input_path(path), "{path} is an authorization input");
+        }
+        for path in [
+            "",
+            "gateway.host",
+            "security",
+            "security.trust_daemon_uid_extra",
+            "security.sandbox.enabled",
+            "usersx.me.uid",
+            "oidc_providers.corp",
+            "permission_profiles_extra",
+            "agents.users.model",
+            "trust_daemon_uid",
+        ] {
+            assert!(
+                !is_auth_input_path(path),
+                "{path} is not an authorization input"
+            );
+        }
+    }
+
+    /// A value for `field` that differs from its current one, derived from
+    /// its kind, or `None` where `set_prop` takes no plain value for it.
+    fn changed_value(field: &zeroclaw_config::traits::PropFieldInfo) -> Option<String> {
+        use zeroclaw_config::traits::{PropKind, UNSET_DISPLAY};
+        let current = field.display_value.as_str();
+        let unset = current == UNSET_DISPLAY;
+        match field.kind {
+            PropKind::Bool => Some((current != "true").to_string()),
+            PropKind::Integer if unset => Some("1".to_owned()),
+            PropKind::Integer => Some(current.parse::<i64>().ok()?.checked_add(1)?.to_string()),
+            PropKind::Float if unset => Some("1.0".to_owned()),
+            PropKind::Float => Some((current.parse::<f64>().ok()? + 1.0).to_string()),
+            PropKind::String | PropKind::AliasRef if unset => Some("drift-guard".to_owned()),
+            PropKind::String | PropKind::AliasRef => Some(format!("{current}-drift-guard")),
+            PropKind::Enum => (field.enum_variants?)()
+                .into_iter()
+                .find(|variant| variant != current),
+            PropKind::StringArray => {
+                let mut items: Vec<String> = if unset {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(current).ok()?
+                };
+                items.push("drift-guard".to_owned());
+                serde_json::to_string(&items).ok()
+            }
+            // A secret map's row is its container; its entries are separate
+            // secret rows, which the loop exercises on their own.
+            PropKind::Object | PropKind::ObjectArray | PropKind::SecretMap => None,
+        }
+    }
+
+    /// The drift guard for `is_auth_input_path`: a property whose write
+    /// changes the authorization inputs but which the predicate does not
+    /// name would let an edit bypass the running daemon's policy. Every
+    /// property the configuration exposes, with one entry in each
+    /// authorization section so their fields are exposed too, is changed on
+    /// its own and the inputs compared before and after.
+    #[test]
+    fn is_auth_input_path_names_every_property_that_changes_the_authorization_inputs() {
+        let mut config = Config::default();
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["operator".into()],
+            },
+        );
+        config
+            .permission_profiles
+            .insert("operator".into(), PermissionProfileConfig::default());
+        config.oidc.insert("corp".into(), OidcConfig::default());
+        let inputs = auth_inputs(&config).expect("the fixture encodes");
+        let serialized = |config: &Config| toml::to_string(config).expect("the config encodes");
+        let unedited = serialized(&config);
+
+        let mut exercised: Vec<String> = Vec::new();
+        for field in config.prop_fields() {
+            let Some(value) = changed_value(&field) else {
+                continue;
+            };
+            let mut staged = config.clone();
+            if staged.set_prop(&field.name, &value).is_err() {
+                continue;
+            }
+            // `get_prop` masks a secret whatever its value, so a write to one
+            // is seen in the serialized configuration instead.
+            let took_effect = staged.get_prop(&field.name).ok()
+                != config.get_prop(&field.name).ok()
+                || (field.is_secret && serialized(&staged) != unedited);
+            if !took_effect {
+                continue;
+            }
+            let changed = auth_inputs(&staged).expect("the edited config encodes") != inputs;
+            if changed {
+                assert!(
+                    is_auth_input_path(&field.name),
+                    "a write to {} changes the authorization inputs, but is_auth_input_path does not name it",
+                    field.name
+                );
+            } else {
+                // No property under the authorization sections takes a write
+                // that serialization does not show, so none is exempt here.
+                assert!(
+                    !is_auth_input_path(&field.name),
+                    "is_auth_input_path names {}, but a write to it leaves the authorization inputs unchanged",
+                    field.name
+                );
+            }
+            exercised.push(field.name);
+        }
+
+        for section in ["users.", "permission_profiles.", "oidc."] {
+            assert!(
+                exercised.iter().any(|name| name.starts_with(section)),
+                "no property under {section} was exercised: {exercised:?}"
+            );
+        }
+        assert!(
+            exercised
+                .iter()
+                .any(|name| name == "security.trust_daemon_uid"),
+            "security.trust_daemon_uid was not exercised: {exercised:?}"
+        );
+    }
+
+    /// Write `contents` where `spawn_state_writer` writes the heartbeat.
+    fn write_heartbeat_file(config: &Config, contents: &[u8]) {
+        let path = state_file_path(config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn recorded_daemon_reads_what_the_heartbeat_writer_records() {
+        let (_tmp, config) = scratch_config();
+        assert_eq!(recorded_daemon(&config), None, "no heartbeat yet");
+
+        // The writer's format: the health snapshot, which carries the pid,
+        // plus the stamp, pretty-printed.
+        let written_at = Utc::now();
+        let mut state = zeroclaw_runtime::health::snapshot_json();
+        state["written_at"] = serde_json::json!(written_at.to_rfc3339());
+        write_heartbeat_file(&config, &serde_json::to_vec_pretty(&state).unwrap());
+        assert_eq!(
+            recorded_daemon(&config),
+            Some(RecordedDaemon {
+                pid: Some(std::process::id()),
+                written_at,
+            })
+        );
+
+        let unstamped_pid = serde_json::json!({ "written_at": written_at.to_rfc3339() });
+        write_heartbeat_file(&config, unstamped_pid.to_string().as_bytes());
+        assert_eq!(
+            recorded_daemon(&config).map(|recorded| recorded.pid),
+            Some(None),
+            "a heartbeat without a pid still records its stamp"
+        );
+    }
+
+    /// The writer truncates before it writes, so a reader can find the file
+    /// empty or cut short; a file that never parses records nothing.
+    #[test]
+    fn recorded_daemon_records_nothing_for_a_torn_or_unstamped_heartbeat() {
+        let (_tmp, config) = scratch_config();
+        let stamp = Utc::now().to_rfc3339();
+        for torn in [
+            String::new(),
+            format!("{{\"pid\": 4321, \"written_at\": \"{stamp}"),
+            serde_json::json!({ "pid": 4321 }).to_string(),
+            serde_json::json!({ "pid": 4321, "written_at": "yesterday" }).to_string(),
+        ] {
+            write_heartbeat_file(&config, torn.as_bytes());
+            assert_eq!(recorded_daemon(&config), None, "{torn:?}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_is_recent_within_three_writer_intervals_either_way() {
+        let now = Utc::now();
+        let written = |seconds_ago: i64| RecordedDaemon {
+            pid: Some(4321),
+            written_at: now - chrono::TimeDelta::seconds(seconds_ago),
+        };
+        let bound = i64::try_from(STATUS_FLUSH_SECONDS * HEARTBEAT_MISSED_WRITES).unwrap();
+
+        assert!(written(0).is_recent(now), "written just now");
+        assert!(
+            written(bound).is_recent(now),
+            "three intervals is the bound"
+        );
+        assert!(
+            !written(bound + 1).is_recent(now),
+            "three missed writes and more mean the writer is gone"
+        );
+        assert!(
+            written(-2).is_recent(now),
+            "a stamp slightly ahead of this clock is still recent"
+        );
+        assert!(
+            !written(-(bound + 1)).is_recent(now),
+            "a stamp far ahead of this clock is not"
+        );
+    }
+
     /// Record `pid` as `config`'s daemon, stamped `written_at`, where the
     /// daemon's heartbeat goes.
     fn write_heartbeat_of(config: &Config, written_at: chrono::DateTime<chrono::Utc>, pid: u32) {
-        let path = zeroclaw_runtime::daemon::state_file_path(config);
-        std::fs::create_dir_all(path.parent().expect("the state file has a directory"))
-            .expect("the state directory is writable");
         let state = serde_json::json!({ "pid": pid, "written_at": written_at.to_rfc3339() });
-        std::fs::write(path, state.to_string()).expect("the state file is writable");
+        write_heartbeat_file(config, state.to_string().as_bytes());
     }
 
     /// Record this test process as `config`'s running daemon: a fresh stamp
@@ -856,6 +1292,44 @@ mod tests {
         staged
     }
 
+    /// `config` with roster entries alice (uid 1000) and bob (uid 3000), both
+    /// granted the `operator` profile: a policy that compiles.
+    fn with_roster(config: &Config) -> Config {
+        let mut staged = config.clone();
+        staged
+            .permission_profiles
+            .insert("operator".into(), PermissionProfileConfig::default());
+        for (name, uid) in [("alice", 1000), ("bob", 3000)] {
+            staged.users.insert(
+                name.into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(uid),
+                    permission_profiles: vec!["operator".into()],
+                },
+            );
+        }
+        staged
+    }
+
+    /// `config` as loaded with `ZEROCLAW_users__alice__uid=2000` exported:
+    /// the override's value in memory, and the value it replaced kept for a
+    /// save to write back. The process environment is left alone, since
+    /// other tests load configurations meanwhile.
+    fn with_alice_uid_overridden(config: &Config) -> Config {
+        let mut loaded = config.clone();
+        loaded
+            .users
+            .get_mut("alice")
+            .expect("alice is on the roster")
+            .uid = Some(2000);
+        loaded.env_overridden_paths.insert("users.alice.uid".into());
+        loaded
+            .pre_override_snapshots
+            .insert("users.alice.uid".into(), "1000".into());
+        loaded
+    }
+
     /// What keeps an endpoint from being connected to: nothing on Unix, where
     /// the path does it, and the pipe instance that refuses the open on
     /// Windows.
@@ -903,6 +1377,63 @@ mod tests {
             }
             other => panic!("expected PolicyWouldNotCompile, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn persisted_policy_validation_does_not_accept_salvaged_auth_defaults() {
+        let valid = format!(
+            "schema_version = {}\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        let malformed = format!("{valid}\n[users.bob]\nuid = \"not-a-uid\"\n");
+        assert!(validate_persisted_auth(Some(&malformed)).is_err());
+        let failure = refuse_breaking_persisted(Some(&valid), &malformed, true)
+            .expect_err("a dropped auth section is not a valid empty policy");
+        assert!(matches!(
+            failure.downcast_ref::<CommitFailure>(),
+            Some(CommitFailure::PolicyWouldNotCompile { .. })
+        ));
+        refuse_breaking_persisted(Some(&malformed), &valid, true)
+            .expect("a malformed persisted policy remains repairable");
+    }
+
+    #[test]
+    fn unrelated_salvage_does_not_disable_persisted_policy_validation() {
+        let before = format!(
+            "schema_version = {}\n[gateway]\nport = \"not-a-port\"\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        validate_persisted_auth(Some(&before)).expect("non-auth salvage preserves a valid policy");
+        let after = format!("{before}\n[users.bob]\nuid = 4242\n");
+        let failure = refuse_breaking_persisted(Some(&before), &after, false)
+            .expect_err("non-auth salvage must not let a profileless user through");
+        assert_would_not_compile(&failure, false);
+    }
+
+    #[tokio::test]
+    async fn pending_local_save_validates_new_file_against_the_default_policy() {
+        let (_dir, config) = scratch_config();
+        let publication = Publication::Pending {
+            reason: PendingReason::OfflineCommand,
+            detail: String::new(),
+        };
+        let mut invalid = with_profileless_user(&config);
+        invalid.mark_dirty("users");
+        let failure = publication
+            .save_local(&mut invalid, true)
+            .await
+            .expect_err("absence is not an already-invalid policy");
+        assert_would_not_compile(&failure, true);
+        assert!(!config.config_path.exists());
+        assert!(invalid.dirty_paths.contains("users"));
+        let mut valid = with_trust_flipped(&config);
+        valid.mark_dirty("security.trust_daemon_uid");
+        publication
+            .save_local(&mut valid, true)
+            .await
+            .expect("valid file creation");
+        validate_persisted_auth(Some(&std::fs::read_to_string(&config.config_path).unwrap()))
+            .expect("new file compiles");
     }
 
     #[test]
@@ -1317,6 +1848,88 @@ mod tests {
         );
     }
 
+    /// Pending saves preserve both policies: the effective one this CLI
+    /// loaded, and the actual masked document the writer would persist.
+    #[tokio::test]
+    async fn pending_local_save_judges_effective_and_persisted_policies() {
+        let (_dir, config) = scratch_config();
+        let persisted = with_roster(&config);
+        Box::pin(persisted.save())
+            .await
+            .expect("persist a valid baseline");
+        let loaded = with_alice_uid_overridden(&persisted);
+        let before = AuthSnapshot::capture(&loaded).expect("encodes");
+        record_running_daemon(&loaded);
+        let touched = ["users.bob.uid".to_owned()];
+
+        let mut colliding = loaded.clone();
+        colliding
+            .set_prop_persistent("users.bob.uid", "1000")
+            .unwrap();
+        validate_accepted_auth_config(&colliding)
+            .expect("effective policy maps alice to 2000 and bob to 1000");
+        let publication = classify_local_save(
+            &before,
+            &colliding,
+            &touched,
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect("the effective policy still compiles");
+        let original = std::fs::read_to_string(&loaded.config_path).unwrap();
+        let failure = publication
+            .save_local(&mut colliding, true)
+            .await
+            .expect_err("the file would map uid 1000 to both alice and bob");
+        assert_would_not_compile(&failure, true);
+        assert_eq!(
+            std::fs::read_to_string(&loaded.config_path).unwrap(),
+            original
+        );
+
+        let mut effective_collision = loaded.clone();
+        effective_collision
+            .set_prop_persistent("users.bob.uid", "2000")
+            .unwrap();
+        let failure = classify_local_save(
+            &before,
+            &effective_collision,
+            &touched,
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect_err("the effective policy must still compile too");
+        assert_would_not_compile(&failure, true);
+        assert_eq!(
+            std::fs::read_to_string(&loaded.config_path).unwrap(),
+            original
+        );
+
+        let mut renumbered = loaded.clone();
+        renumbered
+            .set_prop_persistent("users.bob.uid", "4000")
+            .unwrap();
+        let publication = classify_local_save(
+            &before,
+            &renumbered,
+            &touched,
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect("both policies still compile");
+        publication
+            .save_local(&mut renumbered, true)
+            .await
+            .expect("save valid policy");
+        let saved: Config =
+            toml::from_str(&std::fs::read_to_string(&loaded.config_path).unwrap()).unwrap();
+        assert_eq!(saved.users["alice"].uid, Some(1000));
+        assert_eq!(saved.users["bob"].uid, Some(4000));
+    }
+
     /// A write to an authorization input counts even when it leaves the
     /// inputs as they were on disk: the daemon may enforce something else.
     #[test]
@@ -1572,11 +2185,13 @@ mod tests {
         let listener = listen_at_the_endpoint(&config);
         let staged = with_trust_flipped(&config);
         let value = staged.security.trust_daemon_uid.to_string();
-        let lock = config
-            .data_dir
-            .join("config-lifecycle.lock")
-            .display()
-            .to_string();
+        // The lock reports where it lives when it is already held, which
+        // keeps this test independent of the lock's layout under the data
+        // directory.
+        let lock = match ConfigOwnershipGuard::acquire(&config.data_dir) {
+            Err(ConfigOwnershipError::AlreadyOwned { path }) => path.display().to_string(),
+            other => panic!("the test's own guard holds the lock: {other:?}"),
+        };
         let unconfirmed = |publication: &Publication| {
             matches!(
                 publication,
@@ -1698,12 +2313,13 @@ mod tests {
         drop(held);
     }
 
-    /// A batch a running daemon would commit applies its writes to the
-    /// daemon's live configuration, so a `test` op the CLI checked on its own
-    /// copy of an authorization input fails the batch before the daemon is
-    /// contacted. A `test` op elsewhere does not stop the batch.
+    /// A batch a running daemon would commit applies all of its writes to the
+    /// daemon's live configuration, so any `test` op the CLI checked on its
+    /// own copy fails the batch before the daemon is contacted, whether it
+    /// tests an authorization input or not. A batch without `test` ops is
+    /// still offered to the daemon.
     #[tokio::test]
-    async fn a_batch_testing_an_authorization_input_is_not_sent_to_a_running_daemon() {
+    async fn a_batch_with_a_test_op_is_not_sent_to_a_running_daemon() {
         let (_dir, config) = scratch_config();
         let before = AuthSnapshot::capture(&config).expect("encodes");
         record_running_daemon(&config);
@@ -1728,7 +2344,7 @@ mod tests {
         .expect_err("the batch is refused");
         match failure.downcast_ref::<CommitFailure>() {
             Some(CommitFailure::UncheckableTest { path }) => {
-                assert_eq!(path, "users.me.permission_profiles");
+                assert_eq!(path, "gateway.host", "the first `test` op is named");
             }
             other => panic!("expected UncheckableTest, got {other:?}"),
         }
@@ -1737,15 +2353,29 @@ mod tests {
         #[cfg(windows)]
         assert_nothing_connected(&listener).await;
 
-        // An endpoint that fails at once shows the batch was offered to the
-        // daemon when its only `test` op is outside the authorization inputs.
+        let failure = commit_set_many(&before, &staged, &sets, &["gateway.host".to_owned()], false)
+            .await
+            .expect_err("a `test` op outside the authorization inputs also refuses the batch");
+        assert!(
+            matches!(
+                failure.downcast_ref::<CommitFailure>(),
+                Some(CommitFailure::UncheckableTest { path }) if path == "gateway.host"
+            ),
+            "{failure:?}"
+        );
+        #[cfg(unix)]
+        assert_nothing_connected(&listener);
+        #[cfg(windows)]
+        assert_nothing_connected(&listener).await;
+
+        // An endpoint that fails at once shows a batch without `test` ops is
+        // still offered to the daemon.
         let (unconnectable, _endpoint) = unconnectable_endpoint(&config);
         record_running_daemon(&unconnectable);
         let staged = with_trust_flipped(&unconnectable);
-        let publication =
-            commit_set_many(&before, &staged, &sets, &["gateway.host".to_owned()], false)
-                .await
-                .expect("classifies");
+        let publication = commit_set_many(&before, &staged, &sets, &[], false)
+            .await
+            .expect("classifies");
         assert!(
             matches!(
                 publication,
