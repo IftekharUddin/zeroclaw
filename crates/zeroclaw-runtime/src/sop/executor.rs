@@ -767,6 +767,62 @@ impl Drop for HeadlessDriverLease {
     }
 }
 
+/// The step failure for an owned run whose owner's memory could not be
+/// built, in the operator's language.
+fn owner_memory_unavailable(error: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+        "cli-sop-step-owner-memory-unavailable",
+        &[("error", &format!("{error:#}"))],
+    ))
+}
+
+/// The memory override for a headless step of `owner`'s run: the owner's
+/// plane for the step agent. `None` for an unowned run, whose step turn builds
+/// the agent's memory as before.
+async fn headless_step_memory(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_memory::Memory>>> {
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let api_key = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    crate::agent::turn::step_agent_memory(config, agent_alias, api_key.as_deref(), Some(owner))
+        .await
+        .map(Some)
+}
+
+/// Test-only: the owner of the memory override each headless step turn was
+/// started with (`None` for no override), by run and step, so a regression can
+/// check the driver's wiring and not only [`headless_step_memory`].
+#[cfg(test)]
+type StepTurnMemory = (
+    String,
+    u32,
+    Option<Option<zeroclaw_api::memory_traits::PrincipalScope>>,
+);
+#[cfg(test)]
+static STEP_TURN_MEMORY: std::sync::Mutex<Vec<StepTurnMemory>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_step_turn_memory(
+    run_id: &str,
+    step: u32,
+    overrides: &crate::agent::loop_::AgentRunOverrides,
+) {
+    let owner = overrides
+        .memory
+        .as_ref()
+        .map(|memory| memory.principal_scope());
+    STEP_TURN_MEMORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((run_id.to_string(), step, owner));
+}
+
 /// Drive a broker-approved run from a headless approval surface.
 ///
 /// Every transport that resolves through `SopEngine::resolve_via_broker` calls
@@ -958,15 +1014,18 @@ async fn drive_headless_run(
                 // Read per action, not once per driver: the run is the durable
                 // record of who started it, and it survives the daemon
                 // generation the initiating turn belonged to.
-                let run_initiator = {
+                let (run_initiator, run_owner) = {
                     let guard = match engine.lock() {
                         Ok(guard) => guard,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    guard
-                        .get_run(&run_id)
-                        .and_then(|run| run.initiating_agent.clone())
+                    let run = guard.get_run(&run_id);
+                    (
+                        run.and_then(|run| run.initiating_agent.clone()),
+                        run.and_then(|run| run.memory_owner.clone()),
+                    )
                 };
+                let run_audit = crate::sop::audit::audit_for_run(audit.clone(), run_owner.as_ref());
                 let cancel_at_boundary = {
                     let mut guard = match engine.lock() {
                         Ok(g) => g,
@@ -1001,58 +1060,101 @@ async fn drive_headless_run(
                 // Take the remaining engine view before reading the step's config.
                 let scope = headless_step_scope(&engine, &run_id, &step);
                 #[cfg(test)]
-                step_boundary_pause::reached(&engine, &run_id).await;
+                step_boundary_pause::reached(
+                    &engine,
+                    &run_id,
+                    step_boundary_pause::Boundary::Execution,
+                )
+                .await;
                 // Resolve only the procedure's owner before witness admission.
                 // A fallback snapshot cannot decide whether a managed alias is
                 // currently configured or enabled.
-                let selected_agent =
-                    headless_step_owner(&step, run_initiator.as_deref()).map(str::to_string);
-                let execution_admission = match selected_agent
-                    .as_deref()
-                    .ok()
-                    .and_then(|alias| {
-                        execution_witness
-                            .as_ref()
-                            .map(|witness| witness.admit(alias))
-                    })
-                    .transpose()
-                {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Reject
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "run_id": run_id,
-                                "error": error.to_string(),
-                            })),
-                            "SOP headless driver: authority witness rejected before target execution"
-                        );
-                        settle_undriven_run(
+                // An owned memory plane may take time to open. If its source
+                // configuration changed during that wait, build it again from
+                // the same configuration that will authorize and run the turn.
+                let memory_config =
+                    run_owner
+                        .as_ref()
+                        .and_then(|_| match (&execution_witness, &config_source) {
+                            (Some(witness), _) => Some(witness.config_handle()),
+                            (None, SopDriverConfig::Live(handle)) => Some(handle.clone()),
+                            (None, SopDriverConfig::Snapshot(_)) => None,
+                        });
+                let (execution_admission, resolved_agent, step_memory) = loop {
+                    let before_memory = memory_config.as_ref().map(|handle| handle.revision());
+                    let selected_agent =
+                        headless_step_owner(&step, run_initiator.as_deref()).map(str::to_string);
+                    let execution_admission = match selected_agent
+                        .as_deref()
+                        .ok()
+                        .and_then(|alias| {
+                            execution_witness
+                                .as_ref()
+                                .map(|witness| witness.admit(alias))
+                        })
+                        .transpose()
+                    {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "run_id": run_id,
+                                    "error": error.to_string(),
+                                })),
+                                "SOP headless driver: authority witness rejected before target execution"
+                            );
+                            settle_undriven_run(
+                                &engine,
+                                &run_id,
+                                crate::sop::engine::OrphanedRunSettlement::ExecutionRejected,
+                            );
+                            return;
+                        }
+                    };
+                    let resolved_agent = match execution_admission.as_ref() {
+                        Some(admission) => {
+                            let config = admission.config().as_ref().clone();
+                            configured_headless_step_agent(&config, step.number, admission.alias())
+                                .map(str::to_string)
+                                .map(|alias| (config, alias))
+                        }
+                        None => selected_agent.and_then(|_| {
+                            let config = config_source.current();
+                            headless_step_agent(&config, &step, run_initiator.as_deref())
+                                .map(str::to_string)
+                                .map(|alias| (config, alias))
+                        }),
+                    };
+                    let (resolved_agent, memory) = match resolved_agent {
+                        Ok((config, alias)) => {
+                            match headless_step_memory(&config, &alias, run_owner.as_ref()).await {
+                                Ok(memory) => (Ok((config, alias)), memory),
+                                Err(error) => (Err(owner_memory_unavailable(&error)), None),
+                            }
+                        }
+                        Err(error) => (Err(error), None),
+                    };
+                    #[cfg(test)]
+                    if run_owner.is_some() {
+                        step_boundary_pause::reached(
                             &engine,
                             &run_id,
-                            crate::sop::engine::OrphanedRunSettlement::ExecutionRejected,
-                        );
-                        return;
+                            step_boundary_pause::Boundary::OwnerMemory,
+                        )
+                        .await;
                     }
-                };
-                let resolved_agent = match execution_admission.as_ref() {
-                    Some(admission) => {
-                        let config = admission.config().as_ref().clone();
-                        configured_headless_step_agent(&config, step.number, admission.alias())
-                            .map(str::to_string)
-                            .map(|alias| (config, alias))
+                    if let Some(handle) = &memory_config
+                        && Some(handle.revision()) != before_memory
+                    {
+                        continue;
                     }
-                    None => selected_agent.and_then(|_| {
-                        let config = config_source.current();
-                        headless_step_agent(&config, &step, run_initiator.as_deref())
-                            .map(str::to_string)
-                            .map(|alias| (config, alias))
-                    }),
+                    break (execution_admission, resolved_agent, memory);
                 };
                 // Attribution follows execution: a step that never ran — no
                 // owner, or an owner naming an unconfigured agent — is recorded
@@ -1096,6 +1198,25 @@ async fn drive_headless_run(
                                 // while the value is still being built on it, before
                                 // `Box::pin` can move it to the heap.
                                 let task_scope = scope.clone();
+                                let overrides = crate::agent::loop_::AgentRunOverrides {
+                                    security: Some(Arc::new(policy)),
+                                    // An owned run's step keeps its owner's plane;
+                                    // an unowned one builds the agent's memory as
+                                    // before.
+                                    memory: step_memory,
+                                    execution_admission: execution_admission.clone(),
+                                    sop_step_scope: Some(scope),
+                                    // Runtime-owned step identifier, matching the
+                                    // engine's nested-SOP turn-id shape.
+                                    internal_principal: Some(
+                                        zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                                            task: format!("sop:{run_id}:step:{}", step.number),
+                                        },
+                                    ),
+                                    ..Default::default()
+                                };
+                                #[cfg(test)]
+                                record_step_turn_memory(&run_id, step.number, &overrides);
                                 let turn = Box::pin(crate::agent::run(
                                     effective_config.clone(),
                                     &agent_alias,
@@ -1110,19 +1231,7 @@ async fn drive_headless_run(
                                     Some(session_path),
                                     None,
                                     zeroclaw_api::ingress::TurnOrigin::Daemon,
-                                    crate::agent::loop_::AgentRunOverrides {
-                                        security: Some(Arc::new(policy)),
-                                        execution_admission: execution_admission.clone(),
-                                        sop_step_scope: Some(scope),
-                                        // Runtime-owned step identifier, matching
-                                        // the engine's nested-SOP turn-id shape.
-                                        internal_principal: Some(
-                                            zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                                                task: format!("sop:{run_id}:step:{}", step.number),
-                                            },
-                                        ),
-                                        ..Default::default()
-                                    },
+                                    overrides,
                                 ));
                                 // Canonical run attribution for every provider and
                                 // tool event the step turn emits, so a run-filtered
@@ -1195,7 +1304,7 @@ async fn drive_headless_run(
                 {
                     Ok((next, finished_run)) => {
                         audit_sop_step(
-                            audit.as_deref(),
+                            run_audit.as_deref(),
                             &run_id,
                             &step_result,
                             finished_run.as_ref(),
@@ -1497,8 +1606,16 @@ pub(crate) mod step_boundary_pause {
 
     type Pause = (Arc<Notify>, Arc<Notify>);
 
-    fn armed() -> &'static Mutex<HashMap<String, Pause>> {
-        static ARMED: OnceLock<Mutex<HashMap<String, Pause>>> = OnceLock::new();
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) enum Boundary {
+        Execution,
+        OwnerMemory,
+    }
+
+    type Pauses = Mutex<HashMap<(String, Boundary), Pause>>;
+
+    fn armed() -> &'static Pauses {
+        static ARMED: OnceLock<Pauses> = OnceLock::new();
         ARMED.get_or_init(Mutex::default)
     }
 
@@ -1507,15 +1624,19 @@ pub(crate) mod step_boundary_pause {
     /// driver is parked there, and the driver waits for `release`. Tests
     /// sharing a process must use distinct procedure names.
     pub(crate) fn arm(sop_name: &str) -> (Arc<Notify>, Arc<Notify>) {
+        arm_at(sop_name, Boundary::Execution)
+    }
+
+    pub(super) fn arm_at(sop_name: &str, boundary: Boundary) -> Pause {
         let pause: Pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         armed()
             .lock()
             .unwrap()
-            .insert(sop_name.to_string(), pause.clone());
+            .insert((sop_name.to_string(), boundary), pause.clone());
         pause
     }
 
-    pub(super) async fn reached(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+    pub(super) async fn reached(engine: &Arc<Mutex<SopEngine>>, run_id: &str, boundary: Boundary) {
         let sop_name = {
             let guard = match engine.lock() {
                 Ok(guard) => guard,
@@ -1526,7 +1647,7 @@ pub(crate) mod step_boundary_pause {
         let Some(sop_name) = sop_name else {
             return;
         };
-        let pause = armed().lock().unwrap().remove(&sop_name);
+        let pause = armed().lock().unwrap().remove(&(sop_name, boundary));
         if let Some((reached, release)) = pause {
             reached.notify_one();
             release.notified().await;
@@ -1581,6 +1702,226 @@ mod tests {
         }
     }
 
+    /// A config whose agent `stepper` is enabled and bound to a provider
+    /// nothing listens on, so a headless step turn ends quickly in a failure,
+    /// which the driver still advances and audits.
+    fn owned_run_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let base = providers
+                .models
+                .ensure("openai", "closed")
+                .expect("the openai slot exists");
+            base.api_key = Some("test-key".into());
+            base.model = Some("test-model".into());
+            base.uri = Some("http://127.0.0.1:1".into());
+        }
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            providers,
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert("stepper".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "stepper".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.closed".into(),
+                risk_profile: "stepper".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    fn owned_sop() -> Sop {
+        let mut sop = test_sop("owned-sop");
+        sop.execution_mode = SopExecutionMode::Supervised;
+        sop
+    }
+
+    /// The `sop` audit rows in `memory` as text, on the shared plane or on
+    /// `owner`'s.
+    async fn sop_rows(
+        memory: &Arc<dyn zeroclaw_memory::Memory>,
+        owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    ) -> String {
+        let category = zeroclaw_memory::traits::MemoryCategory::Custom("sop".into());
+        let rows = match owner {
+            Some(owner) => memory
+                .list_for_principal(owner, Some(&category), None)
+                .await
+                .unwrap(),
+            None => memory.list(Some(&category), None).await.unwrap(),
+        };
+        rows.iter()
+            .map(|row| format!("{} {}", row.key, row.content))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// An owned run parks at its approval, is approved off-session, and
+    /// resumes through `drive_resumed_broker_action`, the boundary every
+    /// approval surface (RPC `sops/decide`, HTTP, WebSocket, channels) uses,
+    /// with the daemon's shared audit logger. With `restart`, the engine is
+    /// dropped and a fresh one restores the run from the same SQLite store
+    /// first, as after a daemon restart. The run's rows, which carry its
+    /// private payload, land on the owner's plane and never the shared one.
+    async fn resume_an_owned_run_off_session(restart: bool) {
+        use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal};
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = owned_run_config(&tmp);
+        let shared: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let shared_audit = Arc::new(SopAuditLogger::new(Arc::clone(&shared)));
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("stepper".to_string()));
+        let db = tmp.path().join("sop.db");
+        let open_engine = || {
+            let store = Arc::new(crate::sop::store::sqlite::SqliteRunStore::open(&db).unwrap());
+            let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
+            engine.set_sops_for_test(vec![owned_sop()]);
+            engine
+        };
+
+        let mut engine = open_engine();
+        let event = SopEvent {
+            payload: Some("P-HEADLESS-PAYLOAD-MARKER".into()),
+            ..manual_event()
+        };
+        let parked = engine
+            .start_run_for("owned-sop", event, Some("stepper"), Some(owner.clone()))
+            .unwrap();
+        let run_id = match &parked {
+            SopRunAction::WaitApproval { run_id, .. } => run_id.clone(),
+            other => panic!("a supervised run parks for approval, got {other:?}"),
+        };
+        if restart {
+            drop(engine);
+            engine = open_engine();
+            engine.restore_runs();
+            assert_eq!(
+                engine
+                    .get_run(&run_id)
+                    .and_then(|run| run.memory_owner.clone()),
+                Some(owner.clone()),
+                "the owner survives the restart with the run"
+            );
+        }
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+        let handles = SopDriverHandles::default();
+        drive_resumed_broker_action(
+            &config,
+            Arc::clone(&engine),
+            Some(shared_audit),
+            Some(&handles),
+            &outcome,
+        );
+        let drivers = handles.lock().unwrap().close_and_take();
+        assert!(
+            !drivers.is_empty(),
+            "the approval resumed the run on a driver"
+        );
+        for driver in drivers {
+            tokio::time::timeout(std::time::Duration::from_secs(120), driver)
+                .await
+                .expect("the resumed driver settles")
+                .unwrap();
+        }
+
+        let step_turns: Vec<_> = STEP_TURN_MEMORY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(id, ..)| *id == run_id)
+            .map(|(_, step, owner)| (*step, owner.clone()))
+            .collect();
+        assert_eq!(
+            step_turns,
+            vec![(1, Some(Some(owner.clone())))],
+            "the resumed step turn is started over the owner's plane for the step agent"
+        );
+        let on_shared = sop_rows(&shared, None).await;
+        assert!(
+            !on_shared.contains("P-HEADLESS-PAYLOAD-MARKER") && !on_shared.contains(&run_id),
+            "an owned run resumed off-session must not be audited on the shared plane:\n{on_shared}"
+        );
+        let on_owner = sop_rows(&shared, Some(&owner)).await;
+        assert!(
+            on_owner.contains(&format!("sop_step_{run_id}_1")),
+            "the resumed step is audited on the owner's plane:\n{on_owner}"
+        );
+        assert!(
+            on_owner.contains("P-HEADLESS-PAYLOAD-MARKER"),
+            "the finished run, payload included, is audited on the owner's plane:\n{on_owner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owned_run_resumed_off_session_is_audited_on_its_owners_plane() {
+        resume_an_owned_run_off_session(false).await;
+    }
+
+    #[tokio::test]
+    async fn an_owned_run_restored_and_resumed_off_session_is_audited_on_its_owners_plane() {
+        resume_an_owned_run_off_session(true).await;
+    }
+
+    /// The failure a headless step of an owned run reports when the owner's
+    /// memory cannot be built reads from the catalogue and keeps the cause.
+    #[test]
+    fn an_unavailable_owner_memory_fails_the_step_in_the_catalogues_words() {
+        let reported = owner_memory_unavailable(&anyhow::Error::msg("disk detached")).to_string();
+        assert_eq!(
+            reported,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-sop-step-owner-memory-unavailable",
+                &[("error", "disk detached")],
+            )
+        );
+        assert!(
+            reported.contains("disk detached") && !reported.starts_with('{'),
+            "{reported}"
+        );
+    }
+
+    /// A resumed step of an owned run runs over the owner's plane for the
+    /// step agent; an unowned run's step builds the agent's memory as before.
+    #[tokio::test]
+    async fn a_headless_step_of_an_owned_run_runs_on_its_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = owned_run_config(&tmp);
+        assert!(
+            headless_step_memory(&config, "stepper", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
+        let memory = headless_step_memory(&config, "stepper", Some(&owner))
+            .await
+            .unwrap()
+            .expect("an owned run's step gets the owner's memory");
+        assert_eq!(
+            memory.principal_scope(),
+            Some(owner.with_agent(Some("stepper".to_string())))
+        );
+    }
+
     fn extract_run_id(action: &SopRunAction) -> String {
         match action {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
@@ -1617,6 +1958,8 @@ mod tests {
             "fallback-disabled",
             "canonical-disabled",
             "canonical-deleted",
+            "owner-memory-disabled",
+            "owner-memory-unchanged",
         ] {
             let temp = tempfile::tempdir().unwrap();
             let mut config = zeroclaw_config::schema::Config {
@@ -1662,10 +2005,19 @@ mod tests {
             let mut engine = SopEngine::new(SopConfig::default())
                 .with_execution_capability(authority.execution_capability());
             engine.set_sops_for_test(vec![sop]);
-            let action = engine.start_run(&name, manual_event()).unwrap();
+            let owned = case.starts_with("owner-memory-");
+            let owner =
+                owned.then(|| zeroclaw_api::memory_traits::PrincipalScope::new("user:alice"));
+            let action = engine
+                .start_run_for(&name, manual_event(), None, owner)
+                .unwrap();
             let run_id = extract_run_id(&action);
             let engine = Arc::new(Mutex::new(engine));
-            let (reached, release) = step_boundary_pause::arm(&name);
+            let (reached, release) = if owned {
+                step_boundary_pause::arm_at(&name, step_boundary_pause::Boundary::OwnerMemory)
+            } else {
+                step_boundary_pause::arm(&name)
+            };
             let driver = spawn_headless_run_driver_with_capability(
                 fallback,
                 engine.clone(),
@@ -1692,7 +2044,7 @@ mod tests {
                         "missing-replacement-profile".into();
                     authority.publish_for_test(config);
                 }
-                "canonical-disabled" => {
+                "canonical-disabled" | "owner-memory-disabled" => {
                     config.agents.get_mut("alpha").unwrap().enabled = false;
                     authority.publish_for_test(config);
                 }
@@ -1718,7 +2070,7 @@ mod tests {
             } else {
                 let step = &run.step_results[0];
                 assert_eq!(step.status, SopStepStatus::Failed);
-                if case == "canonical-disabled" {
+                if matches!(case, "canonical-disabled" | "owner-memory-disabled") {
                     assert_eq!(step.effective_agent, None);
                     assert!(
                         step.output.contains("'alpha', which is disabled"),

@@ -84,13 +84,6 @@ pub enum SopIngressOutcome {
     Dispatched(Vec<DispatchResult>),
 }
 
-/// A caller's authority over one matched procedure, evaluated at run
-/// admission: after trigger matching on the normalized event and after any
-/// decision-model wait, under the engine lock, immediately before the run
-/// starts. `Err` carries the refusal reason and the procedure is reported as
-/// skipped instead of started. The check must not take the engine lock.
-pub type SopAdmissionCheck<'a> = &'a (dyn Fn(&Sop) -> Result<(), String> + Sync);
-
 /// Borrowed, per-call adapter from transport deliveries into canonical SOP events.
 ///
 /// This is the ingress boundary for untrusted fan-in sources. Transport adapters
@@ -107,7 +100,7 @@ pub struct SopIngress<'a> {
     driver_sink: Option<&'a crate::sop::executor::SopDriverSink>,
     /// When attached, every matched procedure must pass this check at run
     /// admission (see [`SopAdmissionCheck`]).
-    admission_check: Option<SopAdmissionCheck<'a>>,
+    admission_check: Option<&'a SopAdmissionCheck<'a>>,
 }
 
 impl<'a> SopIngress<'a> {
@@ -130,7 +123,7 @@ impl<'a> SopIngress<'a> {
     /// model deliberates starts nothing, and a procedure the caller could not
     /// see because it matched only on the normalized topic is refused.
     #[must_use]
-    pub fn with_admission_check(mut self, check: SopAdmissionCheck<'a>) -> Self {
+    pub(super) fn with_admission_check(mut self, check: &'a SopAdmissionCheck<'a>) -> Self {
         self.admission_check = Some(check);
         self
     }
@@ -677,6 +670,38 @@ pub async fn dispatch_sop_event_to_deduplicated(
     .await
 }
 
+/// Keeps a caller's authority valid until a synchronous SOP effect finishes.
+/// Callbacks must return this guard rather than just checking and releasing it.
+pub trait SopEffectGuard {}
+impl<T> SopEffectGuard for T {}
+
+pub type SopAdmissionCheck<'a> =
+    dyn Fn(&super::Sop) -> Result<Box<dyn SopEffectGuard + 'a>, String> + Sync + 'a;
+
+/// RPC admission hook, borrowed only for this dispatch. It runs under the engine
+/// lock after decision-model waits, against the procedure that will actually
+/// start (including when a producer key would coalesce). No policy is stored on
+/// the engine or carried into running steps. Trusted non-RPC callers omit it.
+pub(crate) async fn dispatch_sop_event_to_authorized(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+    dedup_key: Option<&str>,
+    authorize: &SopAdmissionCheck<'_>,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(
+        engine,
+        audit,
+        event,
+        Some(target_sop),
+        None,
+        dedup_key,
+        Some(authorize),
+    )
+    .await
+}
+
 async fn dispatch_sop_event_filtered(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
@@ -693,9 +718,16 @@ async fn dispatch_sop_event_filtered(
     // Semantic key shared by fresh producers. Coalesces only while its run is
     // active; terminal retries remain possible.
     active_dedup: Option<&str>,
-    // The caller's authority, re-evaluated per procedure at run admission.
-    admission_check: Option<SopAdmissionCheck<'_>>,
+    authorize: Option<&SopAdmissionCheck<'_>>,
 ) -> Vec<DispatchResult> {
+    if authorize.is_some()
+        && !matches!(
+            event.source,
+            SopTriggerSource::Manual | SopTriggerSource::Webhook
+        )
+    {
+        return Vec::new();
+    }
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
         Err(e) => {
@@ -823,53 +855,30 @@ async fn dispatch_sop_event_filtered(
             }
         };
 
-        // Re-establish the caller's authority over each procedure now, on the
-        // normalized match set and after the decision wait, with the lock that
-        // starts the runs held so nothing can change between check and start.
-        let matched_names = match admission_check {
-            None => matched_names,
-            Some(check) => {
-                let mut admitted = Vec::with_capacity(matched_names.len());
-                for sop_name in matched_names {
-                    let verdict = eng.get_sop(&sop_name).map(check);
-                    match verdict {
-                        Some(Err(reason)) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "sop_name": sop_name, "reason": reason
-                                })),
-                                &format!(
-                                    "SOP dispatch: '{sop_name}' refused at admission: {reason}"
-                                )
-                            );
-                            results.push(DispatchResult::Skipped {
-                                sop_name,
-                                reason: format!("{NOT_AUTHORIZED_PREFIX}{reason}"),
-                            });
-                        }
-                        // A procedure that is no longer loaded fails its own start below.
-                        Some(Ok(())) | None => admitted.push(sop_name),
-                    }
-                }
-                admitted
-            }
-        };
-        if matched_names.is_empty() {
-            return results;
-        }
-
         // Keep producer/delivery idempotency orthogonal to admission. This pre-pass
         // removes SOPs already active for a shared producer key, or already known to
         // have started for a confirmed AMQP redelivery. Every remaining SOP still
         // follows the same single-run or atomic AMQP-batch path.
         let mut candidate_names = Vec::with_capacity(matched_names.len());
+        // RPC admits one name at a time, with its guard held through the
+        // complete effect. Its only ingress sources are Manual and Webhook.
+        let mut seen = std::collections::HashSet::new();
         for sop_name in &matched_names {
+            if authorize.is_some() {
+                if seen.insert(sop_name) {
+                    if eng.get_sop(sop_name).is_some() {
+                        candidate_names.push(sop_name.clone());
+                    } else if event.source == SopTriggerSource::Manual {
+                        results.push(DispatchResult::Skipped {
+                            sop_name: sop_name.clone(),
+                            reason: crate::i18n::get_required_cli_string(
+                                "sop-rpc-definition-unavailable",
+                            ),
+                        });
+                    }
+                }
+                continue;
+            }
             if let Some(result) = coalesce_active_duplicate(&eng, sop_name, active_dedup) {
                 results.push(result);
             } else if let Some(result) =
@@ -881,6 +890,9 @@ async fn dispatch_sop_event_filtered(
             }
         }
         if candidate_names.is_empty() {
+            if authorize.is_some() && results.is_empty() {
+                results.push(DispatchResult::NoMatch);
+            }
             return results;
         }
 
@@ -1160,7 +1172,7 @@ async fn dispatch_sop_event_filtered(
             let mut remaining = reservations.into_iter();
             for reservation in remaining.by_ref() {
                 let sop_name = reservation.sop_name().to_string();
-                match eng.activate_reserved_run(reservation, event.clone(), None) {
+                match eng.activate_reserved_run(reservation, event.clone(), None, None) {
                     Ok(action) => activated.push((sop_name, action)),
                     Err(e) => {
                         activation_failure = Some((sop_name, e.to_string()));
@@ -1204,6 +1216,28 @@ async fn dispatch_sop_event_filtered(
             }
         } else {
             for sop_name in &candidate_names {
+                let _authority = if let Some(authorize) = authorize {
+                    let Some(sop) = eng.get_sop(sop_name) else {
+                        continue;
+                    };
+                    let guard = match authorize(sop) {
+                        Ok(guard) => guard,
+                        Err(reason) => {
+                            results.push(DispatchResult::Skipped {
+                                sop_name: sop_name.clone(),
+                                reason,
+                            });
+                            continue;
+                        }
+                    };
+                    if let Some(result) = coalesce_active_duplicate(&eng, sop_name, active_dedup) {
+                        results.push(result);
+                        continue;
+                    }
+                    Some(guard)
+                } else {
+                    None
+                };
                 // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
                 // the authoritative CAS start; the other outcomes are surfaced (logged +
                 // carried on a DispatchResult) so a non-admitted trigger is never lost.
@@ -1269,12 +1303,19 @@ async fn dispatch_sop_event_filtered(
                     SopAdmission::Admit => {}
                 }
                 let decision = decided.remove(sop_name).unwrap_or_default();
-                match eng.start_run_with_mode(
-                    sop_name,
-                    event.clone(),
-                    decision.mode,
-                    decision.parts,
-                ) {
+                let start = if authorize.is_some() {
+                    eng.with_nonblocking_store(|eng| {
+                        eng.start_run_with_mode(
+                            sop_name,
+                            event.clone(),
+                            decision.mode,
+                            decision.parts,
+                        )
+                    })
+                } else {
+                    eng.start_run_with_mode(sop_name, event.clone(), decision.mode, decision.parts)
+                };
+                match start {
                     Ok(action) => {
                         let result =
                             record_started_run(&eng, sop_name, action, &mut pending_deterministic);
@@ -1566,7 +1607,7 @@ pub async fn dispatch_untrusted_fan_in(
     }
 }
 
-struct PreparedSopIngress<'a> {
+struct PreparedSopIngress<'a, 'auth> {
     source: SopTriggerSource,
     topic: Option<&'a str>,
     payload: Option<&'a str>,
@@ -1574,13 +1615,13 @@ struct PreparedSopIngress<'a> {
     delivery_dedup: Option<(String, bool)>,
     active_dedup: Option<String>,
     max_bytes: usize,
-    admission_check: Option<SopAdmissionCheck<'a>>,
+    admission_check: Option<&'auth SopAdmissionCheck<'auth>>,
 }
 
 async fn dispatch_untrusted_fan_in_inner(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
-    ingress: PreparedSopIngress<'_>,
+    ingress: PreparedSopIngress<'_, '_>,
 ) -> Vec<DispatchResult> {
     let PreparedSopIngress {
         source,
@@ -1641,10 +1682,6 @@ async fn dispatch_untrusted_fan_in_inner(
     process_headless_results(&results);
     results
 }
-
-/// Prefix on the reason of a procedure the admission check refused, so a
-/// caller can tell a refusal apart from an ordinary skip.
-pub const NOT_AUTHORIZED_PREFIX: &str = "not authorized: ";
 
 /// The procedures an untrusted delivery on `topic` would match, computed on
 /// the topic exactly as the dispatch path normalizes it (capped to the

@@ -130,6 +130,15 @@ the connection's authentication, never from anything the client claims:
 - The unauthenticated local operator is anonymous and cannot satisfy a policy
   with a `required_group`.
 
+Over RPC, starting a run, dispatching a webhook event, or submitting a decision
+requires current administrator authority. A vote that still needs another
+member returns the run overlay with `pending_quorum: true`. A signed-in
+approver outside the required group receives `FORBIDDEN`.
+
+A scoped caller with the SOP execute grant may cancel a shared run or their own
+private run when their agent selector covers the procedure. Cancellation stops
+the run at its next step boundary and can be retried safely.
+
 The paired-token subject is the lowercase SHA-256 hex digest of the bearer
 token. After pairing, copy the digest from the canonical
 `gateway.paired_tokens` entry, or compute it from the bearer token without

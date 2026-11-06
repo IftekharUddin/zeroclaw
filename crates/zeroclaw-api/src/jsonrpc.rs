@@ -329,6 +329,12 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Reserve frame capacity before a caller performs its final authorization.
+    /// Sending through the returned permit is synchronous.
+    pub async fn reserve_frame(&self) -> Option<mpsc::OwnedPermit<String>> {
+        self.writer_tx.clone().reserve_owned().await.ok()
+    }
+
     /// Resolve when the writer end is closed (peer dropped). Useful for
     /// long-lived forwarders that need to exit on disconnect even when
     /// there is no payload to send.
@@ -499,6 +505,15 @@ pub struct SopDecideRequest {
     pub name: Option<String>,
     pub run_id: String,
     pub decision: serde_json::Value,
+}
+
+/// The run overlay after a checkpoint vote, including its pending quorum when applicable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopDecideResult<T = serde_json::Map<String, Value>> {
+    #[serde(flatten)]
+    pub overlay: T,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_quorum: Option<bool>,
 }
 
 /// Request payload for `sops/cancel`: request a safe cancellation of a run.

@@ -81,14 +81,14 @@ pub enum WebhookDispatch {
 /// lock before a step runs. The driver reads the configuration only at the
 /// step's execution boundary, after those waits, so an agent disabled or
 /// re-profiled during any of them does not run under its former settings.
-pub async fn dispatch_webhook_event(
-    engine: &Arc<Mutex<SopEngine>>,
-    audit: &Arc<SopAuditLogger>,
+pub async fn dispatch_webhook_event<'a>(
+    engine: &'a Arc<Mutex<SopEngine>>,
+    audit: &'a Arc<SopAuditLogger>,
     driver_handles: Option<&SopDriverHandles>,
     live_config: &LiveConfigHandle,
     path: &str,
     payload: Option<&str>,
-    admission_check: Option<SopAdmissionCheck<'_>>,
+    admission_check: Option<&'a SopAdmissionCheck<'a>>,
 ) -> WebhookDispatch {
     let mut ingress = SopIngress::new(Some(engine), Some(audit.as_ref()));
     if let Some(check) = admission_check {
