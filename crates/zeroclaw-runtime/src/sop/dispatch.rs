@@ -786,12 +786,18 @@ async fn dispatch_sop_event_filtered(
 
     // Phase 1: match
     let matched_names: Vec<String> = match engine.lock() {
-        Ok(eng) => eng
-            .match_trigger(&event)
-            .iter()
-            .map(|s| s.name.clone())
-            .filter(|name| target_sop.is_none_or(|target| name == target))
-            .collect(),
+        Ok(eng) => {
+            // The engine resolves one procedure per name. On RPC, duplicate
+            // manifests must not consult its external decision model twice.
+            let mut seen = std::collections::HashSet::new();
+            eng.match_trigger(&event)
+                .into_iter()
+                .map(|sop| sop.name.as_str())
+                .filter(|name| target_sop.is_none_or(|target| *name == target))
+                .filter(|name| authorize.is_none() || seen.insert(*name))
+                .map(str::to_owned)
+                .collect()
+        }
         Err(e) => {
             crate::health::mark_component_error("sop_dispatch", format!("lock poisoned: {e}"));
             ::zeroclaw_log::record!(
@@ -862,20 +868,17 @@ async fn dispatch_sop_event_filtered(
         let mut candidate_names = Vec::with_capacity(matched_names.len());
         // RPC admits one name at a time, with its guard held through the
         // complete effect. Its only ingress sources are Manual and Webhook.
-        let mut seen = std::collections::HashSet::new();
         for sop_name in &matched_names {
             if authorize.is_some() {
-                if seen.insert(sop_name) {
-                    if eng.get_sop(sop_name).is_some() {
-                        candidate_names.push(sop_name.clone());
-                    } else if event.source == SopTriggerSource::Manual {
-                        results.push(DispatchResult::Skipped {
-                            sop_name: sop_name.clone(),
-                            reason: crate::i18n::get_required_cli_string(
-                                "sop-rpc-definition-unavailable",
-                            ),
-                        });
-                    }
+                if eng.get_sop(sop_name).is_some() {
+                    candidate_names.push(sop_name.clone());
+                } else if event.source == SopTriggerSource::Manual {
+                    results.push(DispatchResult::Skipped {
+                        sop_name: sop_name.clone(),
+                        reason: crate::i18n::get_required_cli_string(
+                            "sop-rpc-definition-unavailable",
+                        ),
+                    });
                 }
                 continue;
             }
@@ -4097,6 +4100,36 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        #[tokio::test]
+        async fn sop_rpc_duplicate_manifests_consult_a_declining_model_once() {
+            let model = Scripted::answering(0.1, "auto", 0.9);
+            let sop = webhook_sop("refunds", SopExecutionMode::Supervised, Some(spec()));
+            let engine = engine_with(vec![sop.clone(), sop], Some(model.clone()));
+            let audit = test_audit();
+            let authorize =
+                |_: &Sop| -> Result<Box<dyn SopEffectGuard>, String> { Ok(Box::new(())) };
+            let result = SopIngress::new(Some(&engine), Some(&audit))
+                .with_admission_check(&authorize)
+                .dispatch(
+                    SopTriggerSource::Webhook,
+                    Some("/support"),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            let SopIngressOutcome::Dispatched(results) = result else {
+                panic!("matched webhook was not dispatched")
+            };
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                matches!(&results[..], [DispatchResult::Skipped { sop_name, reason }]
+                if sop_name == "refunds" && reason.starts_with("decision gate declined")),
+                "{results:?}"
+            );
+            assert!(engine.lock().unwrap().active_runs().is_empty());
         }
 
         #[tokio::test]
