@@ -1216,122 +1216,134 @@ async fn dispatch_sop_event_filtered(
             }
         } else {
             for sop_name in &candidate_names {
-                let _authority = if let Some(authorize) = authorize {
-                    let Some(sop) = eng.get_sop(sop_name) else {
-                        continue;
+                // Admission, error classification and start can all consult the
+                // store. RPC must use its nonblocking view for the complete
+                // synchronous effect while the caller holds authority.
+                let mut dispatch_one = |eng: &mut SopEngine| {
+                    let _authority = if let Some(authorize) = authorize {
+                        let Some(sop) = eng.get_sop(sop_name) else {
+                            return DispatchResult::Skipped {
+                                sop_name: sop_name.clone(),
+                                reason: crate::i18n::get_required_cli_string(
+                                    "sop-rpc-definition-unavailable",
+                                ),
+                            };
+                        };
+                        let guard = match authorize(sop) {
+                            Ok(guard) => guard,
+                            Err(reason) => {
+                                return DispatchResult::Skipped {
+                                    sop_name: sop_name.clone(),
+                                    reason,
+                                };
+                            }
+                        };
+                        if let Some(result) = coalesce_active_duplicate(eng, sop_name, active_dedup)
+                        {
+                            return result;
+                        }
+                        Some(guard)
+                    } else {
+                        None
                     };
-                    let guard = match authorize(sop) {
-                        Ok(guard) => guard,
-                        Err(reason) => {
-                            results.push(DispatchResult::Skipped {
+                    // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
+                    // the authoritative CAS start; the other outcomes are surfaced (logged +
+                    // carried on a DispatchResult) so a non-admitted trigger is never lost.
+                    match eng.evaluate_admission(sop_name) {
+                        SopAdmission::Defer { reason } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!(
+                                    "SOP dispatch: deferred '{sop_name}' (backpressure): {reason}"
+                                )
+                            );
+                            return DispatchResult::Deferred {
                                 sop_name: sop_name.clone(),
                                 reason,
-                            });
-                            continue;
+                            };
                         }
-                    };
-                    if let Some(result) = coalesce_active_duplicate(&eng, sop_name, active_dedup) {
-                        results.push(result);
-                        continue;
+                        SopAdmission::Coalesce { existing_run_id } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "existing_run_id": existing_run_id
+                                })),
+                                &format!(
+                                    "SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}"
+                                )
+                            );
+                            return DispatchResult::Coalesced {
+                                sop_name: sop_name.clone(),
+                                existing_run_id,
+                            };
+                        }
+                        SopAdmission::Drop { reason } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!("SOP dispatch: dropped '{sop_name}': {reason}")
+                            );
+                            return DispatchResult::Skipped {
+                                sop_name: sop_name.clone(),
+                                reason,
+                            };
+                        }
+                        SopAdmission::Admit => {}
                     }
-                    Some(guard)
-                } else {
-                    None
+                    let decision = decided.remove(sop_name).unwrap_or_default();
+                    let start = eng.start_run_with_mode(
+                        sop_name,
+                        event.clone(),
+                        decision.mode,
+                        decision.parts,
+                    );
+                    match start {
+                        Ok(action) => {
+                            let result = record_started_run(
+                                eng,
+                                sop_name,
+                                action,
+                                &mut pending_deterministic,
+                            );
+                            remember_dispatch_start(
+                                eng,
+                                sop_name,
+                                delivery_dedup,
+                                active_dedup,
+                                &result,
+                            );
+                            result
+                        }
+                        Err(e) => reclassify_failed_start(eng, sop_name, &e),
+                    }
                 };
-                // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
-                // the authoritative CAS start; the other outcomes are surfaced (logged +
-                // carried on a DispatchResult) so a non-admitted trigger is never lost.
-                match eng.evaluate_admission(sop_name) {
-                    SopAdmission::Defer { reason } => {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({
-                                "sop_name": sop_name, "reason": reason
-                            })),
-                            &format!(
-                                "SOP dispatch: deferred '{sop_name}' (backpressure): {reason}"
-                            )
-                        );
-                        results.push(DispatchResult::Deferred {
+                let result = if authorize.is_some() {
+                    eng.with_nonblocking_store(|eng| Ok(dispatch_one(eng)))
+                        .unwrap_or_else(|error| DispatchResult::Skipped {
                             sop_name: sop_name.clone(),
-                            reason,
-                        });
-                        continue;
-                    }
-                    SopAdmission::Coalesce { existing_run_id } => {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({
-                                "sop_name": sop_name, "existing_run_id": existing_run_id
-                            })),
-                            &format!(
-                                "SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}"
-                            )
-                        );
-                        results.push(DispatchResult::Coalesced {
-                            sop_name: sop_name.clone(),
-                            existing_run_id,
-                        });
-                        continue;
-                    }
-                    SopAdmission::Drop { reason } => {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({
-                                "sop_name": sop_name, "reason": reason
-                            })),
-                            &format!("SOP dispatch: dropped '{sop_name}': {reason}")
-                        );
-                        results.push(DispatchResult::Skipped {
-                            sop_name: sop_name.clone(),
-                            reason,
-                        });
-                        continue;
-                    }
-                    SopAdmission::Admit => {}
-                }
-                let decision = decided.remove(sop_name).unwrap_or_default();
-                let start = if authorize.is_some() {
-                    eng.with_nonblocking_store(|eng| {
-                        eng.start_run_with_mode(
-                            sop_name,
-                            event.clone(),
-                            decision.mode,
-                            decision.parts,
-                        )
-                    })
+                            reason: error.to_string(),
+                        })
                 } else {
-                    eng.start_run_with_mode(sop_name, event.clone(), decision.mode, decision.parts)
+                    dispatch_one(&mut eng)
                 };
-                match start {
-                    Ok(action) => {
-                        let result =
-                            record_started_run(&eng, sop_name, action, &mut pending_deterministic);
-                        remember_dispatch_start(
-                            &mut eng,
-                            sop_name,
-                            delivery_dedup,
-                            active_dedup,
-                            &result,
-                        );
-                        results.push(result);
-                    }
-                    Err(e) => {
-                        results.push(reclassify_failed_start(&eng, sop_name, &e));
-                    }
-                }
+                results.push(result);
             }
         }
     } // lock dropped
@@ -1919,6 +1931,64 @@ mod tests {
 
     fn test_audit() -> SopAuditLogger {
         SopAuditLogger::new(Arc::new(TestMemory::default()))
+    }
+
+    #[test]
+    fn sop_rpc_admission_refuses_a_busy_store_before_reading_or_starting() {
+        use crate::sop::store::InMemoryRunStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        let sop = test_sop("busy", vec![SopTrigger::Manual]);
+        // Duplicate manifests resolve to a single name and effect.
+        engine.set_sops_for_test(vec![sop.clone(), sop]);
+        let engine = Arc::new(Mutex::new(engine));
+        let audit = test_audit();
+        let calls = AtomicUsize::new(0);
+        let authorize = |_: &Sop| -> Result<Box<dyn SopEffectGuard>, String> {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(()))
+        };
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dispatch = || {
+            runtime.block_on(dispatch_sop_event_to_authorized(
+                &engine,
+                &audit,
+                event.clone(),
+                "busy",
+                None,
+                &authorize,
+            ))
+        };
+        let refusal = std::thread::scope(|scope| {
+            let locked = store.hold_for_test();
+            let (done, completed) = std::sync::mpsc::channel();
+            let dispatch = &dispatch;
+            scope.spawn(move || {
+                let _ = done.send(dispatch());
+            });
+            let response = completed.recv_timeout(std::time::Duration::from_secs(2));
+            drop(locked);
+            response.expect("authorized dispatch must return before the ordinary store is unlocked")
+        });
+        assert!(
+            matches!(&refusal[..], [DispatchResult::Skipped { reason, .. }] if reason.contains(&crate::i18n::get_required_cli_string("sop-store-busy"))),
+            "{refusal:?}"
+        );
+        assert!(engine.lock().unwrap().active_runs().is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(&dispatch()[..], [DispatchResult::Started { .. }]));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

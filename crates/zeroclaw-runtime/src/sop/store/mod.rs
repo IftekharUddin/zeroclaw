@@ -314,6 +314,11 @@ impl Default for InMemoryRunStore {
 }
 
 impl InMemoryRunStore {
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> impl Drop + '_ {
+        self.inner.lock().unwrap()
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
