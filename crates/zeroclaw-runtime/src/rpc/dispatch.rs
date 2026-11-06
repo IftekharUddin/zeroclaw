@@ -30542,17 +30542,15 @@ mod tests {
             json!({"run_id":"unknown"}),
         )
         .await;
-        let refused = rpc(
-            &mut peer,
-            &mut rx,
-            2,
-            "sops/cancel",
+        for params in [
+            json!({"run_id":foreign}),
             json!({"run_id":foreign,"name":"wrong"}),
-        )
-        .await;
-        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
-        assert_eq!(refused["error"], missing["error"]);
-        assert_eq!(run_state(&engine, &foreign), before);
+        ] {
+            let refused = rpc(&mut peer, &mut rx, 2, "sops/cancel", params).await;
+            assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+            assert_eq!(refused["error"], missing["error"]);
+            assert_eq!(run_state(&engine, &foreign), before);
+        }
         for id in [own, shared] {
             let cancelled = rpc(&mut peer, &mut rx, 3, "sops/cancel", json!({"run_id":id})).await;
             assert_eq!(cancelled["result"]["outcome"], "cancelled", "{cancelled}");
