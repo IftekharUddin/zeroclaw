@@ -6423,7 +6423,7 @@ mod tests {
             "file_read"
         );
 
-        let long = "echo ".to_string() + &"a".repeat(200);
+        let long = format!("echo {}", "a".repeat(200));
         let title = acp_tool_title("shell", &serde_json::json!({"command": long}));
         assert_eq!(title.chars().count(), ACP_TOOL_TITLE_MAX_CHARS);
         assert!(title.ends_with('…'));
