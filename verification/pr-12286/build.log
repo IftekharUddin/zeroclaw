@@ -1,0 +1,59 @@
+    Blocking waiting for file lock on build directory
+   Compiling serde_core v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling tokio v1.53.3
+   Compiling futures-util v0.3.34
+   Compiling clap v4.6.6
+   Compiling tempfile v3.27.0
+   Compiling rcgen v0.13.2
+   Compiling crossterm v0.29.0 (<checkout>/vendor/crossterm-0.29.0)
+   Compiling zeroclaw-buildinfo v0.8.7 (<checkout>/crates/zeroclaw-buildinfo)
+   Compiling dialoguer v0.12.0
+   Compiling zeroclaw v0.8.7 (<checkout>)
+   Compiling clap-markdown v0.1.5
+   Compiling clap_complete v4.6.9
+   Compiling futures-executor v0.3.34
+   Compiling tokio-util v0.7.19
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper v1.11.1
+   Compiling tower v0.5.3
+   Compiling futures v0.3.32
+   Compiling tokio-tungstenite v0.29.0
+   Compiling tokio-stream v0.1.19
+   Compiling tower-http v0.6.11
+   Compiling hyper-util v0.1.20
+   Compiling serde v1.0.229
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling serde_spanned v1.1.1
+   Compiling hyper-rustls v0.27.9
+   Compiling toml v1.1.2+spec-1.1.0
+   Compiling toml_edit v0.25.12+spec-1.1.0
+   Compiling chrono v0.4.45
+   Compiling schemars v1.2.2
+   Compiling serde_urlencoded v0.7.1
+   Compiling zeroclaw-commands v0.8.7 (<checkout>/crates/zeroclaw-commands)
+   Compiling zeroclaw-sop-graph v0.8.7 (<checkout>/crates/zeroclaw-sop-graph)
+   Compiling zeroclaw-relay-proto v0.8.7 (<checkout>/crates/zeroclaw-relay-proto)
+   Compiling reqwest v0.12.28
+   Compiling async-imap v0.11.3
+   Compiling chrono-tz v0.10.4
+   Compiling cron v0.15.0
+   Compiling zeroclaw-api v0.8.7 (<checkout>/crates/zeroclaw-api)
+   Compiling zeroclaw-log v0.8.7 (<checkout>/crates/zeroclaw-log)
+   Compiling zeroclaw-spawn v0.8.7 (<checkout>/crates/zeroclaw-spawn)
+   Compiling zeroclaw-tls v0.8.7 (<checkout>/crates/zeroclaw-tls)
+   Compiling zeroclaw-tool-call-parser v0.8.7 (<checkout>/crates/zeroclaw-tool-call-parser)
+   Compiling zeroclaw-infra v0.8.7 (<checkout>/crates/zeroclaw-infra)
+   Compiling zeroclaw-config v0.8.7 (<checkout>/crates/zeroclaw-config)
+   Compiling zeroclaw-providers v0.8.7 (<checkout>/crates/zeroclaw-providers)
+   Compiling zeroclaw-memory v0.8.7 (<checkout>/crates/zeroclaw-memory)
+   Compiling zeroclaw-tools v0.8.7 (<checkout>/crates/zeroclaw-tools)
+   Compiling zeroclaw-runtime v0.8.7 (<checkout>/crates/zeroclaw-runtime)
+   Compiling zeroclaw-channels v0.8.7 (<checkout>/crates/zeroclaw-channels)
+   Compiling zeroclaw-eval v0.8.7 (<checkout>/crates/zeroclaw-eval)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `zeroclaw` (bin "zeroclaw") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7m 34s

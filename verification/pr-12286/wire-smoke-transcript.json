@@ -1,0 +1,237 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "result": {
+      "_meta": {
+        "zeroclaw": {
+          "defaultModel": "acp-title-fixture",
+          "maxSessions": 10,
+          "sessionTimeoutSecs": 3600
+        }
+      },
+      "agentCapabilities": {
+        "loadSession": true,
+        "mcpCapabilities": {
+          "http": false,
+          "sse": false
+        },
+        "promptCapabilities": {
+          "audio": false,
+          "embeddedContext": true,
+          "image": false
+        },
+        "sessionCapabilities": {
+          "close": {},
+          "resume": {}
+        }
+      },
+      "agentInfo": {
+        "name": "zeroclaw-acp",
+        "title": "ZeroClaw ACP",
+        "version": "0.8.7"
+      },
+      "authMethods": [],
+      "protocolVersion": 1
+    },
+    "id": 1
+  },
+  {
+    "jsonrpc": "2.0",
+    "result": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "workspaceDir": "<verification>/workspace"
+    },
+    "id": 2
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/request_permission",
+    "params": {
+      "options": [
+        {
+          "kind": "allow_once",
+          "name": "Allow once",
+          "optionId": "allow-once"
+        },
+        {
+          "kind": "allow_always",
+          "name": "Always allow",
+          "optionId": "allow-always"
+        },
+        {
+          "kind": "reject_once",
+          "name": "Reject",
+          "optionId": "reject-once"
+        }
+      ],
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "toolCall": {
+        "content": [
+          {
+            "content": {
+              "text": "approved: false, command:   sleep  30; printf   ACP-title-verified  ",
+              "type": "text"
+            },
+            "type": "content"
+          }
+        ],
+        "kind": "execute",
+        "rawInput": {
+          "tool": "shell"
+        },
+        "status": "pending",
+        "title": "Approve shell?",
+        "toolCallId": "approval-38877b4c-c9ef-497d-b14c-6b3750f5655e"
+      }
+    },
+    "id": "zc-out-0"
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "update": {
+        "kind": "execute",
+        "name": "shell",
+        "rawInput": {
+          "approved": true,
+          "command": "  sleep  30; printf   ACP-title-verified  "
+        },
+        "sessionUpdate": "tool_call",
+        "status": "pending",
+        "title": "sleep 30; printf ACP-title-verified",
+        "toolCallId": "acp-title-shell"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "update": {
+        "body": "ACP-title-verified",
+        "content": [
+          {
+            "content": {
+              "text": "ACP-title-verified",
+              "type": "text"
+            },
+            "type": "content"
+          }
+        ],
+        "kind": "execute",
+        "name": "shell",
+        "rawOutput": "ACP-title-verified",
+        "sessionUpdate": "tool_call_update",
+        "status": "completed",
+        "title": "sleep 30; printf ACP-title-verified",
+        "toolCallId": "acp-title-shell"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "update": {
+        "content": {
+          "text": "The harmless shell title check completed.",
+          "type": "text"
+        },
+        "sessionUpdate": "agent_message_chunk"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "result": {
+      "content": "The harmless shell title check completed.",
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "stopReason": "end_turn"
+    },
+    "id": 3
+  },
+  {
+    "jsonrpc": "2.0",
+    "result": {},
+    "id": 4
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "update": {
+        "content": {
+          "text": "[CURRENT DATE & TIME: 2026-11-07 17:53:44 -08:00]\n\nRun the harmless shell title check.",
+          "type": "text"
+        },
+        "sessionUpdate": "user_message_chunk"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "update": {
+        "kind": "execute",
+        "name": "shell",
+        "rawInput": {
+          "command": "  sleep  30; printf   ACP-title-verified  "
+        },
+        "sessionUpdate": "tool_call",
+        "status": "completed",
+        "title": "sleep 30; printf ACP-title-verified",
+        "toolCallId": "acp-title-shell"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "update": {
+        "body": "ACP-title-verified",
+        "content": [
+          {
+            "content": {
+              "text": "ACP-title-verified",
+              "type": "text"
+            },
+            "type": "content"
+          }
+        ],
+        "rawOutput": "ACP-title-verified",
+        "sessionUpdate": "tool_call_update",
+        "status": "completed",
+        "title": "sleep 30; printf ACP-title-verified",
+        "toolCallId": "acp-title-shell"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "7ce30a08-8571-40e7-8dbd-6d3016b45534",
+      "update": {
+        "content": {
+          "text": "The harmless shell title check completed.",
+          "type": "text"
+        },
+        "sessionUpdate": "agent_message_chunk"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "result": {},
+    "id": 5
+  }
+]

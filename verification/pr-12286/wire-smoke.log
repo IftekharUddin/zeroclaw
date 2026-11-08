@@ -1,0 +1,2 @@
+PASS: live: command titles, statuses, and real shell output
+PASS: session/load: command titles, statuses, and real shell output

@@ -1,0 +1,38 @@
+{
+  "revision": "4592c5035a3a4720066895f5a78391200608676b",
+  "base": "3c6382115e65ff94bdd925a3a45e4f20713e4152",
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
+  "validation": {
+    "fmt": "passed",
+    "clippy-ci-all": "passed",
+    "acp-server-tests": "130 passed",
+    "stdio-smoke": "passed: live + session/load",
+    "zed-rendering": "passed: pending, completed, session/load"
+  },
+  "logs": {
+    "clippy.log": "80f02924727a707fb4f5c0e03b2c41bd9ea84f3252e37ebc46018a3364c0207f",
+    "tests.log": "2d18999f07e04eba52c957a5c250106a310b819d4bb1afece37aed82f107131f"
+  },
+  "client": "Zed 1.27.0, isolated custom ACP agent over stdio",
+  "screenshots": {
+    "pending.png": "sleep 30; printf ACP-title-verified \u2014 pending",
+    "completed.png": "same command \u2014 completed",
+    "reloaded.png": "earlier printf-only session \u2014 completed after session/load; slow-command reload also confirmed in zed-transcript.json"
+  },
+  "binary_sha256": "68356e0ad9d1649beb660c55c14aaebcdf50fb3e1db86d3c3bb9047fdc9fbca4",
+  "published_files_sha256": {
+    "wire_smoke.py": "4f39f6f4748ac5efb8f7961b02c1d96838746921bad2daf7d7205af942e86f7b",
+    "mock_provider.py": "7d458de95429c40166776d9364402d1cd77d493b85048098028489219a7ab9e7",
+    "reloaded.png": "f436b36ca21f0bc0c3918d8a95692bcc0eb54eadb704882f5d7c4f3e9e9e9d60",
+    "zed-transcript.json": "303c443d03eff535a68ca87ef2c6afd780e2443cb261f136eac1e7088d026bc6",
+    "wire-smoke.log": "1322c2cf823646cb978fb48b5c0fbf474a0703516121797f8cd36949692355b9",
+    "acp_wrapper.py": "b0c8083f32ad8bd5bdea1b80e43a7d6a7c31e799606a00c4ad49fa08b7b4cd3c",
+    "clippy.log": "0e6259d005b390db892686b1df13f8892104a40034ffb52ddc711fa0f0f5ca56",
+    "completed.png": "9297659a2a09827f55c8254732866853d7824d9a4e26c71ebfa73d634c8dbe0b",
+    "tests.log": "cb2b265860b0fecd3e62dbf6b368a368cd520a36b9dc9313d592751d006498f4",
+    "wire-smoke-transcript.json": "ea1b63ad175336712b4eb850d510634d0072b003e113edf7683f49dc79f235b2",
+    "pending.png": "2689e309688be054c29a03402e89acc3aebaf5a5773e1def4044a1b341ff7599",
+    "build.log": "0a783ed939da7b9d4fbebce9fe9942668236df40ac0dc09ec29725479cacc6a9"
+  }
+}

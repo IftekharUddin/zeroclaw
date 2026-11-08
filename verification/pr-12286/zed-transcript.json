@@ -1,0 +1,901 @@
+[
+  {
+    "time": 1794102681.398408,
+    "server_process": 88782,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "52a3710f-f313-4b99-aff2-3a5fd3712161",
+      "method": "initialize",
+      "params": {
+        "protocolVersion": 1,
+        "clientCapabilities": {
+          "fs": {
+            "readTextFile": true,
+            "writeTextFile": true
+          },
+          "terminal": true,
+          "session": {
+            "compaction": {},
+            "configOptions": {
+              "boolean": {}
+            },
+            "notices": {}
+          },
+          "auth": {
+            "terminal": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          },
+          "_meta": {
+            "terminal_output": true,
+            "terminal-auth": true
+          }
+        },
+        "clientInfo": {
+          "name": "zed",
+          "title": "Zed",
+          "version": "1.27.0+stable.386.c84af5b99cbc366d675064e52b23664a015b6e35"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102681.436469,
+    "server_process": 88782,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {
+        "_meta": {
+          "zeroclaw": {
+            "defaultModel": "acp-title-fixture",
+            "maxSessions": 10,
+            "sessionTimeoutSecs": 3600
+          }
+        },
+        "agentCapabilities": {
+          "loadSession": true,
+          "mcpCapabilities": {
+            "http": false,
+            "sse": false
+          },
+          "promptCapabilities": {
+            "audio": false,
+            "embeddedContext": true,
+            "image": false
+          },
+          "sessionCapabilities": {
+            "close": {},
+            "resume": {}
+          }
+        },
+        "agentInfo": {
+          "name": "zeroclaw-acp",
+          "title": "ZeroClaw ACP",
+          "version": "0.8.7"
+        },
+        "authMethods": [],
+        "protocolVersion": 1
+      },
+      "id": "52a3710f-f313-4b99-aff2-3a5fd3712161"
+    }
+  },
+  {
+    "time": 1794102681.437376,
+    "server_process": 88782,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "054bfd12-3841-44b0-bbc9-e7e215274ac5",
+      "method": "session/new",
+      "params": {
+        "cwd": "<verification>/workspace",
+        "mcpServers": []
+      }
+    }
+  },
+  {
+    "time": 1794102681.447943,
+    "server_process": 88782,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "workspaceDir": "<verification>/workspace"
+      },
+      "id": "054bfd12-3841-44b0-bbc9-e7e215274ac5"
+    }
+  },
+  {
+    "time": 1794102708.654793,
+    "server_process": 88782,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "fb796a70-fa4e-436c-8992-75fd5d8423dc",
+      "method": "session/prompt",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "prompt": [
+          {
+            "type": "text",
+            "text": "Run the harmless shell title check."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "time": 1794102708.765055,
+    "server_process": 88782,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/request_permission",
+      "params": {
+        "options": [
+          {
+            "kind": "allow_once",
+            "name": "Allow once",
+            "optionId": "allow-once"
+          },
+          {
+            "kind": "allow_always",
+            "name": "Always allow",
+            "optionId": "allow-always"
+          },
+          {
+            "kind": "reject_once",
+            "name": "Reject",
+            "optionId": "reject-once"
+          }
+        ],
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "toolCall": {
+          "content": [
+            {
+              "content": {
+                "text": "approved: false, command:   printf   ACP-title-verified  ",
+                "type": "text"
+              },
+              "type": "content"
+            }
+          ],
+          "kind": "execute",
+          "rawInput": {
+            "tool": "shell"
+          },
+          "status": "pending",
+          "title": "Approve shell?",
+          "toolCallId": "approval-bfbdb5e5-94c3-4ba6-b048-9a8abe1292f8"
+        }
+      },
+      "id": "zc-out-0"
+    }
+  },
+  {
+    "time": 1794102734.0786939,
+    "server_process": 88782,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "zc-out-0",
+      "result": {
+        "outcome": {
+          "outcome": "selected",
+          "optionId": "allow-once"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102734.0841868,
+    "server_process": 88782,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "update": {
+          "kind": "execute",
+          "name": "shell",
+          "rawInput": {
+            "approved": true,
+            "command": "  printf   ACP-title-verified  "
+          },
+          "sessionUpdate": "tool_call",
+          "status": "pending",
+          "title": "printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102734.0956821,
+    "server_process": 88782,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "update": {
+          "body": "ACP-title-verified",
+          "content": [
+            {
+              "content": {
+                "text": "ACP-title-verified",
+                "type": "text"
+              },
+              "type": "content"
+            }
+          ],
+          "kind": "execute",
+          "name": "shell",
+          "rawOutput": "ACP-title-verified",
+          "sessionUpdate": "tool_call_update",
+          "status": "completed",
+          "title": "printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102734.203243,
+    "server_process": 88782,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "update": {
+          "content": {
+            "text": "The harmless shell title check completed.",
+            "type": "text"
+          },
+          "sessionUpdate": "agent_message_chunk"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102734.203798,
+    "server_process": 88782,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": "The harmless shell title check completed.",
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "stopReason": "end_turn"
+      },
+      "id": "fb796a70-fa4e-436c-8992-75fd5d8423dc"
+    }
+  },
+  {
+    "time": 1794102810.78549,
+    "server_process": 88953,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "7d0ffd47-fe45-4526-88e9-c5a2f39648e8",
+      "method": "initialize",
+      "params": {
+        "protocolVersion": 1,
+        "clientCapabilities": {
+          "fs": {
+            "readTextFile": true,
+            "writeTextFile": true
+          },
+          "terminal": true,
+          "session": {
+            "compaction": {},
+            "configOptions": {
+              "boolean": {}
+            },
+            "notices": {}
+          },
+          "auth": {
+            "terminal": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          },
+          "_meta": {
+            "terminal_output": true,
+            "terminal-auth": true
+          }
+        },
+        "clientInfo": {
+          "name": "zed",
+          "title": "Zed",
+          "version": "1.27.0+stable.386.c84af5b99cbc366d675064e52b23664a015b6e35"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102810.827258,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {
+        "_meta": {
+          "zeroclaw": {
+            "defaultModel": "acp-title-fixture",
+            "maxSessions": 10,
+            "sessionTimeoutSecs": 3600
+          }
+        },
+        "agentCapabilities": {
+          "loadSession": true,
+          "mcpCapabilities": {
+            "http": false,
+            "sse": false
+          },
+          "promptCapabilities": {
+            "audio": false,
+            "embeddedContext": true,
+            "image": false
+          },
+          "sessionCapabilities": {
+            "close": {},
+            "resume": {}
+          }
+        },
+        "agentInfo": {
+          "name": "zeroclaw-acp",
+          "title": "ZeroClaw ACP",
+          "version": "0.8.7"
+        },
+        "authMethods": [],
+        "protocolVersion": 1
+      },
+      "id": "7d0ffd47-fe45-4526-88e9-c5a2f39648e8"
+    }
+  },
+  {
+    "time": 1794102810.827927,
+    "server_process": 88953,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "c74717bf-6929-4aaf-840a-3597176de7e9",
+      "method": "session/load",
+      "params": {
+        "mcpServers": [],
+        "cwd": "<verification>/workspace",
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261"
+      }
+    }
+  },
+  {
+    "time": 1794102810.839494,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "update": {
+          "content": {
+            "text": "[CURRENT DATE & TIME: 2026-11-07 17:51:48 -08:00]\n\nRun the harmless shell title check.",
+            "type": "text"
+          },
+          "sessionUpdate": "user_message_chunk"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102810.8395462,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "update": {
+          "kind": "execute",
+          "name": "shell",
+          "rawInput": {
+            "command": "  printf   ACP-title-verified  "
+          },
+          "sessionUpdate": "tool_call",
+          "status": "completed",
+          "title": "printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102810.8396459,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "update": {
+          "body": "ACP-title-verified",
+          "content": [
+            {
+              "content": {
+                "text": "ACP-title-verified",
+                "type": "text"
+              },
+              "type": "content"
+            }
+          ],
+          "rawOutput": "ACP-title-verified",
+          "sessionUpdate": "tool_call_update",
+          "status": "completed",
+          "title": "printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102810.8397481,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "f62434c8-9091-4fb6-852a-6b61d0d3d261",
+        "update": {
+          "content": {
+            "text": "The harmless shell title check completed.",
+            "type": "text"
+          },
+          "sessionUpdate": "agent_message_chunk"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102810.839838,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {},
+      "id": "c74717bf-6929-4aaf-840a-3597176de7e9"
+    }
+  },
+  {
+    "time": 1794102828.6401868,
+    "server_process": 88953,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "fd2216c7-f2b6-418f-a431-9ad62536c55e",
+      "method": "session/new",
+      "params": {
+        "cwd": "<verification>/workspace",
+        "mcpServers": []
+      }
+    }
+  },
+  {
+    "time": 1794102828.645462,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "workspaceDir": "<verification>/workspace"
+      },
+      "id": "fd2216c7-f2b6-418f-a431-9ad62536c55e"
+    }
+  },
+  {
+    "time": 1794102834.818837,
+    "server_process": 88953,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "4d35b23e-18af-4f4d-ac35-b732c786dd21",
+      "method": "session/prompt",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "prompt": [
+          {
+            "type": "text",
+            "text": "Run the harmless shell title check."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "time": 1794102834.952587,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/request_permission",
+      "params": {
+        "options": [
+          {
+            "kind": "allow_once",
+            "name": "Allow once",
+            "optionId": "allow-once"
+          },
+          {
+            "kind": "allow_always",
+            "name": "Always allow",
+            "optionId": "allow-always"
+          },
+          {
+            "kind": "reject_once",
+            "name": "Reject",
+            "optionId": "reject-once"
+          }
+        ],
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "toolCall": {
+          "content": [
+            {
+              "content": {
+                "text": "approved: false, command:   sleep  30; printf   ACP-title-verified  ",
+                "type": "text"
+              },
+              "type": "content"
+            }
+          ],
+          "kind": "execute",
+          "rawInput": {
+            "tool": "shell"
+          },
+          "status": "pending",
+          "title": "Approve shell?",
+          "toolCallId": "approval-1657829e-b57d-459f-8e65-40211dca8107"
+        }
+      },
+      "id": "zc-out-0"
+    }
+  },
+  {
+    "time": 1794102842.260014,
+    "server_process": 88953,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "zc-out-0",
+      "result": {
+        "outcome": {
+          "outcome": "selected",
+          "optionId": "allow-once"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102842.265308,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "update": {
+          "kind": "execute",
+          "name": "shell",
+          "rawInput": {
+            "approved": true,
+            "command": "  sleep  30; printf   ACP-title-verified  "
+          },
+          "sessionUpdate": "tool_call",
+          "status": "pending",
+          "title": "sleep 30; printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102872.286902,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "update": {
+          "body": "ACP-title-verified",
+          "content": [
+            {
+              "content": {
+                "text": "ACP-title-verified",
+                "type": "text"
+              },
+              "type": "content"
+            }
+          ],
+          "kind": "execute",
+          "name": "shell",
+          "rawOutput": "ACP-title-verified",
+          "sessionUpdate": "tool_call_update",
+          "status": "completed",
+          "title": "sleep 30; printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102872.389686,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "update": {
+          "content": {
+            "text": "The harmless shell title check completed.",
+            "type": "text"
+          },
+          "sessionUpdate": "agent_message_chunk"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102872.390107,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": "The harmless shell title check completed.",
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "stopReason": "end_turn"
+      },
+      "id": "4d35b23e-18af-4f4d-ac35-b732c786dd21"
+    }
+  },
+  {
+    "time": 1794102887.738218,
+    "server_process": 88953,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "734c406c-d5f9-4261-a243-005b6b393136",
+      "method": "session/close",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd"
+      }
+    }
+  },
+  {
+    "time": 1794102887.739079,
+    "server_process": 88953,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {},
+      "id": "734c406c-d5f9-4261-a243-005b6b393136"
+    }
+  },
+  {
+    "time": 1794102979.044402,
+    "server_process": 89149,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "e693dec1-d46c-4476-aeb1-1592d4c1745e",
+      "method": "initialize",
+      "params": {
+        "protocolVersion": 1,
+        "clientCapabilities": {
+          "fs": {
+            "readTextFile": true,
+            "writeTextFile": true
+          },
+          "terminal": true,
+          "session": {
+            "compaction": {},
+            "configOptions": {
+              "boolean": {}
+            },
+            "notices": {}
+          },
+          "auth": {
+            "terminal": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          },
+          "_meta": {
+            "terminal_output": true,
+            "terminal-auth": true
+          }
+        },
+        "clientInfo": {
+          "name": "zed",
+          "title": "Zed",
+          "version": "1.27.0+stable.386.c84af5b99cbc366d675064e52b23664a015b6e35"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102979.088622,
+    "server_process": 89149,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {
+        "_meta": {
+          "zeroclaw": {
+            "defaultModel": "acp-title-fixture",
+            "maxSessions": 10,
+            "sessionTimeoutSecs": 3600
+          }
+        },
+        "agentCapabilities": {
+          "loadSession": true,
+          "mcpCapabilities": {
+            "http": false,
+            "sse": false
+          },
+          "promptCapabilities": {
+            "audio": false,
+            "embeddedContext": true,
+            "image": false
+          },
+          "sessionCapabilities": {
+            "close": {},
+            "resume": {}
+          }
+        },
+        "agentInfo": {
+          "name": "zeroclaw-acp",
+          "title": "ZeroClaw ACP",
+          "version": "0.8.7"
+        },
+        "authMethods": [],
+        "protocolVersion": 1
+      },
+      "id": "e693dec1-d46c-4476-aeb1-1592d4c1745e"
+    }
+  },
+  {
+    "time": 1794102979.089359,
+    "server_process": 89149,
+    "direction": "client_to_server",
+    "frame": {
+      "jsonrpc": "2.0",
+      "id": "438d3476-0a21-43ed-8df8-d312b497da01",
+      "method": "session/load",
+      "params": {
+        "mcpServers": [],
+        "cwd": "<verification>/workspace",
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd"
+      }
+    }
+  },
+  {
+    "time": 1794102979.100688,
+    "server_process": 89149,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "update": {
+          "content": {
+            "text": "[CURRENT DATE & TIME: 2026-11-07 17:53:54 -08:00]\n\nRun the harmless shell title check.",
+            "type": "text"
+          },
+          "sessionUpdate": "user_message_chunk"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102979.100824,
+    "server_process": 89149,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "update": {
+          "kind": "execute",
+          "name": "shell",
+          "rawInput": {
+            "command": "  sleep  30; printf   ACP-title-verified  "
+          },
+          "sessionUpdate": "tool_call",
+          "status": "completed",
+          "title": "sleep 30; printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102979.1008918,
+    "server_process": 89149,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "update": {
+          "body": "ACP-title-verified",
+          "content": [
+            {
+              "content": {
+                "text": "ACP-title-verified",
+                "type": "text"
+              },
+              "type": "content"
+            }
+          ],
+          "rawOutput": "ACP-title-verified",
+          "sessionUpdate": "tool_call_update",
+          "status": "completed",
+          "title": "sleep 30; printf ACP-title-verified",
+          "toolCallId": "acp-title-shell"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102979.1009998,
+    "server_process": 89149,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "d8614786-0353-4ac3-94b2-44ad7d9d13cd",
+        "update": {
+          "content": {
+            "text": "The harmless shell title check completed.",
+            "type": "text"
+          },
+          "sessionUpdate": "agent_message_chunk"
+        }
+      }
+    }
+  },
+  {
+    "time": 1794102979.1010702,
+    "server_process": 89149,
+    "direction": "server_to_client",
+    "frame": {
+      "jsonrpc": "2.0",
+      "result": {},
+      "id": "438d3476-0a21-43ed-8df8-d312b497da01"
+    }
+  }
+]
