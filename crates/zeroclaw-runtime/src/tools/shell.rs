@@ -230,10 +230,25 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution_for_shell(
+        // The prepared command owns the executable choice, including a TUI's
+        // forwarded PATH. On setup failure, still run portable policy checks
+        // first so a policy refusal takes precedence over the resolver error.
+        let tui_env_snapshot = self.tui_env.as_ref();
+        let effective_path = tui_env_snapshot
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let prepared = self.runtime.build_shell_command_with_effective_path(
+            command,
+            &self.security.workspace_dir,
+            effective_path,
+        );
+        let shell_program = prepared.as_ref().ok().map(|cmd| cmd.as_std().get_program());
+
+        match self.security.validate_command_execution_for_shell_program(
             command,
             approved,
             self.runtime.shell_dialect(),
+            shell_program,
         ) {
             Ok(_) => {}
             Err(reason) => {
@@ -251,7 +266,11 @@ impl Tool for ShellTool {
         // null device only on the native Windows execution path.
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_for_shell_program(
+                command,
+                self.runtime.shell_dialect(),
+                shell_program,
+            )
         {
             return Ok(ToolResult {
                 success: false,
@@ -265,15 +284,7 @@ impl Tool for ShellTool {
         // (CWE-200), then re-add only safe, functional variables.
         // The forwarded map is immutable for the session incarnation, so
         // launcher resolution and the child process read the same values.
-        let tui_env_snapshot = self.tui_env.as_ref();
-        let effective_path = tui_env_snapshot
-            .and_then(|env| env.get("PATH"))
-            .map(OsStr::new);
-        let mut cmd = match self.runtime.build_shell_command_with_effective_path(
-            command,
-            &self.security.workspace_dir,
-            effective_path,
-        ) {
+        let mut cmd = match prepared {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -2393,6 +2404,111 @@ mod tests {
             "unexpected error: {:?}",
             result.error
         );
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn shell_grammar_follows_prepared_program_and_forwarded_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bash = which::which("bash").expect("bash is required for this regression");
+        let launcher = dir.path().join("selected-shell");
+        std::os::unix::fs::symlink(&bash, &launcher).unwrap();
+        let path = std::env::join_paths([
+            dir.path(),
+            std::path::Path::new("/usr/bin"),
+            std::path::Path::new("/bin"),
+        ])
+        .unwrap()
+        .into_string()
+        .unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: dir.path().canonicalize().unwrap(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        });
+        for shell in [bash.to_string_lossy().into_owned(), "selected-shell".into()] {
+            let inner =
+                ShellTool::new(security.clone(), Arc::new(NativeRuntime::with_shell(shell)))
+                    .with_tui_env(Some(HashMap::from([("PATH".into(), path.clone())])));
+            let tool = RateLimitedTool::new(inner, security.clone());
+            let result = tool
+                .execute(json!({"command": "cat <<$'EOF'\nhello\nEOF"}))
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            assert_eq!(result.output.trim(), "hello");
+
+            let result = tool
+                .execute(json!({"command": "cat <<$'EOF'\nhello\nEOF\ncat ../outside"}))
+                .await
+                .unwrap();
+            assert_path_argument_blocked(&result, "path after a Bash heredoc");
+            let result = tool
+                .execute(json!({"command": "cat <<$'EOF'\nhello\nEOF\ntouch must-not-exist"}))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.error.unwrap().contains("requires explicit approval"));
+            assert!(!dir.path().join("must-not-exist").exists());
+        }
+
+        // Reusing the policy after PATH's executable changes must not retain
+        // Bash's grammar. The harmless non-shell program must never be run.
+        std::fs::remove_file(&launcher).unwrap();
+        std::os::unix::fs::symlink(which::which("true").unwrap(), &launcher).unwrap();
+        let tool = RateLimitedTool::new(
+            ShellTool::new(
+                security.clone(),
+                Arc::new(NativeRuntime::with_shell("selected-shell".into())),
+            )
+            .with_tui_env(Some(HashMap::from([("PATH".into(), path)]))),
+            security,
+        );
+        let result = tool
+            .execute(json!({"command": "cat <<$'EOF'\nhello\nEOF"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not allowed"));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn shell_grammar_setup_failure_preserves_policy_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: dir.path().canonicalize().unwrap(),
+            allowed_commands: vec!["cat".into()],
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        });
+        let tool = RateLimitedTool::new(
+            ShellTool::new(
+                security.clone(),
+                Arc::new(NativeRuntime::with_shell(
+                    dir.path()
+                        .join("missing-shell")
+                        .to_string_lossy()
+                        .into_owned(),
+                )),
+            ),
+            security,
+        );
+        let denied = tool
+            .execute(json!({"command": "ungranted-command"}))
+            .await
+            .unwrap();
+        assert!(denied.error.unwrap().contains("not allowed"));
+        let path = tool
+            .execute(json!({"command": "cat ../outside"}))
+            .await
+            .unwrap();
+        assert_path_argument_blocked(&path, "path denial before shell resolution error");
+        let setup = tool.execute(json!({"command": "cat"})).await.unwrap();
+        assert!(!setup.success);
+        assert!(setup.error.unwrap().contains("missing-shell"));
     }
 
     #[tokio::test(flavor = "current_thread")]

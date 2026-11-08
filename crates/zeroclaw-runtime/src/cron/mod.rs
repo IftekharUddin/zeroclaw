@@ -1,5 +1,6 @@
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
+use std::ffi::OsStr;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
@@ -95,8 +96,25 @@ pub fn validate_shell_command_with_security(
     command: &str,
     approved: bool,
 ) -> Result<()> {
+    validate_shell_command_with_security_and_program(runtime, security, command, approved, None)
+}
+
+/// Execution-time validation borrows the prepared command's program. Admission
+/// without a prepared command keeps the portable POSIX grammar.
+fn validate_shell_command_with_security_and_program(
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    command: &str,
+    approved: bool,
+    shell_program: Option<&OsStr>,
+) -> Result<()> {
     security
-        .validate_command_execution_for_shell(command, approved, runtime.shell_dialect())
+        .validate_command_execution_for_shell_program(
+            command,
+            approved,
+            runtime.shell_dialect(),
+            shell_program,
+        )
         .map(|_| ())
         .map_err(|reason| {
             ::zeroclaw_log::record!(
@@ -554,6 +572,57 @@ mod security_validation_tests {
             &config.data_dir,
         );
         assert!(security.is_command_allowed("echo safe"));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn shell_grammar_admission_stays_portable_without_a_prepared_command() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let security = SecurityPolicy {
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        };
+        let runtime = crate::platform::NativeRuntime::with_shell(
+            which::which("bash")
+                .expect("bash is required for this regression")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let result = add_shell_job_with_runtime(
+            &config,
+            &runtime,
+            &security,
+            "test-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "cat <<$'EOF'\nhello\nEOF",
+            None,
+            false,
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocked by security policy")
+        );
+        assert!(list_jobs(&config).unwrap().is_empty());
+        let job = add_shell_job_with_runtime(
+            &config,
+            &runtime,
+            &security,
+            "test-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "echo hello",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(get_job(&config, &job.id).unwrap().command, "echo hello");
     }
 
     #[test]

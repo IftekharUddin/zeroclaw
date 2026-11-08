@@ -1659,13 +1659,23 @@ async fn run_job_command_with_runtime_and_timeout(
     // Jobs created via the validated helpers were already checked at creation
     // time, but we re-validate at execution time to catch policy changes and
     // manually-edited job stores.
-    if let Err(error) =
-        crate::cron::validate_shell_command_with_security(runtime, security, &job.command, approved)
-    {
+    let prepared = runtime.build_shell_command(&job.command, &config.data_dir);
+    let shell_program = prepared.as_ref().ok().map(|cmd| cmd.as_std().get_program());
+    if let Err(error) = crate::cron::validate_shell_command_with_security_and_program(
+        runtime,
+        security,
+        &job.command,
+        approved,
+        shell_program,
+    ) {
         return (false, error.to_string());
     }
 
-    if let Some(path) = security.forbidden_path_argument(&job.command) {
+    if let Some(path) = security.forbidden_path_argument_for_shell_program(
+        &job.command,
+        runtime.shell_dialect(),
+        shell_program,
+    ) {
         return (
             false,
             format!("blocked by security policy: forbidden path argument: {path}"),
@@ -1688,7 +1698,7 @@ async fn run_job_command_with_runtime_and_timeout(
     // override an imperative job's stored format.
     let output_format = &job.shell_output_format;
 
-    let mut command = match runtime.build_shell_command(&job.command, &config.data_dir) {
+    let mut command = match prepared {
         Ok(command) => command,
         Err(error) => return (false, format!("shell setup error: {error}")),
     };
@@ -2015,9 +2025,83 @@ mod tests {
             runtime
                 .build_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "policy rejection must happen before the runtime builds a command"
+            2,
+            "each command is prepared once, but a rejected command never executes"
         );
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn cron_shell_grammar_follows_prepared_program() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy {
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        };
+        let runtime = crate::platform::NativeRuntime::with_shell(
+            which::which("bash")
+                .expect("bash is required for this regression")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        for (command, expected) in [
+            ("cat <<$'EOF'\nhello\nEOF", "hello"),
+            (
+                "cat <<$'EOF'\nhello\nEOF\ncat ../outside",
+                "forbidden path argument",
+            ),
+            (
+                "cat <<$'EOF'\nhello\nEOF\ntouch must-not-exist",
+                "requires explicit approval",
+            ),
+        ] {
+            let mut job = test_job(command);
+            job.shell_output_format = CronShellOutputFormat::Raw;
+            let (success, output) =
+                run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+            assert_eq!(success, expected == "hello", "{output}");
+            assert!(output.contains(expected), "{output}");
+            assert!(!config.data_dir.join("must-not-exist").exists());
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn cron_shell_grammar_setup_failure_preserves_policy_refusals() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy {
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["cat".into()],
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        };
+        let runtime = crate::platform::NativeRuntime::with_shell(
+            tmp.path()
+                .join("missing-shell")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        for (command, expected) in [
+            ("ungranted-command", "not allowed"),
+            ("cat ../outside", "forbidden path argument"),
+            ("cat", "shell setup error"),
+        ] {
+            let (success, output) = run_job_command_with_runtime(
+                &config,
+                &runtime,
+                &security,
+                &test_job(command),
+                false,
+            )
+            .await;
+            assert!(!success);
+            assert!(output.contains(expected), "{output}");
+        }
     }
 
     fn unique_component(prefix: &str) -> String {

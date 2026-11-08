@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroclaw_api::runtime_traits::ShellDialect;
@@ -380,15 +381,6 @@ pub struct SecurityPolicy {
     /// built-in default; carried here so status surfaces report the image the
     /// sandbox will actually run rather than assuming the default.
     pub sandbox_image: Option<String>,
-    /// The shell the native runtime runs this agent's commands with, from
-    /// `platform::native_runtime_shell`, the derivation the runtime factory
-    /// uses. Recorded from the same config the agent's runtime is built
-    /// from; it is not a live view of later config changes. `None` when the
-    /// runtime is not native or the policy was built without a config. POSIX
-    /// command checks use it to identify bash (see
-    /// `SecurityPolicy::posix_shell`); otherwise they keep the rules that are
-    /// safe for any POSIX shell.
-    pub native_shell: Option<String>,
     pub tracker: PerSenderTracker,
 }
 
@@ -788,7 +780,6 @@ impl Default for SecurityPolicy {
             sandbox_backend: None,
             firejail_args: vec![],
             sandbox_image: None,
-            native_shell: None,
             tracker: PerSenderTracker::new(),
         }
     }
@@ -1060,7 +1051,7 @@ enum QuoteState {
 /// `((x << 1))` as arithmetic, while dash ends that heredoc at a literal
 /// `$EOF` line and runs `((...))` as nested subshells. The splitter refuses
 /// those forms for [`PosixShell::Unknown`] and follows bash for
-/// [`PosixShell::Bash`]. See [`SecurityPolicy::posix_shell`] for how a shell
+/// [`PosixShell::Bash`]. See [`native_posix_shell`] for how a shell
 /// is identified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PosixShell {
@@ -1092,22 +1083,22 @@ impl From<ShellDialect> for ShellGrammar {
     }
 }
 
-/// Identify the POSIX shell the native runtime spawns for a configured
-/// `[runtime].shell` value (see [`SecurityPolicy::posix_shell`]).
+/// Identify the POSIX shell from the program of the command prepared for
+/// execution. The caller borrows it from `Command::get_program`; policy never
+/// retains a copy of the runtime's shell configuration.
 ///
 /// The shell is bash only when the program that runs is bound to a file
 /// this check can inspect, and that file is bash:
-/// - The value is an absolute path. A bare name, `bash` included, is looked
-///   up on whichever `PATH` the command runs with: the daemon's, or the one a
-///   connected TUI forwards, which this check cannot see. The runtime
-///   resolves an absolute path to the same canonical file under any `PATH`.
+/// - The value is an absolute path. Native command construction resolves
+///   bare names against the execution PATH before this check. An unresolved
+///   name, `bash` included, proves nothing about the executable.
 /// - No container sandbox can run the command. A container runs the
 ///   configured name or path inside its image, where it can be any shell.
 ///   Host sandboxes run the canonical host file.
 /// - The path canonicalizes to an executable named exactly `bash`.
 ///
 /// Everything else, including a `bash` link to another shell, is `Unknown`.
-fn native_posix_shell(shell: &str, container_sandbox_possible: bool) -> PosixShell {
+fn native_posix_shell(shell: &OsStr, container_sandbox_possible: bool) -> PosixShell {
     #[cfg(unix)]
     {
         if container_sandbox_possible || !Path::new(shell).is_absolute() {
@@ -1115,10 +1106,8 @@ fn native_posix_shell(shell: &str, container_sandbox_possible: bool) -> PosixShe
         }
         // Resolution canonicalizes, the same way the runtime resolves the
         // program it spawns.
-        match crate::platform::resolve_executable(std::ffi::OsStr::new(shell)) {
-            Ok(canonical) if canonical.file_name() == Some(std::ffi::OsStr::new("bash")) => {
-                PosixShell::Bash
-            }
+        match crate::platform::resolve_executable(shell) {
+            Ok(canonical) if canonical.file_name() == Some(OsStr::new("bash")) => PosixShell::Bash,
             _ => PosixShell::Unknown,
         }
     }
@@ -4330,7 +4319,7 @@ impl SecurityPolicy {
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
         self.command_risk_level_for_posix_like_shell(
             command,
-            self.shell_grammar(ShellDialect::Posix),
+            self.shell_grammar(ShellDialect::Posix, None),
         )
     }
 
@@ -4384,7 +4373,7 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> CommandRiskLevel {
-        self.command_risk_level_for_grammar(command, self.shell_grammar(dialect))
+        self.command_risk_level_for_grammar(command, self.shell_grammar(dialect, None))
     }
 
     fn command_risk_level_for_grammar(
@@ -4505,7 +4494,19 @@ impl SecurityPolicy {
         approved: bool,
         dialect: ShellDialect,
     ) -> Result<CommandRiskLevel, String> {
-        let shell = self.shell_grammar(dialect);
+        self.validate_command_execution_for_shell_program(command, approved, dialect, None)
+    }
+
+    /// Validate using the program borrowed from the command prepared for
+    /// execution. Without a bound program, POSIX checks use portable grammar.
+    pub fn validate_command_execution_for_shell_program(
+        &self,
+        command: &str,
+        approved: bool,
+        dialect: ShellDialect,
+        shell_program: Option<&OsStr>,
+    ) -> Result<CommandRiskLevel, String> {
+        let shell = self.shell_grammar(dialect, shell_program);
         if dialect == ShellDialect::None {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
@@ -4649,7 +4650,7 @@ impl SecurityPolicy {
     /// platform-specific redirect safety (the Windows `nul` null device is only
     /// discard-safe under `cmd.exe`).
     pub fn is_command_allowed_for_shell(&self, command: &str, dialect: ShellDialect) -> bool {
-        self.is_command_allowed_for_grammar(command, self.shell_grammar(dialect))
+        self.is_command_allowed_for_grammar(command, self.shell_grammar(dialect, None))
     }
 
     fn is_command_allowed_for_grammar(&self, command: &str, shell: ShellGrammar) -> bool {
@@ -4919,7 +4920,22 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, self.shell_grammar(dialect), false)
+        self.forbidden_path_argument_for_shell_program(command, dialect, None)
+    }
+
+    /// Like [`Self::forbidden_path_argument_for_shell`], with the program
+    /// borrowed from the command prepared for execution.
+    pub fn forbidden_path_argument_for_shell_program(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+        shell_program: Option<&OsStr>,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(
+            command,
+            self.shell_grammar(dialect, shell_program),
+            false,
+        )
     }
 
     /// Like [`SecurityPolicy::forbidden_workspace_path_argument`], but against
@@ -4932,7 +4948,18 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, self.shell_grammar(dialect), true)
+        self.forbidden_workspace_path_argument_for_shell_program(command, dialect, None)
+    }
+
+    /// Like [`Self::forbidden_workspace_path_argument_for_shell`], with the
+    /// program borrowed from the command prepared for execution.
+    pub fn forbidden_workspace_path_argument_for_shell_program(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+        shell_program: Option<&OsStr>,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, self.shell_grammar(dialect, shell_program), true)
     }
 
     fn forbidden_path_argument_impl(
@@ -5955,21 +5982,7 @@ impl SecurityPolicy {
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             sandbox_image: risk_profile.sandbox_image.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
-            // Set by `for_agent`, which knows the runtime; the profile-only
-            // constructor keeps the portable POSIX rules.
-            native_shell: None,
             tracker: PerSenderTracker::new(),
-        }
-    }
-
-    /// The POSIX shell this policy's native runtime will run commands with,
-    /// when the policy can identify it (see [`native_posix_shell`]). Resolved
-    /// on each use, from the recorded `[runtime].shell` and this profile's
-    /// sandbox settings, so it follows the binary the runtime spawns now.
-    fn posix_shell(&self) -> PosixShell {
-        match self.native_shell.as_deref() {
-            Some(shell) => native_posix_shell(shell, self.container_sandbox_possible()),
-            None => PosixShell::Unknown,
         }
     }
 
@@ -5995,11 +6008,13 @@ impl SecurityPolicy {
     }
 
     /// The grammar to check a command in for `dialect`.
-    fn shell_grammar(&self, dialect: ShellDialect) -> ShellGrammar {
+    fn shell_grammar(&self, dialect: ShellDialect, shell_program: Option<&OsStr>) -> ShellGrammar {
         ShellGrammar {
             dialect,
-            posix_shell: match dialect {
-                ShellDialect::Posix => self.posix_shell(),
+            posix_shell: match (dialect, shell_program) {
+                (ShellDialect::Posix, Some(program)) => {
+                    native_posix_shell(program, self.container_sandbox_possible())
+                }
                 _ => PosixShell::Unknown,
             },
         }
@@ -6038,15 +6053,6 @@ impl SecurityPolicy {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
         policy.config_path = Some(config.config_path.clone());
-        // The shell the tools' native runtime runs, from the same derivation
-        // `platform::create_runtime` uses. Android pins `/system/bin/sh`
-        // regardless, and other runtimes run a shell the host cannot
-        // inspect, so both keep the portable rules.
-        if config.runtime.kind == crate::schema::RuntimeKind::Native
-            && !zeroclaw_api::platform::is_android()
-        {
-            policy.native_shell = Some(crate::platform::native_runtime_shell(&config.runtime));
-        }
         // Runtime data dir: same predicate extends there so state files
         // that the gateway constructs with `&config.data_dir`
         // (`webauthn_credentials.json` for WebAuthnManager) are protected
@@ -10317,24 +10323,42 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let bash = bash.to_str().unwrap();
-        assert_eq!(native_posix_shell(bash, false), PosixShell::Bash);
+        assert_eq!(
+            native_posix_shell(OsStr::new(bash), false),
+            PosixShell::Bash
+        );
         // A container sandbox runs the configured path inside its image,
         // where it can be any shell.
-        assert_eq!(native_posix_shell(bash, true), PosixShell::Unknown);
+        assert_eq!(
+            native_posix_shell(OsStr::new(bash), true),
+            PosixShell::Unknown
+        );
         // A bare name is resolved on whichever `PATH` the command runs with,
         // and a connected TUI forwards its own, so the name proves nothing.
-        assert_eq!(native_posix_shell("bash", false), PosixShell::Unknown);
-        assert_eq!(native_posix_shell("bash", true), PosixShell::Unknown);
+        assert_eq!(
+            native_posix_shell(OsStr::new("bash"), false),
+            PosixShell::Unknown
+        );
+        assert_eq!(
+            native_posix_shell(OsStr::new("bash"), true),
+            PosixShell::Unknown
+        );
 
         let sh = dir.path().join("sh");
         std::os::unix::fs::symlink(bash, &sh).unwrap();
         let sh = sh.to_str().unwrap();
-        assert_eq!(native_posix_shell(sh, false), PosixShell::Bash);
-        assert_eq!(native_posix_shell(sh, true), PosixShell::Unknown);
-        assert_eq!(native_posix_shell("sh", false), PosixShell::Unknown);
+        assert_eq!(native_posix_shell(OsStr::new(sh), false), PosixShell::Bash);
+        assert_eq!(
+            native_posix_shell(OsStr::new(sh), true),
+            PosixShell::Unknown
+        );
+        assert_eq!(
+            native_posix_shell(OsStr::new("sh"), false),
+            PosixShell::Unknown
+        );
 
         assert_eq!(
-            native_posix_shell("/no/such/bash", false),
+            native_posix_shell(OsStr::new("/no/such/bash"), false),
             PosixShell::Unknown
         );
         let Some(other) = host_shell_other_than_bash() else {
@@ -10344,7 +10368,7 @@ mod tests {
         let fake_bash = dir.path().join("bash");
         std::os::unix::fs::symlink(&other, &fake_bash).unwrap();
         assert_eq!(
-            native_posix_shell(fake_bash.to_str().unwrap(), false),
+            native_posix_shell(OsStr::new(fake_bash.to_str().unwrap()), false),
             PosixShell::Unknown
         );
     }
@@ -10384,54 +10408,59 @@ mod tests {
         }
     }
 
-    /// Through the public checks: a policy whose native runtime runs bash
-    /// accepts a bash `$'...'` heredoc, and one that cannot identify its
-    /// shell refuses it.
+    /// The same policy follows each prepared program, without retaining a
+    /// runtime configuration or granting shell-specific grammar to admission.
     #[cfg(unix)]
     #[test]
-    fn policy_reads_commands_in_the_native_shells_grammar() {
+    fn policy_reads_commands_in_the_prepared_shells_grammar() {
         let Some(bash) = host_bash() else {
             eprintln!("skipping: no bash on this host");
             return;
         };
         let command = "cat <<$'EOF'\nhello\nEOF";
-        let portable = SecurityPolicy {
+        let policy = SecurityPolicy {
             allowed_commands: vec!["*".into()],
             block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
             ..SecurityPolicy::default()
         };
-        let bash = SecurityPolicy {
-            native_shell: Some(bash.to_string_lossy().into_owned()),
-            sandbox_enabled: Some(false),
-            ..portable.clone()
-        };
+        let program = Some(bash.as_os_str());
         assert_eq!(
-            bash.validate_command_execution_for_shell(command, false, ShellDialect::Posix),
+            policy.validate_command_execution_for_shell_program(
+                command,
+                false,
+                ShellDialect::Posix,
+                program,
+            ),
             Ok(CommandRiskLevel::Low)
         );
-        assert_eq!(bash.forbidden_path_argument(command), None);
-        assert!(
-            portable
-                .validate_command_execution_for_shell(command, false, ShellDialect::Posix)
-                .is_err()
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell_program(command, ShellDialect::Posix, program),
+            None
         );
         assert_eq!(
-            portable.forbidden_path_argument(command),
+            policy.forbidden_workspace_path_argument_for_shell_program(
+                command,
+                ShellDialect::Posix,
+                program,
+            ),
+            None
+        );
+        assert!(policy.validate_command_execution(command, false).is_err());
+        assert_eq!(policy.command_risk_level(command), CommandRiskLevel::High);
+        assert!(!policy.is_command_allowed(command));
+        assert_eq!(
+            policy.forbidden_path_argument(command),
             Some("unreadable heredoc delimiter".into())
         );
-        // Another dialect never takes the POSIX shell's grammar.
         assert_eq!(
-            bash.shell_grammar(ShellDialect::WindowsCmd).posix_shell,
+            policy
+                .shell_grammar(ShellDialect::WindowsCmd, program)
+                .posix_shell,
             PosixShell::Unknown
         );
     }
 
-    /// A policy keeps the portable grammar whenever the program that runs
-    /// may not be the bash it can see. Under bash, `<<$'EOF'` ends at `EOF`
-    /// and hides the `wc` line as heredoc body. Dash ends it at the literal
-    /// `$EOF` line and runs `wc`. A bare `bash` can resolve to dash on a
-    /// connected TUI's `PATH`, and a container sandbox runs its image's
-    /// program at the configured name or path.
     #[cfg(unix)]
     #[test]
     fn policy_keeps_portable_grammar_when_bash_is_not_bound() {
@@ -10440,50 +10469,61 @@ mod tests {
             return;
         };
         let command = "cat <<$'EOF'\nx\n$EOF\nwc -l /etc/passwd\nEOF";
-        let base = SecurityPolicy {
+        let host = SecurityPolicy {
             allowed_commands: vec!["*".into()],
             block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
             ..SecurityPolicy::default()
         };
-        let bare_name = SecurityPolicy {
-            native_shell: Some("bash".into()),
-            sandbox_enabled: Some(false),
-            ..base.clone()
-        };
         let container = SecurityPolicy {
-            native_shell: Some(bash.to_string_lossy().into_owned()),
             sandbox_enabled: Some(true),
             sandbox_backend: Some("docker".into()),
-            ..base.clone()
+            ..host.clone()
         };
-        let auto_sandbox = SecurityPolicy {
-            native_shell: Some(bash.to_string_lossy().into_owned()),
-            ..base
+        let auto = SecurityPolicy {
+            sandbox_enabled: None,
+            ..host.clone()
         };
-        for (name, policy) in [
-            ("bare name", &bare_name),
-            ("docker sandbox", &container),
-            ("auto sandbox", &auto_sandbox),
+        for (name, policy, program) in [
+            ("no program", &host, None),
+            ("bare name", &host, Some(OsStr::new("bash"))),
+            ("docker sandbox", &container, Some(bash.as_os_str())),
+            ("auto sandbox", &auto, Some(bash.as_os_str())),
         ] {
-            assert_eq!(policy.posix_shell(), PosixShell::Unknown, "{name}");
+            assert_eq!(
+                policy
+                    .shell_grammar(ShellDialect::Posix, program)
+                    .posix_shell,
+                PosixShell::Unknown,
+                "{name}"
+            );
             assert!(
                 policy
-                    .validate_command_execution_for_shell(command, false, ShellDialect::Posix)
+                    .validate_command_execution_for_shell_program(
+                        command,
+                        false,
+                        ShellDialect::Posix,
+                        program,
+                    )
                     .is_err(),
                 "{name}"
             );
             assert_eq!(
-                policy.forbidden_path_argument(command),
+                policy.forbidden_path_argument_for_shell_program(
+                    command,
+                    ShellDialect::Posix,
+                    program
+                ),
                 Some("unreadable heredoc delimiter".into()),
                 "{name}"
             );
         }
     }
 
-    /// `for_agent` records the native shell the runtime factory would choose,
-    /// and records none for other runtimes.
+    /// Configuring bash does not authorize its grammar before a command has
+    /// been prepared; the public policy-only checks stay portable.
     #[test]
-    fn for_agent_records_the_native_runtime_shell() {
+    fn for_agent_does_not_infer_grammar_from_configured_shell() {
         use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
         let dir = tempfile::tempdir().unwrap();
@@ -10492,8 +10532,15 @@ mod tests {
             config_path: dir.path().join("config.toml"),
             ..Config::default()
         };
-        cfg.risk_profiles
-            .insert("default".into(), RiskProfileConfig::default());
+        cfg.risk_profiles.insert(
+            "default".into(),
+            RiskProfileConfig {
+                allowed_commands: vec!["*".into()],
+                block_high_risk_commands: false,
+                sandbox_enabled: Some(false),
+                ..RiskProfileConfig::default()
+            },
+        );
         cfg.agents.insert(
             "agent_a".into(),
             AliasedAgentConfig {
@@ -10501,55 +10548,13 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        cfg.runtime.kind = crate::schema::RuntimeKind::Native;
         cfg.runtime.shell = Some("/bin/bash".into());
         let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
-        if zeroclaw_api::platform::is_android() {
-            assert_eq!(policy.native_shell, None);
-        } else {
-            assert_eq!(policy.native_shell.as_deref(), Some("/bin/bash"));
-        }
-
-        cfg.runtime.kind = crate::schema::RuntimeKind::Docker;
-        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
-        assert_eq!(policy.native_shell, None);
-        assert_eq!(policy.posix_shell(), PosixShell::Unknown);
-    }
-
-    /// The shell policy records and the program the runtime factory spawns
-    /// come from one derivation of `[runtime]`, for an explicit shell and for
-    /// the detected default alike.
-    #[cfg(all(unix, not(target_os = "android")))]
-    #[test]
-    fn for_agent_records_the_shell_the_runtime_factory_spawns() {
-        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config {
-            data_dir: dir.path().join("data"),
-            config_path: dir.path().join("config.toml"),
-            ..Config::default()
-        };
-        cfg.risk_profiles
-            .insert("default".into(), RiskProfileConfig::default());
-        cfg.agents.insert(
-            "agent_a".into(),
-            AliasedAgentConfig {
-                risk_profile: "default".into(),
-                ..AliasedAgentConfig::default()
-            },
+        assert!(
+            policy
+                .validate_command_execution("cat <<$'EOF'\nhello\nEOF", false)
+                .is_err()
         );
-        cfg.runtime.kind = crate::schema::RuntimeKind::Native;
-        for shell in [Some("/bin/sh".to_string()), None] {
-            cfg.runtime.shell = shell.clone();
-            let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
-            let runtime = crate::platform::create_runtime(&cfg.runtime).unwrap();
-            assert_eq!(
-                policy.native_shell.as_deref().map(std::ffi::OsStr::new),
-                runtime.shell_program(),
-                "{shell:?}"
-            );
-        }
     }
 
     /// The body of an unquoted heredoc is expanded, so a line ending in an odd

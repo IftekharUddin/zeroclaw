@@ -167,13 +167,20 @@ impl Tool for SkillShellTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
+        let prepared = self
+            .runtime
+            .build_shell_command(&command, &self.security.workspace_dir);
+        let shell_program = prepared.as_ref().ok().map(|cmd| cmd.as_std().get_program());
 
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution_for_shell(
+        // A failed shell resolution still receives portable policy checks
+        // before its setup error is reported.
+        match self.security.validate_command_execution_for_shell_program(
             &command,
             true,
             self.runtime.shell_dialect(),
+            shell_program,
         ) {
             Ok(_) => {}
             Err(reason) => {
@@ -187,7 +194,11 @@ impl Tool for SkillShellTool {
 
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_for_shell_program(
+                &command,
+                self.runtime.shell_dialect(),
+                shell_program,
+            )
         {
             return Ok(ToolResult {
                 success: false,
@@ -196,10 +207,7 @@ impl Tool for SkillShellTool {
             });
         }
 
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(&command, &self.security.workspace_dir)
-        {
+        let mut cmd = match prepared {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -713,6 +721,81 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn skill_shell_grammar_follows_prepared_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let bash = which::which("bash").expect("bash is required for this regression");
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: dir.path().canonicalize().unwrap(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell(
+            bash.to_string_lossy().into_owned(),
+        ));
+        for (command, expected) in [
+            ("cat <<$'EOF'\nhello\nEOF", "hello"),
+            ("cat <<$'EOF'\nhello\nEOF\ncat ../outside", "Path blocked"),
+        ] {
+            let skill = SkillTool {
+                command: command.into(),
+                ..sample_skill_tool()
+            };
+            let tool =
+                SkillShellTool::new_with_runtime("test", &skill, security.clone(), runtime.clone());
+            let result = tool.execute(serde_json::json!({})).await.unwrap();
+            if expected == "hello" {
+                assert!(result.success, "{result:?}");
+                assert_eq!(result.output.trim(), expected);
+            } else {
+                assert!(!result.success);
+                assert!(
+                    result.error.as_deref().unwrap_or("").contains(expected),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn skill_shell_grammar_setup_failure_preserves_policy_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: dir.path().canonicalize().unwrap(),
+            allowed_commands: vec!["cat".into()],
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell(
+            dir.path()
+                .join("missing-shell")
+                .to_string_lossy()
+                .into_owned(),
+        ));
+        for (command, expected) in [
+            ("ungranted-command", "not allowed"),
+            ("cat ../outside", "Path blocked"),
+            ("cat", "missing-shell"),
+        ] {
+            let skill = SkillTool {
+                command: command.into(),
+                ..sample_skill_tool()
+            };
+            let tool =
+                SkillShellTool::new_with_runtime("test", &skill, security.clone(), runtime.clone());
+            let result = tool.execute(serde_json::json!({})).await.unwrap();
+            assert!(!result.success);
+            assert!(
+                result.error.as_deref().unwrap_or("").contains(expected),
+                "{result:?}"
+            );
+        }
     }
 
     #[cfg(windows)]
