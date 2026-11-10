@@ -1,0 +1,11 @@
+==> rust quality: provider dispatch gate (no direct ModelProvider method calls outside ProviderDispatch)
+❌ Direct ModelProvider method calls found outside the dispatcher:
+crates/zeroclaw-runtime/src/agent/safety_net_loop_recovery.rs:35:            .chat_with_system(system, message, model, temperature)
+crates/zeroclaw-runtime/src/agent/safety_net_loop_recovery.rs:58:        self.scripted.chat(request, model, temperature).await
+
+Route the call through zeroclaw_providers::ProviderDispatch:
+    ProviderDispatch::new(provider.clone()).<method>(...)        // Arc<dyn ModelProvider>
+    ProviderDispatch::from_ref(&*provider).<method>(...)         // &dyn ModelProvider
+
+If this is a false positive (e.g. .chat() on a non-ModelProvider type),
+extend the awk filter in scripts/ci/rust_quality_gate.sh.
