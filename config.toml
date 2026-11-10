@@ -1,0 +1,70 @@
+schema_version = 4
+
+[gateway]
+host = "127.0.0.1"
+port = 42991
+require_pairing = false
+
+[cost]
+enabled = true
+track_per_agent = true
+daily_limit_usd = 100.0
+monthly_limit_usd = 100.0
+
+[memory]
+backend = "none"
+auto_save = false
+response_cache_enabled = false
+
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+
+[providers.models.custom.demo]
+uri = "http://127.0.0.1:42992/v1"
+api_key = "scripted-provider-fixture"
+model = "parent_demo"
+wire_api = "chat_completions"
+
+[providers.models.custom.worker]
+uri = "http://127.0.0.1:42992/v1"
+api_key = "scripted-provider-fixture"
+model = "worker_demo"
+wire_api = "chat_completions"
+
+[cost.rates.providers.models.custom.parent_demo]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+
+[cost.rates.providers.models.custom.worker_demo]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+
+[risk_profiles.demo]
+level = "supervised"
+workspace_only = true
+allowed_tools = ["delegate"]
+auto_approve = ["delegate"]
+
+[risk_profiles.demo.delegation_policy]
+mode = "allow"
+
+[runtime_profiles.demo]
+agentic = true
+max_tool_iterations = 8
+
+[agents.demo]
+model_provider = "custom.demo"
+risk_profile = "demo"
+runtime_profile = "demo"
+
+[agents.demo.workspace]
+path = "/tmp/conversation-cost-demo/workspace"
+
+[agents.worker]
+model_provider = "custom.worker"
+risk_profile = "demo"
+runtime_profile = "demo"
+
+[agents.worker.workspace]
+path = "/tmp/conversation-cost-demo/workspace"
