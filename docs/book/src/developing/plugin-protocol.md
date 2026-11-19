@@ -502,10 +502,14 @@ Every call passes five host-owned checks before spawning a turn:
    arrives while another wake is still being admitted and registered waits for
    that claim to settle, re-resolves the live grant and target (so an operator
    edit made while it waited applies), then coalesces or claims the pair
-   itself, so a failed claim never drops a wake that already returned success. The follow-up
-   re-checks live grants and target availability before running; a follow-up
-   that cannot run is skipped and the next pending wake is drained, rather than
-   releasing the pair with accepted wakes still queued.
+   itself, so a failed claim never drops a wake that already returned success.
+   The worker retries transient failures to register the durable task record
+   with backoff capped at five seconds. The latest accepted wake stays queued
+   for retry until registration succeeds or a newer wake replaces it. Before
+   each attempt, the worker rechecks live grants, target availability, and
+   execution admission. If the grant is revoked, the target is disabled or
+   missing, or admission fails, the worker can skip that wake and drain any
+   newer pending wake.
    Idle pairs also spend from the per-instance continuous token bucket, admit
    against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
    under `InternalPrincipal::PluginTool`.

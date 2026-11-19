@@ -78,6 +78,7 @@ const WAKE_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// attributed to the caller that most recently replaced it rather than to
 /// whoever happened to win the slot.
 struct PendingWake {
+    task_id: String,
     prompt: String,
     depth: u32,
     caller_alias: Option<String>,
@@ -401,7 +402,9 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         // inherit task-locals, so the woken turn would otherwise rebuild its
         // full tool surface and escape a headless SOP step's boundary.
         let step_scope = crate::sop::active_scope::active_headless_step_scope();
+        let task_id = uuid::Uuid::new_v4().to_string();
         let mut pending = Some(Box::new(PendingWake {
+            task_id: task_id.clone(),
             prompt: prompt.to_string(),
             depth,
             caller_alias: caller_alias.map(str::to_string),
@@ -532,9 +535,10 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         let control_plane_boot_id = control_plane.boot_id.clone();
         let package = scope.id().package().to_string();
         let next_depth = depth.saturating_add(1);
-        let task = match admit_wake_task(
-            Some(task_store.as_ref()),
-            &control_plane_boot_id,
+        let task = WakeTask::new(task_id, &control_plane_boot_id);
+        if let Err(error) = admit_wake_task(
+            task_store.as_ref(),
+            &task,
             &package,
             &canonical,
             caller_alias,
@@ -542,22 +546,19 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         )
         .await
         {
-            Ok(task) => task,
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "plugin": package,
-                            "agent": canonical,
-                            "error": format!("{error:#}"),
-                        })),
-                    "plugin wake durable registration failed"
-                );
-                return Err(AgentWakeError::Unavailable);
-            }
-        };
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": package,
+                        "agent": canonical,
+                        "error": format!("{error:#}"),
+                    })),
+                "plugin wake durable registration failed"
+            );
+            return Err(AgentWakeError::Unavailable);
+        }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
@@ -651,18 +652,28 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                 )
                 .await;
                 settle_wake_task(&task_store, &plan.task, &result).await;
+                // Release the completed turn's lease before a follow-up can
+                // wait on the task store.
+                drop(plan.admission.take());
 
-                // Drain wakes that coalesced while this turn ran until one is
-                // ready to run. A follow-up that cannot run (grant revoked,
-                // target disabled, re-admission or registration failed) is
-                // skipped, never the slot: wakes that coalesced while it was
-                // being prepared stay pending and are drained next. The slot is
-                // released only here, under the lock, when nothing is pending,
-                // so no accepted wake is dropped with it.
+                // Keep the identity of a possibly committed write until that
+                // wake registers successfully or its row is reconciled.
+                let mut unconfirmed_task: Option<WakeTask> = None;
+                let mut registration_failures = 0_u32;
                 plan = 'drain: loop {
                     let next = {
                         let mut slots = coordinator.slots.lock();
                         match slots.get_mut(&spawn_key) {
+                            Some(WakeSlotState::Running { pending })
+                                if unconfirmed_task.as_ref().is_some_and(|task| {
+                                    pending.as_ref().is_none_or(|wake| wake.task_id != task.id)
+                                }) =>
+                            {
+                                // This candidate was superseded or lost its
+                                // authorization. Reconcile it before taking
+                                // the latest pending input or releasing the slot.
+                                None
+                            }
                             Some(WakeSlotState::Running { pending }) => {
                                 let next = pending.take();
                                 if next.is_none() {
@@ -676,10 +687,13 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         }
                     };
                     let Some(next) = next else {
+                        if let Some(task) = unconfirmed_task.take() {
+                            cancel_unconfirmed_wake_task(task_store.as_ref(), &task).await;
+                            continue 'drain;
+                        }
                         spawned_guard.disarm();
                         return;
                     };
-                    let next = *next;
 
                     let follow_up_snapshot = match live_config.as_ref() {
                         Some(handle) => Arc::new(handle.read().clone()),
@@ -794,9 +808,10 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         continue 'drain;
                     }
                     let next_depth = next.depth.saturating_add(1);
-                    let task = match admit_wake_task(
-                        Some(task_store.as_ref()),
-                        &control_plane_boot_id,
+                    let task = WakeTask::new(next.task_id.clone(), &control_plane_boot_id);
+                    if let Err(error) = admit_wake_task(
+                        task_store.as_ref(),
+                        &task,
                         &package,
                         &spawn_canonical,
                         next.caller_alias.as_deref(),
@@ -804,25 +819,38 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                     )
                     .await
                     {
-                        Ok(task) => task,
-                        Err(error) => {
+                        registration_failures = registration_failures.saturating_add(1);
+                        if registration_failures.is_power_of_two() {
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
                                     module_path!(),
-                                    ::zeroclaw_log::Action::Reject
+                                    ::zeroclaw_log::Action::Write
                                 )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                 .with_attrs(::serde_json::json!({
                                     "plugin": package,
                                     "agent": spawn_canonical,
+                                    "task_id": &task.id,
+                                    "attempt": registration_failures,
                                     "error": format!("{error:#}"),
                                 })),
-                                "coalesced plugin wake registration failed"
+                                "coalesced plugin wake registration will retry"
                             );
-                            continue 'drain;
                         }
-                    };
+                        unconfirmed_task = Some(task);
+                        if let Some(WakeSlotState::Running { pending }) =
+                            coordinator.slots.lock().get_mut(&spawn_key)
+                        {
+                            // The wake already reserved its token. Restore it
+                            // only when no newer wake is already pending.
+                            pending.get_or_insert(next);
+                        }
+                        drop(admission);
+                        tokio::time::sleep(wake_store_retry_delay(registration_failures)).await;
+                        continue 'drain;
+                    }
+                    let next = *next;
                     break 'drain WakeTurnPlan {
                         cfg,
                         admission,
@@ -873,26 +901,28 @@ struct WakeTask {
     owner_boot_id: String,
 }
 
+impl WakeTask {
+    fn new(id: String, owner_boot_id: &str) -> Self {
+        Self {
+            id,
+            owner_pid: std::process::id(),
+            owner_boot_id: owner_boot_id.to_string(),
+        }
+    }
+}
+
 /// Register the durable record for one wake turn before the turn runs.
 ///
 /// Registration precedes the turn so a crash mid-turn leaves a visible row
 /// rather than a silently lost notification, mirroring the peer-inbox path.
 async fn admit_wake_task(
-    registry: Option<&dyn TaskRegistry>,
-    owner_boot_id: &str,
+    registry: &dyn TaskRegistry,
+    task: &WakeTask,
     package: &str,
     agent_alias: &str,
     caller_alias: Option<&str>,
     depth: u32,
-) -> Result<WakeTask> {
-    let registry = registry.ok_or_else(|| {
-        anyhow::Error::msg("plugin wake dispatch requires an available durable task store")
-    })?;
-    let task = WakeTask {
-        id: uuid::Uuid::new_v4().to_string(),
-        owner_pid: std::process::id(),
-        owner_boot_id: owner_boot_id.to_string(),
-    };
+) -> Result<()> {
     registry
         .create(TaskRecord {
             id: task.id.clone(),
@@ -918,8 +948,56 @@ async fn admit_wake_task(
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
         })
-        .await?;
-    Ok(task)
+        .await
+}
+
+fn wake_store_retry_delay(failures: u32) -> Duration {
+    let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
+    WAKE_SETTLEMENT_RETRY_DELAY
+        .saturating_mul(multiplier)
+        .min(WAKE_SETTLEMENT_MAX_RETRY_DELAY)
+}
+
+/// An error from create can leave a row behind for a wake that never ran.
+async fn cancel_unconfirmed_wake_task(registry: &dyn TaskRegistry, task: &WakeTask) {
+    let mut failures = 0_u32;
+    loop {
+        let result = match registry.get(&task.id).await {
+            Ok(Some(row)) if !row.status.is_terminal() => registry
+                .transition_terminal_if_owner(
+                    &task.id,
+                    task.owner_pid,
+                    &task.owner_boot_id,
+                    TaskStatus::Cancelled,
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ()),
+            Ok(_) => return,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                if failures.is_power_of_two() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": &task.id,
+                                "attempt": failures,
+                                "error": format!("{error:#}"),
+                            })),
+                        "unconfirmed plugin wake cancellation will retry"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(wake_store_retry_delay(failures)).await;
+    }
 }
 
 /// Settle one wake turn's durable record, retrying transient store failures.
@@ -984,11 +1062,7 @@ async fn settle_wake_task(
             }
         }
 
-        let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
-        let delay = WAKE_SETTLEMENT_RETRY_DELAY
-            .saturating_mul(multiplier)
-            .min(WAKE_SETTLEMENT_MAX_RETRY_DELAY);
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(wake_store_retry_delay(failures)).await;
     }
 }
 
@@ -1731,9 +1805,10 @@ mod tests {
         // A panicked woken turn becomes a `Failed` settlement rather than a
         // process abort, and the slot guard clears the claim so the pair is
         // wakeable again.
-        let panic_task = admit_wake_task(
-            Some(store.as_ref()),
-            "boot-test",
+        let panic_task = WakeTask::new(uuid::Uuid::new_v4().to_string(), "boot-test");
+        admit_wake_task(
+            store.as_ref(),
+            &panic_task,
             "waker",
             "recipient",
             Some("sender-1"),
@@ -2237,6 +2312,7 @@ mod tests {
         inner: Arc<dyn TaskRegistry>,
         creates: std::sync::atomic::AtomicUsize,
         gated_call: usize,
+        persist_before_error: bool,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
@@ -2251,6 +2327,9 @@ mod tests {
             if call == self.gated_call {
                 self.entered.notify_one();
                 self.release.notified().await;
+                if self.persist_before_error {
+                    self.inner.create(rec).await?;
+                }
                 anyhow::bail!("gated registration failure");
             }
             self.inner.create(rec).await
@@ -2372,6 +2451,7 @@ mod tests {
     fn gated_control_plane(
         dir: &Path,
         gated_call: usize,
+        persist_before_error: bool,
         entered: &Arc<tokio::sync::Notify>,
         release: &Arc<tokio::sync::Notify>,
     ) -> (ControlPlaneHandle, Arc<dyn TaskRegistry>) {
@@ -2382,6 +2462,7 @@ mod tests {
                 inner: Arc::clone(&store),
                 creates: std::sync::atomic::AtomicUsize::new(0),
                 gated_call,
+                persist_before_error,
                 entered: Arc::clone(entered),
                 release: Arc::clone(release),
             }),
@@ -2422,7 +2503,8 @@ mod tests {
 
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let (control_plane, store) = gated_control_plane(workspace.path(), 1, &entered, &release);
+        let (control_plane, store) =
+            gated_control_plane(workspace.path(), 1, false, &entered, &release);
         let coordinator = Arc::new(SharedWakeCoordinator::new());
         let backend = Arc::new(RuntimeAgentWakeBackend::for_tests(
             Arc::new(config),
@@ -2495,7 +2577,8 @@ mod tests {
 
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let (control_plane, store) = gated_control_plane(workspace.path(), 1, &entered, &release);
+        let (control_plane, store) =
+            gated_control_plane(workspace.path(), 1, false, &entered, &release);
         let coordinator = Arc::new(SharedWakeCoordinator::new());
         let backend = Arc::new(RuntimeAgentWakeBackend::for_tests(
             Arc::new(base_config(workspace.path())),
@@ -2564,19 +2647,43 @@ mod tests {
     /// it: the worker keeps draining instead of releasing the slot.
     #[tokio::test]
     async fn wake_coalesced_during_a_failed_followup_registration_still_runs() {
+        check_failed_followup_registration(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn lone_coalesced_wake_runs_after_registration_retry() {
+        check_failed_followup_registration(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn lone_coalesced_wake_reuses_a_row_written_before_error() {
+        check_failed_followup_registration(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn superseded_followup_cancels_a_row_written_before_error() {
+        check_failed_followup_registration(true, true).await;
+    }
+
+    async fn check_failed_followup_registration(newer_wake: bool, persist_before_error: bool) {
         use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
         struct RequestState {
-            count: Arc<Mutex<u32>>,
+            prompts: Arc<Mutex<Vec<String>>>,
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         }
         async fn capture_chat(
             State(state): State<RequestState>,
-            Json(_body): Json<serde_json::Value>,
+            Json(body): Json<serde_json::Value>,
         ) -> Json<serde_json::Value> {
-            *state.count.lock() += 1;
+            let prompt = body["messages"]
+                .as_array()
+                .and_then(|messages| messages.iter().rfind(|m| m["role"] == "user"))
+                .and_then(|message| message["content"].as_str())
+                .unwrap_or_default();
+            state.prompts.lock().push(prompt.to_string());
             state.entered.notify_one();
             state.release.notified().await;
             Json(serde_json::json!({
@@ -2584,7 +2691,7 @@ mod tests {
             }))
         }
 
-        let request_count = Arc::new(Mutex::new(0));
+        let prompts = Arc::new(Mutex::new(Vec::new()));
         let provider_entered = Arc::new(tokio::sync::Notify::new());
         let provider_release = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2594,7 +2701,7 @@ mod tests {
         let app = Router::new()
             .route("/v1/chat/completions", post(capture_chat))
             .with_state(RequestState {
-                count: Arc::clone(&request_count),
+                prompts: Arc::clone(&prompts),
                 entered: Arc::clone(&provider_entered),
                 release: Arc::clone(&provider_release),
             });
@@ -2618,13 +2725,20 @@ mod tests {
                 ..OllamaModelProviderConfig::default()
             },
         );
-        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], None)];
+        // A lone follow-up has no spare token to spend on a retry.
+        let rate = if newer_wake { 3 } else { 2 };
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], Some(rate))];
 
         // Registration 1 is the first turn; 2 is the first follow-up and fails.
         let registry_entered = Arc::new(tokio::sync::Notify::new());
         let registry_release = Arc::new(tokio::sync::Notify::new());
-        let (control_plane, store) =
-            gated_control_plane(workspace.path(), 2, &registry_entered, &registry_release);
+        let (control_plane, store) = gated_control_plane(
+            workspace.path(),
+            2,
+            persist_before_error,
+            &registry_entered,
+            &registry_release,
+        );
         let coordinator = Arc::new(SharedWakeCoordinator::new());
         let backend = RuntimeAgentWakeBackend::for_tests(
             Arc::new(config),
@@ -2636,7 +2750,7 @@ mod tests {
 
         assert_eq!(
             backend
-                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .wake(&scope(), Some("sender-1"), "recipient", "first wake prompt")
                 .await,
             Ok(())
         );
@@ -2645,7 +2759,12 @@ mod tests {
             .expect("first turn reaches mock provider");
         assert_eq!(
             backend
-                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .wake(
+                    &scope(),
+                    Some("sender-2"),
+                    "recipient",
+                    "second wake prompt"
+                )
                 .await,
             Ok(()),
             "the second wake coalesces onto the running turn"
@@ -2658,35 +2777,46 @@ mod tests {
             .expect("the worker reaches the follow-up registration");
 
         // A third wake coalesces while that registration is in flight.
-        assert_eq!(
-            backend
-                .wake(&scope(), Some("sender-3"), "recipient", "third")
-                .await,
-            Ok(())
-        );
+        let (followup_sender, followup_prompt) = if newer_wake {
+            assert_eq!(
+                backend
+                    .wake(&scope(), Some("sender-3"), "recipient", "third wake prompt")
+                    .await,
+                Ok(())
+            );
+            ("sender-3", "third wake prompt")
+        } else {
+            ("sender-2", "second wake prompt")
+        };
 
-        // The follow-up registration fails; the third wake must still run.
+        // The write errors. The worker must run the latest accepted prompt.
         registry_release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
             .await
-            .expect("the third wake's turn must reach the provider");
+            .expect("the latest wake's turn must reach the provider");
         provider_release.notify_one();
 
         await_slots_released(&coordinator).await;
         let tasks = tasks_for(store.as_ref(), "recipient").await;
-        let principals: Vec<_> = tasks
+        let completed_senders: Vec<_> = tasks
             .iter()
+            .filter(|task| task.status == TaskStatus::Completed)
             .map(|task| task.principal_id.as_deref())
             .collect();
-        assert_eq!(
-            tasks.len(),
-            2,
-            "the first turn and the third wake run; the failed follow-up registered \
-             nothing: {principals:?}"
-        );
-        assert!(principals.contains(&Some("sender-1")));
-        assert!(principals.contains(&Some("sender-3")));
-        assert_eq!(*request_count.lock(), 2);
+        assert_eq!(completed_senders.len(), 2, "{tasks:?}");
+        assert!(completed_senders.contains(&Some("sender-1")));
+        assert!(completed_senders.contains(&Some(followup_sender)));
+        if newer_wake && persist_before_error {
+            assert_eq!(tasks.len(), 3, "{tasks:?}");
+            assert!(tasks.iter().any(|task| task.status == TaskStatus::Cancelled
+                && task.principal_id.as_deref() == Some("sender-2")));
+        } else {
+            assert_eq!(tasks.len(), 2, "{tasks:?}");
+        }
+        let prompts = prompts.lock();
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert!(prompts[0].contains("first wake prompt"), "{prompts:?}");
+        assert!(prompts[1].contains(followup_prompt), "{prompts:?}");
         server.abort();
     }
 
