@@ -653,14 +653,6 @@ impl OidcAuthProvider {
         self.jwks.read().get(kid).cloned()
     }
 
-    /// Whether this entry may accept an access token without the RFC 9068
-    /// type. Re-checks the audience separation config validation enforces,
-    /// because a provider can be built from configuration that never went
-    /// through validation.
-    fn accepts_untyped_access_tokens(&self) -> bool {
-        !self.config.require_at_jwt && self.config.audience_shared_with_a_client().is_none()
-    }
-
     /// The operator-declared claim naming the client, when it replaces the
     /// RFC 9068 default. JWKS only: introspection answers follow RFC 7662.
     fn declared_client_id_claim(&self, via: VerifiedVia) -> Option<&str> {
@@ -686,18 +678,9 @@ impl OidcAuthProvider {
             Some(h) => h,
             None => return deny(DenyReason::BadCredential),
         };
-        // The bearer profile accepts RFC 9068 typed access tokens. A
-        // nonce-less ID token is not a safe discriminator, so an untyped
-        // token (no `typ`, or the generic `JWT`) is accepted only when the
-        // operator waived typing AND the audience is one no client signs in
-        // as, which no ID token can carry. Any other type is never an
-        // access token.
-        let typed = is_access_token_type(header.typ.as_deref());
-        let untyped = header
-            .typ
-            .as_deref()
-            .is_none_or(|typ| typ.eq_ignore_ascii_case("JWT"));
-        if !typed && !(untyped && self.accepts_untyped_access_tokens()) {
+        // The bearer profile accepts RFC 9068 typed access tokens only. A
+        // nonce-less ID token is not a safe discriminator.
+        if !is_access_token_type(header.typ.as_deref()) {
             return deny(DenyReason::BadCredential);
         }
         let Some(kid) = header.kid.as_deref().filter(|kid| !kid.trim().is_empty()) else {
@@ -1650,23 +1633,15 @@ mod tests {
         )
     }
 
-    impl TestIdp {
-        /// JWKS entry that waives RFC 9068 typing: the daemon's own client
-        /// (`zeroclaw-daemon`) differs from the API audience (`zeroclaw`), and
-        /// no declared client is the audience either.
-        fn untyped_config(&self) -> OidcConfig {
-            let mut config = self.config(OidcValidation::Jwks);
-            config.require_at_jwt = false;
-            config.client_id = "zeroclaw-daemon".into();
-            config
-        }
-    }
-
     #[tokio::test]
-    async fn untyped_access_tokens_are_refused_while_typing_is_required() {
+    async fn jwks_requires_an_explicit_access_token_type() {
         let idp = start_idp().await;
         let provider = idp.provider(OidcValidation::Jwks);
-        for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+        for header in [
+            UNTYPED_JWT_HEADER,
+            NO_TYP_HEADER,
+            r#"{"alg":"ES256","kid":"test-key","typ":"logout+jwt"}"#,
+        ] {
             let token = idp.mint_with_header(header, &idp.good_claims());
             let outcome = provider.verify(&bearer(token)).await;
             assert!(is_bad_credential(&outcome), "{header}: {outcome:?}");
@@ -1674,70 +1649,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untyped_access_tokens_verify_once_typing_is_waived_for_a_separate_audience() {
-        // Okta (no `typ`) and Entra ID (`typ: JWT`) header shapes.
+    async fn jwks_checks_token_type_before_key_lookup_even_with_unvalidated_config() {
         let idp = start_idp().await;
-        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
-        for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
-            let token = idp.mint_with_header(header, &idp.good_claims());
-            let outcome = provider.verify(&bearer(token)).await;
-            let identity = outcome.identity().unwrap_or_else(|| panic!("{header}"));
-            assert_eq!(
-                identity.subject,
-                IdentitySubject::Oidc {
-                    issuer: idp.issuer.clone(),
-                    subject: "alice".into(),
-                }
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn waived_typing_still_refuses_other_token_types_and_id_tokens() {
-        let idp = start_idp().await;
-        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
-        // A header naming any other JWT type is not an access token.
-        for typ in ["logout+jwt", "dpop+jwt", "secevent+jwt", "JOSE"] {
-            let header = format!(r#"{{"alg":"ES256","kid":"test-key","typ":"{typ}"}}"#);
-            let token = idp.mint_with_header(&header, &idp.good_claims());
-            let outcome = provider.verify(&bearer(token)).await;
-            assert!(is_bad_credential(&outcome), "typ {typ}: {outcome:?}");
-        }
-        // An untyped ID token: its `aud` is the client it was issued to, and
-        // it echoes the sign-in nonce. Either alone refuses it.
-        let mut id_token = idp.good_claims();
-        id_token["aud"] = serde_json::json!("zerocode-cli");
-        let mut nonce_only = idp.good_claims();
-        nonce_only["nonce"] = serde_json::json!("n-0S6_WzA2Mj");
-        for claims in [id_token, nonce_only] {
-            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
-            let outcome = provider.verify(&bearer(token)).await;
-            assert!(is_bad_credential(&outcome), "{claims}: {outcome:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn waived_typing_without_audience_separation_is_refused_by_the_verifier() {
-        // Config validation refuses this entry; the verifier must not rely
-        // on that, since a provider can be built from unvalidated config.
-        let idp = start_idp().await;
-        for client_id in ["", "zeroclaw"] {
-            let mut config = idp.untyped_config();
-            config.client_id = client_id.into();
-            let provider = OidcAuthProvider::new("test", config).unwrap();
-            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.good_claims());
-            let outcome = provider.verify(&bearer(token)).await;
-            assert!(is_bad_credential(&outcome), "{client_id:?}: {outcome:?}");
-        }
-        let mut config = idp.untyped_config();
-        config.interactive_clients.push("zeroclaw".into());
+        let mut config = idp.config(OidcValidation::Jwks);
+        config.client_id = "zeroclaw-daemon".into();
+        config.require_at_jwt = false;
         let provider = OidcAuthProvider::new("test", config).unwrap();
-        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.good_claims());
-        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+        let payload =
+            URL_SAFE_NO_PAD.encode(r#"{"aud":["zerocode-cli","zeroclaw"],"azp":"zerocode-cli"}"#);
+
+        for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+            // An invalid signature keeps this fixture inert. A cold provider's
+            // request history distinguishes header rejection from signature rejection.
+            let token = format!("{}.{payload}.AA", URL_SAFE_NO_PAD.encode(header));
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(is_bad_credential(&outcome), "{header}: {outcome:?}");
+            assert!(idp.server.received_requests().await.unwrap().is_empty());
+        }
     }
 
-    /// Okta custom authorization server access token: no `typ`, client in
-    /// `cid`, user marker in `uid`, no `client_id`.
+    #[tokio::test]
+    async fn jwks_accepts_both_access_token_types_with_multiple_audiences() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let mut claims = idp.good_claims();
+        claims["aud"] = serde_json::json!(["https://api.example.com", "zeroclaw"]);
+
+        for typ in ["at+jwt", "application/at+jwt"] {
+            let header = format!(r#"{{"alg":"ES256","kid":"test-key","typ":"{typ}"}}"#);
+            let token = idp.mint_with_header(&header, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(outcome.identity().is_some(), "{typ}: {outcome:?}");
+        }
+    }
+
+    /// Typed access token fixture with the Okta-style `cid` and `uid` claims.
     fn okta_claims(idp: &TestIdp) -> serde_json::Value {
         let mut claims = idp.good_claims();
         let object = claims.as_object_mut().unwrap();
@@ -1750,28 +1696,28 @@ mod tests {
     #[tokio::test]
     async fn a_declared_client_id_claim_names_the_client() {
         let idp = start_idp().await;
-        let mut config = idp.untyped_config();
+        let mut config = idp.config(OidcValidation::Jwks);
         config.client_id_claim = "cid".into();
         let provider = OidcAuthProvider::new("test", config).unwrap();
-        let token = idp.mint_with_header(NO_TYP_HEADER, &okta_claims(&idp));
+        let token = idp.mint(okta_claims(&idp));
         let outcome = provider.verify(&bearer(token)).await;
         assert!(outcome.identity().is_some(), "{outcome:?}");
 
         // Undeclared, the same token names no client and is refused.
-        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
-        let token = idp.mint_with_header(NO_TYP_HEADER, &okta_claims(&idp));
+        let provider = idp.provider(OidcValidation::Jwks);
+        let token = idp.mint(okta_claims(&idp));
         assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
     }
 
     #[tokio::test]
     async fn a_declared_client_id_claim_contradicted_by_client_id_is_refused() {
         let idp = start_idp().await;
-        let mut config = idp.untyped_config();
+        let mut config = idp.config(OidcValidation::Jwks);
         config.client_id_claim = "cid".into();
         let provider = OidcAuthProvider::new("test", config).unwrap();
         let mut claims = okta_claims(&idp);
         claims["client_id"] = serde_json::json!("someone-else");
-        let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+        let token = idp.mint(claims);
         assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
     }
 
@@ -1780,19 +1726,17 @@ mod tests {
         // The Keycloak `azp` fallback applies only to the default claim: an
         // operator who named the client claim has said where it lives.
         let idp = start_idp().await;
-        let mut config = idp.untyped_config();
+        let mut config = idp.config(OidcValidation::Jwks);
         config.client_id_claim = "cid".into();
         let provider = OidcAuthProvider::new("test", config).unwrap();
         let mut claims = okta_claims(&idp);
         claims.as_object_mut().unwrap().remove("cid");
         claims["azp"] = serde_json::json!("zerocode-cli");
-        let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+        let token = idp.mint(claims);
         assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
     }
 
-    /// Entra ID v2.0 app-only (client_credentials) access token: `typ: JWT`,
-    /// client only in `azp`, token id in `uti`, `sub` is the service
-    /// principal's object id.
+    /// Typed service access token fixture with Entra-style `azp` and `uti` claims.
     fn entra_service_claims(idp: &TestIdp) -> serde_json::Value {
         serde_json::json!({
             "iss": idp.issuer,
@@ -1807,16 +1751,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_declared_azp_client_claim_admits_entra_service_tokens() {
+    async fn a_declared_azp_client_claim_admits_typed_service_tokens() {
         let idp = start_idp().await;
-        let mut config = idp.untyped_config();
+        let mut config = idp.config(OidcValidation::Jwks);
         config.client_id_claim = "azp".into();
         config.token_id_claim = "uti".into();
         config.service_clients = vec!["batch-app".into()];
         config.service_profile_map =
             HashMap::from([("batch-app".to_string(), "operator".to_string())]);
         let provider = OidcAuthProvider::new("test", config.clone()).unwrap();
-        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &entra_service_claims(&idp));
+        let token = idp.mint(entra_service_claims(&idp));
         let outcome = provider.verify(&bearer(token)).await;
         assert_eq!(
             outcome.identity().expect("service token").subject,
@@ -1830,7 +1774,7 @@ mod tests {
         // client (Keycloak stamps it on user tokens too), so it is refused.
         config.client_id_claim = "client_id".into();
         let provider = OidcAuthProvider::new("test", config).unwrap();
-        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &entra_service_claims(&idp));
+        let token = idp.mint(entra_service_claims(&idp));
         assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
     }
 

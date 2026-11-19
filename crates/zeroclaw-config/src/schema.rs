@@ -14343,19 +14343,8 @@ pub struct OidcConfig {
     pub actor_claim: String,
     /// Which actor kind the presence of `actor_claim` proves.
     pub actor_claim_marks: OidcActorKind,
-    /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
-    /// tokens remain valid only through configured introspection.
-    ///
-    /// Typing is how the verifier tells an access token from an ID token.
-    /// For issuers that don't type their access tokens (Okta: no `typ`;
-    /// Entra ID: `typ: JWT`), set `false` and prove the difference by
-    /// audience instead: an ID token's `aud` is always the client it was
-    /// issued to, so `audience` must be an API identifier that is not
-    /// `client_id` and not any client declared here or by another entry for
-    /// the same issuer. Untyped tokens are then accepted with no header
-    /// `typ` or `typ: JWT`; any other type is still refused, as are `nonce`
-    /// and non-access purpose markers. The IdP must also never sign anyone
-    /// in AS the API registration itself, which ZeroClaw cannot check.
+    /// Must be true for JWKS validation, which requires an RFC 9068 access
+    /// token header type. This setting does not apply to introspection.
     pub require_at_jwt: bool,
     /// Top-level claim naming the OAuth client in JWKS-validated access
     /// tokens. Default `client_id` (RFC 9068), where a person's token may
@@ -14525,31 +14514,6 @@ impl Config {
         for alias in oidc_aliases {
             let oidc = &self.oidc[alias];
             oidc.validate(alias)?;
-            // An entry that accepts untyped access tokens relies on no client
-            // signing in with its audience. Clients of other entries for the
-            // same issuer are clients of that issuer too.
-            if oidc.validation == OidcValidation::Jwks && !oidc.require_at_jwt {
-                let mut siblings: Vec<&String> = self
-                    .oidc
-                    .iter()
-                    .filter(|(other, entry)| *other != alias && entry.issuer == oidc.issuer)
-                    .map(|(other, _)| other)
-                    .collect();
-                siblings.sort();
-                for sibling in siblings {
-                    if let Some(field) = self.oidc[sibling].field_naming_client(&oidc.audience) {
-                        validation_bail!(
-                            ValidationFailed,
-                            format!("oidc.{alias}.audience"),
-                            "oidc.{alias}.require_at_jwt = false needs an audience no client \
-                             signs in as, but oidc.{sibling}.{field} names {:?} as a client of \
-                             the same issuer: an ID token issued to it would pass as an access \
-                             token for oidc.{alias}",
-                            oidc.audience
-                        );
-                    }
-                }
-            }
             let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
             claim_values.sort();
             for claim_value in claim_values {
@@ -14858,16 +14822,10 @@ impl OidcConfig {
                  tokens need a bounded authentication lifetime"
             );
         }
-        if self.validation == OidcValidation::Jwks
-            && !self.require_at_jwt
-            && let Some(field) = self.audience_shared_with_a_client()
-        {
+        if self.validation == OidcValidation::Jwks && !self.require_at_jwt {
             anyhow::bail!(
-                "oidc.{alias}.require_at_jwt = false needs an audience no client signs in as, \
-                 but `audience` {:?} is also named by `{field}`: an ID token issued to that \
-                 client would carry the same audience and pass as an access token. Use a \
-                 separate API identifier for `audience`, or keep require_at_jwt = true",
-                self.audience
+                "oidc.{alias}.require_at_jwt must be true: bearer authentication accepts only \
+                 RFC 9068 typed access tokens"
             );
         }
         for (field, name) in [
@@ -14975,44 +14933,6 @@ impl OidcConfig {
     #[must_use]
     pub fn effective_service_scope(&self) -> String {
         join_scopes(&self.service_scopes)
-    }
-
-    /// The field that names `audience` as one of this entry's own clients,
-    /// or `None` when the audience is separate from all of them.
-    ///
-    /// Every ID token's `aud` is the client it was issued to (OIDC Core), so
-    /// an audience no client signs in as is what lets the verifier tell an
-    /// untyped access token from an ID token. Shared by config validation
-    /// and the verifier so the rule has one definition; clients of OTHER
-    /// entries for the same issuer are checked by [`Config::validate_auth`].
-    #[must_use]
-    pub fn audience_shared_with_a_client(&self) -> Option<&'static str> {
-        self.field_naming_client(&self.audience)
-    }
-
-    /// The first field of this entry that names `client` as an OAuth client
-    /// it signs in as or accepts tokens from, if any.
-    #[must_use]
-    pub fn field_naming_client(&self, client: &str) -> Option<&'static str> {
-        if self.effective_client_id() == client {
-            return Some("client_id");
-        }
-        [
-            ("interactive_clients", &self.interactive_clients),
-            ("service_clients", &self.service_clients),
-            (
-                "allowed_authorized_parties",
-                &self.allowed_authorized_parties,
-            ),
-        ]
-        .into_iter()
-        .find(|(_, clients)| clients.iter().any(|named| named == client))
-        .map(|(field, _)| field)
-        .or_else(|| {
-            self.service_profile_map
-                .contains_key(client)
-                .then_some("service_profile_map")
-        })
     }
 }
 
@@ -31574,9 +31494,23 @@ zeroclaw-operators = "operator"
     #[::core::prelude::v1::test]
     fn oidc_bearer_profile_requires_typed_access_tokens() {
         let mut config = auth_config();
-        config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
+        config.validate().expect("default JWKS config validates");
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.client_id = "zeroclaw-daemon".to_string();
+        oidc.require_at_jwt = false;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("require_at_jwt"), "got: {err}");
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.require_at_jwt = true;
+        config
+            .validate()
+            .expect("explicit strict JWKS config validates");
+
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.validation = OidcValidation::Introspection;
+        oidc.client_secret = Some("s3cret".to_string());
+        oidc.require_at_jwt = false;
+        config.validate().expect("introspection config validates");
     }
 
     #[::core::prelude::v1::test]
@@ -31584,83 +31518,6 @@ zeroclaw-operators = "operator"
         let defaults = OidcConfig::default();
         assert_eq!(defaults.client_id_claim, "client_id");
         assert_eq!(defaults.token_id_claim, "jti");
-    }
-
-    /// An entry that may waive RFC 9068 typing: its daemon client differs from
-    /// its API audience, so no ID token it receives can carry that audience.
-    fn untyped_jwks_config() -> Config {
-        let mut config = auth_config();
-        {
-            let oidc = config.oidc.get_mut("corp").unwrap();
-            oidc.require_at_jwt = false;
-            oidc.client_id = "zeroclaw-daemon".to_string();
-            oidc.interactive_clients = vec!["zerocode-cli".to_string()];
-        }
-        config
-    }
-
-    #[::core::prelude::v1::test]
-    fn oidc_untyped_tokens_are_allowed_when_audience_is_no_client() {
-        untyped_jwks_config()
-            .validate()
-            .expect("audience separated from every configured client");
-    }
-
-    #[::core::prelude::v1::test]
-    fn oidc_untyped_tokens_require_the_audience_to_differ_from_every_client() {
-        // Defaulted client_id (falls back to audience), an explicit equal
-        // client_id, and the audience declared as an interactive or service
-        // client: each would let an ID token issued to that client pass.
-        type Case = (&'static str, fn(&mut OidcConfig));
-        let cases: [Case; 5] = [
-            ("client_id", |oidc| oidc.client_id = String::new()),
-            ("client_id", |oidc| oidc.client_id = "zeroclaw".to_string()),
-            ("interactive_clients", |oidc| {
-                oidc.interactive_clients = vec!["zeroclaw".to_string()];
-            }),
-            ("service_clients", |oidc| {
-                oidc.service_clients = vec!["zeroclaw".to_string()];
-            }),
-            ("allowed_authorized_parties", |oidc| {
-                oidc.allowed_authorized_parties = vec!["zeroclaw".to_string()];
-            }),
-        ];
-        for (field, mutate) in cases {
-            let mut config = untyped_jwks_config();
-            mutate(config.oidc.get_mut("corp").unwrap());
-            let err = config.validate().unwrap_err().to_string();
-            assert!(
-                err.contains("require_at_jwt") && err.contains(field),
-                "{field}: got: {err}"
-            );
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn oidc_untyped_tokens_refuse_an_audience_another_entry_signs_in_as() {
-        // A second entry for the SAME issuer whose client is this entry's
-        // audience would receive ID tokens carrying that audience.
-        let mut config = untyped_jwks_config();
-        let mut sibling = config.oidc["corp"].clone();
-        sibling.require_at_jwt = true;
-        sibling.audience = "dashboard".to_string();
-        sibling.client_id = "zeroclaw".to_string();
-        sibling.interactive_clients = Vec::new();
-        config
-            .oidc
-            .insert("corp-dashboard".to_string(), sibling.clone());
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("oidc.corp") && err.contains("oidc.corp-dashboard"),
-            "got: {err}"
-        );
-
-        // The same client id at a DIFFERENT issuer names a different client.
-        sibling.issuer = "https://other.example.com".to_string();
-        config.oidc.insert("corp-dashboard".to_string(), sibling);
-        config
-            .validate()
-            .expect("client ids are scoped to their issuer");
     }
 
     #[::core::prelude::v1::test]
@@ -31675,7 +31532,7 @@ issuer = "https://example.okta.com/oauth2/default"
 audience = "api://zeroclaw"
 client_id = "0oaexampleclient"
 claim_path = "groups"
-require_at_jwt = false
+require_at_jwt = true
 client_id_claim = "cid"
 interactive_clients = ["0oaexampleclient"]
 
