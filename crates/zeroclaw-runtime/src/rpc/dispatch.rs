@@ -7948,17 +7948,41 @@ impl RpcDispatcher {
             .await?;
         validate_session_configure_overrides(&req.overrides)?;
 
-        // Wait for a provisional binding to be confirmed, for the same reason
-        // `session/prompt` does: a session rehydrated during a route-affecting
-        // commit is live but unconfirmed, and committing an override against
-        // it would compose with a binding the reconciliation is about to
-        // replace. Precedes the ordering lock because the reconciliation task
-        // holds that same guard.
-        //
-        // The returned generation is discarded here, unlike in
-        // `session/prompt`: this handler caches no `Agent`, and it already
-        // captures the generation below and re-verifies it under the lock, so
-        // a same-ID replacement is rejected on that path instead.
+        // A failed ACP turn drops the live incarnation (`RecoveryRequired`) so
+        // the next prompt rebuilds provider-safe history from the durable row.
+        // Zerocode `/model-provider` is `session/configure` and does not prompt,
+        // so without this restore a Code pane whose provider just rate-limited
+        // cannot switch: the row still exists, but configure only looked at
+        // the live map and returned SESSION_NOT_FOUND. Restore before taking
+        // the config writer gate — rehydration try-locks that same gate and
+        // must not park behind this handler.
+        #[cfg(test)]
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("configure-live-agent")
+            .await;
+        if self.ctx.sessions.get_agent(&req.session_id).await.is_none() {
+            let admission = self
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(&req.session_id)
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+            let grants = self.recheck_authority_after_admission(Method::SessionConfigure)?;
+            self.rehydrate_reaped_session_under_guard(
+                &req.session_id,
+                None,
+                grants.as_ref(),
+                Method::SessionConfigure,
+            )
+            .await?;
+            drop(admission);
+        }
+
+        // Another request can publish a provisional binding while configure
+        // waits for admission. Confirm the live binding after the optional
+        // restore so reconciliation cannot overwrite this provider switch.
         match self
             .ctx
             .sessions
@@ -7974,53 +7998,6 @@ impl RpcDispatcher {
                     SESSION_BUSY,
                     "session generation reconciliation in progress; retry shortly",
                 ));
-            }
-        }
-
-        // A failed ACP turn drops the live incarnation (`RecoveryRequired`) so
-        // the next prompt rebuilds provider-safe history from the durable row.
-        // Zerocode `/model-provider` is `session/configure` and does not prompt,
-        // so without this restore a Code pane whose provider just rate-limited
-        // cannot switch: the row still exists, but configure only looked at
-        // the live map and returned SESSION_NOT_FOUND. Restore before taking
-        // the config writer gate — rehydration try-locks that same gate and
-        // must not park behind this handler.
-        if self.ctx.sessions.get_agent(&req.session_id).await.is_none() {
-            let admission = self
-                .ctx
-                .sessions
-                .session_queue
-                .acquire(&req.session_id)
-                .await
-                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
-            let grants = self.recheck_authority_after_admission(Method::SessionConfigure)?;
-            let rehydrated = self
-                .rehydrate_reaped_session_under_guard(
-                    &req.session_id,
-                    None,
-                    grants.as_ref(),
-                    Method::SessionConfigure,
-                )
-                .await?;
-            drop(admission);
-            if rehydrated.is_some() {
-                match self
-                    .ctx
-                    .sessions
-                    .await_pending_generation(&req.session_id, std::time::Duration::from_secs(30))
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
-                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                    }
-                    Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
-                        return Err(rpc_err(
-                            SESSION_BUSY,
-                            "session generation reconciliation in progress; retry shortly",
-                        ));
-                    }
-                }
             }
         }
 
@@ -15748,6 +15725,115 @@ mod tests {
             agent.resolved_route_for_test("anything").provider_name,
             "openai.provider-b",
             "the restored session must serve the provider selected by /model-provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_waits_for_acp_session_restored_by_another_request() {
+        assert_configure_waits_for_competing_restore(ConfigureRestoreTiming::WaitingForAdmission)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn session_configure_waits_for_acp_session_published_before_live_lookup() {
+        assert_configure_waits_for_competing_restore(ConfigureRestoreTiming::BeforeLiveLookup)
+            .await;
+    }
+
+    enum ConfigureRestoreTiming {
+        WaitingForAdmission,
+        BeforeLiveLookup,
+    }
+
+    async fn assert_configure_waits_for_competing_restore(timing: ConfigureRestoreTiming) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "provider-b")
+            .unwrap();
+        provider.api_key = Some("test-key-b".into());
+        provider.model = Some("model-b".into());
+        provider.uri = Some("http://127.0.0.1:2".into());
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let dispatcher = Arc::new(dispatcher);
+        let sid = "cfg-concurrent-acp";
+        let workspace = tmp.path().join("workspace");
+        acp_store
+            .create_session(sid, "test-agent", workspace.to_str().unwrap(), None)
+            .unwrap();
+
+        // Own admission for the competing restore. Holding the writer forces
+        // the restore to publish a provisional binding.
+        let admission = sessions.session_queue.acquire(sid).await.unwrap();
+        let config_writer = dispatcher.ctx.config_authority.lock_config_writer().await;
+        let lookup_pause = match timing {
+            ConfigureRestoreTiming::BeforeLiveLookup => {
+                Some(sessions.set_test_effect_pause("configure-live-agent"))
+            }
+            ConfigureRestoreTiming::WaitingForAdmission => None,
+        };
+        let configure_dispatcher = Arc::clone(&dispatcher);
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": sid,
+                    "overrides": { "model_provider": "openai.provider-b" },
+                }))
+                .await
+        });
+        if let Some((arrived, _)) = &lookup_pause {
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
+                .await
+                .expect("configure must reach the live-agent lookup before the competing restore");
+        } else {
+            wait_for_queue_depth(&sessions, sid, 2).await;
+        }
+        assert!(
+            dispatcher
+                .rehydrate_reaped_session_under_guard(sid, None, None, Method::SessionPrompt)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let admission = if let Some((_, release)) = lookup_pause {
+            // Keep admission occupied while configure sees the live agent.
+            // Only the path that skips its own restore can reach the wait.
+            release.notify_one();
+            Some(admission)
+        } else {
+            drop(admission);
+            None
+        };
+
+        // In both orderings, the writer keeps the pending marker in place so
+        // the notification can only come from configure reaching its wait.
+        let waiting = sessions.pending_generation_waiting();
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .expect("configure must wait for the other request's provisional binding");
+        assert_eq!(
+            sessions.session_queue.queue_depth(sid).await,
+            usize::from(admission.is_some()),
+            "configure must not hold admission while waiting"
+        );
+        drop(admission);
+        drop(config_writer);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), configure)
+            .await
+            .expect("configure must complete after reconciliation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["overrides"]["model_provider"], "openai.provider-b");
+        let agent = sessions.get_agent(sid).await.unwrap();
+        let agent = agent.lock().await;
+        assert_eq!(
+            agent.resolved_route_for_test("anything").provider_name,
+            "openai.provider-b"
         );
     }
 
