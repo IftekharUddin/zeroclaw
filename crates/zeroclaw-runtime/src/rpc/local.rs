@@ -471,9 +471,13 @@ mod platform {
                         );
                     }
                     // Best-effort: record this owner's pid so a conflicting
-                    // startup can name the live owner in its error. Ownership
-                    // itself is the flock — a failed write only degrades the
-                    // conflict diagnostic, never correctness.
+                    // startup can report it in its error. Ownership itself is
+                    // the flock — a failed write only degrades the conflict
+                    // diagnostic, never correctness. The record is written
+                    // after the lock is won, so a contender can still read
+                    // the previous holder's pid; the conflict error therefore
+                    // reports it as the last recorded owner, not as proof of
+                    // who holds the lock.
                     {
                         use std::io::Write;
                         let _ = file.set_len(0);
@@ -485,19 +489,31 @@ mod platform {
                     // The flock is released automatically when the owning
                     // process exits, so a held lock proves the owner is
                     // alive right now — this branch is never a stale socket.
-                    let owner = read_owner_pid(&file)
-                        .map(|pid| format!(" (pid {pid})"))
+                    //
+                    // The recorded pid is weaker evidence than the lock: it
+                    // is published after the lock is won and only on a
+                    // best-effort basis, so it can still name the previous
+                    // holder. Report it as a record to verify, and keep the
+                    // recovery guidance conditional on that verification.
+                    let recorded = read_owner_pid(&file)
+                        .map(|pid| {
+                            format!(
+                                " The lock file last recorded pid {pid} as the owner; \
+                                 that record can be out of date, so confirm the process \
+                                 is a ZeroClaw daemon before stopping it."
+                            )
+                        })
                         .unwrap_or_default();
                     Err(std::io::Error::new(
                         ErrorKind::AddrInUse,
                         format!(
-                            "another ZeroClaw daemon{owner} is already running and owns the \
+                            "another ZeroClaw daemon is already running and owns the \
                              local IPC endpoint at {}. The owner is alive — this is not a \
-                             stale socket, so do not delete it. If ZeroCode is running, it \
-                             supervises its daemon and restarts it when killed; quit ZeroCode \
-                             to stop that daemon. Stop a standalone daemon with SIGTERM \
-                             (`kill <pid>`), or `zeroclaw service stop` if it runs as a \
-                             managed service.",
+                             stale socket, so do not delete it.{recorded} If ZeroCode is \
+                             running, it supervises its daemon and restarts it when killed; \
+                             quit ZeroCode to stop that daemon. Stop a standalone daemon \
+                             with `zeroclaw service stop` if it runs as a managed service, \
+                             or with SIGTERM once you have confirmed its pid.",
                             path.display()
                         ),
                     )
@@ -513,7 +529,9 @@ mod platform {
         }
     }
 
-    /// Owner pid recorded in the lifecycle lock file by [`EndpointLock::acquire`].
+    /// Owner pid last recorded in the lifecycle lock file by
+    /// [`EndpointLock::acquire`]. The record is diagnostic only: it is written
+    /// after the lock is won, so it can still name the previous holder.
     /// Absent or unparsable content (e.g. a lock held by an older daemon that
     /// did not record its pid) degrades to `None` and the conflict error omits
     /// the pid clause.
@@ -1308,8 +1326,19 @@ mod tests {
 
         let message = io.to_string();
         assert!(
-            message.contains(&format!("(pid {})", std::process::id())),
-            "conflict error must name the recorded owner pid: {message}"
+            message.contains(&format!(
+                "last recorded pid {} as the owner",
+                std::process::id()
+            )),
+            "conflict error must report the recorded owner pid: {message}"
+        );
+        assert!(
+            message.contains("can be out of date"),
+            "conflict error must qualify the recorded pid: {message}"
+        );
+        assert!(
+            !message.contains("kill <pid>"),
+            "conflict error must not direct an unconditional kill: {message}"
         );
         assert!(
             message.contains("another ZeroClaw daemon"),
@@ -1330,6 +1359,62 @@ mod tests {
         assert!(
             !message.contains("lifecycle lock"),
             "conflict error should describe the situation, not the lock mechanism: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_lock_conflict_qualifies_stale_or_missing_owner_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let lock_path = tmp.path().join("daemon.sock.lock");
+
+        let _owner = platform::EndpointLock::acquire(&sock_path).unwrap();
+        let conflict_message = || {
+            let error = platform::EndpointLock::acquire(&sock_path)
+                .expect_err("a held lifecycle lock must reject a second acquire");
+            let io = error
+                .downcast_ref::<std::io::Error>()
+                .expect("ownership conflict stays an io::Error");
+            assert_eq!(io.kind(), ErrorKind::AddrInUse);
+            io.to_string()
+        };
+
+        // A contender that loses the lock before the new holder publishes its
+        // pid reads the previous holder's record. The pid is not this
+        // process's, so the message must present it as a record to verify,
+        // never as the identified owner.
+        let stale_pid = std::process::id().wrapping_add(1);
+        std::fs::write(&lock_path, stale_pid.to_string()).unwrap();
+        let message = conflict_message();
+        assert!(
+            message.contains(&format!("last recorded pid {stale_pid} as the owner")),
+            "a stale record must be reported as a record: {message}"
+        );
+        assert!(
+            message.contains("can be out of date"),
+            "a stale record must be qualified: {message}"
+        );
+        assert!(
+            !message.contains(&format!("daemon (pid {stale_pid})")),
+            "a stale record must not be asserted as the owner: {message}"
+        );
+
+        // A lock held by an older daemon carries no record; the pid clause is
+        // omitted and the rest of the guidance stands.
+        std::fs::write(&lock_path, "").unwrap();
+        let message = conflict_message();
+        assert!(
+            !message.contains("recorded pid"),
+            "a missing record must omit the pid clause: {message}"
+        );
+        assert!(
+            message.contains("another ZeroClaw daemon is already running"),
+            "a missing record must keep the situation summary: {message}"
+        );
+        assert!(
+            message.contains("zeroclaw service stop"),
+            "a missing record must keep the recovery path: {message}"
         );
     }
 
