@@ -3,7 +3,6 @@
 import importlib.util
 import json
 import os
-import re
 import tempfile
 import textwrap
 from pathlib import Path
@@ -13,7 +12,6 @@ from unittest.mock import patch
 
 from fixtures import ModelFixture
 from support import Installation
-import workflow_policy
 
 spec = importlib.util.spec_from_file_location("acceptance_selection", Path(__file__).with_name("scope.py"))
 selection = importlib.util.module_from_spec(spec)
@@ -68,50 +66,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(selection.classify(["crates/zeroclaw-runtime/src/rpc/old.rs", "tests/new.rs"], [], "pull_request")[0], "full")
 
 
-class WorkflowPolicyTests(unittest.TestCase):
-    def test_only_relevant_labels_select_quality(self):
-        for action in ("labeled", "unlabeled"):
-            for label in selection.HIGH_RISK:
-                self.assertTrue(workflow_policy.selected("pull_request", action, label))
-            for label in ("ci", "docs", "size:XL", "status:ready", "risk:low"):
-                self.assertFalse(workflow_policy.selected("pull_request", action, label))
-            self.assertTrue(workflow_policy.selected("pull_request", action, None))
-        for event in ("push", "merge_group", "workflow_dispatch"):
-            self.assertTrue(workflow_policy.selected(event))
-        for action in ("opened", "synchronize", "reopened", "ready_for_review"):
-            self.assertTrue(workflow_policy.selected("pull_request", action, "docs"))
-        self.assertFalse(workflow_policy.selected("workflow_dispatch", acceptance_cost=True))
-
-    def test_materialized_filters_cover_every_job(self):
-        workflow = (selection.ROOT / ".github/workflows/ci.yml").read_text()
-        self.assertEqual(workflow_policy.materialize(workflow), workflow)
-        jobs = workflow.split("\njobs:\n", 1)[1]
-        blocks = re.split(r"(?m)(?=^  [a-z][a-z0-9-]*:\n)", jobs)
-        checked = 0
-        for block in blocks:
-            name = re.match(r"  ([a-z][a-z0-9-]*):", block)
-            if not name or name[1] == "acceptance-cost":
-                continue
-            condition = re.search(r"(?m)^    if: (.+)$", block)
-            self.assertIsNotNone(condition, name[1])
-            if name[1] == "crates-preflight":
-                self.assertEqual(condition[1], "needs.crates-preflight-changes.outputs.run == 'true'")
-                self.assertIn("    needs: [crates-preflight-changes]", block)
-                continue
-            if name[1] == "master-debounce":
-                self.assertEqual(condition[1], "github.event_name == 'push'")
-                continue
-            self.assertIn(workflow_policy.expression(), condition[1], name[1])
-            checked += 1
-        self.assertGreater(checked, 30)
-        self.assertIn("&& 'CI Required Gate' || 'Quality Gate not requested'", workflow)
-        self.assertIn("&& 'quality' || github.run_id", workflow)
-        # Removing a job guard or changing the canonical labels must be detected.
-        damaged = workflow.replace("    if: ${{ " + workflow_policy.expression() + " }}\n", "", 1)
-        self.assertNotEqual(workflow_policy.materialize(damaged), damaged)
-        with patch.object(workflow_policy, "HIGH_RISK", selection.HIGH_RISK | {"risk:new"}):
-            self.assertNotEqual(workflow_policy.materialize(workflow), workflow)
-
+class WorkflowBuildTests(unittest.TestCase):
     def test_actual_build_script_selects_packages(self):
         workflow = (selection.ROOT / ".github/workflows/ci.yml").read_text()
         block = workflow.split("      - name: ${{ matrix.label }}\n", 1)[1]

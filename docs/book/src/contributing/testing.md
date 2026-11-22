@@ -100,43 +100,36 @@ and does not add ZeroCode compilation.
 `scope.py` is the sole selection policy: documentation/metadata-only PRs skip,
 ordinary code runs core, and sensitive paths or `risk:high`, `domain:security`,
 `priority:p0`, and `priority:p1` labels select full. Unknown or unusable inputs
-select full. Merge queue, master pushes, and ordinary manual dispatches run full.
-PR updates and changes to the four selection labels reevaluate Quality Gate.
-Other label events allocate no runners, use a separate concurrency group, and
-cannot cancel active CI or publish a skipped check named `CI Required Gate`.
-Missing label-event data fails closed and runs Quality Gate. Acceptance failures
+select full. Merge queue, master pushes, and manual dispatches run full.
+Selection is evaluated when a PR is opened, reopened, or updated. A label change
+alone does not start Quality Gate: it takes effect at the next PR update, and
+the merge queue runs the full suite before anything lands. Acceptance failures
 fail the existing build dependency, and `CI Required Gate` rejects skipped builds.
-
-GitHub must filter events before checkout. The job and concurrency expressions
-are generated from the canonical labels in `scope.py`; after changing that
-policy, run `python3 tests/system/runtime_acceptance/workflow_policy.py --write`.
-The selector contract checks their materialized form and actual build arguments.
+The selector contract in `test_contracts.py` checks the selection policy and the
+actual build arguments.
 
 ### Measuring CI cost
 
-Quality Gate has an explicit `acceptance_cost` manual-dispatch input, defaulting
-to false. Setting it to true runs only a disposable cost-measurement job. It
-cannot satisfy or replace `CI Required Gate`, does not change normal PR coverage,
-and never writes shared caches:
+No workflow job measures acceptance cost. To repeat the measurement, compare the
+existing root build with the two-binary build on a disposable Linux x86_64
+runner, using the same source revision, toolchain, linker, target path, and
+initial restored cache for both:
 
 ```sh
-gh workflow run ci.yml --ref <branch> -f acceptance_cost=true
+cargo build --profile ci --locked --target x86_64-unknown-linux-gnu
+cargo build --profile ci --locked --target x86_64-unknown-linux-gnu -p zeroclaw -p zerocode --bins
 ```
 
-The measurement uses the same source revision, Linux x86_64 runner, toolchain,
-linker, target path, and initial restored cache for the existing root build and
-the proposed two-binary build. It fetches dependencies before timing and restores
-the original target snapshot before each build in baseline/candidate/candidate/
-baseline order. It then runs core, full, and negative controls using the measured
-candidate binaries. Logs, individual timings, means, cache state, revision, and
-application results are retained in the `acceptance-cost` artifact for seven days.
-The job is bounded to 60 minutes and costs runner time only when requested.
+Fetch dependencies before timing and restore the original target snapshot before
+each build, in baseline/candidate/candidate/baseline order. Then run core, full,
+and the negative controls using the measured candidate binaries. Do not write
+shared caches from a measurement run.
 
 Report elapsed time and summed runner-minutes separately. Include the added
-ZeroCode compilation, test execution, artifact overhead, and any extra workflow
-runs from risk-label edits. Convert measured usage to money using the project's
-confirmed Blacksmith rate and allowances; public pricing cannot establish an
-organization's OSS sponsorship or invoice terms.
+ZeroCode compilation, test execution, and artifact overhead. Convert measured
+usage to money using the project's confirmed Blacksmith rate and allowances;
+public pricing cannot establish an organization's OSS sponsorship or invoice
+terms.
 
 Core has a five-minute execution budget and full has ten minutes, excluding
 compilation. Individual waits are bounded. The full job also proves failure

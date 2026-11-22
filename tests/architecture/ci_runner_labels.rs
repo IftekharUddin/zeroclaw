@@ -65,8 +65,7 @@ const HOSTED_LINUX_JOBS: [&str; 1] = ["test-landlock"];
 /// Every job that compiles the workspace on the Blacksmith fleet. A new compile
 /// job must be added here, which is the point: the list is the inventory this
 /// gate checks the workflow against.
-const COMPILE_JOBS: [&str; 13] = [
-    "acceptance-cost",
+const COMPILE_JOBS: [&str; 12] = [
     "lint",
     "build",
     "check",
