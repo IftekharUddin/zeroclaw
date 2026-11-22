@@ -691,3 +691,4 @@ zc-config-section-peer-groups-help = Grupos con nombre que vinculan un canal, ag
 zc-config-section-cron-help = Tareas programadas que vinculan un horario con un prompt, un canal y un destino.
 zc-config-section-tunnel-help = Expón opcionalmente la puerta de enlace mediante Cloudflare o ngrok, o mantenla solo local.
 zc-config-section-onboard-state-help = Estado del ciclo de vida del inicio rápido y su registro heredado de finalización por sección.
+zc-thinking-not-acknowledged = El daemon no confirmó este cambio de razonamiento. Actualiza o reinicia el daemon y vuelve a intentarlo. Tu preferencia guardada no ha cambiado.

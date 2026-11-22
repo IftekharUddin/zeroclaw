@@ -901,22 +901,27 @@ mod tests {
     }
 
     #[test]
-    fn thinking_acknowledgement_guidance_uses_catalogue_fallback() {
-        let english = build_ftl_bundle(EN_FTL, "en");
+    fn thinking_acknowledgement_guidance_is_translated_in_all_builtin_catalogues() {
+        const KEY: &str = "zc-thinking-not-acknowledged";
+        let english = format_ftl_message(&build_ftl_bundle(EN_FTL, "en"), KEY, &[])
+            .unwrap_or_else(|| panic!("{KEY} must be defined for en"));
+        assert!(english.contains("daemon"));
+        assert!(english.contains("saved preference"));
+
         for (locale, source) in [
-            ("en", EN_FTL),
             ("es", include_str!("../locales/es/zerocode.ftl")),
             ("fr", include_str!("../locales/fr/zerocode.ftl")),
             ("ja", include_str!("../locales/ja/zerocode.ftl")),
             ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
         ] {
             let bundle = build_ftl_bundle(source, locale);
-            let text = format_ftl_message(&bundle, "zc-thinking-not-acknowledged", &[])
-                .or_else(|| format_ftl_message(&english, "zc-thinking-not-acknowledged", &[]))
-                .expect("thinking guidance must render");
-            assert!(!text.contains("{zc-thinking-not-acknowledged}"));
-            assert!(text.contains("daemon"));
-            assert!(text.contains("saved preference"));
+            let text = format_ftl_message(&bundle, KEY, &[])
+                .unwrap_or_else(|| panic!("{KEY} must be defined for {locale}"));
+            assert!(
+                !text.trim().is_empty(),
+                "{KEY} must not be blank for {locale}"
+            );
+            assert_ne!(text, english, "{KEY} must be translated for {locale}");
         }
     }
 }

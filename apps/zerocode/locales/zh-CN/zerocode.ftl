@@ -691,3 +691,4 @@ zc-config-section-peer-groups-help = 绑定频道、成员代理和外部对等�
 zc-config-section-cron-help = 将计划与提示、频道和目标绑定的计划任务。
 zc-config-section-tunnel-help = 可选择通过 Cloudflare 或 ngrok 暴露网关，或仅保持本地访问。
 zc-config-section-onboard-state-help = 快速入门生命周期状态及其按分区记录的旧版完成记录。
+zc-thinking-not-acknowledged = 守护进程未确认此思考设置更改。请更新或重启守护进程，然后重试。已保存的偏好设置未更改。
