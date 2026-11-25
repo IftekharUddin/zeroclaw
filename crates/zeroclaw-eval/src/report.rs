@@ -19,20 +19,26 @@ pub struct CaseReport {
     pub error: Option<String>,
 }
 
+/// The single verdict rule over a completed run's grades: at least one grade,
+/// and every non-diagnostic grade passed.
+///
+/// Every caller that turns grades into a pass or fail goes through this rule
+/// (the suite report and the live flakiness re-run), so a diagnostic grade such
+/// as a judge score cannot decide a verdict on one path and be ignored on
+/// another.
+///
+/// Fixture admission rejects assertion-free cases, but this aggregation
+/// boundary also fails closed so a caller cannot manufacture a green verdict
+/// from an empty grade vector.
+pub fn grades_pass(grades: &[GradeResult]) -> bool {
+    !grades.is_empty() && grades.iter().all(|grade| grade.passed || grade.diagnostic)
+}
+
 impl CaseReport {
-    /// A case passes when it ran without error, produced at least one grade,
-    /// and every non-diagnostic grade passed.
-    ///
-    /// Fixture admission rejects assertion-free cases, but this aggregation
-    /// boundary also fails closed so a caller cannot manufacture a green
-    /// report from an empty grade vector.
+    /// A case passes when it ran without error and its grades satisfy
+    /// [`grades_pass`].
     pub fn passed(&self) -> bool {
-        self.error.is_none()
-            && !self.grades.is_empty()
-            && self
-                .grades
-                .iter()
-                .all(|grade| grade.passed || grade.diagnostic)
+        self.error.is_none() && grades_pass(&self.grades)
     }
 
     fn checks_passed(&self) -> usize {
@@ -338,6 +344,27 @@ mod tests {
         assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
         // No checks cannot certify a passing case.
         assert!(!case("a", vec![], None).passed());
+    }
+
+    #[test]
+    fn diagnostic_grades_never_decide_the_shared_verdict() {
+        let diagnostic_failure = GradeResult {
+            diagnostic: true,
+            ..grade("judge:tone", false, "score=0.20 reason=weak")
+        };
+
+        // A failing diagnostic grade beside passing checks does not fail the run.
+        let grades = vec![grade("c1", true, ""), diagnostic_failure.clone()];
+        assert!(grades_pass(&grades));
+        assert!(case("a", grades, None).passed());
+
+        // It does not excuse a failing deterministic check either.
+        let grades = vec![grade("c1", false, ""), diagnostic_failure];
+        assert!(!grades_pass(&grades));
+        assert!(!case("a", grades, None).passed());
+
+        // No grades is not a pass on any path.
+        assert!(!grades_pass(&[]));
     }
 
     #[test]

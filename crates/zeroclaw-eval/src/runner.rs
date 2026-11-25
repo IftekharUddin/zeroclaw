@@ -70,6 +70,14 @@ pub struct CaseOutcome {
     pub grades: Vec<GradeResult>,
 }
 
+impl CaseOutcome {
+    /// Whether this completed run passed, by the same rule as
+    /// [`CaseReport::passed`]: diagnostic grades never decide the verdict.
+    pub fn passed(&self) -> bool {
+        crate::report::grades_pass(&self.grades)
+    }
+}
+
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
 /// The provider is injected as a closure so replay, live, and deterministic tests

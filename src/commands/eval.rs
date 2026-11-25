@@ -407,23 +407,35 @@ async fn rerun_live_regressions(
         .filter(|(_, c)| matches!(c, CaseComparison::Regression { .. }))
         .map(|(id, _)| id.as_str())
         .collect();
-    let mut out = BTreeMap::new();
     if regressed.is_empty() {
-        return Ok(out);
+        return Ok(BTreeMap::new());
     }
     let traces = zeroclaw_eval::case::load_suite(suite_path)?;
     let deps = build_run_deps(config, Mode::Live)?;
-    for (_, trace) in &traces {
+    Ok(rerun_cases(&traces, &regressed, &deps).await)
+}
+
+/// Run each trace named in `regressed` once and report whether that run passed,
+/// keyed by case id. The verdict is the report's own pass rule
+/// ([`zeroclaw_eval::CaseOutcome::passed`]), so a diagnostic judge grade on the
+/// re-run can neither confirm a regression nor excuse one.
+async fn rerun_cases(
+    traces: &[(PathBuf, LlmTrace)],
+    regressed: &[&str],
+    deps: &RunDeps,
+) -> BTreeMap<String, bool> {
+    let mut out = BTreeMap::new();
+    for (_, trace) in traces {
         let id = trace.display_id();
         if regressed.contains(&id) {
             let passed = matches!(
-                Box::pin(zeroclaw_eval::run_case(trace, &deps)).await,
-                Ok(outcome) if outcome.grades.iter().all(|g| g.passed)
+                Box::pin(zeroclaw_eval::run_case(trace, deps)).await,
+                Ok(outcome) if outcome.passed()
             );
             out.insert(id.to_string(), passed);
         }
     }
-    Ok(out)
+    out
 }
 
 /// Print a compact per-case comparison summary.
@@ -1839,5 +1851,127 @@ mod tests {
         config.eval.case_timeout_secs = 0;
 
         assert!(build_run_deps(&config, Mode::Replay).is_ok());
+    }
+
+    const RERUN_CASE_ID: &str = "rerun-case";
+
+    fn scripted_provider(reply: &str) -> zeroclaw_eval::replay::TraceLlmProvider {
+        let script: LlmTrace = serde_json::from_value(serde_json::json!({
+            "model_name": "scripted",
+            "turns": [{ "user_input": "", "steps": [
+                { "response": { "type": "text", "content": reply } }
+            ] }],
+        }))
+        .unwrap();
+        zeroclaw_eval::replay::TraceLlmProvider::try_from_trace(&script).unwrap()
+    }
+
+    /// Live-mode dependencies with a scripted agent provider and a scripted
+    /// judge, so the re-run path runs end to end with no network.
+    fn scripted_live_deps(agent_reply: &'static str, judge_reply: &str) -> RunDeps {
+        RunDeps {
+            mode: Mode::Live,
+            provider: Box::new(move |_trace| {
+                Ok(CaseProvider::from_provider(Box::new(scripted_provider(
+                    agent_reply,
+                ))))
+            }),
+            provider_ref: "test.model:test".to_string(),
+            live_tools: Vec::new(),
+            case_timeout: Duration::from_secs(5),
+            judge: Some(zeroclaw_eval::grader::JudgeDeps {
+                provider: std::sync::Arc::new(scripted_provider(judge_reply)),
+                model: "judge-model".to_string(),
+                judge_ref: "test.judge:judge-model".to_string(),
+            }),
+        }
+    }
+
+    /// One deterministic check (the response must contain `ok`) plus one judge
+    /// rubric at the default 0.7 threshold.
+    fn rerun_suite() -> Vec<(PathBuf, LlmTrace)> {
+        let trace: LlmTrace = serde_json::from_value(serde_json::json!({
+            "model_name": RERUN_CASE_ID,
+            "turns": [{ "user_input": "hi" }],
+            "expects": {
+                "response_contains": ["ok"],
+                "judge": [{ "name": "tone", "rubric": "grade it" }],
+            },
+        }))
+        .unwrap();
+        vec![(PathBuf::from("rerun-case.json"), trace)]
+    }
+
+    fn regressed_comparison() -> baseline::BaselineComparison {
+        baseline::BaselineComparison {
+            per_case: BTreeMap::from([(
+                RERUN_CASE_ID.to_string(),
+                CaseComparison::Regression {
+                    categories: vec![GradeCategory::Response],
+                },
+            )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn rerun_with_a_failing_diagnostic_judge_grade_still_downgrades_to_flaky() {
+        const LOW_SCORE: &str = r#"{"score":0.2,"unknown":false,"reason":"weak"}"#;
+        let suite = rerun_suite();
+
+        // The judge really is attached and really scores below the threshold;
+        // otherwise the assertions below would hold vacuously.
+        let deps = scripted_live_deps("ok", LOW_SCORE);
+        let outcome = Box::pin(zeroclaw_eval::run_case(&suite[0].1, &deps))
+            .await
+            .unwrap();
+        let judge = outcome
+            .grades
+            .iter()
+            .find(|grade| grade.check == "judge:tone")
+            .expect("the judge grade must be present on the re-run");
+        assert!(!judge.passed && judge.diagnostic, "judge grade: {judge:?}");
+
+        let rerun = rerun_cases(
+            &suite,
+            &[RERUN_CASE_ID],
+            &scripted_live_deps("ok", LOW_SCORE),
+        )
+        .await;
+        assert_eq!(
+            rerun.get(RERUN_CASE_ID).copied(),
+            Some(true),
+            "every deterministic check passed; the judge grade is diagnostic"
+        );
+
+        let mut comparison = regressed_comparison();
+        let flaky = baseline::downgrade_flaky_regressions(&mut comparison, Mode::Live, &rerun);
+        assert_eq!(flaky, vec![RERUN_CASE_ID.to_string()]);
+        assert!(
+            !comparison.gates(),
+            "a judge score must not confirm a regression and set the exit code"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerun_with_a_failing_deterministic_grade_stays_a_confirmed_regression() {
+        const HIGH_SCORE: &str = r#"{"score":0.9,"unknown":false,"reason":"fine"}"#;
+        let suite = rerun_suite();
+
+        let rerun = rerun_cases(
+            &suite,
+            &[RERUN_CASE_ID],
+            &scripted_live_deps("nope", HIGH_SCORE),
+        )
+        .await;
+        assert_eq!(
+            rerun.get(RERUN_CASE_ID).copied(),
+            Some(false),
+            "a passing judge grade must not excuse a failing deterministic check"
+        );
+
+        let mut comparison = regressed_comparison();
+        let flaky = baseline::downgrade_flaky_regressions(&mut comparison, Mode::Live, &rerun);
+        assert!(flaky.is_empty());
+        assert!(comparison.gates());
     }
 }
