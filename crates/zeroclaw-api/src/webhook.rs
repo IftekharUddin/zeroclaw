@@ -271,8 +271,8 @@ impl WebhookReservationStore {
         true
     }
 
-    /// Committed keys currently held, across both ingress kinds. Expired keys
-    /// are dropped on the next record or reservation, not by this call.
+    /// Committed keys currently held by this store. Expired keys are dropped
+    /// on the next record or reservation, not by this call.
     #[must_use]
     pub fn committed_len(&self) -> usize {
         self.entries().committed.len()
