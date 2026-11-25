@@ -295,7 +295,8 @@ this socket.
 
 All three are served only on the local IPC endpoint. A WSS connection,
 including one that arrives through the relay, gets `FORBIDDEN` whatever its
-grants. Grants are checked when a request is admitted. A dispatch ends within
+grants, and so does an in-process connection, which no OS credential vouches
+for. Grants are checked when a request is admitted. A dispatch ends within
 the ingress deadline, so it is not rechecked while it runs.
 
 Each grant reaches only the channel instances the caller's permission profile
@@ -418,7 +419,8 @@ explicitly stopped.
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
 - The `plugin-webhook/*` methods are refused with `FORBIDDEN` on WSS,
-  including relayed connections, whatever the caller's grants
+  including relayed connections, and on in-process connections, whatever the
+  caller's grants
 - A local caller holding `channels:execute` can dispatch to the routes of
   the channel instances its profile names in `allowed_channels`, unless the
   instance or an agent handling it refuses injected webhooks. The gateway's
