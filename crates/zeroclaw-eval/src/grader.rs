@@ -1377,6 +1377,33 @@ mod tests {
         assert!(!no_transcript.contains("transcript"));
     }
 
+    #[test]
+    fn judge_transcript_carries_the_system_prompt_and_reasoning_content() {
+        // The transcript is the serialized conversation history, so the agent's
+        // system prompt and any preserved reasoning content cross to the judge
+        // provider with it. The operator guide discloses both; this pins them.
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        let history = vec![
+            ConversationMessage::Chat(ChatMessage::system("SYSTEM-PROMPT-MARKER")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: Vec::new(),
+                reasoning_content: Some("REASONING-MARKER".to_string()),
+            },
+        ];
+        let mut rubric = rubric("state", 0.7);
+
+        rubric.include_transcript = true;
+        let with_transcript = judge_message(&["task".to_string()], "answer", &history, &rubric);
+        assert!(with_transcript.contains("SYSTEM-PROMPT-MARKER"));
+        assert!(with_transcript.contains("REASONING-MARKER"));
+
+        rubric.include_transcript = false;
+        let without_transcript = judge_message(&["task".to_string()], "answer", &history, &rubric);
+        assert!(!without_transcript.contains("SYSTEM-PROMPT-MARKER"));
+        assert!(!without_transcript.contains("REASONING-MARKER"));
+    }
+
     #[tokio::test]
     async fn judge_sends_only_bounded_untrusted_run_evidence() {
         let provider = std::sync::Arc::new(RecordingJudgeProvider {

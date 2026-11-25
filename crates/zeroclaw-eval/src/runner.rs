@@ -472,6 +472,24 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn recorded_history_starts_with_the_agent_system_prompt() {
+        // Graders receive this history, and a judge rubric with
+        // `include_transcript` forwards it to the judge provider, so the system
+        // prompt is part of what the operator guide must disclose.
+        let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        let history = &outcome.record.completion.as_ref().unwrap().history;
+        assert!(
+            matches!(
+                history.first(),
+                Some(zeroclaw_api::model_provider::ConversationMessage::Chat(message))
+                    if message.role == "system"
+            ),
+            "history: {history:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_case_uses_the_default_grader_catalog() {
         // `run_case` must remain a thin wrapper over the seam: if it drifted to a
         // different catalog, the seam-based regression above would be testing a

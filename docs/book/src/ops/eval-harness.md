@@ -271,8 +271,10 @@ unverifiable rather than silently comparable. Judge token usage is never added
 to the case's own totals because the judge runs outside the agent.
 
 The judge receives the case's task turns, final response, and, when
-`include_transcript` is true, the full conversation history including tool
-arguments and results. This data is sent to the configured external provider,
+`include_transcript` is true, the full conversation history: the agent's
+system prompt, every message, tool arguments and results, and any reasoning
+content the model under test returned with its tool calls. This data is sent
+to the configured external provider,
 can contain sensitive workspace or model output, and is explicitly framed as
 untrusted evidence so instructions inside it are not part of the rubric. The
 serialized evidence is capped at 16,000 characters; oversized evidence is
