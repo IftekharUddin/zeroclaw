@@ -408,6 +408,36 @@ mod tests {
     }
 
     #[test]
+    fn sop_controls_keys_present_in_all_builtin_catalogues() {
+        // The SOP pane sizes its Run/Resume hit boxes from these labels, so
+        // every shipped catalogue must define them as non-empty single-line
+        // values: a `{key}` placeholder or a blank label would draw a control
+        // the operator cannot read.
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            for key in [
+                "zc-sop-controls-title",
+                "zc-sop-controls-run",
+                "zc-sop-controls-resume",
+            ] {
+                let value = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{key} must be defined for {locale}"));
+                assert!(
+                    !value.trim().is_empty() && !value.contains('\n'),
+                    "{key} must be one non-empty line for {locale}: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn daemon_process_labels_are_explicit_in_all_builtin_catalogues() {
         let catalogues = [
             ("en", EN_FTL, "Daemon Memory", "Daemon CPU"),

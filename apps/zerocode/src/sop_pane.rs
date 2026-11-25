@@ -1817,11 +1817,17 @@ impl SopPane {
             self.resume_btn_rect = None;
             return;
         };
-        let block = Block::default().borders(Borders::ALL).title("Controls");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(crate::i18n::t(CONTROLS_TITLE_KEY));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let (run_rect, resume_rect) = control_button_rects(inner);
+        // Resolve each label once per frame: the hit rects and the drawn
+        // spans must measure the same translated string.
+        let run_label = crate::i18n::t(RUN_LABEL_KEY);
+        let resume_label = crate::i18n::t(RESUME_LABEL_KEY);
+        let (run_rect, resume_rect) = control_button_rects(inner, &run_label, &resume_label);
         self.run_btn_rect = run_rect;
         self.resume_btn_rect = resume_rect;
 
@@ -1829,11 +1835,11 @@ impl SopPane {
         let resume_enabled = !self.read_only && self.selected_resume_target().is_some();
         let mut spans = Vec::new();
         if run_rect.is_some() {
-            spans.push(Span::styled(RUN_LABEL, button_style(run_enabled)));
+            spans.push(Span::styled(run_label, button_style(run_enabled)));
         }
         if resume_rect.is_some() {
             spans.push(Span::raw(BUTTON_GAP));
-            spans.push(Span::styled(RESUME_LABEL, button_style(resume_enabled)));
+            spans.push(Span::styled(resume_label, button_style(resume_enabled)));
         }
         if spans.is_empty() {
             return;
@@ -2337,8 +2343,12 @@ const CONTROLS_H: u16 = 3;
 /// so the strip is dropped rather than squeezing the list to nothing.
 const MIN_LEFT_COL_H: u16 = 5;
 
-const RUN_LABEL: &str = "[▶ Run]";
-const RESUME_LABEL: &str = "[⏯ Resume]";
+/// Fluent keys for the strip's on-screen text. English values live in
+/// `locales/en/zerocode.ftl`; the labels keep their brackets and glyphs in
+/// the catalogue, like the other bracketed zerocode buttons.
+const CONTROLS_TITLE_KEY: &str = "zc-sop-controls-title";
+const RUN_LABEL_KEY: &str = "zc-sop-controls-run";
+const RESUME_LABEL_KEY: &str = "zc-sop-controls-resume";
 /// One blank cell between the two labels.
 const BUTTON_GAP: &str = " ";
 
@@ -2358,18 +2368,25 @@ fn button_style(enabled: bool) -> Style {
 
 /// Hit rects for the two control labels inside the strip's *inner* rect.
 ///
-/// Widths come from [`crate::display_width::display_width`] because the glyphs
-/// are emoji (`▶`/`⏯`) whose cell width is not their char count. Layout is
-/// left-aligned: `[▶ Run]`, one space, `[⏯ Resume]`. A label that does not fit
-/// in the remaining width is `None` (clipped, hence unclickable) rather than a
-/// rect running off the edge; zero height yields `(None, None)`.
-fn control_button_rects(inner: Rect) -> (Option<Rect>, Option<Rect>) {
+/// `run_label` and `resume_label` are the strings actually drawn this frame
+/// (the translated catalogue values), so a locale whose labels are wider or
+/// narrower than English moves the hit boxes with the text. Widths come from
+/// [`crate::display_width::display_width`] because neither the emoji glyphs
+/// (`▶`/`⏯`) nor wide scripts occupy one cell per char. Layout is
+/// left-aligned: run label, one space, resume label. A label that does not
+/// fit in the remaining width is `None` (clipped, hence unclickable) rather
+/// than a rect running off the edge; zero height yields `(None, None)`.
+fn control_button_rects(
+    inner: Rect,
+    run_label: &str,
+    resume_label: &str,
+) -> (Option<Rect>, Option<Rect>) {
     if inner.height == 0 || inner.width == 0 {
         return (None, None);
     }
-    let run_w = crate::display_width::display_width(RUN_LABEL) as u16;
-    let gap_w = crate::display_width::display_width(BUTTON_GAP) as u16;
-    let resume_w = crate::display_width::display_width(RESUME_LABEL) as u16;
+    let run_w = label_cells(run_label);
+    let gap_w = label_cells(BUTTON_GAP);
+    let resume_w = label_cells(resume_label);
 
     if run_w > inner.width {
         return (None, None);
@@ -2379,6 +2396,13 @@ fn control_button_rects(inner: Rect) -> (Option<Rect>, Option<Rect>) {
     let used = run_w.saturating_add(gap_w).saturating_add(resume_w);
     let resume = (used <= inner.width).then(|| Rect::new(resume_x, inner.y, resume_w, 1));
     (Some(run), resume)
+}
+
+/// Cell width of a control label, saturating instead of wrapping: catalogue
+/// text is not a compile-time constant, and an over-long label must read as
+/// "does not fit", never as a short one.
+fn label_cells(label: &str) -> u16 {
+    u16::try_from(crate::display_width::display_width(label)).unwrap_or(u16::MAX)
 }
 
 /// Newest *active* run per SOP that is blocked on a human, as
@@ -3638,11 +3662,21 @@ mod status_agg_tests {
 #[cfg(test)]
 mod controls_tests {
     use super::{
-        CONTROLS_H, MIN_LEFT_COL_H, RESUME_LABEL, RUN_LABEL, control_button_rects, list_row_rects,
-        resume_targets_from,
+        CONTROLS_H, CONTROLS_TITLE_KEY, MIN_LEFT_COL_H, RESUME_LABEL_KEY, RUN_LABEL_KEY,
+        control_button_rects, list_row_rects, resume_targets_from,
     };
     use crate::client::{SopRunStatusView, SopRunSummaryView};
     use ratatui::layout::Rect;
+
+    /// English catalogue values, pinned so the rect-math tests below stay pure
+    /// functions of their inputs instead of depending on the process locale.
+    /// `control_labels_come_from_fluent_catalogue` ties them to the catalogue.
+    const RUN_LABEL: &str = "[▶ Run]";
+    const RESUME_LABEL: &str = "[⏯ Resume]";
+
+    fn english_rects(inner: Rect) -> (Option<Rect>, Option<Rect>) {
+        control_button_rects(inner, RUN_LABEL, RESUME_LABEL)
+    }
 
     fn run(
         run_id: &str,
@@ -3783,7 +3817,7 @@ mod controls_tests {
     #[test]
     fn normal_width_places_both_buttons_side_by_side() {
         let inner = Rect::new(1, 5, 30, 1);
-        let (run_rect, resume_rect) = control_button_rects(inner);
+        let (run_rect, resume_rect) = english_rects(inner);
         let run_rect = run_rect.expect("run button fits");
         let resume_rect = resume_rect.expect("resume button fits");
         assert_eq!((run_rect.x, run_rect.y, run_rect.height), (1, 5, 1));
@@ -3814,10 +3848,64 @@ mod controls_tests {
     }
 
     #[test]
+    fn control_labels_come_from_fluent_catalogue() {
+        assert_eq!(crate::i18n::t(CONTROLS_TITLE_KEY), "Controls");
+        assert_eq!(crate::i18n::t(RUN_LABEL_KEY), RUN_LABEL);
+        assert_eq!(crate::i18n::t(RESUME_LABEL_KEY), RESUME_LABEL);
+    }
+
+    #[test]
+    fn translated_labels_move_the_hit_rects_with_the_text() {
+        // Wide-script labels occupy two cells per ideograph. The rects must
+        // follow the string that is drawn, not the English widths.
+        let (run_label, resume_label) = ("[▶ 実行]", "[⏯ 再開]");
+        let run_w = crate::display_width::display_width(run_label) as u16;
+        let resume_w = crate::display_width::display_width(resume_label) as u16;
+        assert!(
+            usize::from(run_w) > run_label.chars().count(),
+            "fixture must be wider than its char count"
+        );
+
+        let inner = Rect::new(1, 5, 30, 1);
+        let (run_rect, resume_rect) = control_button_rects(inner, run_label, resume_label);
+        let run_rect = run_rect.expect("translated run label fits");
+        let resume_rect = resume_rect.expect("translated resume label fits");
+        assert_eq!(run_rect.width, run_w);
+        assert_eq!(resume_rect.x, inner.x + run_w + 1);
+        assert_eq!(resume_rect.width, resume_w);
+
+        let (english_run, english_resume) = english_rects(inner);
+        assert_ne!(
+            resume_rect,
+            english_resume.expect("english resume label fits"),
+            "a different label must not reuse the English hit box"
+        );
+        assert_ne!(Some(run_rect), english_run);
+    }
+
+    #[test]
+    fn translation_too_wide_for_the_strip_clips_instead_of_overflowing() {
+        let (run_label, resume_label) = ("[▶ Exécuter]", "[⏯ Reprendre]");
+        let run_w = crate::display_width::display_width(run_label) as u16;
+        let inner = Rect::new(0, 0, run_w, 1);
+        let (run_rect, resume_rect) = control_button_rects(inner, run_label, resume_label);
+        assert!(run_rect.is_some(), "the first label fits exactly");
+        assert_eq!(
+            resume_rect, None,
+            "a label wider than the remaining cells is unclickable"
+        );
+        assert_eq!(
+            control_button_rects(inner, "[▶ Exécuter maintenant]", resume_label),
+            (None, None),
+            "a first label wider than the strip leaves no clickable button"
+        );
+    }
+
+    #[test]
     fn too_narrow_clips_the_second_button() {
         let run_w = crate::display_width::display_width(RUN_LABEL) as u16;
         let inner = Rect::new(0, 0, run_w + 2, 1);
-        let (run_rect, resume_rect) = control_button_rects(inner);
+        let (run_rect, resume_rect) = english_rects(inner);
         assert!(run_rect.is_some(), "the first button still fits");
         assert_eq!(
             resume_rect, None,
@@ -3828,13 +3916,13 @@ mod controls_tests {
     #[test]
     fn width_below_the_first_label_yields_no_buttons() {
         let inner = Rect::new(0, 0, 3, 1);
-        assert_eq!(control_button_rects(inner), (None, None));
+        assert_eq!(english_rects(inner), (None, None));
     }
 
     #[test]
     fn zero_height_yields_no_buttons() {
         let inner = Rect::new(0, 0, 40, 0);
-        assert_eq!(control_button_rects(inner), (None, None));
+        assert_eq!(english_rects(inner), (None, None));
     }
 
     #[test]
@@ -3843,7 +3931,7 @@ mod controls_tests {
             + 1
             + crate::display_width::display_width(RESUME_LABEL);
         let inner = Rect::new(0, 0, w as u16, 1);
-        let (run_rect, resume_rect) = control_button_rects(inner);
+        let (run_rect, resume_rect) = english_rects(inner);
         assert!(run_rect.is_some());
         let resume_rect = resume_rect.expect("both labels fit exactly");
         assert_eq!(
@@ -3887,7 +3975,7 @@ mod controls_tests {
         let strip = Rect::new(0, 9, 20, CONTROLS_H);
         let inner = Rect::new(strip.x + 1, strip.y + 1, strip.width - 2, strip.height - 2);
         assert_eq!(inner.height, 1, "borders leave exactly one label row");
-        let (run_rect, _) = control_button_rects(inner);
+        let (run_rect, _) = english_rects(inner);
         assert_eq!(run_rect.map(|r| r.y), Some(strip.y + 1));
     }
 }
