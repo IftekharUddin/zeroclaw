@@ -3979,3 +3979,216 @@ mod controls_tests {
         assert_eq!(run_rect.map(|r| r.y), Some(strip.y + 1));
     }
 }
+
+#[cfg(test)]
+mod control_click_tests {
+    use super::SopPane;
+    use crate::client::{RpcClient, SopDraft, method};
+    use crate::jsonrpc::RpcOutbound;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// A pane listing `alpha` (selected, nothing parked) and `deploy` (one
+    /// run parked on a human), drawn once so the button and row hit rects are
+    /// the ones a real frame produces. `read_only` is set directly so each
+    /// test states which side of the mutation gate it exercises.
+    fn rendered_pane(read_only: bool) -> (SopPane, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut pane = SopPane::new(rpc);
+        pane.names = vec!["alpha".to_string(), "deploy".to_string()];
+        pane.list_state.select(Some(0));
+        pane.resume_targets
+            .insert("deploy".to_string(), "run-7".to_string());
+        pane.read_only = read_only;
+
+        let area = Rect::new(0, 0, 100, 24);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|f| pane.render(f, area))
+            .expect("render SOP pane");
+        assert_eq!(pane.list_row_rects.len(), 2, "both rows are drawn");
+        (pane, outbound, rx)
+    }
+
+    fn left_click_at(rect: Rect) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// In a drawn frame the strip and the list never share a cell, so moving
+    /// the row check ahead of the button checks in `handle_mouse` would change
+    /// nothing observable. Parking row `idx`'s hit rect on a button gives one
+    /// click two candidate handlers, and the assertions tell which one ran.
+    fn park_row_on(pane: &mut SopPane, idx: usize, button: Rect) {
+        pane.list_row_rects[idx] = button;
+    }
+
+    /// Click `at`, require exactly one daemon request, answer it with
+    /// `result`, and return the request once the click has finished.
+    async fn click_answering_one_request(
+        pane: &mut SopPane,
+        outbound: &RpcOutbound,
+        rx: &mut mpsc::Receiver<String>,
+        at: Rect,
+        result: serde_json::Value,
+    ) -> serde_json::Value {
+        let request = {
+            let click = pane.handle_mouse(left_click_at(at));
+            tokio::pin!(click);
+            let raw = tokio::select! {
+                biased;
+                () = &mut click => panic!("the click returned without asking the daemon"),
+                raw = tokio::time::timeout(Duration::from_secs(2), rx.recv()) => raw
+                    .expect("the click should send its request promptly")
+                    .expect("RPC writer should remain connected"),
+            };
+            let request: serde_json::Value = serde_json::from_str(&raw).expect("request is JSON");
+            let id = request["id"].as_str().expect("request id").to_string();
+            outbound.dispatch_response(&id, Some(result), None);
+            tokio::time::timeout(Duration::from_secs(2), click)
+                .await
+                .expect("the click should finish once the daemon answers");
+            request
+        };
+        assert!(
+            rx.try_recv().is_err(),
+            "one click must not fan out into a second request"
+        );
+        request
+    }
+
+    /// Click `at` and require that it returns without contacting the daemon.
+    async fn click_expecting_no_request(
+        pane: &mut SopPane,
+        rx: &mut mpsc::Receiver<String>,
+        at: Rect,
+    ) {
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            pane.handle_mouse(left_click_at(at)),
+        )
+        .await
+        .expect("a swallowed click must not wait on the daemon");
+        assert!(
+            rx.try_recv().is_err(),
+            "a swallowed click must not send any request"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_click_wins_over_a_row_at_the_same_cell_and_opens_the_payload_prompt() {
+        let (mut pane, outbound, mut rx) = rendered_pane(false);
+        let run_rect = pane.run_btn_rect.expect("run button is drawn");
+        park_row_on(&mut pane, 1, run_rect);
+
+        let manual_sop = serde_json::to_value(SopDraft {
+            name: "alpha".to_string(),
+            ..SopDraft::default()
+        })
+        .expect("draft serializes");
+        let request =
+            click_answering_one_request(&mut pane, &outbound, &mut rx, run_rect, manual_sop).await;
+
+        assert_eq!(
+            request["method"],
+            method::SOPS_GET,
+            "Run takes the same manual-trigger lookup as the keyboard path, \
+             not the row handler's graph load"
+        );
+        assert_eq!(request["params"]["name"], "alpha");
+        assert_eq!(
+            pane.list_state.selected(),
+            Some(0),
+            "the row under the button must not steal the selection"
+        );
+        assert_eq!(
+            pane.run_payload_input.as_deref(),
+            Some(""),
+            "an enabled Run click opens the payload prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_click_wins_over_a_row_at_the_same_cell() {
+        // Pins click routing only. What Resume does with the parked run after
+        // it wins the click is asserted nowhere here, so this test holds for
+        // any approval flow that still acts on the selected SOP's parked run.
+        let (mut pane, outbound, mut rx) = rendered_pane(false);
+        pane.list_state.select(Some(1));
+        let resume_rect = pane.resume_btn_rect.expect("resume button is drawn");
+        park_row_on(&mut pane, 0, resume_rect);
+
+        let request = click_answering_one_request(
+            &mut pane,
+            &outbound,
+            &mut rx,
+            resume_rect,
+            serde_json::Value::Null,
+        )
+        .await;
+
+        assert_ne!(
+            request["method"],
+            method::SOPS_GRAPH,
+            "the click must not reach the row handler's graph load"
+        );
+        assert_eq!(request["params"]["name"], "deploy");
+        assert_eq!(request["params"]["run_id"], "run-7");
+        assert_eq!(
+            pane.list_state.selected(),
+            Some(1),
+            "the row under the button must not steal the selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_button_clicks_are_swallowed_instead_of_selecting_a_row() {
+        let (mut pane, _outbound, mut rx) = rendered_pane(false);
+        let run_rect = pane.run_btn_rect.expect("run button is drawn");
+        let resume_rect = pane.resume_btn_rect.expect("resume button is drawn");
+
+        // Resume is disabled: `alpha` is selected and has no parked run.
+        park_row_on(&mut pane, 1, resume_rect);
+        click_expecting_no_request(&mut pane, &mut rx, resume_rect).await;
+        assert_eq!(pane.list_state.selected(), Some(0));
+        assert_eq!(pane.current_run_id, None);
+
+        // Run is disabled: nothing is selected.
+        pane.list_state.select(None);
+        park_row_on(&mut pane, 1, run_rect);
+        click_expecting_no_request(&mut pane, &mut rx, run_rect).await;
+        assert_eq!(pane.list_state.selected(), None);
+        assert_eq!(pane.run_payload_input, None);
+    }
+
+    #[tokio::test]
+    async fn read_only_pane_swallows_both_buttons_even_with_a_valid_target() {
+        let (mut pane, _outbound, mut rx) = rendered_pane(true);
+        pane.list_state.select(Some(1));
+        let run_rect = pane.run_btn_rect.expect("run button is drawn");
+        let resume_rect = pane.resume_btn_rect.expect("resume button is drawn");
+
+        park_row_on(&mut pane, 0, run_rect);
+        click_expecting_no_request(&mut pane, &mut rx, run_rect).await;
+        assert_eq!(pane.run_payload_input, None);
+
+        park_row_on(&mut pane, 0, resume_rect);
+        click_expecting_no_request(&mut pane, &mut rx, resume_rect).await;
+        assert_eq!(pane.current_run_id, None);
+        assert_eq!(
+            pane.list_state.selected(),
+            Some(1),
+            "a read-only click on a button still must not fall through to a row"
+        );
+    }
+}
