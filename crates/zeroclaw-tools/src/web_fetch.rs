@@ -515,15 +515,21 @@ impl WebFetchTool {
             ));
         }
 
-        // Handed back unshaped: delivery decides inline-vs-spill for Firecrawl
-        // markdown on exactly the same terms as a standard fetch. Firecrawl
-        // reads a parsed JSON field rather than the size-capped stream, so
-        // `max_response_size` never cut it short.
+        // Bound the extracted field before delivery can persist it. Parsing
+        // Firecrawl's JSON envelope still buffers the response as before.
+        let mut end = if self.max_response_size == 0 {
+            markdown.len()
+        } else {
+            markdown.len().min(self.max_response_size)
+        };
+        while !markdown.is_char_boundary(end) {
+            end -= 1;
+        }
         Ok(FetchAttempt::Content(FetchedContent {
-            text: markdown.to_string(),
+            text: markdown[..end].to_string(),
             extension: "md",
             title: None,
-            cap_hit: false,
+            cap_hit: end < markdown.len(),
         }))
     }
 
@@ -4528,6 +4534,102 @@ mod tests {
             markdown.replace('\n', ""),
             "the spilled file must hold the full Firecrawl markdown"
         );
+    }
+
+    /// Firecrawl hands back a parsed JSON field rather than the size-capped
+    /// stream, so `max_response_size` has to be applied to the markdown itself
+    /// before delivery decides anything. A cap under the spill threshold keeps
+    /// the result inline and writes nothing; a cap over it bounds the bytes
+    /// that reach the workspace; zero stays unlimited. The body is multi-byte
+    /// and the caps are odd, so a cut that ignored character boundaries would
+    /// panic here.
+    #[tokio::test]
+    async fn firecrawl_markdown_is_capped_before_inline_or_spill_delivery() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Two bytes per character: 120_000 bytes, well over the spill threshold.
+        let markdown = "é".repeat(60_000);
+
+        let firecrawl_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/scrape"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {"markdown": markdown}
+            })))
+            .mount(&firecrawl_server)
+            .await;
+
+        // SAFETY: test-only, and the variable name is unique to this test.
+        unsafe { std::env::set_var("FIRECRAWL_CAP_TEST_KEY", "test-key-12345") };
+
+        let url = "https://example.com/page";
+        let mut fetched = Vec::new();
+        for cap in [31, 55_001, 0] {
+            let workspace = tempfile::tempdir().expect("tempdir");
+            let mut tool = spill_test_tool(workspace.path(), cap);
+            tool.firecrawl = FirecrawlConfig {
+                enabled: true,
+                api_key_env: "FIRECRAWL_CAP_TEST_KEY".into(),
+                api_url: format!("http://{}", firecrawl_server.address()),
+                ..FirecrawlConfig::default()
+            };
+            let attempt = Box::pin(tool.fetch_via_firecrawl(url)).await;
+            fetched.push((cap, workspace, tool, attempt));
+        }
+
+        // SAFETY: test-only, and the variable name is unique to this test.
+        unsafe { std::env::remove_var("FIRECRAWL_CAP_TEST_KEY") };
+
+        for (cap, workspace, tool, attempt) in fetched {
+            let FetchAttempt::Content(content) = attempt.expect("firecrawl call") else {
+                panic!("expected firecrawl content with cap {cap}");
+            };
+
+            // An odd cap lands inside a two-byte character and backs off to
+            // the boundary below it.
+            let expected_len = if cap == 0 { markdown.len() } else { cap - 1 };
+            assert_eq!(
+                content.text.len(),
+                expected_len,
+                "Firecrawl markdown must be cut to max_response_size={cap} before delivery"
+            );
+            assert_eq!(
+                content.cap_hit,
+                cap != 0,
+                "cap_hit must report whether max_response_size={cap} dropped the tail"
+            );
+
+            let result = tool.deliver(url, content).await;
+            assert!(result.success, "error={:?}", result.error);
+            let output = result.output.as_str();
+
+            if expected_len <= SPILL_THRESHOLD_BYTES {
+                assert_eq!(
+                    output,
+                    format!("{}{}", &markdown[..expected_len], TRUNCATION_MARKER),
+                    "a capped Firecrawl result under the spill threshold stays inline and marked"
+                );
+                assert!(
+                    !workspace.path().join("tmp").exists(),
+                    "a Firecrawl result capped under the spill threshold must not be written"
+                );
+            } else {
+                let written = std::fs::read_to_string(workspace.path().join(saved_path(output)))
+                    .expect("spill file");
+                assert_eq!(
+                    written.replace('\n', ""),
+                    markdown[..expected_len],
+                    "max_response_size={cap} must bound the spilled Firecrawl bytes"
+                );
+                assert_eq!(
+                    output.contains("max_response_size"),
+                    cap != 0,
+                    "the spill message must disclose the cap exactly when it fired, got:\n{output}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
