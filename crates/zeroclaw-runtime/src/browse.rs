@@ -1502,15 +1502,6 @@ mod tests {
         assert!(ws.join("SOUL.md/x").is_dir());
     }
 
-    /// Nothing bounds a path's depth before these checks run, so judging it
-    /// must cost time linear in its length. Each operation here is handed a
-    /// path of a million components, 2 MB and well inside an RPC frame, and
-    /// must return within the bound: one with a protected first component,
-    /// one that stops at a file on the way, a move whose source is missing,
-    /// which is noticed before its destination is judged, and one whose
-    /// destination runs through a file. They take about a
-    /// second together; comparing every leading prefix against the protected
-    /// names takes minutes at this length.
     /// A path past the bound is refused before anything looks at it, so a
     /// megabyte of path costs no more than a short one and makes nothing,
     /// whichever operation it is handed to. Only a path's first component is

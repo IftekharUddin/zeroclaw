@@ -338,7 +338,6 @@ fn warn_otel_content_policy(config: OtelContentConfig) {
     }
 }
 
-/// Factory: create the right observer from config
 /// Content type of the Prometheus text exposition.
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -364,6 +363,7 @@ pub fn prometheus_exposition(config: &ObservabilityConfig) -> String {
     PROMETHEUS_DISABLED_HINT.to_string()
 }
 
+/// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
         primary: create_primary_observer(config),

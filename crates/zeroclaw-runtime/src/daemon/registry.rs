@@ -231,13 +231,14 @@ impl DaemonRegistry {
         self
     }
 
+    /// Register the process's one canvas store, the one the gateway and
+    /// channels draw on, so the RPC context shares it.
     pub fn set_canvas_store(&mut self, canvas_store: crate::tools::CanvasStore) -> &mut Self {
         self.canvas_store = Some(canvas_store);
         self
     }
 
-    /// The registered canvas store, or a fresh one when none was registered
-    /// (an embedder with no gateway or channels to share it with).
+    /// Register the channel operations behind `channels/*`.
     pub fn set_channel_control(
         &mut self,
         control: Arc<dyn crate::rpc::channels::ChannelControl>,
@@ -252,6 +253,8 @@ impl DaemonRegistry {
         self.channel_control.take()
     }
 
+    /// The registered canvas store, or a fresh one when none was registered
+    /// (an embedder with no gateway or channels to share it with).
     pub(crate) fn take_canvas_store(&mut self) -> crate::tools::CanvasStore {
         self.canvas_store.take().unwrap_or_default()
     }
