@@ -53,20 +53,26 @@ pub enum TurnOrigin {
 }
 
 impl TurnOrigin {
-    /// Whether this turn's user-side text is a person's own words.
+    /// Whether this turn arrived on a person-facing calling surface.
     ///
-    /// True only for origins where the "user" half of the turn was typed by a
-    /// human: an interactive operator session or a channel peer message.
-    /// Autonomous origins (cron, heartbeat) put operator-configured task text
-    /// there, and `AgentDirect`/`SubTurn` put whatever the embedding program
-    /// or parent turn composed — none of that is a person speaking for
-    /// themself, even when it quotes one.
+    /// True only for the origins a person can address directly: an
+    /// interactive operator session, or a turn the channel orchestrator
+    /// dispatched for a channel peer. Autonomous origins (cron, heartbeat)
+    /// put operator-configured task text in the "user" half of the turn, and
+    /// `AgentDirect`/`SubTurn` put whatever the embedding program or parent
+    /// turn composed there, so those are never person-facing.
     ///
-    /// Consumers use this as a provenance attestation (e.g. memory
-    /// consolidation only honors the model-emitted `preference` subtype for
-    /// user-authored turns), so the default for any new origin must be `false`
-    /// until someone argues otherwise — which is why this match has no
-    /// wildcard arm.
+    /// The result names the calling surface. It is not proof of who authored
+    /// the content: a channel can relay generated events (Git lifecycle and
+    /// workflow notifications, for example), and an interactive transport
+    /// accepts whatever text its client submits. Both report `true` here, so
+    /// do not treat the result as an attestation of human authorship.
+    ///
+    /// Consumers use it as a fail-closed filter (e.g. memory consolidation
+    /// honors a model-emitted `preference` label on a newly inserted Core
+    /// entry only for these origins), so the answer for any new origin must
+    /// be `false` until someone argues otherwise — which is why this match
+    /// has no wildcard arm.
     #[must_use]
     pub fn user_authored(self) -> bool {
         match self {
@@ -197,8 +203,8 @@ pub enum IngressDecision {
 mod tests {
     use super::*;
 
-    /// The full truth table, pinned per variant. `user_authored` is a
-    /// provenance attestation consumed fail-closed (preference capture,
+    /// The full truth table, pinned per variant. `user_authored` names the
+    /// calling surface and is consumed fail-closed (preference capture,
     /// eventually other origin-gated memory behavior), so every variant's
     /// answer is an explicit decision here, not a wildcard default.
     #[test]
@@ -213,8 +219,8 @@ mod tests {
     }
 
     /// The serde fail-closed default (`SubTurn`) must also be fail-closed
-    /// for provenance: a legacy envelope with no origin never attests
-    /// user authorship.
+    /// here: a legacy envelope with no origin is never treated as a
+    /// person-facing turn.
     #[test]
     fn default_origin_is_not_user_authored() {
         assert!(!TurnOrigin::default().user_authored());
