@@ -10107,8 +10107,9 @@ async fn process_channel_message_body(
                             model_provider.as_ref(),
                             &model,
                             temperature,
-                            // A channel peer's message: the user text is a
-                            // person's own words.
+                            // The orchestrator dispatched this turn for a
+                            // channel peer. The origin names that surface;
+                            // it does not verify who wrote the text.
                             zeroclaw_api::ingress::TurnOrigin::Channel,
                         )
                         .await

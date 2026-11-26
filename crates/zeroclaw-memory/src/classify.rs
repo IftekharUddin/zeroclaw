@@ -7,12 +7,17 @@ use zeroclaw_api::ingress::TurnOrigin;
 /// Classify the long-lived Core write for a consolidation result.
 ///
 /// Provenance clause: the `Preference` subtype asserts "the user themself
-/// expressed this preference," so it is honored only when the turn's text is
-/// a person's own words ([`TurnOrigin::user_authored`]). On an autonomous
-/// turn the model is summarizing its own work — a "preference" it emits
-/// there is inference, not something anyone said — so the update is recorded
-/// as a plain `Fact`: the content survives, the preference authority does
-/// not. Every other subtype is origin-independent.
+/// expressed this preference," so it is honored only when the turn arrived
+/// on a person-facing origin ([`TurnOrigin::user_authored`]). On an
+/// autonomous turn the model is summarizing its own work — a "preference" it
+/// emits there is inference, not something anyone said — so the update is
+/// recorded as a plain `Fact`: the content survives, the preference
+/// authority does not. Every other subtype is origin-independent.
+///
+/// The clause is a filter, not a guarantee. A person-facing origin does not
+/// verify that a person wrote the turn's text, and this function decides
+/// the kind only where the caller asks it to: a consolidation merge into an
+/// entry that already has a kind keeps that kind.
 pub fn kind_of_core(result: &ConsolidationResult, origin: TurnOrigin) -> MemoryKind {
     let subtype = result
         .kind
