@@ -519,8 +519,7 @@ Every call passes five host-owned checks before spawning a turn:
    whose durable `TaskRecord` registration fails transiently is not dropped: it
    returns to the pending slot (unless a newer wake has already replaced it)
    and is retried with capped exponential backoff, re-checking the live grant
-   and target before each attempt. While the process keeps running, an accepted
-   wake therefore runs once or is cancelled by an operator edit. The finished
+   and target before each attempt. The finished
    turn's lifecycle lease is released as soon as the turn returns, before its
    terminal write or any follow-up registration is retried, so an idle target
    stays deletable while the worker waits for the store.
