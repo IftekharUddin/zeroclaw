@@ -156,32 +156,54 @@ impl Snapshot {
     }
 }
 
+/// How long startup may wait on the daemon while pruning the saved list. The
+/// ACP list and every Chat probe share this one budget, so a daemon that
+/// accepts the connection but leaves requests unanswered delays the panes by
+/// one budget, not by one RPC timeout per saved session.
+const PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Prune Code sessions using the ACP list and Chat sessions using stored
 /// history. Chat listing is not an existence check: JSONL sessions lack the
 /// alias/channel metadata required by `session/list`. Keep entries on probe
 /// errors except the daemon's specific missing-or-unowned session refusal.
+///
+/// Every request waits only for what is left of [`PRUNE_BUDGET`]. Once it is
+/// spent, the entry being checked and every entry after it are kept unverified
+/// for the resume path, in saved order and with their focus flags.
 async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize) {
+    let deadline = tokio::time::Instant::now() + PRUNE_BUDGET;
     let wants = |pane| saved.sessions.iter().any(|s| s.pane == pane);
     let code = if wants(SavedPane::Code) {
-        rpc.acp_session_list().await.ok().map(|list| list.sessions)
+        tokio::time::timeout_at(deadline, rpc.acp_session_list())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|list| list.sessions)
     } else {
         None
     };
     let mut dropped = saved.retain_known(code.as_deref());
     let mut kept = Vec::with_capacity(saved.sessions.len());
     for session in saved.sessions {
-        let missing = if session.pane == SavedPane::Chat {
-            match rpc
-                .session_messages_page(&session.session_id, Some(1), None)
-                .await
+        // An expired deadline sends no further probes: `timeout_at` polls its
+        // future once before it reports the timeout.
+        let probe = session.pane == SavedPane::Chat && tokio::time::Instant::now() < deadline;
+        let missing = if probe {
+            match tokio::time::timeout_at(
+                deadline,
+                rpc.session_messages_page(&session.session_id, Some(1), None),
+            )
+            .await
             {
-                Ok(page) => page.total == 0,
-                Err(error) => error.downcast_ref::<JsonRpcError>().is_some_and(|error| {
+                Ok(Ok(page)) => page.total == 0,
+                Ok(Err(error)) => error.downcast_ref::<JsonRpcError>().is_some_and(|error| {
                     error.code == -32012
                         && error
                             .message
                             .contains("Session not found or not owned by this principal")
                 }),
+                // The budget ran out before the daemon answered.
+                Err(_) => false,
             }
         } else {
             false
@@ -942,6 +964,105 @@ mod tests {
         assert!(restored.sessions[1].focused);
         assert!(restored.sessions[2].focused);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_probes_share_one_startup_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = "local:/run/stalled-restore.sock";
+        let saved = Snapshot::from_rows(
+            &[
+                row(PaneKind::Acp, "code-kept", "alpha", true),
+                row(PaneKind::Chat, "chat-gone", "alpha", false),
+                row(PaneKind::Chat, "chat-focused", "alpha", true),
+                row(PaneKind::Chat, "chat-tail-1", "alpha", false),
+                row(PaneKind::Chat, "chat-tail-2", "alpha", false),
+            ],
+            Some(PaneKind::Chat),
+        );
+        owned(dir.path(), target).save_if_changed(&saved).unwrap();
+        let mut window = owned(dir.path(), target);
+        let (out, client, mut rx) = rpc_on(Transport::Local);
+        let started = tokio::time::Instant::now();
+        let startup = tokio::spawn(async move {
+            let outcome = window.start(&client, true).await;
+            (window, outcome)
+        });
+        async fn next_request(rx: &mut tokio::sync::mpsc::Receiver<String>) -> serde_json::Value {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("restore should ask the daemon")
+                .unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        // The ACP list answers late and spends part of the shared budget.
+        let request = next_request(&mut rx).await;
+        assert_eq!(request["method"], crate::client::method::SESSION_LIST_ACP);
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        out.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({ "sessions": [{
+                "session_id": "code-kept", "session_key": "code-kept",
+                "created_at": "", "last_activity": "", "message_count": 2,
+                "agent_alias": "alpha"
+            }]})),
+            None,
+        );
+
+        // One Chat session is confirmed missing.
+        let request = next_request(&mut rx).await;
+        assert_eq!(request["method"], crate::client::method::SESSION_MESSAGES);
+        assert_eq!(request["params"]["session_id"], "chat-gone");
+        out.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({ "messages": [], "total": 0, "start": 0 })),
+            None,
+        );
+
+        // The daemon then stops answering. The next probe gets only what is
+        // left of the budget, and the probes after it are never sent.
+        let request = next_request(&mut rx).await;
+        assert_eq!(request["method"], crate::client::method::SESSION_MESSAGES);
+        assert_eq!(request["params"]["session_id"], "chat-focused");
+        let (mut window, outcome) = startup.await.unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited >= PRUNE_BUDGET,
+            "the stalled probe gets what is left of the budget: {waited:?}"
+        );
+        assert!(
+            waited < PRUNE_BUDGET + std::time::Duration::from_secs(1),
+            "the late list and the stalled probes spend one budget, not a timeout each: {waited:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no probe is sent after the budget is spent"
+        );
+
+        assert_eq!(outcome.dropped, 1, "only the confirmed-missing session");
+        let restored = outcome.snapshot.expect("the restore goes ahead");
+        let rows: Vec<_> = restored
+            .sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.focused))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("code-kept", true),
+                ("chat-focused", true),
+                ("chat-tail-1", false),
+                ("chat-tail-2", false),
+            ],
+            "unverified entries keep their saved order and focus"
+        );
+        assert_eq!(restored.start_pane(), Some(PaneKind::Chat));
+        assert_eq!(
+            window.load().as_ref(),
+            Some(&restored),
+            "the window publishes the list it reopens"
+        );
     }
 
     #[test]
