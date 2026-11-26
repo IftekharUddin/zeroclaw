@@ -848,6 +848,72 @@ mod tests {
     }
 
     #[test]
+    fn sessions_startup_errors_format_in_every_builtin_catalogue() {
+        // The English catalogue is the source; the shipped translations are
+        // filled later and may not define these keys yet. `t_args` falls back
+        // to English then, so every locale must still render the limits and
+        // the config path instead of the raw `{key}` form.
+        const PATH: &str = "/home/user/.zeroclaw/zerocode-config.toml";
+        let english = build_ftl_bundle(EN_FTL, "en");
+
+        // Moving these messages into the catalogue must not reword them.
+        let range = format_ftl_message(
+            &english,
+            "zc-config-sessions-max-tracked-range",
+            &[("min", "1"), ("max", "32")],
+        )
+        .unwrap();
+        assert_eq!(range, "max_tracked_per_pane must be between 1 and 32");
+        assert_eq!(
+            format_ftl_message(&english, "zc-config-sessions-invalid", &[("error", &range)])
+                .unwrap(),
+            "[sessions] is invalid: max_tracked_per_pane must be between 1 and 32"
+        );
+        assert_eq!(
+            format_ftl_message(&english, "zc-config-sessions-malformed", &[("path", PATH)])
+                .unwrap(),
+            format!("[sessions] in {PATH} is malformed")
+        );
+
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundles = FtlBundles {
+                english: build_ftl_bundle(EN_FTL, "en"),
+                disk: Some(build_ftl_bundle(source, locale)),
+            };
+            let range = bundles
+                .format(
+                    "zc-config-sessions-max-tracked-range",
+                    &[("min", "1"), ("max", "32")],
+                )
+                .unwrap_or_else(|| panic!("range message must format for {locale}"));
+            assert!(
+                range.contains('1') && range.contains("32"),
+                "{locale} dropped a limit: {range}"
+            );
+            let invalid = bundles
+                .format("zc-config-sessions-invalid", &[("error", &range)])
+                .unwrap_or_else(|| panic!("invalid-section message must format for {locale}"));
+            assert!(
+                invalid.contains(&range),
+                "{locale} dropped the reason: {invalid}"
+            );
+            let malformed = bundles
+                .format("zc-config-sessions-malformed", &[("path", PATH)])
+                .unwrap_or_else(|| panic!("malformed-section message must format for {locale}"));
+            assert!(
+                malformed.contains(PATH),
+                "{locale} dropped the config path: {malformed}"
+            );
+        }
+    }
+
+    #[test]
     fn doctor_persistence_keys_present_in_all_builtin_catalogues() {
         // The Doctor view surfaces four persistence keys in the detail panel.
         // Every shipped catalogue must define them so the operator-facing

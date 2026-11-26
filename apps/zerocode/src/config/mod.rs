@@ -581,6 +581,7 @@ impl Default for SidebarSection {
 // ── Tracked sessions ────────────────────────────────────────────────────────
 
 pub(crate) const DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
+pub(crate) const MIN_CONFIGURED_TRACKED_SESSIONS_PER_PANE: usize = 1;
 pub(crate) const MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE: usize = 32;
 
 /// The `[sessions]` section: client-side tracked-session capacity.
@@ -602,12 +603,61 @@ impl Default for SessionsSection {
 
 impl SessionsSection {
     pub(crate) fn validate(&self) -> Result<()> {
-        if !(1..=MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE).contains(&self.max_tracked_per_pane) {
-            anyhow::bail!(
-                "max_tracked_per_pane must be between 1 and {MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE}"
-            );
+        if !(MIN_CONFIGURED_TRACKED_SESSIONS_PER_PANE..=MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE)
+            .contains(&self.max_tracked_per_pane)
+        {
+            return Err(SessionsConfigError::MaxTrackedOutOfRange.into());
         }
         Ok(())
+    }
+}
+
+/// A `[sessions]` setting that stops startup.
+///
+/// The text is built when the error is displayed, not when it is created, so
+/// it is in the language startup selected.
+#[derive(Debug)]
+pub(crate) enum SessionsConfigError {
+    /// `max_tracked_per_pane` is outside the accepted range.
+    MaxTrackedOutOfRange,
+    /// The effective section, after environment overrides, failed validation.
+    Invalid(anyhow::Error),
+    /// The section stored in the file at `path` does not parse.
+    Malformed {
+        path: String,
+        source: toml::de::Error,
+    },
+}
+
+impl std::fmt::Display for SessionsConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::MaxTrackedOutOfRange => {
+                let min = MIN_CONFIGURED_TRACKED_SESSIONS_PER_PANE.to_string();
+                let max = MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE.to_string();
+                crate::i18n::t_args(
+                    "zc-config-sessions-max-tracked-range",
+                    &[("min", min.as_str()), ("max", max.as_str())],
+                )
+            }
+            Self::Invalid(error) => crate::i18n::t_args(
+                "zc-config-sessions-invalid",
+                &[("error", error.to_string().as_str())],
+            ),
+            Self::Malformed { path, .. } => {
+                crate::i18n::t_args("zc-config-sessions-malformed", &[("path", path.as_str())])
+            }
+        };
+        formatter.write_str(&message)
+    }
+}
+
+impl std::error::Error for SessionsConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Malformed { source, .. } => Some(source),
+            Self::MaxTrackedOutOfRange | Self::Invalid(_) => None,
+        }
     }
 }
 
@@ -911,13 +961,16 @@ pub(crate) fn resolve_max_tracked_sessions_per_pane_checked(config_dir: &Path) -
             value
                 .clone()
                 .try_into::<SessionsSection>()
-                .with_context(|| format!("[sessions] in {} is malformed", path.display()))?;
+                .map_err(|source| SessionsConfigError::Malformed {
+                    path: path.display().to_string(),
+                    source,
+                })?;
         }
     }
     let config = ensure_and_load(config_dir)?;
     config
         .resolve_max_tracked_sessions_per_pane()
-        .map_err(|error| anyhow::Error::msg(format!("[sessions] is invalid: {error}")))
+        .map_err(|error| SessionsConfigError::Invalid(error).into())
 }
 
 /// Resolve the effective `[todotracker]` settings for a session boundary,
@@ -2783,21 +2836,58 @@ mod tests {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
 
-        for value in [0, MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE + 1] {
+        let range = crate::i18n::t_args(
+            "zc-config-sessions-max-tracked-range",
+            &[("min", "1"), ("max", "32")],
+        );
+        assert_ne!(
+            range, "{zc-config-sessions-max-tracked-range}",
+            "the range key must resolve from the catalogue"
+        );
+        let invalid = crate::i18n::t_args("zc-config-sessions-invalid", &[("error", &range)]);
+        assert_ne!(invalid, "{zc-config-sessions-invalid}");
+
+        for value in [
+            MIN_CONFIGURED_TRACKED_SESSIONS_PER_PANE - 1,
+            MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE + 1,
+        ] {
             seed(
                 dir.path(),
                 &format!("[sessions]\nmax_tracked_per_pane = {value}\n"),
             );
             let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
             assert!(
-                format!("{error:#}").contains("max_tracked_per_pane must be between 1 and 32"),
+                matches!(
+                    error.downcast_ref::<SessionsConfigError>(),
+                    Some(SessionsConfigError::Invalid(_))
+                ),
                 "unexpected error for {value}: {error:#}"
+            );
+            assert_eq!(
+                format!("{error:#}"),
+                invalid,
+                "an out-of-range {value} must render the catalogue messages with both limits"
             );
         }
 
         seed(dir.path(), "[sessions]\nmax_tracked_per_pane = \"many\"\n");
         let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
-        assert!(format!("{error:#}").contains("[sessions]"));
+        assert!(
+            matches!(
+                error.downcast_ref::<SessionsConfigError>(),
+                Some(SessionsConfigError::Malformed { .. })
+            ),
+            "unexpected error: {error:#}"
+        );
+        let path = config_path(dir.path()).display().to_string();
+        let malformed = crate::i18n::t_args("zc-config-sessions-malformed", &[("path", &path)]);
+        assert_ne!(malformed, "{zc-config-sessions-malformed}");
+        assert_eq!(error.to_string(), malformed);
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.starts_with(&format!("{malformed}: ")),
+            "the parser detail must follow the catalogue message, got: {rendered}"
+        );
     }
 
     #[test]
