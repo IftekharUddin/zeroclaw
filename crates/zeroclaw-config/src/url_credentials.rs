@@ -10,8 +10,10 @@
 //! from error text, using [`split`].
 //!
 //! Config reads show each sensitive component as [`MASKED_SECRET`]. A client
-//! that writes such a value back gets the stored component in its place (see
-//! [`restore`]), so editing the host of a masked URL keeps its password.
+//! that writes such a value back to the same endpoint gets the stored
+//! component in its place (see [`restore`]). A write that changes the scheme,
+//! host, port or path has to carry the full URL: a masked component restored
+//! onto another endpoint would send the stored credential there.
 
 use std::fmt;
 
@@ -247,9 +249,11 @@ pub fn carries_mask(value: &str) -> bool {
 ///
 /// `edited` is the value a client wrote. Each of its components that is
 /// exactly [`MASKED_SECRET`] takes the same component of `current`, the
-/// stored value it was masked from; everything else in `edited` stands, so a
-/// client can change the host and keep the stored password. A value without
-/// the placeholder is returned as it is.
+/// stored value it was masked from, when `edited` names the endpoint
+/// `current` does: the same scheme and location, byte for byte. Everything
+/// else in `edited` stands, so a client can replace or drop one credential
+/// component and keep another. A value without the placeholder is returned
+/// as it is.
 ///
 /// # Errors
 ///
@@ -259,6 +263,16 @@ pub fn carries_mask(value: &str) -> bool {
 /// value, userinfo, query or fragment, or stands for a component `current` does not
 /// have: there is then no stored value to restore, and writing the
 /// placeholder would store it as if it were real.
+///
+/// Also when a component is masked and the scheme or location differs from
+/// `current`'s. The stored credential would be written to an endpoint the
+/// client chose and sent there on the next request, which hands it to a
+/// client that may write the URL but was never shown the credential.
+///
+/// Also when a component is masked and reads show `current` masked whole.
+/// No read showed that endpoint, so the placeholder was not read from it,
+/// and the unreadable location can hold the credential itself: comparing it
+/// with what the client wrote would confirm a guess.
 pub fn restore(edited: &str, current: Option<&str>) -> Result<String, UnresolvedMask> {
     if !carries_mask(edited) {
         return Ok(edited.to_string());
@@ -273,19 +287,25 @@ pub fn restore(edited: &str, current: Option<&str>) -> Result<String, Unresolved
     if carries_mask(edited_parts.scheme) || carries_mask(edited_parts.location) {
         return Err(UnresolvedMask::url());
     }
-    let current_parts = current.map(split);
-    let userinfo = restored(
-        edited_parts.userinfo,
-        current_parts.and_then(|parts| parts.userinfo),
-    )?;
-    let query = restored(
-        edited_parts.query,
-        current_parts.and_then(|parts| parts.query),
-    )?;
-    let fragment = restored(
-        edited_parts.fragment,
-        current_parts.and_then(|parts| parts.fragment),
-    )?;
+    // Nothing stored, or a stored URL that reads mask whole: no read showed
+    // a component of it masked, and comparing its location, which reads
+    // withhold, would tell the client whether a guess matched.
+    let current_parts = current
+        .filter(|stored| !stored.is_empty() && mask(stored) != MASKED_SECRET)
+        .map(split)
+        .ok_or_else(UnresolvedMask::url)?;
+    // A masked component is restored only onto the endpoint it was masked
+    // from. A changed scheme or location with a component still masked would
+    // carry the stored credential to another host: the client has to send
+    // the full URL.
+    if current_parts.scheme != edited_parts.scheme
+        || current_parts.location != edited_parts.location
+    {
+        return Err(UnresolvedMask::moved());
+    }
+    let userinfo = restored(edited_parts.userinfo, current_parts.userinfo)?;
+    let query = restored(edited_parts.query, current_parts.query)?;
+    let fragment = restored(edited_parts.fragment, current_parts.fragment)?;
     Ok(edited_parts.join(userinfo, query, fragment))
 }
 
@@ -341,6 +361,19 @@ impl UnresolvedMask {
             message: format!(
                 "the URL carries the masked placeholder `{MASKED_SECRET}` where no stored value \
                  can replace it; send the full URL"
+            ),
+        }
+    }
+
+    /// A URL whose scheme or location differs from the stored one while a
+    /// credential component is still the placeholder.
+    fn moved() -> Self {
+        Self {
+            message: format!(
+                "the URL's scheme, host, port or path differs from the stored URL while a \
+                 credential component is still the masked placeholder `{MASKED_SECRET}`; a \
+                 stored credential is restored only onto the endpoint it was read from, so \
+                 send the full URL"
             ),
         }
     }
@@ -525,14 +558,32 @@ mod tests {
         let stored = "https://user:pw@old.example/v1?key=abc#f";
         // An unchanged echo restores the stored value exactly.
         assert_eq!(restore(&mask(stored), Some(stored)).unwrap(), stored);
-        // A new host keeps the stored password and query.
+        // The same endpoint keeps the stored password and query; the
+        // fragment, left out of the edit, is dropped.
         assert_eq!(
+            restore(
+                "https://***MASKED***@old.example/v1?***MASKED***",
+                Some(stored)
+            )
+            .unwrap(),
+            "https://user:pw@old.example/v1?key=abc"
+        );
+        // One component can be rewritten while another stays masked.
+        assert_eq!(
+            restore(
+                "https://***MASKED***@old.example/v1?key=new#***MASKED***",
+                Some(stored)
+            )
+            .unwrap(),
+            "https://user:pw@old.example/v1?key=new#f"
+        );
+        // A new host does not get the stored password and query.
+        assert!(
             restore(
                 "https://***MASKED***@new.example/v2?***MASKED***",
                 Some(stored)
             )
-            .unwrap(),
-            "https://user:pw@new.example/v2?key=abc"
+            .is_err()
         );
         // A new credential replaces the stored one.
         assert_eq!(
@@ -541,6 +592,109 @@ mod tests {
         );
         // A value without the placeholder is written as it is.
         assert_eq!(restore("https://h/v1", None).unwrap(), "https://h/v1");
+    }
+
+    /// A masked component is restored only onto the endpoint it was masked
+    /// from. A changed host, port, path or scheme, with the userinfo or the
+    /// query still masked, is refused: the stored credential would be sent
+    /// to whatever endpoint the client wrote.
+    #[test]
+    fn restore_refuses_a_masked_component_on_a_changed_endpoint() {
+        let stored = "https://user:pw@host.example:8443/v1?key=abc";
+        for (scheme, location) in [
+            ("https://", "attacker.example:8443/v1"),
+            ("https://", "host.example.attacker.example:8443/v1"),
+            ("https://", "HOST.example:8443/v1"),
+            ("https://", "host.example:9443/v1"),
+            ("https://", "host.example/v1"),
+            ("https://", "host.example:8443/v2"),
+            ("https://", "host.example:8443/v1/"),
+            ("https://", "host.example:8443"),
+            ("http://", "host.example:8443/v1"),
+            ("https:///", "host.example:8443/v1"),
+            ("custom:https://", "host.example:8443/v1"),
+            ("", "host.example:8443/v1"),
+        ] {
+            for (userinfo, query) in [
+                ("***MASKED***@", "?***MASKED***"),
+                ("***MASKED***@", ""),
+                ("***MASKED***@", "?key=other"),
+                ("", "?***MASKED***"),
+                ("other:secret@", "?***MASKED***"),
+            ] {
+                let edited = format!("{scheme}{userinfo}{location}{query}");
+                assert_eq!(
+                    restore(&edited, Some(stored)),
+                    Err(UnresolvedMask::moved()),
+                    "{edited}"
+                );
+            }
+            // The full URL is how a client moves the endpoint.
+            let full = format!("{scheme}other:secret@{location}?key=other");
+            assert_eq!(restore(&full, Some(stored)).unwrap(), full);
+        }
+        // An unchanged echo names the same endpoint in every spelling.
+        for (url, _) in SPELLINGS {
+            assert_eq!(restore(&mask(url), Some(url)).unwrap(), url, "{url}");
+        }
+    }
+
+    /// Writes that try to pass another host off as the stored endpoint. Each
+    /// is refused, or the runtime's URL parser still finds the stored host
+    /// and port in what would be stored.
+    #[test]
+    fn a_restored_credential_stays_on_the_stored_host() {
+        let stored = "https://user:pw@host.example:8443/v1?key=abc";
+        let refused = [
+            "https://attacker.example\\@host.example:8443/v1?***MASKED***",
+            "https://attacker.example/@host.example:8443/v1?***MASKED***",
+            "https://attacker.example#@host.example:8443/v1?***MASKED***",
+            "https://attacker.example?@host.example:8443/v1?***MASKED***",
+            "https://***MASKED***@attacker.example/@host.example:8443/v1",
+            "https://***MASKED***@host.example:8443@attacker.example/v1",
+            "https://***MASKED***@host.example:8443/v1/../../v2",
+            "https://***MASKED***@host.example:8443\\v1",
+            "https://***MASKED***@host.example:8443/v1 ",
+            " https://***MASKED***@host.example:8443/v1",
+            "https:/\t/***MASKED***@host.example:8443/v1",
+            "https://***MASKED***@host.example:\t8443/v1",
+        ];
+        for edited in refused {
+            assert!(restore(edited, Some(stored)).is_err(), "{edited:?}");
+        }
+        let kept = [
+            "https://***MASKED***@host.example:8443/v1?***MASKED***",
+            "https://attacker.example:443@host.example:8443/v1?***MASKED***",
+            "https://attacker.example\t@host.example:8443/v1?***MASKED***",
+            "https://attacker.example%2F@host.example:8443/v1?***MASKED***",
+            "https://***MASKED***@host.example:8443/v1?next=//attacker.example/",
+            "https://***MASKED***@host.example:8443/v1#@attacker.example/",
+        ];
+        for edited in kept {
+            let written = restore(edited, Some(stored)).expect(edited);
+            let parsed = reqwest::Url::parse(&written).expect(edited);
+            assert_eq!(parsed.host_str(), Some("host.example"), "{written:?}");
+            assert_eq!(parsed.port(), Some(8443), "{written:?}");
+            assert_eq!(parsed.path(), "/v1", "{written:?}");
+        }
+    }
+
+    /// A stored URL that reads mask whole never shows its endpoint, and what
+    /// `split` reads as its location can hold the credential. Only the whole
+    /// placeholder restores it. A component placeholder is refused the same
+    /// way whether or not the rest of the write matches the stored bytes, so
+    /// the refusal does not confirm a guess.
+    #[test]
+    fn a_url_masked_whole_is_not_restored_by_component() {
+        let stored = "custom:\thttp://reader:whole-password@example.invalid/v1?token=whole-query";
+        assert_eq!(mask(stored), MASKED_SECRET);
+        let right = "custom:\thttp://reader:whole-password@example.invalid/v1?***MASKED***";
+        let wrong = "custom:\thttp://reader:other-password@example.invalid/v1?***MASKED***";
+        assert_eq!(split(right).location, split(stored).location);
+        assert_ne!(split(wrong).location, split(stored).location);
+        assert_eq!(restore(right, Some(stored)), Err(UnresolvedMask::url()));
+        assert_eq!(restore(wrong, Some(stored)), Err(UnresolvedMask::url()));
+        assert_eq!(restore(MASKED_SECRET, Some(stored)).unwrap(), stored);
     }
 
     #[test]

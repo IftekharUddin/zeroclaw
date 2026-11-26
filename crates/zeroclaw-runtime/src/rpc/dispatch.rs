@@ -13982,8 +13982,9 @@ mod tests {
     }
 
     /// `config/set` writing a provider URI back as `config/get` shows it keeps
-    /// the stored credentials. A placeholder that no stored value can resolve
-    /// is refused as invalid params, the caller's error, and stores nothing.
+    /// the stored credentials. A placeholder that no stored value can resolve,
+    /// or one written with another endpoint, is refused as invalid params,
+    /// the caller's error, and stores nothing.
     #[tokio::test]
     async fn config_set_restores_a_masked_uri_and_refuses_an_unresolvable_one() {
         const PATH: &str = "providers.models.custom.credential_url.uri";
@@ -14026,6 +14027,17 @@ mod tests {
         )
         .await;
         assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert_eq!(uri().as_deref(), Some(stored));
+
+        let moved = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "config/set",
+            json!({"prop": PATH, "value": "http://***MASKED***@other.invalid:9/v1?***MASKED***"}),
+        )
+        .await;
+        assert_eq!(moved["error"]["code"], json!(INVALID_PARAMS), "{moved}");
         assert_eq!(uri().as_deref(), Some(stored));
     }
 

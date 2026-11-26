@@ -3622,7 +3622,8 @@ mod tests {
 
     /// A provider URI written back through the property route as reads show
     /// it keeps the stored credentials. A placeholder that no stored value
-    /// can resolve is refused as `validation_failed` and stores nothing.
+    /// can resolve, or one written with another endpoint, is refused as
+    /// `validation_failed` and stores nothing.
     #[tokio::test]
     async fn prop_put_restores_a_masked_uri_and_refuses_an_unresolvable_one() {
         const PATH: &str = "providers.models.custom.credential_url.uri";
@@ -3667,6 +3668,19 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
         assert_eq!(json["code"], "validation_failed", "{json}");
         assert_eq!(uri().as_deref(), Some(stored));
+
+        // A writer who was never shown the credentials cannot have them
+        // stored on, and then sent to, a host of their choosing.
+        for moved in [
+            "http://***MASKED***@other.invalid:9/v1?***MASKED***",
+            "http://***MASKED***@127.0.0.1:9/v2",
+            "http://127.0.0.1:8/v1?***MASKED***",
+        ] {
+            let (status, json) = response_json(put(moved).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{moved}: {json}");
+            assert_eq!(json["code"], "validation_failed", "{moved}: {json}");
+            assert_eq!(uri().as_deref(), Some(stored), "{moved}");
+        }
     }
 
     #[tokio::test]
@@ -3712,7 +3726,7 @@ mod tests {
                 HeaderMap::new(),
                 axum::Json(serde_json::json!([{
                     "op": "replace", "path": "/providers/models/custom/credential_url/uri",
-                    "value": "https://***MASKED***@example.invalid/v2?***MASKED***"
+                    "value": "https://***MASKED***@example.invalid/v1?***MASKED***"
                 }])),
             )
             .await,

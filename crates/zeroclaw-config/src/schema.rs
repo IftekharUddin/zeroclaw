@@ -42884,19 +42884,25 @@ stream_tool_arguments = [
             .expect("the uri is a listed property");
         assert_eq!(listed.display_value, shown);
 
-        // The masked value written back is the stored URL; a new host keeps
-        // the stored credentials.
+        // The masked value written back is the stored URL.
         config.set_prop(path, shown).unwrap();
         assert_eq!(custom_uri(&config), Some(stored.clone()));
-        config
-            .set_prop(path, "http://***MASKED***@10.0.0.2:9/v1?***MASKED***")
-            .unwrap();
-        assert_eq!(
-            custom_uri(&config).as_deref(),
-            Some(
-                format!("http://review-user:{PASSWORD}@10.0.0.2:9/v1?credential={QUERY}").as_str()
-            )
-        );
+        // A new host does not get the stored credentials: a write that
+        // moves the endpoint with a component still masked is refused.
+        for moved in [
+            "http://***MASKED***@10.0.0.2:9/v1?***MASKED***",
+            "http://***MASKED***@10.0.0.2:9/v1",
+            "http://10.0.0.2:9/v1?***MASKED***",
+        ] {
+            let error = config.set_prop(path, moved).expect_err(moved);
+            assert!(
+                error
+                    .downcast_ref::<crate::url_credentials::UnresolvedMask>()
+                    .is_some(),
+                "{moved}: {error}"
+            );
+            assert_eq!(custom_uri(&config), Some(stored.clone()), "{moved}");
+        }
         // A placeholder with nothing stored behind it is refused, not stored.
         config.set_prop(path, "http://10.0.0.2:9/v1").unwrap();
         assert!(
@@ -43475,6 +43481,18 @@ stream_tool_arguments = [
         // An entry renamed while masked matches no stored registry: refused.
         let renamed = listed.display_value.replace("\"team\"", "\"other\"");
         assert!(config.set_prop(path, &renamed).is_err());
+        assert_eq!(
+            config.skills.extra_registries[0].url,
+            format!("https://{TOKEN}@github.com/org/skills.git")
+        );
+        // So is a registry pointed at another host while its token is
+        // masked: the token is not sent there.
+        let moved = listed.display_value.replace(
+            "@github.com/org/skills.git",
+            "@registry.invalid/org/skills.git",
+        );
+        assert_ne!(moved, listed.display_value);
+        assert!(config.set_prop(path, &moved).is_err());
         assert_eq!(
             config.skills.extra_registries[0].url,
             format!("https://{TOKEN}@github.com/org/skills.git")
