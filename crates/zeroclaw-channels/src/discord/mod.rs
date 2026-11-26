@@ -202,6 +202,34 @@ fn member_roles_from_payload(d: &serde_json::Value) -> Vec<String> {
     parsed
 }
 
+/// The author ID of a message event's `d` object, or `""` when the payload
+/// carries none.
+///
+/// A missing or non-string `author.id` reads as empty instead of being
+/// guessed, and the identity gate refuses an empty sender, so an event that
+/// cannot be attributed never reaches dispatch.
+fn message_author_id(d: &serde_json::Value) -> &str {
+    d.get("author")
+        .and_then(|a| a.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// The invoking user ID of an interaction's `d` object, or `""` when the
+/// payload carries none.
+///
+/// Discord nests the invoker under `member.user` in a guild and under `user`
+/// in a DM. A missing or non-string ID reads as empty instead of being
+/// guessed, and [`interaction_gate`] refuses an empty sender.
+fn interaction_user_id(d: &serde_json::Value) -> &str {
+    d.get("member")
+        .and_then(|m| m.get("user"))
+        .or_else(|| d.get("user"))
+        .and_then(|u| u.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
 #[derive(Clone, Debug, Default)]
 struct DiscordGatewaySession {
     session_id: Option<String>,
@@ -844,7 +872,15 @@ impl DiscordChannel {
     /// can name individuals, grant a role, or both. `member_roles` empty
     /// (a DM, or a payload with no member object) degrades to the user-ID
     /// check, so this is never weaker than the peer allowlist alone.
+    ///
+    /// An empty `user_id` is refused before either grant is consulted. A role
+    /// match says which roles the payload claims, not who sent it, and a `"*"`
+    /// peer entry admits any sender, not an absent one: an event that cannot
+    /// be attributed to a user is not authorized by either list.
     fn is_member_allowed(&self, user_id: &str, member_roles: &[String]) -> bool {
+        if user_id.is_empty() {
+            return false;
+        }
         let peers = (self.peer_resolver)();
         if crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive) {
             return true;
@@ -1555,6 +1591,12 @@ fn interaction_gate(
     channel_id: &str,
     thread_parent: Option<&str>,
 ) -> Result<(), InteractionDenial> {
+    // Same rule as `DiscordChannel::is_member_allowed`: an interaction with no
+    // usable invoker ID cannot be attributed, so neither the peer list nor a
+    // role match may admit it.
+    if user_id.is_empty() {
+        return Err(InteractionDenial::UnauthorizedUser);
+    }
     let by_user =
         crate::allowlist::is_user_allowed(peers, user_id, crate::allowlist::Match::Sensitive);
     if !by_user && !member_role_allowed(allowed_role_ids, member_roles) {
@@ -2500,14 +2542,7 @@ impl Channel for DiscordChannel {
                                 let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let command = d.get("data").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 // user is under `member.user` (guild) or `user` (DM)
-                                let user_id = d
-                                    .get("member")
-                                    .and_then(|m| m.get("user"))
-                                    .or_else(|| d.get("user"))
-                                    .and_then(|u| u.get("id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let user_id = interaction_user_id(d).to_string();
                                 // `/ask` carries a `prompt` option; skill
                                 // commands carry `input`. Extract both —
                                 // routing happens in the spawned task.
@@ -2562,12 +2597,17 @@ impl Channel for DiscordChannel {
                                         // first check so an unauthorized click
                                         // never costs a thread-parent REST call.
                                         // Keep the two in step: a member admitted
-                                        // by role must survive this too.
-                                        if !crate::allowlist::is_user_allowed(
-                                            &peers,
-                                            &user_id,
-                                            crate::allowlist::Match::Sensitive,
-                                        ) && !member_role_allowed(&allowed_role_ids, &member_roles)
+                                        // by role must survive this too, and an
+                                        // empty invoker ID must not.
+                                        if user_id.is_empty()
+                                            || (!crate::allowlist::is_user_allowed(
+                                                &peers,
+                                                &user_id,
+                                                crate::allowlist::Match::Sensitive,
+                                            ) && !member_role_allowed(
+                                                &allowed_role_ids,
+                                                &member_roles,
+                                            ))
                                         {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized slash command interaction");
                                             let msg = i18n::get_required_cli_string(
@@ -2711,14 +2751,7 @@ impl Channel for DiscordChannel {
                                 } else {
                                     Vec::new()
                                 };
-                                let user_id = d
-                                    .get("member")
-                                    .and_then(|m| m.get("user"))
-                                    .or_else(|| d.get("user"))
-                                    .and_then(|u| u.get("id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let user_id = interaction_user_id(d).to_string();
                                 let interaction_guild = d
                                     .get("guild_id")
                                     .and_then(serde_json::Value::as_str)
@@ -2755,12 +2788,17 @@ impl Channel for DiscordChannel {
                                         // first check so an unauthorized click
                                         // never costs a thread-parent REST call.
                                         // Keep the two in step: a member admitted
-                                        // by role must survive this too.
-                                        if !crate::allowlist::is_user_allowed(
-                                            &peers,
-                                            &user_id,
-                                            crate::allowlist::Match::Sensitive,
-                                        ) && !member_role_allowed(&allowed_role_ids, &member_roles)
+                                        // by role must survive this too, and an
+                                        // empty invoker ID must not.
+                                        if user_id.is_empty()
+                                            || (!crate::allowlist::is_user_allowed(
+                                                &peers,
+                                                &user_id,
+                                                crate::allowlist::Match::Sensitive,
+                                            ) && !member_role_allowed(
+                                                &allowed_role_ids,
+                                                &member_roles,
+                                            ))
                                         {
                                             // Shared-token deployments: every
                                             // alias receives every click, and
@@ -3126,14 +3164,7 @@ impl Channel for DiscordChannel {
                             } else if itype == 4 {
                                 let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let user_id = d
-                                    .get("member")
-                                    .and_then(|m| m.get("user"))
-                                    .or_else(|| d.get("user"))
-                                    .and_then(|u| u.get("id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let user_id = interaction_user_id(d).to_string();
                                 let interaction_guild = d
                                     .get("guild_id")
                                     .and_then(serde_json::Value::as_str)
@@ -3273,7 +3304,7 @@ impl Channel for DiscordChannel {
                     }
 
                     // Skip messages from the bot itself
-                    let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
+                    let author_id = message_author_id(d);
                     if author_id == bot_user_id {
                         continue;
                     }
@@ -4596,6 +4627,260 @@ mod tests {
             !ch.is_member_allowed("u-maintainer", &member_roles_from_payload(&dm)),
             "a DM has no roles and must fall back to the peer allowlist"
         );
+    }
+
+    /// Every way a payload can fail to name its sender while still being valid
+    /// JSON: the field is absent, null, the wrong type, or blank.
+    fn unusable_ids() -> Vec<(&'static str, Option<serde_json::Value>)> {
+        vec![
+            ("absent", None),
+            ("null", Some(serde_json::Value::Null)),
+            ("numeric", Some(serde_json::json!(1234))),
+            ("blank", Some(serde_json::json!(""))),
+        ]
+    }
+
+    /// Overwrite (or, for `None`, delete) the `id` of the object at `pointer`.
+    fn with_id(
+        payload: &serde_json::Value,
+        pointer: &str,
+        id: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut payload = payload.clone();
+        let holder = payload
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("fixture names the object that holds the id");
+        match id {
+            Some(id) => holder.insert("id".to_string(), id.clone()),
+            None => holder.remove("id"),
+        };
+        payload
+    }
+
+    fn role_channel(peers: &'static [&'static str]) -> DiscordChannel {
+        DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(move || s(peers)),
+            false,
+            true,
+        )
+        .with_allowed_role_ids(s(&["role-maintainer"]))
+    }
+
+    /// A `MESSAGE_CREATE` that carries an authorized role but no usable
+    /// `author.id` is refused at the identity gate, the first thing the listen
+    /// loop does with a sender, so nothing is archived or dispatched for it.
+    /// The same payload with a real ID is still admitted by role.
+    #[test]
+    fn message_create_without_a_sender_id_is_never_admitted() {
+        // Shape of a guild MESSAGE_CREATE `d` object.
+        let message = serde_json::json!({
+            "id": "m1",
+            "type": 0,
+            "guild_id": "g1",
+            "channel_id": "c1",
+            "content": "ship it",
+            "author": { "id": "u-maintainer", "username": "maintainer" },
+            "member": { "roles": ["role-other", "role-maintainer"] }
+        });
+        let admits = |ch: &DiscordChannel, d: &serde_json::Value| {
+            ch.is_member_allowed(message_author_id(d), &member_roles_from_payload(d))
+        };
+
+        // Empty peer list: a pass can only have come through the role grant.
+        let by_role = role_channel(&[]);
+        // `"*"` peers: the pre-existing way an empty sender could get through.
+        let by_wildcard = role_channel(&["*"]);
+
+        for ch in [&by_role, &by_wildcard] {
+            assert_eq!(message_author_id(&message), "u-maintainer");
+            assert!(
+                admits(ch, &message),
+                "a role holder with a real sender ID must still be admitted"
+            );
+            for (label, id) in unusable_ids() {
+                let malformed = with_id(&message, "/author", id.as_ref());
+                assert_eq!(message_author_id(&malformed), "", "{label} author.id");
+                assert!(
+                    !admits(ch, &malformed),
+                    "{label} author.id must not be admitted by role or wildcard"
+                );
+            }
+            // No author object at all, or one that is not an object.
+            let mut authorless = message.clone();
+            authorless["author"] = serde_json::json!("u-maintainer");
+            assert!(!admits(ch, &authorless), "a non-object author is unusable");
+            authorless
+                .as_object_mut()
+                .expect("fixture is an object")
+                .remove("author");
+            assert!(!admits(ch, &authorless), "a missing author is unusable");
+        }
+    }
+
+    /// The interaction counterpart: an `INTERACTION_CREATE` whose member holds
+    /// an authorized role but whose invoker ID is unusable is denied by
+    /// `interaction_gate`, which every interaction arm consults before it
+    /// defers, takes a pending component, or answers with choices.
+    #[test]
+    fn interaction_without_an_invoker_id_is_never_admitted() {
+        // Shape of a guild INTERACTION_CREATE `d` object.
+        let interaction = serde_json::json!({
+            "id": "interaction-1",
+            "token": "interaction-token",
+            "application_id": "app-1",
+            "type": 2,
+            "guild_id": "g1",
+            "channel_id": "c1",
+            "data": { "name": "lookup" },
+            "member": {
+                "user": { "id": "u-maintainer", "username": "maintainer" },
+                "roles": ["role-other", "role-maintainer"]
+            }
+        });
+        let allowed_roles = s(&["role-maintainer"]);
+        // Reads the payload the way the listen loop does, then asks the gate.
+        let gate = |peers: &[String], d: &serde_json::Value| {
+            interaction_gate(
+                peers,
+                &allowed_roles,
+                &s(&["g1"]),
+                &s(&["c1"]),
+                interaction_user_id(d),
+                &member_roles_from_payload(d),
+                d.get("guild_id").and_then(serde_json::Value::as_str),
+                d.get("channel_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                None,
+            )
+        };
+
+        for peers in [s(&[]), s(&["*"])] {
+            assert_eq!(interaction_user_id(&interaction), "u-maintainer");
+            assert_eq!(
+                gate(&peers, &interaction),
+                Ok(()),
+                "a role holder with a real invoker ID must still be admitted"
+            );
+            for (label, id) in unusable_ids() {
+                let malformed = with_id(&interaction, "/member/user", id.as_ref());
+                assert_eq!(interaction_user_id(&malformed), "", "{label} user.id");
+                assert_eq!(
+                    gate(&peers, &malformed),
+                    Err(InteractionDenial::UnauthorizedUser),
+                    "{label} member.user.id must not be admitted by role or wildcard"
+                );
+            }
+            // The member object keeps its roles but names no user at all.
+            let mut userless = interaction.clone();
+            userless["member"]
+                .as_object_mut()
+                .expect("fixture member is an object")
+                .remove("user");
+            assert_eq!(
+                gate(&peers, &userless),
+                Err(InteractionDenial::UnauthorizedUser),
+                "a member without a user object is unusable"
+            );
+        }
+
+        // A DM interaction names its invoker under `user`. The wildcard is the
+        // only grant available there, and it needs a real ID as well.
+        let dm = serde_json::json!({
+            "id": "interaction-2",
+            "token": "interaction-token",
+            "application_id": "app-1",
+            "type": 2,
+            "channel_id": "c1",
+            "data": { "name": "lookup" },
+            "user": { "id": "u-maintainer" }
+        });
+        assert_eq!(gate(&s(&["*"]), &dm), Ok(()));
+        for (label, id) in unusable_ids() {
+            assert_eq!(
+                gate(&s(&["*"]), &with_id(&dm, "/user", id.as_ref())),
+                Err(InteractionDenial::UnauthorizedUser),
+                "{label} user.id must not be admitted by the wildcard"
+            );
+        }
+    }
+
+    /// The two tests above prove the decision for an extracted ID. This pins
+    /// that the listen loop reads its sender through those same extractors and
+    /// gates on it before any work is dispatched, so the decision they prove is
+    /// the one production takes.
+    #[test]
+    fn listen_loop_gates_on_the_extracted_sender_before_dispatch() {
+        let src = include_str!("mod.rs");
+        let listen = src
+            .find("async fn listen(&self, tx:")
+            .expect("listen loop present");
+        let end = src[listen..]
+            .find("async fn health_check(")
+            .map(|i| listen + i)
+            .expect("listen loop end boundary present");
+        let body = &src[listen..end];
+
+        // MESSAGE_CREATE: extract, gate, and only then archive or enqueue.
+        let extract = body
+            .find("let author_id = message_author_id(d);")
+            .expect("MESSAGE_CREATE reads its author through the extractor");
+        let gated = body[extract..]
+            .find("if !self.is_member_allowed(author_id, &member_roles_from_payload(d)) {")
+            .map(|i| extract + i)
+            .expect("MESSAGE_CREATE gates on the extracted author");
+        for dispatch in [
+            "if let Some(ref archive_mem) = archive_memory {",
+            "tx.send(",
+        ] {
+            let at = body[extract..]
+                .find(dispatch)
+                .map(|i| extract + i)
+                .expect("MESSAGE_CREATE dispatch site present");
+            assert!(
+                gated < at,
+                "identity gate must precede `{dispatch}` on the message path"
+            );
+        }
+
+        // INTERACTION_CREATE: every arm reads its invoker through the
+        // extractor and hands that value to the gate.
+        let arm2 = body.find("if itype == 2 {").expect("type-2 arm present");
+        let arm35 = body
+            .find("} else if itype == 3 || itype == 5 {")
+            .expect("type-3/5 arm present");
+        let arm4 = body
+            .find("} else if itype == 4 {")
+            .expect("type-4 arm present");
+        let arms_end = body
+            .find("// MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK")
+            .expect("interaction arms end boundary present");
+        for (label, arm) in [
+            ("type-2", &body[arm2..arm35]),
+            ("type-3/5", &body[arm35..arm4]),
+            ("type-4", &body[arm4..arms_end]),
+        ] {
+            let extract = arm
+                .find("let user_id = interaction_user_id(d).to_string();")
+                .unwrap_or_else(|| panic!("{label} arm reads its invoker through the extractor"));
+            let gate = arm
+                .find("interaction_gate(")
+                .unwrap_or_else(|| panic!("{label} arm gates"));
+            assert!(extract < gate, "{label}: extraction precedes the gate");
+            // The gate call's arguments, up to its first `Option` argument.
+            let call = &arm[gate..];
+            let call = &call[..call
+                .find(".as_deref()")
+                .unwrap_or_else(|| panic!("{label} gate call passes the guild"))];
+            assert!(
+                call.contains("&user_id,"),
+                "{label}: the extracted invoker is what the gate judges"
+            );
+        }
     }
 
     #[test]
