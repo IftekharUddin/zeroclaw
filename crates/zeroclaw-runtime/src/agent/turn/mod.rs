@@ -921,14 +921,20 @@ fn safe_endpoint_identifier(url: &str) -> String {
     }
 }
 
+/// A URL-shaped token runs to the next whitespace. It must not end at
+/// punctuation such as `(`, `)`, `'`, `"`, `<`, `>` or `]`: those characters
+/// are legal inside userinfo and query values, so ending the token there would
+/// hand the rest of a credential back to the surrounding text unredacted.
 static URL_TOKEN_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r#"(?i)\b[a-z][a-z0-9+.\-]*://[^\s"'<>()\]]+"#)
+    regex::Regex::new(r"(?i)\b[a-z][a-z0-9+.\-]*://\S+")
         .expect("static URL token regex must compile")
 });
 
 /// Redact text that may echo a bare `custom:<url>` endpoint, such as an HTTP
 /// error. Every URL-shaped token is replaced by its safe identifier, then the
-/// general credential scrubber runs over what remains.
+/// general credential scrubber runs over what remains. Punctuation that
+/// follows a URL without whitespace is treated as part of that URL, so it is
+/// kept only where it lands in the path and dropped with the query otherwise.
 fn redact_endpoint_text(text: &str) -> String {
     let replaced = URL_TOKEN_REGEX.replace_all(text, |caps: &regex::Captures<'_>| {
         safe_endpoint_identifier(&caps[0])
@@ -6107,6 +6113,96 @@ native_tools = true
                 "{junk}"
             );
         }
+    }
+
+    #[test]
+    fn echoed_endpoint_credentials_are_redacted_through_delimiter_characters() {
+        // Each credential carries one character that is legal in a URL but
+        // reads as closing punctuation in prose. The part after it must not
+        // survive in the logged error text.
+        // (echoed URL, secrets that must not appear, expected safe identifier)
+        let cases: [(&str, &[&str], &str); 9] = [
+            (
+                "https://gw.example.com/v1?api_key=abc(defghijklmnop",
+                &["defghijklmnop", "api_key"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "https://gw.example.com/v1?api_key=abc)defghijklmnop",
+                &["defghijklmnop", "api_key"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "https://gw.example.com/v1?api_key=abc'defghijklmnop",
+                &["defghijklmnop", "api_key"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "https://gw.example.com/v1?api_key=abc\"defghijklmnop",
+                &["defghijklmnop", "api_key"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "https://gw.example.com/v1?api_key=abc<defghijklmnop",
+                &["defghijklmnop", "api_key"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "https://gw.example.com/v1?api_key=abc>defghijklmnop",
+                &["defghijklmnop", "api_key"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "https://gw.example.com/v1?api_key=abc]defghijklmnop",
+                &["defghijklmnop", "api_key"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "https://svc:demo)part2@gw.example.com/v1",
+                &["svc", "demo", "part2"],
+                "https://gw.example.com/v1",
+            ),
+            (
+                "http://[::1]:8080/v1?sig=abc%2Fdefghijklmnop",
+                &["abc%2Fdefghijklmnop", "defghijklmnop", "sig="],
+                "http://[::1]:8080/v1",
+            ),
+        ];
+        for (url, secrets, safe) in cases {
+            for echoed_error in [
+                format!("error sending request for url ({url}): connection refused"),
+                format!("upstream rejected '{url}' with status 400"),
+                format!(
+                    "{{\"error\":{{\"message\":\"unsupported parameter: tools\",\"url\":\"{url}\"}}}}"
+                ),
+                format!("redirected to <{url}>"),
+                format!("endpoint {url}"),
+            ] {
+                let rendered = redact_endpoint_text(&echoed_error);
+                for secret in secrets {
+                    assert!(
+                        !rendered.contains(secret),
+                        "{secret} leaked from {echoed_error}: {rendered}"
+                    );
+                }
+                assert!(
+                    rendered.contains(safe),
+                    "{safe} missing from {echoed_error}: {rendered}"
+                );
+            }
+        }
+        // Text without a URL, and a credential-free URL followed by prose
+        // punctuation, keep their wording.
+        assert_eq!(
+            redact_endpoint_text("unsupported parameter: tools"),
+            "unsupported parameter: tools"
+        );
+        assert_eq!(
+            redact_endpoint_text(
+                "error sending request for url (http://127.0.0.1:8080/v1/chat/completions): connection refused"
+            ),
+            "error sending request for url (http://127.0.0.1:8080/v1/chat/completions): connection refused"
+        );
     }
 
     #[test]
