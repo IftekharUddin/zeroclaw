@@ -136,7 +136,7 @@ docker exec -it zeroclaw zeroclaw gateway get-paircode --new
 
 - **Base:** `gcr.io/distroless/cc-debian13:nonroot`
 - **Startup:** the default command runs `zeroclaw daemon`, which serves the gateway on port 42617.
-- **Storage:** mount `/zeroclaw-data` to persist the config under `.zeroclaw/`, per-agent workspaces under `.zeroclaw/agents/<alias>/workspace/`, and instance databases under `data/`.
+- **Storage:** mount `/zeroclaw-data` to persist the config under `.zeroclaw/`, per-agent workspaces under `.zeroclaw/agents/<alias>/workspace/`, and instance databases under `.zeroclaw/data/`.
 - **Pairing:** the v0.9.0 release image uses the schema default of `true` on a fresh volume. An existing config or environment override can change it.
 - **Web dashboard:** bundled and served by default in the published image. The image sets `gateway.web_dist_dir = "/usr/share/zeroclawlabs/web/dist"` and includes the built frontend there, so the gateway serves the SPA fallback out-of-the-box. The assets live **outside** the `/zeroclaw-data` mount point so a `-v …:/zeroclaw-data` volume mount cannot shadow them (ref #6400).
 
