@@ -194,6 +194,13 @@ limit still runs:
   alternative), but no model substitution exists yet. It refuses the
   request as `block` does and logs that it fell back to `block`.
 
+> **Upgrade note.** A `config.toml` first written before schema V3 may
+> already contain `mode = "warn"` under `[cost.enforcement]`. The build
+> that wrote the file saved it there; the operator may never have chosen
+> it. Earlier releases ignored the line and stopped at the limit. It now
+> lets calls through past the shared limits. To keep the stop, delete the
+> line or set `mode = "block"`.
+
 `allow_override = true` lets a request bypass `block` by passing an
 override token on the CLI (`zeroclaw --override`). Defaults to
 `false`. `warn_at_percent` controls when the gateway surfaces a
