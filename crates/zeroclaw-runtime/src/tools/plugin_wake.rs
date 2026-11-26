@@ -352,6 +352,41 @@ impl RuntimeAgentWakeBackend {
             rate_limit,
         })
     }
+
+    /// The lifecycle generation a wake coalescing onto a running slot is
+    /// pinned to, confirmed against the config that generation belongs to.
+    ///
+    /// The grant was resolved from an earlier config read. A deletion that
+    /// commits between that read and the generation read would otherwise pin
+    /// the *advanced* generation while the alias is absent, and a replacement
+    /// published before the drain would match that pin and receive the old
+    /// prompt. A destructive mutation publishes its config before it advances
+    /// the generation, so the order here closes that window: read the
+    /// generation first, then judge the grant and the enabled target on a
+    /// config read made after it, from the authority that owns the
+    /// generation. A generation that already reflects a deletion is then
+    /// followed by a read that no longer shows the deleted target, and the
+    /// wake is refused; a deletion that commits later leaves an older pin,
+    /// which the follow-up's admission rejects as stale.
+    ///
+    /// `Ok(None)` when there is no execution capability, and so no lifecycle
+    /// to pin.
+    fn pin_coalesced_target(
+        &self,
+        instance_key: &str,
+        canonical: &str,
+    ) -> Result<Option<u64>, AgentWakeError> {
+        let Some(capability) = self.execution_capability.as_ref() else {
+            return Ok(None);
+        };
+        let generation = capability.agent_lifecycle_generation(canonical);
+        admitted_wake_target_permitted(
+            &capability.config_handle().read(),
+            instance_key,
+            canonical,
+        )?;
+        Ok(Some(generation))
+    }
 }
 
 /// Judge `instance_key`'s grant for `target_agent` against one config view.
@@ -470,10 +505,18 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         // fail and release the slot, so a wake meeting it waits and retries.
         let slot_key = loop {
             let slot_key = (instance_key.clone(), grant.canonical.clone());
+            // Read before the slot lock and used only if this wake coalesces:
+            // an idle wake takes a real admission instead, which selects its
+            // generation and config together under a lease.
+            let coalesced_target = self.pin_coalesced_target(&instance_key, &grant.canonical);
             let mut claimant_settled = {
                 let mut slots = self.coordinator.slots.lock();
                 match slots.get_mut(&slot_key) {
                     Some(WakeSlotState::Running { pending: existing }) => {
+                        // Refused before a token is spent or a pending wake is
+                        // replaced: a target deleted between the grant read and
+                        // the generation read is not accepted.
+                        let target_generation = coalesced_target?;
                         if existing.is_none()
                             && !self
                                 .coordinator
@@ -486,10 +529,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         // by. A later delete advances it, so the retry cannot
                         // reach a replacement that reuses the alias.
                         if let Some(wake) = pending.as_mut() {
-                            wake.target_generation =
-                                self.execution_capability.as_ref().map(|capability| {
-                                    capability.agent_lifecycle_generation(&grant.canonical)
-                                });
+                            wake.target_generation = target_generation;
                         }
                         *existing = pending.take();
                         ::zeroclaw_log::record!(
@@ -3303,6 +3343,128 @@ mod tests {
             *request_count.lock(),
             1,
             "the stale wake must never reach the replacement"
+        );
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].principal_id.as_deref(), Some("sender-1"));
+
+        // A wake issued against the replacement runs on it.
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-3"), "recipient", "fresh")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("a fresh wake reaches the replacement");
+        provider_release.notify_one();
+        await_slots_released(&coordinator).await;
+
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        let principals: Vec<_> = tasks
+            .iter()
+            .map(|task| task.principal_id.as_deref())
+            .collect();
+        assert_eq!(tasks.len(), 2, "{principals:?}");
+        assert!(principals.contains(&Some("sender-1")));
+        assert!(principals.contains(&Some("sender-3")));
+        for task in &tasks {
+            let snapshot = await_terminal(store.as_ref(), &task.id).await;
+            assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        }
+        assert_eq!(*request_count.lock(), 2);
+        server.abort();
+    }
+
+    /// A coalescing wake reads its grant from config and its generation from
+    /// the lifecycle coordinator. A deletion that commits between the two must
+    /// not leave the wake pinned to the advanced generation: a replacement
+    /// later published under the alias would match that pin and receive the
+    /// old prompt.
+    ///
+    /// The slot is held through settlement backoff, when the finished turn
+    /// has released its lease and the target is deletable. The two reads are
+    /// adjacent and synchronous in production, so the test gives the backend
+    /// a pre-deletion view while the authority has already committed the
+    /// deletion: exactly what the wake observes when the commit lands between
+    /// them.
+    #[tokio::test]
+    async fn delete_between_grant_and_generation_reads_refuses_the_coalescing_wake() {
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let provider_release = Arc::new(tokio::sync::Notify::new());
+        let (server, mock_addr, request_count) =
+            gated_mock_provider(&provider_entered, &provider_release).await;
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let config = mock_provider_config(workspace.path(), mock_addr);
+        let earlier_view = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let lifecycle = authority.agent_lifecycle();
+
+        let settle_failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settle_failed = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) =
+            failing_settlement_control_plane(workspace.path(), &settle_failing, &settle_failed);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config.clone()),
+            Some(earlier_view.handle()),
+            Some(authority.execution_capability()),
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+
+        // The store goes down before the finished turn settles, so the worker
+        // keeps the slot while holding no lease on the target.
+        settle_failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        provider_release.notify_one();
+        for attempt in 1..=2 {
+            tokio::time::timeout(Duration::from_secs(10), settle_failed.notified())
+                .await
+                .unwrap_or_else(|_| panic!("terminal write attempt {attempt} must fail"));
+        }
+        assert_eq!(lifecycle.active_turn_count("recipient"), 0);
+
+        // The deletion commits. The backend's grant view predates it.
+        let mut delete = lifecycle
+            .begin_delete("recipient")
+            .expect("an idle agent can be deleted during settlement backoff");
+        let mut removed = authority.snapshot_config();
+        removed.agents.remove("recipient");
+        authority.publish_for_test(removed);
+        delete.commit_destructive_mutation();
+        drop(delete);
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "stale")
+                .await,
+            Err(AgentWakeError::UnknownAgent),
+            "a wake whose target was deleted between its reads must not be accepted"
+        );
+
+        // A replacement takes the alias before the worker drains.
+        authority.publish_for_test(config.clone());
+
+        // The store recovers and the worker releases the slot with nothing
+        // queued for the replacement.
+        settle_failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        await_slots_released(&coordinator).await;
+        assert_eq!(
+            *request_count.lock(),
+            1,
+            "the refused wake must never reach the replacement"
         );
         let tasks = tasks_for(store.as_ref(), "recipient").await;
         assert_eq!(tasks.len(), 1, "{tasks:?}");

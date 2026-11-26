@@ -508,7 +508,10 @@ Every call passes five host-owned checks before spawning a turn:
    is admitted at the target's lifecycle generation from when the wake was
    accepted, then the live grant and the target's enabled flag are re-checked
    on the config it was admitted with; an idle wake applies the same check to
-   its admitted config before registering a task. A follow-up the operator no
+   its admitted config before registering a task. A coalescing wake reads that
+   generation first and then confirms the grant and target on a later config
+   read, so a target deleted while the wake is being accepted returns
+   `unknown-agent` rather than pinning a later replacement. A follow-up the operator no
    longer permits (target revoked, disabled, removed, or deleted and replaced
    under the same alias, or re-admission refused) is cancelled and the next
    pending wake is drained, rather than releasing the pair with accepted wakes
