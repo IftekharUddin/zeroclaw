@@ -11077,11 +11077,17 @@ impl RpcDispatcher {
     /// connection before this result does, so a client listens for
     /// notifications before it subscribes. A lag is reported with
     /// `subscription/lagged` and is not replayed: run summaries are state,
-    /// and subscribing again gives a fresh snapshot. Every delivery is held
-    /// to the connection's authority: a live credential and, whenever the
-    /// accepted policy moves, the `Sops:Read` grant again. Any holder of that
-    /// grant sees every run, as with `sops/runs`.
+    /// and subscribing again gives a fresh snapshot.
+    ///
+    /// A run summary names no owning principal, so the feed cannot be
+    /// filtered per principal. Like the log and event streams it is limited
+    /// to administrators and the shared operator
+    /// ([`Self::require_global_stream_access`]): `Sops:Read` alone does not
+    /// open it. Every delivery is held to the connection's authority: a live
+    /// credential and, whenever the accepted policy moves, the `Sops:Read`
+    /// grant and that audience again.
     fn handle_sops_subscribe_runs(&self, params: &Value) -> RpcResult {
+        self.require_global_stream_access(Method::SopsSubscribeRuns)?;
         let req: SopRunsRequest = if params.is_null() {
             SopRunsRequest::default()
         } else {
@@ -12006,15 +12012,15 @@ async fn deliver_sop_run_changes(delivery: SopRunsDelivery) {
             let Ok(json) = serde_json::to_string(&notification) else {
                 break 'deliver;
             };
-            let granted = |lease: &crate::rpc::auth::AuthorityLease<'_>| {
-                still_granted_under(
+            let authorized = |lease: &crate::rpc::auth::AuthorityLease<'_>| {
+                still_authorized_under(
                     lease,
                     binding.as_ref(),
                     Method::SopsSubscribeRuns,
                     &mut checked_generation,
                 )
             };
-            if !deliver_frame(&rpc, &cancel, &inbound, granted, json).await {
+            if !deliver_frame(&rpc, &cancel, &inbound, authorized, json).await {
                 break 'deliver;
             }
         }
@@ -12077,6 +12083,9 @@ async fn deliver_frame(
 /// an administrator, or the unauthenticated shared operator. Reaching every
 /// agent (the `*` agent selector) is not enough; it addresses every agent
 /// but owns only its own sessions.
+///
+/// The SOP run feed (`sops/subscribe-runs`) is held to the same rule: a run
+/// summary names no owner either.
 fn sees_every_principal(
     auth: &crate::rpc::auth::ConnectionAuth,
     grants: &zeroclaw_api::grants::ResolvedGrants,
@@ -12099,56 +12108,25 @@ fn still_authorized_under(
     method: Method,
     checked_generation: &mut Option<u64>,
 ) -> bool {
-    recheck_delivery_under(
-        lease,
-        binding,
-        method,
-        checked_generation,
-        |auth, grants| {
-            if sees_every_principal(auth, grants) {
+    let Some(auth) = binding else {
+        return true;
+    };
+    let generation = lease.generation();
+    // A moved policy generation re-resolves the principal: it must still
+    // hold `method`'s grant and still see every principal, so narrowing or
+    // demoting a principal ends its stream.
+    let authority = if *checked_generation == Some(generation) {
+        lease.credential_is_live(auth)
+    } else {
+        current_authority_under(lease, auth, method).and_then(|grants| {
+            if sees_every_principal(auth, &grants) {
                 Ok(())
             } else {
                 Err(crate::rpc::auth::AuthDenied::forbidden(
                     GLOBAL_STREAM_SCOPED_DENIAL,
                 ))
             }
-        },
-    )
-}
-
-/// [`still_authorized_under`] for a stream every holder of `method`'s grant
-/// may read (`sops/subscribe-runs`): a moved policy generation only requires
-/// the principal to still hold that grant.
-fn still_granted_under(
-    lease: &crate::rpc::auth::AuthorityLease<'_>,
-    binding: Option<&crate::rpc::auth::ConnectionAuth>,
-    method: Method,
-    checked_generation: &mut Option<u64>,
-) -> bool {
-    recheck_delivery_under(lease, binding, method, checked_generation, |_, _| Ok(()))
-}
-
-/// The shared body of [`still_authorized_under`] and [`still_granted_under`]:
-/// a live credential on every delivery and, when the held policy generation
-/// has moved, `method`'s grant and then `audience` on the re-resolved grants.
-fn recheck_delivery_under(
-    lease: &crate::rpc::auth::AuthorityLease<'_>,
-    binding: Option<&crate::rpc::auth::ConnectionAuth>,
-    method: Method,
-    checked_generation: &mut Option<u64>,
-    audience: impl FnOnce(
-        &crate::rpc::auth::ConnectionAuth,
-        &zeroclaw_api::grants::ResolvedGrants,
-    ) -> Result<(), crate::rpc::auth::AuthDenied>,
-) -> bool {
-    let Some(auth) = binding else {
-        return true;
-    };
-    let generation = lease.generation();
-    let authority = if *checked_generation == Some(generation) {
-        lease.credential_is_live(auth)
-    } else {
-        current_authority_under(lease, auth, method).and_then(|grants| audience(auth, &grants))
+        })
     };
     if let Err(denied) = authority {
         audit_denial(Some(auth), method, &denied);
@@ -23650,12 +23628,188 @@ mod tests {
         assert!(unknown["error"].get("data").is_none(), "{unknown}");
     }
 
-    /// `Sops:Read` alone opens the feed and shows every run, as `sops/runs`
-    /// does; losing it ends the feed at the next delivery.
+    /// Make the fixture `reader` an administrator with `Sops:Read`: the run
+    /// feed is limited to administrators and the shared operator, and the
+    /// roster peer is an authenticated principal.
+    fn grant_global_run_reads(config: &mut zeroclaw_config::schema::Config) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.insert(Resource::Sops, vec![Verb::Read]);
+        reader.admin = true;
+    }
+
+    /// Withdraw the reader profile's `Sops:Read` and administrator role. An
+    /// administrator holds every grant, so removing `Sops:Read` alone would
+    /// change nothing.
+    fn withdraw_global_run_reads(config: &mut zeroclaw_config::schema::Config) {
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.remove(&zeroclaw_api::grants::Resource::Sops);
+        reader.admin = false;
+    }
+
+    /// A run summary names no owning principal, so a scoped principal is
+    /// refused the feed even with `Sops:Read`, whichever agents it may
+    /// address. The refusal is the global streams' and discloses no run. An
+    /// administrator and the shared operator open it.
+    #[tokio::test]
+    async fn sops_subscribe_runs_refuses_a_scoped_principal_holding_sops_read() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        for agents in [vec![], vec!["alpha".to_string()], vec!["*".to_string()]] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (engine, changes, sop_config) = sop_runs_engine(&tmp, 16);
+            let mut config = roster_config(4242);
+            config.sop = sop_config;
+            configure_agent_alpha(&mut config);
+            let reader = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the fixture profile exists");
+            reader.grants.insert(Resource::Sops, vec![Verb::Read]);
+            reader.allowed_agents = agents.clone();
+            let ctx = sop_runs_ctx(config.clone(), &engine);
+            let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+            let refused = rpc(&mut alice, &mut rx, 1, "sops/subscribe-runs", json!({})).await;
+            assert_eq!(
+                refused["error"]["code"],
+                json!(FORBIDDEN),
+                "{agents:?}: {refused}"
+            );
+            assert_eq!(
+                refused["error"]["message"],
+                json!(GLOBAL_STREAM_SCOPED_DENIAL),
+                "{agents:?}: {refused}"
+            );
+            assert!(
+                !refused.to_string().contains("alpha-sop"),
+                "{agents:?}: a refusal must not disclose runs: {refused}"
+            );
+            assert!(
+                alice.subscriptions.lock().is_empty(),
+                "{agents:?}: a refused call opens no subscription"
+            );
+            assert_eq!(
+                changes.receiver_count(),
+                0,
+                "{agents:?}: a refused call does not listen to the engine"
+            );
+
+            // The same principal, promoted to administrator, opens the feed.
+            let mut promoted = config;
+            promoted
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the fixture profile exists")
+                .admin = true;
+            ctx.auth
+                .refresh_from_config(&promoted)
+                .expect("the promoting policy compiles");
+            let opened = rpc(&mut alice, &mut rx, 2, "sops/subscribe-runs", json!({})).await;
+            assert!(
+                opened["result"]["subscription_id"].is_string(),
+                "{agents:?}: an administrator opens the feed: {opened}"
+            );
+            assert_eq!(
+                opened["result"]["runs"].as_array().map(Vec::len),
+                Some(1),
+                "{agents:?}: {opened}"
+            );
+
+            // So does the shared operator, which holds every grant and is no
+            // authenticated principal.
+            let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+            let opened = rpc(
+                &mut operator,
+                &mut operator_rx,
+                1,
+                "sops/subscribe-runs",
+                json!({}),
+            )
+            .await;
+            assert!(
+                opened["result"]["subscription_id"].is_string(),
+                "{agents:?}: the shared operator opens the feed: {opened}"
+            );
+        }
+    }
+
+    /// Demoting a live run subscriber from administrator ends its feed at
+    /// the next delivery, even though it keeps `Sops:Read` and every agent
+    /// (`*`): each delivery rechecks the audience, not only the grant.
+    #[tokio::test]
+    async fn demoting_a_run_subscriber_from_admin_ends_its_feed() {
+        use crate::sop::SopRunStatus;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, changes, sop_config) = sop_runs_engine(&tmp, 16);
+        let mut config = roster_config(4242);
+        config.sop = sop_config;
+        grant_global_run_reads(&mut config);
+        let ctx = sop_runs_ctx(config.clone(), &engine);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let opened = rpc(&mut alice, &mut rx, 1, "sops/subscribe-runs", json!({})).await;
+        let id = opened["result"]["subscription_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an administrator opens the feed: {opened}"))
+            .to_string();
+        changes
+            .send(run_change(
+                "SENTINEL-WIDE",
+                "alpha-sop",
+                SopRunStatus::Running,
+            ))
+            .unwrap();
+        assert!(
+            next_frame_containing(&mut rx, "SENTINEL-WIDE", std::time::Duration::from_secs(2))
+                .await,
+            "an administrator receives run changes"
+        );
+
+        let mut demoted = config;
+        let reader = demoted
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.admin = false;
+        reader.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        ctx.auth
+            .refresh_from_config(&demoted)
+            .expect("the demoted policy compiles");
+        changes
+            .send(run_change(
+                "SENTINEL-DEMOTED",
+                "alpha-sop",
+                SopRunStatus::Running,
+            ))
+            .unwrap();
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-DEMOTED",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a demoted subscriber that keeps Sops:Read must stop receiving run changes"
+        );
+        assert!(
+            !alice.subscriptions.lock().contains_key(&id),
+            "the refused feed ends"
+        );
+        assert_eq!(changes.receiver_count(), 0, "and lets go of the engine");
+    }
+
+    /// Without `Sops:Read` the call is refused at the gate; an administrator
+    /// opens the feed and sees every run, and losing the grant ends the feed
+    /// at the next delivery.
     #[tokio::test]
     async fn sops_subscribe_runs_needs_sops_read_and_stops_once_it_is_revoked() {
         use crate::sop::SopRunStatus;
-        use zeroclaw_api::grants::{Resource, Verb};
         let tmp = tempfile::TempDir::new().unwrap();
         let (engine, changes, sop_config) = sop_runs_engine(&tmp, 16);
         let mut config = roster_config(4242);
@@ -23665,14 +23819,15 @@ mod tests {
 
         let refused = rpc(&mut alice, &mut rx, 1, "sops/subscribe-runs", json!({})).await;
         assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("sops:read")),
+            "the missing grant is named: {refused}"
+        );
 
         let mut granted = config.clone();
-        granted
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Sops, vec![Verb::Read]);
+        grant_global_run_reads(&mut granted);
         ctx.auth
             .refresh_from_config(&granted)
             .expect("the granting policy compiles");
@@ -23696,7 +23851,7 @@ mod tests {
                 std::time::Duration::from_secs(2)
             )
             .await,
-            "a Sops:Read holder receives run changes"
+            "an administrator holding Sops:Read receives run changes"
         );
 
         ctx.auth
@@ -23720,8 +23875,9 @@ mod tests {
         );
     }
 
-    /// `alice`, holding `Sops:Read`, subscribed to every SOP's run changes
-    /// on a writer with room for one line, the subscribe reply already read.
+    /// `alice`, an administrator holding `Sops:Read`, subscribed to every
+    /// SOP's run changes on a writer with room for one line, the subscribe
+    /// reply already read.
     /// Returns the context (for policy changes), the policy she started
     /// with, her connection, its writer, the engine's change feed and the
     /// subscription id.
@@ -23735,16 +23891,10 @@ mod tests {
         tokio::sync::broadcast::Sender<crate::sop::SopRunSummary>,
         String,
     ) {
-        use zeroclaw_api::grants::{Resource, Verb};
         let (engine, changes, sop_config) = sop_runs_engine(tmp, 16);
         let mut config = roster_config(4242);
         config.sop = sop_config;
-        config
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Sops, vec![Verb::Read]);
+        grant_global_run_reads(&mut config);
         let ctx = sop_runs_ctx(config.clone(), &engine);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut alice = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:uid=4242".into())
@@ -23794,19 +23944,13 @@ mod tests {
     /// the enqueue boundary, after the wait, not before it.
     #[tokio::test]
     async fn sops_read_withdrawn_while_the_writer_is_full_delivers_no_more_run_changes() {
-        use zeroclaw_api::grants::Resource;
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, config, alice, mut rx, changes, id) =
             run_subscriber_on_a_one_line_writer(&tmp).await;
         block_run_delivery_on_a_full_writer(&changes, &rx).await;
 
         let mut narrowed = config;
-        narrowed
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .remove(&Resource::Sops);
+        withdraw_global_run_reads(&mut narrowed);
         ctx.auth
             .refresh_from_config(&narrowed)
             .expect("the narrowed policy compiles");
@@ -23871,7 +24015,6 @@ mod tests {
     #[tokio::test]
     async fn every_sop_run_line_stops_on_a_withdrawal_or_cancel_while_the_writer_is_full() {
         use crate::sop::SopRunStatus;
-        use zeroclaw_api::grants::Resource;
         for path in ["data", "lagged"] {
             for action in ["withdraw", "cancel"] {
                 let case = format!("{path}/{action}");
@@ -23918,12 +24061,7 @@ mod tests {
                 let mut pending = Box::pin(deliver_sop_run_changes(delivery));
                 assert_waiting(pending.as_mut(), &case);
                 if action == "withdraw" {
-                    config
-                        .permission_profiles
-                        .get_mut("reader")
-                        .expect("the fixture profile exists")
-                        .grants
-                        .remove(&Resource::Sops);
+                    withdraw_global_run_reads(&mut config);
                     ctx.auth
                         .refresh_from_config(&config)
                         .expect("the narrowed policy compiles");
