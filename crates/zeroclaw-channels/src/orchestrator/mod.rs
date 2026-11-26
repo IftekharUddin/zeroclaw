@@ -8566,9 +8566,7 @@ async fn process_channel_message_body(
     // same final identity this path reads and writes.
     let mut msg = msg;
 
-    let target_entry = find_channel_entry_for_message(&ctx.channels_by_name, &msg);
-    let originating_channel_key = target_entry.as_ref().map(|(key, _)| key.clone());
-    let target_channel = target_entry.map(|(_, ch)| ch);
+    let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
 
     if let Some(channel) = target_channel.as_ref() {
         if channel.drop_self_messages(&msg) {
@@ -9892,6 +9890,10 @@ async fn process_channel_message_body(
         "Post-loop: draft updater completed"
     );
 
+    // The thread the turn arrived in, read before the follow-up threading
+    // below rewrites `msg.thread_ts`. The same-turn duplicate guard compares
+    // it with the thread an immediate `send_via` message was posted in.
+    let inbound_thread_ts = msg.thread_ts.clone();
     // Thread the final reply only if tools were used (multi-message response)
     if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
         msg.thread_ts = followup_thread_id(&msg);
@@ -10212,11 +10214,6 @@ async fn process_channel_message_body(
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
                     .is_some();
-                let delivery_channel_key = turn_route
-                    .as_ref()
-                    .and_then(|r| r.channel.clone())
-                    .filter(|k| !k.is_empty())
-                    .or_else(|| originating_channel_key.clone());
                 // Same-turn duplicate guard: models sometimes place identical
                 // text in both the assistant `content` and an immediate
                 // `send_via` `body`. When that immediate send already delivered
@@ -10224,22 +10221,40 @@ async fn process_channel_message_body(
                 // the ordinary reply again would double the message. Different
                 // content, or the same content to a different destination, is
                 // intentional fanout and delivers normally.
-                let duplicate_of_immediate_send = immediate_sends.iter().any(|s| {
-                    Some(s.channel_key.as_str()) == delivery_channel_key.as_deref()
+                //
+                // A destination is the channel instance, the recipient and the
+                // thread. The channel is compared by registry identity rather
+                // than key spelling, because a singleton is registered under
+                // both its bare and its composite key. The thread is the one
+                // the turn arrived in: an immediate send is top-level, so on a
+                // threaded turn it is not the in-thread reply. The follow-up
+                // thread a tool-using turn opens under its own inbound message
+                // is not a separate destination, or no turn that called
+                // `send_via` could ever match.
+                let duplicate_immediate_send = immediate_sends.iter().find(|s| {
+                    ctx.channels_by_name
+                        .get(&s.channel_key)
+                        .is_some_and(|sent_through| Arc::ptr_eq(sent_through, channel))
                         && s.recipient == delivery_recipient
+                        && s.thread_ts == inbound_thread_ts
                         && s.body == delivered_response.trim()
                 });
                 // Whether the agent's reply reached a channel — gates the
                 // `fire_message_sent` observer hook below.
-                let reply_delivered = if duplicate_of_immediate_send {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
+                let reply_delivered = if let Some(sent) = duplicate_immediate_send {
+                    // The draft placeholder belongs to the originating channel
+                    // and recipient, which a routing redirect makes different
+                    // from the delivery pair.
+                    if let (Some(orig_ch), Some(draft_id)) =
+                        (target_channel.as_ref(), draft_message_id.as_deref())
+                    {
+                        let _ = orig_ch.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_attrs(::serde_json::json!({
-                                "channel": delivery_channel_key,
+                                "channel": sent.channel_key,
                                 "recipient": delivery_recipient,
                             })),
                         "suppressing final reply: an immediate send_via delivery already sent identical content to this destination this turn"
@@ -13081,29 +13096,6 @@ fn find_channel_for_message<'a>(
     msg.channel
         .split_once(':')
         .and_then(|(base, _)| channels.get(base))
-}
-
-/// Like [`find_channel_for_message`], but also returns the registry key the
-/// channel resolved under, so delivery accounting can compare destinations
-/// in the same key namespace `send_via` records them in.
-fn find_channel_entry_for_message(
-    channels: &HashMap<String, Arc<dyn Channel>>,
-    msg: &zeroclaw_api::channel::ChannelMessage,
-) -> Option<(String, Arc<dyn Channel>)> {
-    if let Some(alias) = msg.channel_alias.as_deref().filter(|s| !s.is_empty()) {
-        let composite = format!("{}.{alias}", msg.channel);
-        if let Some(ch) = channels.get(&composite) {
-            return Some((composite, Arc::clone(ch)));
-        }
-    }
-    if let Some(ch) = channels.get(&msg.channel) {
-        return Some((msg.channel.clone(), Arc::clone(ch)));
-    }
-    msg.channel.split_once(':').and_then(|(base, _)| {
-        channels
-            .get(base)
-            .map(|ch| (base.to_string(), Arc::clone(ch)))
-    })
 }
 
 fn send_message_to_peer_tool_available(
@@ -24493,6 +24485,284 @@ api_key = "anthropic-key"
             channel_impl.final_send_calls.load(Ordering::SeqCst),
             1,
             "the ordinary reply still uses the final-response send path"
+        );
+    }
+
+    /// Real `SendViaTool` over a whole channel registry, the way the channel
+    /// server wires it, with one peer group addressing `peer` on
+    /// `group_channel`.
+    fn send_via_tool_over(
+        registry: &HashMap<String, Arc<dyn Channel>>,
+        group_channel: &str,
+        peer: &str,
+    ) -> Box<dyn Tool> {
+        let map: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(registry.clone()));
+        let mut groups = HashMap::new();
+        groups.insert(
+            "test-group".to_string(),
+            zeroclaw_config::multi_agent::PeerGroupConfig {
+                channel: group_channel.into(),
+                external_peers: vec![zeroclaw_config::multi_agent::PeerUsername::new(peer)],
+                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
+            },
+        );
+        Box::new(tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            map,
+            Arc::new(move || groups.clone()),
+        ))
+    }
+
+    /// Swaps the registry of a freshly built test context, for turns that
+    /// need more keys than the single one the context helpers register.
+    fn with_channel_registry(
+        mut ctx: Arc<ChannelRuntimeContext>,
+        registry: HashMap<String, Arc<dyn Channel>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        Arc::get_mut(&mut ctx)
+            .expect("a freshly built test context has a single owner")
+            .channels_by_name = Arc::new(registry);
+        ctx
+    }
+
+    /// An immediate `send_via` message is top-level. On a threaded turn the
+    /// ordinary reply belongs in the thread, so identical text is not a
+    /// duplicate of it and the in-thread reply must still be delivered.
+    #[tokio::test]
+    async fn duplicate_send_via_body_keeps_the_reply_of_a_threaded_turn() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            Arc::clone(&channel),
+            Arc::new(SendViaBodyModelProvider {
+                body: "Hello there!",
+                final_text: "Hello there!",
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![send_via_tool_for(Arc::clone(&channel))],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                thread_ts: Some("thread-7".to_string()),
+                ..message_sent_hook_test_message()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let threads: Vec<Option<&str>> = sent
+            .iter()
+            .filter(|m| m.recipient == "chat-42" && m.content == "Hello there!")
+            .map(|m| m.thread_ts.as_deref())
+            .collect();
+        assert_eq!(
+            threads,
+            [None, Some("thread-7")],
+            "the top-level immediate send must not suppress the in-thread reply"
+        );
+    }
+
+    /// A singleton channel is registered under its composite and its bare
+    /// key. `send_via` addressed by the bare key and a turn that arrived
+    /// under the composite key reach the same channel instance, so identical
+    /// content is still a duplicate.
+    #[tokio::test]
+    async fn duplicate_send_via_body_via_bare_singleton_key_suppresses_final_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let registry = configured_channel_map(&[ConfiguredChannel {
+            display_name: "Test",
+            alias: Some("default".to_string()),
+            channel: Arc::clone(&channel),
+        }]);
+        let mut keys: Vec<&str> = registry.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["test-channel", "test-channel.default"]);
+
+        let runtime_ctx = with_channel_registry(
+            test_runtime_ctx_with_observer_and_tools(
+                Arc::clone(&channel),
+                Arc::new(SendViaBodyModelProvider {
+                    body: "Hello there!",
+                    final_text: "Hello there!",
+                }),
+                zeroclaw_config::schema::Config::default(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                vec![send_via_tool_over(&registry, "test-channel", "chat-42")],
+            ),
+            registry,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                channel_alias: Some("default".to_string()),
+                ..message_sent_hook_test_message()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent: Vec<String> = channel_impl
+            .sent_messages
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| !entry.contains("🔧"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            sent.as_slice(),
+            ["chat-42:Hello there!"],
+            "the bare and composite keys name one channel, so the content must arrive once"
+        );
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            0,
+            "the ordinary reply must be suppressed whichever key spelling send_via resolved"
+        );
+    }
+
+    /// Provider that, in one response, sends `body` immediately to the
+    /// `test-group` peer group and routes the turn's reply there, then
+    /// answers the tool-result round with the same `body`.
+    struct SendViaBodyThenRouteModelProvider {
+        body: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SendViaBodyThenRouteModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(format!(
+                "<tool_call>\n{{\"name\":\"send_via\",\"arguments\":{{\"target\":\"test-group\",\"body\":\"{}\"}}}}\n</tool_call>\n<tool_call>\n{{\"name\":\"send_via\",\"arguments\":{{\"target\":\"test-group\"}}}}\n</tool_call>",
+                self.body
+            ))
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok(self.body.to_string())
+            } else {
+                self.chat_with_system(None, "", model, temperature).await
+            }
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for SendViaBodyThenRouteModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SendViaBodyThenRouteModelProvider"
+        }
+    }
+
+    /// A turn that drafts on its originating channel, sends immediately to
+    /// another channel and then routes its identical reply there: the reply
+    /// is suppressed, and the draft placeholder is cancelled on the channel
+    /// and recipient that own it. Both channels hand out the same draft id,
+    /// so a cancel sent through the redirect target would name a message the
+    /// turn never created there.
+    #[tokio::test]
+    async fn duplicate_send_via_body_on_redirected_turn_cancels_the_draft_on_its_origin() {
+        let origin_impl = Arc::new(SendMessageRecordingChannel {
+            drafts: true,
+            ..SendMessageRecordingChannel::default()
+        });
+        let target_impl = Arc::new(SendMessageRecordingChannel::telegram(true));
+        let origin: Arc<dyn Channel> = origin_impl.clone();
+        let target: Arc<dyn Channel> = target_impl.clone();
+        let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        registry.insert("test-channel".to_string(), Arc::clone(&origin));
+        registry.insert("telegram.default".to_string(), Arc::clone(&target));
+
+        let runtime_ctx = with_channel_registry(
+            test_runtime_ctx_with_observer_and_tools(
+                Arc::clone(&origin),
+                Arc::new(SendViaBodyThenRouteModelProvider {
+                    body: "Report filed.",
+                }),
+                zeroclaw_config::schema::Config::default(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                vec![send_via_tool_over(
+                    &registry,
+                    "telegram.default",
+                    "ops-chat",
+                )],
+            ),
+            registry,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let delivered_to_target: Vec<(String, String)> = target_impl
+            .sent_messages
+            .lock()
+            .await
+            .iter()
+            .map(|m| (m.recipient.clone(), m.content.clone()))
+            .collect();
+        assert_eq!(
+            delivered_to_target,
+            [("ops-chat".to_string(), "Report filed.".to_string())],
+            "the redirected reply duplicates the immediate send and must arrive once"
+        );
+        assert_eq!(
+            origin_impl.cancelled_drafts.lock().await.as_slice(),
+            ["chat-42:draft-1"],
+            "the draft must be cancelled on the originating channel and recipient"
+        );
+        assert!(
+            target_impl.cancelled_drafts.lock().await.is_empty(),
+            "the redirect target owns no draft from this turn and must not be asked to cancel one"
+        );
+        assert!(
+            origin_impl.finalized.lock().await.is_empty(),
+            "the suppressed reply must not be finalized into the originating draft"
+        );
+        assert!(
+            origin_impl
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .all(|m| m.content != "Report filed."),
+            "the redirected reply must not fall back to the originating channel"
         );
     }
 

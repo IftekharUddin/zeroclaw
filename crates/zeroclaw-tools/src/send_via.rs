@@ -40,15 +40,17 @@ pub struct TurnRoutingEntry {
 
 /// One successful immediate (`body`) delivery performed by `send_via` this
 /// turn. The orchestrator's duplicate-delivery guard reads these after the
-/// tool loop: when the turn's ordinary reply targets the same channel and
-/// recipient with identical content, delivering it again would duplicate the
-/// message, so the ordinary reply is suppressed.
+/// tool loop: when the turn's ordinary reply targets the same channel,
+/// recipient and thread with identical content, delivering it again would
+/// duplicate the message, so the ordinary reply is suppressed.
 #[derive(Debug, Clone)]
 pub struct ImmediateSendRecord {
     /// Resolved channel key the message was sent through (e.g. `"telegram.default"`).
     pub channel_key: String,
     /// Concrete recipient the message was addressed to.
     pub recipient: String,
+    /// Thread the message was posted in, as sent; `None` is a top-level message.
+    pub thread_ts: Option<String>,
     /// Message content exactly as sent.
     pub body: String,
 }
@@ -425,6 +427,7 @@ impl Tool for SendViaTool {
                                 .push(ImmediateSendRecord {
                                     channel_key: channel_key.clone(),
                                     recipient: recipient.clone(),
+                                    thread_ts: message.thread_ts.clone(),
                                     body: body.clone(),
                                 });
                         }
@@ -968,6 +971,10 @@ mod tests {
         assert_eq!(state.immediate_sends.len(), 1);
         assert_eq!(state.immediate_sends[0].channel_key, "telegram.default");
         assert_eq!(state.immediate_sends[0].recipient, "@amaury");
+        assert_eq!(
+            state.immediate_sends[0].thread_ts, None,
+            "an immediate send is top-level and must be recorded as such"
+        );
         assert_eq!(state.immediate_sends[0].body, "extra message");
     }
 
