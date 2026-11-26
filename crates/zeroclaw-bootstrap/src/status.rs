@@ -5,7 +5,11 @@
 //! verified produces a repair recommendation rather than a silent replacement
 //! or an execution.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use zeroclaw_dist::DistTarget;
 
@@ -126,26 +130,98 @@ pub struct BootstrapStatus {
     pub recommendation: Recommendation,
 }
 
+/// How long a candidate binary may take to answer `--version`.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the probe checks whether the candidate has exited.
+const VERSION_PROBE_POLL: Duration = Duration::from_millis(20);
+
+/// How long output the candidate already wrote may take to arrive once it has
+/// exited. Only a descendant still holding the pipe open can exceed this.
+const VERSION_OUTPUT_GRACE: Duration = Duration::from_secs(1);
+
+/// The most `--version` output the probe keeps. Only the first line is ever
+/// read; anything past this is drained and discarded.
+const VERSION_OUTPUT_LIMIT: u64 = 64 * 1024;
+
 /// Probes a candidate binary for its version by running `--version`.
 ///
-/// A file that is not executable, exits non-zero, times out at the OS level,
-/// or prints something that is not a ZeroClaw version banner is reported as
-/// unverifiable. There is no fallback to trusting the file name.
+/// A file that is not executable, exits non-zero, does not exit within the
+/// probe timeout, or prints something that is not a ZeroClaw version banner
+/// is reported as unverifiable. A candidate that overruns the timeout is
+/// killed and reaped, so a hung binary cannot block `status` or `handoff`.
+/// There is no fallback to trusting the file name.
 pub fn probe_version(path: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(path)
+    probe_version_within(path, VERSION_PROBE_TIMEOUT)
+}
+
+/// [`probe_version`] with the timeout as a parameter, so the bound itself can
+/// be exercised without waiting out the production value.
+fn probe_version_within(path: &Path, timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new(path)
         .arg("--version")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|err| format!("could not execute it: {err}"))?;
-    if !output.status.success() {
-        return Err(format!("`--version` exited with {}", output.status));
+
+    // Stdout is collected on its own thread: the candidate can never stall on
+    // a full pipe, and this thread never blocks on a read it cannot bound.
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_and_reap(&mut child);
+        return Err("could not capture `--version` output".to_string());
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let read = stdout
+            .by_ref()
+            .take(VERSION_OUTPUT_LIMIT)
+            .read_to_end(&mut kept);
+        let _ = tx.send(read.map(|_| kept));
+        // Keep the pipe drained so a verbose candidate still exits on its own
+        // terms; nothing past the limit is retained.
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(VERSION_PROBE_POLL),
+            Ok(None) => {
+                kill_and_reap(&mut child);
+                return Err(format!("`--version` did not exit within {timeout:?}"));
+            }
+            Err(err) => {
+                kill_and_reap(&mut child);
+                return Err(format!("could not wait for `--version`: {err}"));
+            }
+        }
+    };
+    if !status.success() {
+        return Err(format!("`--version` exited with {status}"));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let stdout = rx
+        .recv_timeout(VERSION_OUTPUT_GRACE)
+        .map_err(|_| "`--version` exited but left its output open".to_string())?
+        .map_err(|err| format!("could not read `--version` output: {err}"))?;
+    let stdout = String::from_utf8_lossy(&stdout);
     parse_version_banner(&stdout).ok_or_else(|| {
         format!(
             "`--version` printed no recognisable version banner (first line: {:?})",
             stdout.lines().next().unwrap_or("").trim()
         )
     })
+}
+
+/// Stops a probe process that overran its bound and collects its exit status
+/// so it does not linger as a zombie.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Extracts the version from a `zeroclaw <version>` banner.
@@ -352,5 +428,80 @@ mod tests {
         assert!(absent.contains("install"));
         assert!(absent.contains("handoff"));
         assert!(absent.contains("configure"));
+    }
+
+    /// Serialises the tests that write a script and then run it. A process
+    /// forked by one test would otherwise briefly inherit the other's
+    /// still-open script, and executing that script fails with ETXTBSY.
+    #[cfg(unix)]
+    static SCRIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn write_script(dir: &Path, contents: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("zeroclaw");
+        std::fs::write(&path, contents).expect("fixture script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("fixture script mode");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_candidate_that_never_exits_is_unverifiable_within_the_timeout() {
+        let _guard = SCRIPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Far longer than the test could tolerate if the probe were unbounded.
+        let path = write_script(dir.path(), "#!/bin/sh\nexec sleep 600\n");
+
+        let started = Instant::now();
+        let outcome = probe_version_within(&path, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+
+        let reason = outcome.expect_err("a hung candidate must not be verified");
+        assert!(
+            reason.contains("did not exit within"),
+            "reason was: {reason}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "the probe gave up after {elapsed:?}, before its timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "the probe took {elapsed:?}; it must give up at its timeout, not wait for the candidate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_candidate_that_exits_but_leaves_its_output_open_is_unverifiable() {
+        let _guard = SCRIPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("temp dir");
+        // The banner is valid and the exit is clean, but a background child
+        // keeps the pipe open, so the output never reaches end-of-file.
+        let path = write_script(
+            dir.path(),
+            "#!/bin/sh\necho 'zeroclaw 0.8.4'\nsleep 20 &\nexit 0\n",
+        );
+
+        let started = Instant::now();
+        let outcome = probe_version_within(&path, Duration::from_secs(30));
+        let elapsed = started.elapsed();
+
+        let reason = outcome.expect_err("unterminated output must not be verified");
+        assert!(
+            reason.contains("left its output open"),
+            "reason was: {reason}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the probe took {elapsed:?}; it must not wait for the pipe to close"
+        );
     }
 }
