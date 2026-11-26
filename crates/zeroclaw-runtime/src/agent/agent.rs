@@ -9606,6 +9606,23 @@ mod tests {
         }
     }
 
+    struct CancellingBeforeLlmHook;
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for CancellingBeforeLlmHook {
+        fn name(&self) -> &str {
+            "cancel-before-llm"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            crate::hooks::HookResult::Cancel("blocked by request policy".into())
+        }
+    }
+
     type CapturedLlmInputs = Arc<Mutex<Vec<(Vec<ChatMessage>, String)>>>;
 
     struct MutatingBeforeLlmHook {
@@ -15647,6 +15664,67 @@ mod tests {
                  AssistantToolCalls — duplicate narration push was not removed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn before_llm_hook_cancel_prevents_dispatch_and_request_announcement() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(CancellingBeforeLlmHook));
+        let guarded_seen = Arc::new(Mutex::new(Vec::new()));
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut guarded_agent = Agent::builder()
+            .model_provider(Box::new(TranscriptCaptureModelProvider {
+                alias: "guarded-provider".into(),
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("must not be returned".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+                seen_messages: guarded_seen.clone(),
+            }))
+            .model_provider_name("provider-a".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(memory)
+            .observer(capturing.clone())
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .model_name("test-model".into())
+            .temperature(Some(0.0))
+            .turn_datetime(fixed_turn_datetime)
+            .build()
+            .expect("guarded agent should build");
+
+        let error = guarded_agent
+            .turn("same request")
+            .await
+            .expect_err("the request hook must cancel before provider dispatch");
+        assert!(error.to_string().contains("blocked by request policy"));
+        assert!(
+            guarded_seen.lock().is_empty(),
+            "a cancelling request hook must prevent provider dispatch"
+        );
+        assert!(
+            !capturing
+                .events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::LlmRequest { .. })),
+            "a cancelling request hook must prevent request announcement"
+        );
     }
 
     #[tokio::test]

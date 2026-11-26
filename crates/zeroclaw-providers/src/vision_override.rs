@@ -13,7 +13,7 @@ use zeroclaw_api::model_provider::ModelInfo;
 /// and delegates everything else to the wrapped provider.
 ///
 /// The provider factory wraps every leaf it builds with
-/// [`VisionOverrideProvider::factory_leaf`]; with no override set, the wrapper
+/// `VisionOverrideProvider::factory_leaf`; with no override set, the wrapper
 /// passes the inner provider's capability through unchanged.
 pub struct VisionOverrideProvider {
     supports_vision: Option<bool>,
