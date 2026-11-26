@@ -34,6 +34,23 @@ fn the_endpoint_comes_from_the_socket_flag_then_the_environment_then_the_data_di
     );
 }
 
+/// The admin token directory is the `--data-dir` flag and nothing else: a
+/// socket path names no data directory, whichever way it arrives.
+#[test]
+fn only_the_data_dir_flag_names_where_the_admin_token_is() {
+    let socket = bootstrap(&["--socket", "/run/zc.sock"], None).unwrap();
+    assert_eq!(socket.data_dir, None);
+    let env = bootstrap(&[], Some("/run/env.sock")).unwrap();
+    assert_eq!(env.data_dir, None);
+
+    let data_dir = bootstrap(&["--data-dir", "/var/zc"], None).unwrap();
+    assert_eq!(data_dir.data_dir, Some(PathBuf::from("/var/zc")));
+    // A socket given too decides the endpoint, not where the token is.
+    let both = bootstrap(&["--socket", "/run/zc.sock", "--data-dir", "/var/zc"], None).unwrap();
+    assert_eq!(both.endpoint, PathBuf::from("/run/zc.sock"));
+    assert_eq!(both.data_dir, Some(PathBuf::from("/var/zc")));
+}
+
 #[test]
 fn without_an_endpoint_it_refuses_and_never_falls_back_to_config() {
     let refused = bootstrap(&[], None).unwrap_err();
@@ -306,41 +323,99 @@ async fn busy_timeout_and_an_untrusted_endpoint_get_their_own_hints() {
 
 // ── Gateway-local routes ─────────────────────────────────────────
 
-/// `/admin/shutdown` and `/hooks/claude-code` need no core. The preview
-/// answers each request exactly as the in-process routes do, and only a
-/// caller on loopback stops it.
-#[tokio::test]
-async fn the_gateway_local_routes_answer_as_the_in_process_gateway_does() {
+/// What the gateway-local route tests send, and the routers they send it to.
+mod gateway_local {
+    use super::*;
+
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
-    async fn answer(router: &Router, request: Request<Body>) -> (StatusCode, String) {
+    pub(super) const ADMIN_TOKEN: &str = "zc_admin_preview_test_token";
+    pub(super) const HOOK_EVENT: &str =
+        r#"{"session_id":"s1","event_type":"tool_use","tool_name":"Bash","summary":"ls"}"#;
+
+    pub(super) fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 40_000))
+    }
+
+    /// A caller on another machine.
+    pub(super) fn remote() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 7], 40_000))
+    }
+
+    pub(super) async fn answer(router: &Router, request: Request<Body>) -> (StatusCode, String) {
         let response = router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
     }
-    fn request(path: &str, peer: SocketAddr, body: &str) -> Request<Body> {
-        Request::post(path)
+
+    /// A JSON `POST` from `peer`, with any extra `headers`.
+    pub(super) fn request(
+        path: &str,
+        peer: SocketAddr,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Request<Body> {
+        let mut request = Request::post(path)
             .header("content-type", "application/json")
-            .extension(ConnectInfo(peer))
-            .body(Body::from(body.to_owned()))
-            .unwrap()
+            .extension(ConnectInfo(peer));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.body(Body::from(body.to_owned())).unwrap()
     }
 
+    /// The preview's router with no core behind it (neither route may need
+    /// one), reading its admin token from `admin_token_dir`.
+    pub(super) fn preview(
+        dir: &Path,
+        admin_token_dir: Option<&Path>,
+    ) -> (Router, watch::Receiver<bool>) {
+        let endpoint = dir.join("daemon.sock");
+        let (stop, stopped) = watch::channel(false);
+        let router = router(
+            CoreRpc::local(endpoint.clone(), EndpointOwner::SameAccount),
+            endpoint,
+            None,
+            stop,
+            admin_token_dir.map(Path::to_path_buf),
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+        );
+        (router, stopped)
+    }
+
+    /// Write `token` where a gateway serving `data_dir` keeps its admin
+    /// token, standing in for the in-process gateway that mints it.
+    pub(super) fn write_admin_token(data_dir: &Path, token: &str) {
+        std::fs::write(
+            zeroclaw_config::pairing::gateway_admin_token_path(data_dir),
+            token,
+        )
+        .unwrap();
+    }
+
+    pub(super) fn code_of(body: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+}
+
+/// `/admin/shutdown` and `/hooks/claude-code` need no core. To a caller the
+/// preview admits, each answers exactly as the in-process route does. The
+/// preview admits fewer callers: the hook only from loopback, and shutdown
+/// only from loopback with the admin token.
+#[tokio::test]
+async fn the_gateway_local_routes_answer_as_the_in_process_gateway_does() {
+    use gateway_local::{ADMIN_TOKEN, HOOK_EVENT, answer, loopback, remote, request};
+
     let tmp = tempfile::tempdir().unwrap();
-    // No core listens here: neither route may need one.
-    let endpoint = tmp.path().join("daemon.sock");
-    let (preview_stop, preview_stopped) = watch::channel(false);
-    let preview = router(
-        CoreRpc::local(endpoint.clone(), EndpointOwner::SameAccount),
-        endpoint,
-        None,
-        preview_stop,
-        Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
-    );
+    gateway_local::write_admin_token(tmp.path(), ADMIN_TOKEN);
+    let (preview, preview_stopped) = gateway_local::preview(tmp.path(), Some(tmp.path()));
     let state = crate::api::test_state(zeroclaw_config::schema::Config {
         data_dir: tmp.path().to_path_buf(),
         config_path: tmp.path().join("config.toml"),
@@ -354,40 +429,193 @@ async fn the_gateway_local_routes_answer_as_the_in_process_gateway_does() {
             post(crate::api::handle_claude_code_hook),
         )
         .with_state(state);
+    // What the in-process gateway answers a caller that is not on loopback.
+    let localhost_only = answer(&in_process, request("/admin/shutdown", remote(), &[], "")).await;
+    assert_eq!(localhost_only.0, StatusCode::FORBIDDEN);
 
-    let loopback = SocketAddr::from(([127, 0, 0, 1], 40_000));
-    let remote = SocketAddr::from(([203, 0, 113, 7], 40_000));
-    let event = r#"{"session_id":"s1","event_type":"tool_use","tool_name":"Bash","summary":"ls"}"#;
-    for (peer, body) in [
-        (loopback, event),
-        (remote, event),
-        (loopback, "not json"),
-        (loopback, r#"{"event_type":"tool_use"}"#),
-    ] {
-        let served = answer(&preview, request("/hooks/claude-code", peer, body)).await;
-        let in_process = answer(&in_process, request("/hooks/claude-code", peer, body)).await;
-        assert_eq!(served, in_process, "{peer} {body}");
+    // The hook from loopback: the same answers, malformed bodies included.
+    for body in [HOOK_EVENT, "not json", r#"{"event_type":"tool_use"}"#] {
+        let served = answer(
+            &preview,
+            request("/hooks/claude-code", loopback(), &[], body),
+        )
+        .await;
+        let reference = answer(
+            &in_process,
+            request("/hooks/claude-code", loopback(), &[], body),
+        )
+        .await;
+        assert_eq!(served, reference, "{body}");
     }
-    let (status, body) = answer(&preview, request("/hooks/claude-code", remote, event)).await;
+    let (status, body) = answer(
+        &preview,
+        request("/hooks/claude-code", loopback(), &[], HOOK_EVENT),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap(),
         json!({ "ok": true })
     );
 
-    // From another machine: refused the same way, and nothing stops.
-    let served = answer(&preview, request("/admin/shutdown", remote, "")).await;
-    let in_process_answer = answer(&in_process, request("/admin/shutdown", remote, "")).await;
-    assert_eq!(served, in_process_answer);
-    assert_eq!(served.0, StatusCode::FORBIDDEN, "{}", served.1);
+    // The hook from another machine, public or on the local network: the
+    // in-process route acknowledges it; the preview refuses it as the
+    // localhost-only routes refuse.
+    for peer in [remote(), SocketAddr::from(([10, 0, 0, 5], 40_000))] {
+        let reference = answer(
+            &in_process,
+            request("/hooks/claude-code", peer, &[], HOOK_EVENT),
+        )
+        .await;
+        assert_eq!(reference.0, StatusCode::OK, "{peer}");
+        let served = answer(
+            &preview,
+            request("/hooks/claude-code", peer, &[], HOOK_EVENT),
+        )
+        .await;
+        assert_eq!(served, localhost_only, "{peer}");
+    }
+
+    // Shutdown from another machine: refused the same way, token or not,
+    // and nothing stops.
+    let token = [(
+        zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+        ADMIN_TOKEN,
+    )];
+    for headers in [&[][..], &token[..]] {
+        let served = answer(&preview, request("/admin/shutdown", remote(), headers, "")).await;
+        assert_eq!(served, localhost_only);
+    }
     assert!(!*preview_stopped.borrow() && !*in_process_stopped.borrow());
 
-    // From loopback: the same answer, and each asks its own process to stop.
-    let served = answer(&preview, request("/admin/shutdown", loopback, "")).await;
-    let in_process_answer = answer(&in_process, request("/admin/shutdown", loopback, "")).await;
-    assert_eq!(served, in_process_answer);
+    // Shutdown from loopback with the admin token: the in-process answer,
+    // and each asks its own process to stop.
+    let served = answer(&preview, request("/admin/shutdown", loopback(), &token, "")).await;
+    let reference = answer(&in_process, request("/admin/shutdown", loopback(), &[], "")).await;
+    assert_eq!(served, reference);
     assert_eq!(served.0, StatusCode::OK, "{}", served.1);
     assert!(*preview_stopped.borrow() && *in_process_stopped.borrow());
+}
+
+/// A loopback address alone stops nothing: a page in the operator's browser
+/// and a same-host reverse proxy both reach the preview from loopback. Only
+/// the admin token read from the data directory admits a shutdown, and a
+/// preview that was given no data directory admits none.
+#[tokio::test]
+async fn shutdown_needs_the_admin_token_from_the_data_dir() {
+    use gateway_local::{ADMIN_TOKEN, answer, code_of, loopback, request};
+
+    const HEADER: &str = zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER;
+    let tmp = tempfile::tempdir().unwrap();
+    let (preview, stopped) = gateway_local::preview(tmp.path(), Some(tmp.path()));
+
+    // No gateway has written a token yet: nothing presented can match.
+    for headers in [&[][..], &[(HEADER, ADMIN_TOKEN)][..], &[(HEADER, "")][..]] {
+        let (status, body) = answer(
+            &preview,
+            request("/admin/shutdown", loopback(), headers, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}: {body}");
+        assert_eq!(code_of(&body), "admin_token_required", "{headers:?}");
+    }
+
+    gateway_local::write_admin_token(tmp.path(), &format!("{ADMIN_TOKEN}\n"));
+    let longer = format!("{ADMIN_TOKEN}x");
+    let refusals: [&[(&str, &str)]; 6] = [
+        // A bare request, as the CLI and `curl -X POST` send it.
+        &[],
+        // What a page on another origin can send without a preflight.
+        &[("origin", "https://attacker.example")],
+        // Not the token: empty, a prefix of it, an extension of it, and a
+        // dashboard bearer in the header a pairing token travels in.
+        &[(HEADER, "")],
+        &[(HEADER, &ADMIN_TOKEN[..ADMIN_TOKEN.len() - 1])],
+        &[(HEADER, &longer)],
+        &[("authorization", "Bearer zc_admin_preview_test_token")],
+    ];
+    for headers in refusals {
+        let (status, body) = answer(
+            &preview,
+            request("/admin/shutdown", loopback(), headers, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}: {body}");
+        assert_eq!(code_of(&body), "admin_token_required", "{headers:?}");
+        assert!(
+            !body.contains(ADMIN_TOKEN),
+            "the refusal does not echo the token: {body}"
+        );
+    }
+    assert!(!*stopped.borrow(), "no refused request stops the preview");
+
+    // A browser that did add the header must preflight first, and the
+    // preview grants no origin anything.
+    let preflight = axum::http::Request::builder()
+        .method("OPTIONS")
+        .uri("/admin/shutdown")
+        .header("origin", "https://attacker.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", HEADER)
+        .extension(ConnectInfo(loopback()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(preview.clone(), preflight)
+        .await
+        .unwrap();
+    assert!(!response.status().is_success(), "{}", response.status());
+    assert!(
+        response
+            .headers()
+            .keys()
+            .all(|name| !name.as_str().starts_with("access-control-")),
+        "{:?}",
+        response.headers()
+    );
+    assert!(!*stopped.borrow());
+
+    // The file is read per request: once a gateway rotates it, the old
+    // token stops nothing and the new one does. Surrounding whitespace in
+    // the header is not part of the token.
+    gateway_local::write_admin_token(tmp.path(), "zc_admin_rotated");
+    let (status, body) = answer(
+        &preview,
+        request("/admin/shutdown", loopback(), &[(HEADER, ADMIN_TOKEN)], ""),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!*stopped.borrow());
+    let (status, body) = answer(
+        &preview,
+        request(
+            "/admin/shutdown",
+            loopback(),
+            &[(HEADER, " zc_admin_rotated ")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(*stopped.borrow());
+
+    // Started from a socket path, the preview knows no data directory: it
+    // refuses every caller, the holder of a real token included, and says
+    // how to stop it instead.
+    let (socket_only, socket_only_stopped) = gateway_local::preview(tmp.path(), None);
+    for headers in [&[][..], &[(HEADER, "zc_admin_rotated")][..]] {
+        let (status, body) = answer(
+            &socket_only,
+            request("/admin/shutdown", loopback(), headers, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}: {body}");
+        assert_eq!(code_of(&body), "admin_token_unavailable", "{headers:?}");
+        assert!(
+            body.contains("SIGTERM") && body.contains("--data-dir"),
+            "{body}"
+        );
+    }
+    assert!(!*socket_only_stopped.borrow());
 }
 
 // ── Request limits ───────────────────────────────────────────────
@@ -411,6 +639,7 @@ async fn every_route_sits_behind_the_in_process_request_limits() {
         endpoint,
         None,
         stop,
+        None,
         Duration::from_millis(300),
     );
     let loopback = ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
@@ -672,6 +901,7 @@ mod against_a_core {
             core.endpoint.clone(),
             Some(web_dist(tmp.path())),
             watch::channel(false).0,
+            None,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
@@ -857,6 +1087,7 @@ mod against_a_core {
             core.endpoint.clone(),
             None,
             watch::channel(false).0,
+            None,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
         let state = crate::api::tests::test_state_with_session_backend(config, backend);
@@ -951,6 +1182,7 @@ mod against_a_core {
             core.endpoint.clone(),
             None,
             watch::channel(false).0,
+            None,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
         let private = tmp.path().display().to_string();
@@ -995,6 +1227,7 @@ mod against_a_core {
             core.endpoint.clone(),
             Some(web_dist(tmp.path())),
             watch::channel(false).0,
+            None,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
@@ -1030,6 +1263,7 @@ mod against_a_core {
             recorder.endpoint.clone(),
             None,
             watch::channel(false).0,
+            None,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
@@ -1072,6 +1306,7 @@ mod against_a_core {
             recorder.endpoint.clone(),
             None,
             watch::channel(false).0,
+            None,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
@@ -1103,6 +1338,7 @@ mod against_a_core {
             core.endpoint.clone(),
             None,
             watch::channel(false).0,
+            None,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
         let (status, body) = get(&router, "/sessions", None).await;

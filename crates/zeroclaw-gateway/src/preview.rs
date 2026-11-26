@@ -15,6 +15,11 @@
 //! within the request timeout (`408` after it), so a slow or oversized
 //! request is bounded here as it is there, shutdown included.
 //!
+//! Its two routes that reach no core are admitted here, since no core
+//! credential covers them. `POST /admin/shutdown` needs a loopback caller
+//! that presents the gateway admin token from `<data_dir>/gateway-admin.token`;
+//! `POST /hooks/claude-code` needs a loopback caller.
+//!
 //! It is configured from flags and the environment only and never reads
 //! `config.toml`. It runs as the same OS account as the core: every
 //! connection verifies through the kernel that this account serves the
@@ -31,7 +36,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Query, State};
-use axum::http::{Method as HttpMethod, StatusCode, Uri};
+use axum::http::{HeaderMap, Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter, get, on, post};
 use serde_json::json;
@@ -68,7 +73,8 @@ Usage: zeroclaw-gw [--socket PATH | --data-dir DIR] [options]
 
 The core's endpoint (one is required; zeroclaw-gw never reads config.toml):
   --socket PATH         the core's local socket (also ZEROCLAW_SOCKET)
-  --data-dir DIR        the core's data directory; the socket is DIR/daemon.sock
+  --data-dir DIR        the core's data directory; the socket is DIR/daemon.sock,
+                        and DIR/gateway-admin.token admits POST /admin/shutdown
 
 Options:
   --listen ADDR         address to serve on [default: 127.0.0.1:42617]
@@ -83,14 +89,19 @@ Options:
   -V, --version         print the version
 
 Runs as the same OS account as the core, on Unix. On start it prints
-`READY <url>` on stdout once it is serving. It stops on SIGINT or SIGTERM,
-or on `POST /admin/shutdown` from this machine.";
+`READY <url>` on stdout once it is serving. It stops on SIGINT or SIGTERM.
+With --data-dir it also stops on `POST /admin/shutdown` from this machine,
+when the request carries the content of DIR/gateway-admin.token in the
+x-zeroclaw-admin-token header.";
 
 /// Everything the preview needs to start, from flags and the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bootstrap {
     pub listen: SocketAddr,
     pub endpoint: PathBuf,
+    /// `--data-dir`, when given. `POST /admin/shutdown` is admitted against
+    /// the admin token file in it; without it that route is refused.
+    pub data_dir: Option<PathBuf>,
     pub web_dist: Option<PathBuf>,
     pub tls: Option<TlsFiles>,
     /// How long a request may take before it is answered `408`.
@@ -171,7 +182,11 @@ pub fn parse_args(
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from)
         })
-        .or_else(|| data_dir.map(|dir| zeroclaw_rpc_client::endpoint::default_endpoint(&dir)))
+        .or_else(|| {
+            data_dir
+                .as_deref()
+                .map(zeroclaw_rpc_client::endpoint::default_endpoint)
+        })
         .ok_or_else(|| {
             "zeroclaw-gw needs the core's endpoint: pass --socket PATH (or set \
              ZEROCLAW_SOCKET) or --data-dir DIR; it never reads config.toml"
@@ -198,6 +213,7 @@ pub fn parse_args(
     Ok(Invocation::Serve(Bootstrap {
         listen,
         endpoint,
+        data_dir,
         web_dist,
         tls,
         request_timeout,
@@ -546,14 +562,20 @@ struct PreviewState {
     web_dist: Option<Arc<PathBuf>>,
     /// Set by `POST /admin/shutdown` to stop this process.
     shutdown: watch::Sender<bool>,
+    /// `--data-dir`, when given: `<data_dir>/gateway-admin.token` is read
+    /// at request time to admit `POST /admin/shutdown`. Without it the
+    /// route is refused; the process then stops on SIGTERM or Ctrl-C.
+    admin_token_dir: Option<Arc<PathBuf>>,
 }
 
 /// The preview's router. `core` must be attached to the core's socket
 /// (see [`CoreRpc::local`]); `endpoint` is that socket, for the health
 /// probe; `web_dist` holds the built dashboard. `POST /admin/shutdown` sets
-/// `shutdown`, which the caller serving the router stops on. Serve it with
-/// the peer's address (`into_make_service_with_connect_info`), which that
-/// route checks. Every route answers `413` to a body over
+/// `shutdown`, which the caller serving the router stops on, for a loopback
+/// caller presenting the admin token kept in `admin_token_dir`; with no
+/// `admin_token_dir` it refuses everyone. Serve the router with the peer's
+/// address (`into_make_service_with_connect_info`), which that route and
+/// `POST /hooks/claude-code` check. Every route answers `413` to a body over
 /// [`crate::MAX_BODY_SIZE`] and `408` to a request not done within
 /// `request_timeout`, as the in-process gateway's routes do.
 pub fn router(
@@ -561,12 +583,14 @@ pub fn router(
     endpoint: PathBuf,
     web_dist: Option<PathBuf>,
     shutdown: watch::Sender<bool>,
+    admin_token_dir: Option<PathBuf>,
     request_timeout: Duration,
 ) -> Router {
     let state = PreviewState {
         endpoint: Arc::new(endpoint),
         web_dist: web_dist.map(Arc::new),
         shutdown,
+        admin_token_dir: admin_token_dir.map(Arc::new),
     };
     let mut router: Router<PreviewState> = Router::new()
         .route("/health", get(health))
@@ -856,22 +880,79 @@ async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     .await
 }
 
-/// `POST /admin/shutdown`: stop this process, for a caller on loopback, as
-/// the in-process route stops the in-process gateway. No core call: the
-/// core keeps running.
+/// A refusal the preview decides by itself, with no core involved:
+/// `{code, error}`.
+fn refused(status: StatusCode, code: &str, message: &str) -> Response {
+    (status, Json(json!({ "code": code, "error": message }))).into_response()
+}
+
+/// `POST /admin/shutdown`: stop this process, with the acknowledgement the
+/// in-process route gives. No core call: the core keeps running.
+///
+/// A loopback peer address is not enough to be admitted. A page open in a
+/// browser on this machine can send a bodyless cross-origin `POST` from
+/// loopback, and a reverse proxy or tunnel on this host relays every remote
+/// caller from loopback. The caller must also present the gateway admin
+/// token, which is the content of an owner-only file in the data directory,
+/// so holding it shows the caller runs as the gateway's account on this
+/// host. A custom header also makes a browser preflight the request, and
+/// nothing here grants a preflight.
+///
+/// The file is read on each request that presents a token. This process
+/// does not write it, so it keeps no copy and accepts whatever token the
+/// file holds, one left by a gateway that has since stopped included. With
+/// no file, or with no `--data-dir` to find it in, every caller is refused.
 async fn admin_shutdown(
     State(state): State<PreviewState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
-    crate::admin_shutdown(&peer, &state.shutdown)
+    if let Err(refusal) = crate::require_localhost(&peer) {
+        return refusal.into_response();
+    }
+    let Some(dir) = state.admin_token_dir.as_deref() else {
+        return refused(
+            StatusCode::FORBIDDEN,
+            "admin_token_unavailable",
+            "zeroclaw-gw was started without --data-dir, so it has no admin token to check; \
+             stop it with SIGTERM, or start it with --data-dir",
+        );
+    };
+    let presented = headers
+        .get(zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    let admitted = !presented.is_empty()
+        && zeroclaw_config::pairing::read_gateway_admin_token(dir)
+            .is_some_and(|token| zeroclaw_config::pairing::constant_time_eq(presented, &token));
+    if !admitted {
+        return refused(
+            StatusCode::FORBIDDEN,
+            "admin_token_required",
+            "POST /admin/shutdown needs the gateway admin token in the \
+             x-zeroclaw-admin-token header (read <data_dir>/gateway-admin.token as the \
+             user that runs the gateway)",
+        );
+    }
+    crate::admin_shutdown_now(&state.shutdown)
 }
 
 /// `POST /hooks/claude-code`: log the event and acknowledge it, as the
-/// in-process route does. No core call.
+/// in-process route does, for a caller on loopback. No core call.
+///
+/// The route carries no credential because Claude Code subprocesses cannot
+/// obtain one, and those run on this host. Anyone else is refused, so a
+/// preview serving beyond loopback does not write a remote caller's text
+/// into the log.
 async fn claude_code_hook(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
-) -> Json<serde_json::Value> {
-    crate::api::claude_code_hook(&payload)
+) -> Response {
+    if let Err(refusal) = crate::require_localhost(&peer) {
+        return refusal.into_response();
+    }
+    crate::api::claude_code_hook(&payload).into_response()
 }
 
 /// `GET /api/gateway/core`: which principal the caller's credential binds
@@ -996,6 +1077,7 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
         bootstrap.endpoint.clone(),
         bootstrap.web_dist.clone(),
         shutdown,
+        bootstrap.data_dir.clone(),
         bootstrap.request_timeout,
     );
     if tls.is_some() {

@@ -4776,7 +4776,9 @@ struct AdminResponse {
 }
 
 /// Reject requests that do not originate from a loopback address.
-fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+pub(crate) fn require_localhost(
+    peer: &SocketAddr,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if peer.ip().is_loopback() {
         Ok(())
     } else {
@@ -4824,19 +4826,17 @@ async fn handle_admin_shutdown(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    admin_shutdown(&peer, &state.shutdown_tx)
-}
-
-/// The `/admin/shutdown` answer to a caller at `peer`: refused unless it is
-/// on loopback, otherwise a stop request on `shutdown`. The separate
-/// gateway answers with this too, so both stop the same way.
-pub(crate) fn admin_shutdown(
-    peer: &SocketAddr,
-    shutdown: &tokio::sync::watch::Sender<bool>,
-) -> Response {
-    if let Err(refusal) = require_localhost(peer) {
+    if let Err(refusal) = require_localhost(&peer) {
         return refusal.into_response();
     }
+    admin_shutdown_now(&state.shutdown_tx)
+}
+
+/// The `/admin/shutdown` answer to a caller already admitted: a stop
+/// request on `shutdown`, logged and acknowledged. Admission is the
+/// caller's: each gateway checks who is asking before it calls this. The
+/// separate gateway answers with this too, so both stop the same way.
+pub(crate) fn admin_shutdown_now(shutdown: &tokio::sync::watch::Sender<bool>) -> Response {
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),

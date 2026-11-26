@@ -95,12 +95,23 @@ struct Gateway {
 }
 
 impl Gateway {
+    /// Started from the core's socket path: it knows no data directory.
     async fn spawn(endpoint: &Path, extra: &[&str]) -> Self {
+        Self::spawn_reaching("--socket", endpoint, extra).await
+    }
+
+    /// Started from the core's data directory, which also holds the admin
+    /// token that `/admin/shutdown` is admitted against.
+    async fn spawn_in(data_dir: &Path, extra: &[&str]) -> Self {
+        Self::spawn_reaching("--data-dir", data_dir, extra).await
+    }
+
+    async fn spawn_reaching(flag: &str, core: &Path, extra: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_zeroclaw-gw"))
             .arg("--listen")
             .arg("127.0.0.1:0")
-            .arg("--socket")
-            .arg(endpoint)
+            .arg(flag)
+            .arg(core)
             .args(extra)
             .env_remove("ZEROCLAW_SOCKET")
             .stdout(Stdio::piped())
@@ -157,14 +168,24 @@ async fn get(address: &str, path: &str, token: Option<&str>) -> (u16, Value) {
     parse(&response)
 }
 
-/// An HTTP/1.1 POST of a JSON `body`, over `stream`.
-async fn post_on<S>(mut stream: S, address: &str, path: &str, body: &str) -> (u16, Value)
+/// An HTTP/1.1 POST of a JSON `body` with any extra `headers`, over `stream`.
+async fn post_on<S>(
+    mut stream: S,
+    address: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Value)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let headers: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         {headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.expect("send");
@@ -177,10 +198,35 @@ where
 }
 
 async fn post(address: &str, path: &str, body: &str) -> (u16, Value) {
+    post_with(address, path, &[], body).await
+}
+
+async fn post_with(
+    address: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Value) {
     let stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("connect to zeroclaw-gw");
-    post_on(stream, address, path, body).await
+    post_on(stream, address, path, headers, body).await
+}
+
+const ADMIN_TOKEN_HEADER: &str = zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER;
+
+/// Put an admin token where a gateway serving `data_dir` keeps its own, as
+/// the in-process gateway does when it starts, and return it. The preview
+/// never writes this file; it only reads it.
+fn mint_admin_token(data_dir: &Path) -> &'static str {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const ADMIN_TOKEN: &str = "zc_admin_two_process_token";
+    let path = zeroclaw_config::pairing::gateway_admin_token_path(data_dir);
+    std::fs::write(&path, ADMIN_TOKEN).expect("write the admin token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("keep the admin token owner-only");
+    ADMIN_TOKEN
 }
 
 /// The status and the JSON body of an HTTP/1.1 response.
@@ -301,13 +347,32 @@ const HOOK_EVENT: &str =
 async fn it_answers_the_claude_code_hook_and_stops_on_admin_shutdown() {
     let tmp = tempfile::tempdir().unwrap();
     let core = Core::serve(Core::context(tmp.path())).await;
-    let gateway = Gateway::spawn(&core.endpoint, &[]).await;
+    let gateway = Gateway::spawn_in(tmp.path(), &[]).await;
+    let admin_token = mint_admin_token(tmp.path());
 
     let (status, ack) = post(&gateway.address, "/hooks/claude-code", HOOK_EVENT).await;
     assert_eq!(status, 200, "{ack}");
     assert_eq!(ack, serde_json::json!({ "ok": true }));
 
-    let (status, stopping) = post(&gateway.address, "/admin/shutdown", "").await;
+    // Being on loopback is not enough: a bare request, and the request a
+    // page on another origin can send, stop nothing.
+    let cross_origin = [("Origin", "https://attacker.example")];
+    for headers in [&[][..], &cross_origin[..]] {
+        let (status, refused) = post_with(&gateway.address, "/admin/shutdown", headers, "").await;
+        assert_eq!(status, 403, "{headers:?}: {refused}");
+        assert_eq!(refused["code"], "admin_token_required", "{headers:?}");
+    }
+    let (status, health) = get(&gateway.address, "/health", None).await;
+    assert_eq!(status, 200, "zeroclaw-gw keeps serving: {health}");
+    assert_eq!(health["core"]["link"], "reachable");
+
+    let (status, stopping) = post_with(
+        &gateway.address,
+        "/admin/shutdown",
+        &[(ADMIN_TOKEN_HEADER, admin_token)],
+        "",
+    )
+    .await;
     assert_eq!(status, 200, "{stopping}");
     assert_eq!(
         stopping,
@@ -323,6 +388,29 @@ async fn it_answers_the_claude_code_hook_and_stops_on_admin_shutdown() {
             .is_ok(),
         "the core keeps serving"
     );
+    core.stop().await;
+}
+
+/// Started with `--socket`, the preview knows no data directory, so it has
+/// no admin token to check: `/admin/shutdown` is refused for everyone, the
+/// holder of a real token included, and the process keeps serving.
+#[tokio::test]
+async fn started_from_a_socket_it_refuses_admin_shutdown_and_keeps_serving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = Core::serve(Core::context(tmp.path())).await;
+    let gateway = Gateway::spawn(&core.endpoint, &[]).await;
+    let admin_token = mint_admin_token(tmp.path());
+
+    let presented = [(ADMIN_TOKEN_HEADER, admin_token)];
+    for headers in [&[][..], &presented[..]] {
+        let (status, refused) = post_with(&gateway.address, "/admin/shutdown", headers, "").await;
+        assert_eq!(status, 403, "{headers:?}: {refused}");
+        assert_eq!(refused["code"], "admin_token_unavailable", "{headers:?}");
+    }
+    let (status, health) = get(&gateway.address, "/health", None).await;
+    assert_eq!(status, 200, "zeroclaw-gw keeps serving: {health}");
+
+    gateway.kill().await;
     core.stop().await;
 }
 
@@ -398,8 +486,8 @@ async fn connect_tls(address: &str) -> tokio_rustls::client::TlsStream<tokio::ne
 }
 
 /// An HTTPS POST to the TLS listener at `address`.
-async fn post_tls(address: &str, path: &str, body: &str) -> (u16, Value) {
-    post_on(connect_tls(address).await, address, path, body).await
+async fn post_tls(address: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, Value) {
+    post_on(connect_tls(address).await, address, path, headers, body).await
 }
 
 /// The in-process gateway as the daemon serves it (`run_gateway`, every
@@ -505,11 +593,12 @@ async fn the_request_limits_match_the_in_process_gateway() {
     let in_process = InProcess::start(TIMEOUT_SECS).await;
     let tmp = tempfile::tempdir().unwrap();
     let core = Core::serve(Core::context(tmp.path())).await;
-    let gateway = Gateway::spawn(
-        &core.endpoint,
+    let gateway = Gateway::spawn_in(
+        tmp.path(),
         &["--request-timeout", &TIMEOUT_SECS.to_string()],
     )
     .await;
+    let admin_token = mint_admin_token(tmp.path());
     let in_process_address = in_process.addr.to_string();
 
     let oversized = format!(
@@ -549,9 +638,16 @@ async fn the_request_limits_match_the_in_process_gateway() {
     }
 
     // A stalled hook request stays open while shutdown is asked for: each
-    // process still stops within its request timeout.
+    // process still stops within its request timeout. The preview is asked
+    // with its admin token; the in-process route asks for none.
     let pending = stalled_hook(&gateway.address).await;
-    let (status, _) = post(&gateway.address, "/admin/shutdown", "").await;
+    let (status, _) = post_with(
+        &gateway.address,
+        "/admin/shutdown",
+        &[(ADMIN_TOKEN_HEADER, admin_token)],
+        "",
+    )
+    .await;
     assert_eq!(status, 200);
     let started = std::time::Instant::now();
     let exit = gateway.exits().await;
@@ -603,8 +699,9 @@ async fn with_tls_flags_it_serves_https() {
     std::fs::write(&key_path, key.serialize_pem()).unwrap();
 
     let core = Core::serve(Core::context(tmp.path())).await;
-    let gateway = Gateway::spawn(
-        &core.endpoint,
+    let admin_token = mint_admin_token(tmp.path());
+    let gateway = Gateway::spawn_in(
+        tmp.path(),
         &[
             "--tls-cert",
             cert_path.to_str().unwrap(),
@@ -631,10 +728,11 @@ async fn with_tls_flags_it_serves_https() {
     );
 
     // Over TLS the routes see the caller's address too: the hook answers,
-    // and a shutdown from loopback stops the process. A hook request left
-    // stalled over TLS neither keeps it running past the request timeout
-    // nor cuts off the shutdown's own answer.
-    let (status, ack) = post_tls(&gateway.address, "/hooks/claude-code", HOOK_EVENT).await;
+    // and a shutdown from loopback with the admin token stops the process,
+    // where one without it does not. A hook request left stalled over TLS
+    // neither keeps it running past the request timeout nor cuts off the
+    // shutdown's own answer.
+    let (status, ack) = post_tls(&gateway.address, "/hooks/claude-code", &[], HOOK_EVENT).await;
     assert_eq!(status, 200, "{ack}");
     let mut pending = connect_tls(&gateway.address).await;
     pending
@@ -645,7 +743,16 @@ async fn with_tls_flags_it_serves_https() {
         .await
         .expect("send");
     pending.flush().await.expect("flush");
-    let (status, stopping) = post_tls(&gateway.address, "/admin/shutdown", "").await;
+    let (status, refused) = post_tls(&gateway.address, "/admin/shutdown", &[], "").await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(refused["code"], "admin_token_required");
+    let (status, stopping) = post_tls(
+        &gateway.address,
+        "/admin/shutdown",
+        &[(ADMIN_TOKEN_HEADER, admin_token)],
+        "",
+    )
+    .await;
     assert_eq!(status, 200, "{stopping}");
     assert_eq!(
         stopping,
