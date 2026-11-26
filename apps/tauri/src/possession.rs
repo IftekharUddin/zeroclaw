@@ -14,6 +14,13 @@
 //! anything. A credential is then sent on that same connection, so it
 //! reaches the process that proved itself, not whichever process holds the
 //! port a moment later.
+//!
+//! The proof is rooted in that RPC connection, so it is only as strong as the
+//! check on the connection's endpoint. On Unix the endpoint's account is
+//! verified before the handshake. On Windows it is not (see
+//! [`crate::readiness::verify_core`]): a passed proof there shows that one
+//! party serves both the pipe and the dashboard address, not who that party
+//! is.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -263,8 +270,9 @@ fn same_proof(answered: &str, expected: &str) -> bool {
 }
 
 /// The launched core, for proofs and for credentials that never cross HTTP.
-/// Its RPC connection is dialed again, with the endpoint's operating-system
-/// account checked again, if it ends.
+/// Its RPC connection is dialed again if it ends, with the endpoint's
+/// operating-system account checked again on Unix. On Windows the new dial is
+/// as unverified as the first.
 pub struct CoreLink {
     endpoint: PathBuf,
     bundled: bool,

@@ -3,9 +3,11 @@
 //! name.
 //!
 //! The process ID and version the core reports are diagnostics. They decide
-//! which failure to show, never whether a process is owned or trusted: the
-//! endpoint's operating-system account is checked before the handshake, and
-//! ownership comes only from the handle the launch returned.
+//! which failure to show, never whether a process is owned or trusted: on
+//! Unix the endpoint's operating-system account is checked before the
+//! handshake, and ownership comes only from the handle the launch returned.
+//! On Windows nothing here establishes who serves the core's pipe; see
+//! [`verify_core`].
 
 use crate::gateway_client::GatewayClient;
 use crate::possession::ProofFailure;
@@ -117,8 +119,18 @@ pub fn check_handshake(
 
 /// Dial the launched core's endpoint and check its handshake. On Unix the
 /// endpoint must first prove, through the kernel, that it is served by this
-/// app's own account. Windows cannot prove a pipe server's account yet, and
-/// this dial carries no credential, so it is not gated there.
+/// app's own account.
+///
+/// On Windows this check does not establish who serves the pipe. The client
+/// cannot verify a pipe server's account there, so the dial is not gated,
+/// and the process ID in the handshake is whatever the server reports. The
+/// dial carries no credential itself, but it decides where one goes: the
+/// possession challenge and the proof expected for it arrive over this
+/// connection (see [`crate::possession`]). A process serving the pipe in the
+/// core's place that also holds the dashboard address issues its own
+/// challenge, answers it, and is sent the dashboard credential. On Windows a
+/// passed proof therefore shows that one party serves both the pipe and the
+/// dashboard address, not that the party is the core this app launched.
 pub async fn verify_core(
     endpoint: &Path,
     launched_pid: Option<u32>,
