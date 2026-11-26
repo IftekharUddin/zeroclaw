@@ -190,16 +190,27 @@ Resolution, per message:
   or names the agent. A group whose `ignore` names the sender does not apply
   to them.
 - A sender named in `external_peers` outranks a `"*"` entry, so the owners
-  above are not guests. Name owners in the form the channel reports as the
-  sender. Telegram, for example, reports the username when the user has one
-  and the numeric id only otherwise, so an owner listed by numeric id who has
-  a username is matched as a guest.
+  above are not guests. An entry is compared with every identity the channel
+  reports for the sender, the same set channel admission checks. Telegram
+  reports a username and an immutable numeric id, so a group may name either,
+  and a member listed by numeric id is matched whether or not they have a
+  username. An `ignore` entry naming either identity takes the sender out of
+  that group.
 - A sender matching two groups of the same rank that name different profiles
   is refused with a message, and the turn does not run. Nothing is guessed.
+  That includes an account one group names by id and another by username.
 - No matching role group means the agent's own profile, exactly as before.
   An admitted sender that no role group matches is not capped by any role:
   add a `"*"` group to cap everyone the channel admits who is not named
   elsewhere.
+
+A role is only as strong as the identity the channel reports for the sender.
+Prefer the platform's immutable id wherever the channel has one. A name the
+sender controls is a weak key for an owner group: Telegram usernames can be
+changed and reclaimed by someone else, and on most IRC and email deployments
+the nick or `From` address is not authenticated at all, so anyone the channel
+admits can present an owner's name. On those channels, treat a by-name owner
+group as a convenience, not a boundary.
 
 A role only narrows the agent's profile, and only in the four fields a turn
 can change: `excluded_tools` and `always_ask` are added, `auto_approve` keeps
@@ -208,7 +219,10 @@ agent's when the role sets none. The role's exclusions apply even when the
 agent runs at `full`. Every other field
 of the role profile must equal the agent's; validation rejects one that
 differs, because sandbox, command, and autonomy settings are fixed when the
-agent's tools are built.
+agent's tools are built. The daemon still starts when validation fails, with
+a warning, so that the config can be repaired. A sender who reaches such a
+role at runtime is refused with the same message as a conflict; the turn does
+not run under the agent's value for that field.
 
 A role's approval prompts go to that route and never fall back to the room,
 even under `inherit-originator`, so a guest cannot approve their own request.
@@ -247,5 +261,10 @@ Current limits:
 - Roles narrow tools and approvals only. They add no memory isolation: what
   a guest turn can recall is whatever the agent's memory scoping already
   allows. Exclude `memory_recall` for guests if that matters.
-- Like `admin_for_agent_scope`, roles are read from the config snapshot the
-  runtime started with; edits take effect after a restart.
+- Group membership (`external_peers`, `ignore`, `agents`, and which
+  `risk_profile` a group names) is read from the live config on every turn,
+  as channel admission is, so a peer paired or added at runtime is placed by
+  the same table that admitted them. The profiles themselves are the ones
+  the runtime started with: an edit to `[risk_profiles]` takes effect after
+  a restart, and a group pointed at a profile added since the start refuses
+  its senders' turns until then.

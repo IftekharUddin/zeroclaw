@@ -230,8 +230,6 @@ impl ApprovalManager {
         tools
     }
 
-    /// Check whether a tool call requires interactive approval.
-    /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     /// Whether this manager's `always_ask` list names `tool_name` (or holds
     /// `"*"`), matched as [`Self::approval_requirement`] matches it: entries
     /// trimmed, names compared exactly. A caller propagating the list to a
@@ -240,6 +238,8 @@ impl ApprovalManager {
         self.always_ask.contains("*") || self.always_ask.contains(tool_name)
     }
 
+    /// Check whether a tool call requires interactive approval.
+    /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
         self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
     }

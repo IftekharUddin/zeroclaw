@@ -3194,9 +3194,10 @@ fn normalize_peer_username(raw: &str) -> String {
     raw.trim_start_matches('@').to_ascii_lowercase()
 }
 
-/// What a sender role changes for one channel turn. Built from
-/// `ctx.prompt_config`, the same config snapshot the agent-scope gate reads,
-/// so a `peer_groups` edit reaches it when the runtime context is rebuilt.
+/// What a sender role changes for one channel turn. Which role applies is
+/// read from `ctx.live_config` on every turn, the config channel admission
+/// reads; the profiles it narrows come from `ctx.prompt_config`, the snapshot
+/// the agent's tools were built from.
 struct SenderRoleTurn {
     group: String,
     risk_profile: String,
@@ -3227,10 +3228,37 @@ enum SenderRoleOutcome {
     },
 }
 
-/// Resolve the sender's role for this turn from `[peer_groups]`, matching
-/// peers the way [`is_agent_scope_authorized`] does. Fails closed: a
-/// conflicting match or a profile that no longer resolves refuses the turn
-/// instead of falling back to the agent's broader profile.
+/// Every identity the channel reported for the sender, in the shape
+/// [`normalize_peer_username`] gives a configured peer: the display identity
+/// in `sender` and, when the platform assigns one, the immutable id in
+/// `platform_sender_id`. Admission judges them together, so a peer group may
+/// name either and role lookup has to ask about both.
+fn sender_role_identities(msg: &zeroclaw_api::channel::ChannelMessage) -> Vec<String> {
+    std::iter::once(msg.sender.as_str())
+        .chain(msg.platform_sender_id.as_deref())
+        .map(normalize_peer_username)
+        .collect()
+}
+
+/// Resolve the sender's role for this turn from `[peer_groups]`.
+///
+/// Membership is read from `ctx.live_config`, the config channel admission
+/// reads, so a peer admitted at runtime (a pairing, an edited group) is placed
+/// by the same table that let them in. Each configured peer is matched against
+/// every identity the channel reported for the sender, through the allowlist
+/// matcher admission uses, so a group can name the immutable id or the
+/// username. An `ignore` naming either identity takes the sender out of that
+/// group, and groups reached through different identities that name different
+/// profiles are a conflict like any other.
+///
+/// The profiles stay on `ctx.prompt_config`: the agent's tools and security
+/// policy were built from that snapshot, so it is what a role can narrow.
+///
+/// Fails closed. A conflicting match, a profile the snapshot does not hold,
+/// and a profile that differs from the agent's outside the fields a turn can
+/// narrow all refuse the turn instead of running it under the agent's broader
+/// profile. Validation reports the last two, but startup demotes a validation
+/// error to a warning and a runtime edit is not checked against the snapshot.
 fn resolve_sender_role_turn(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -3239,14 +3267,20 @@ fn resolve_sender_role_turn(
     let channel_type = msg.channel.as_str();
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
     let agent_alias = ctx.agent_alias.as_str();
-    let sender = normalize_peer_username(msg.sender.as_str());
-    let resolved = config.channel_sender_role(channel_type, channel_alias, agent_alias, |peer| {
-        crate::allowlist::is_user_allowed(
-            &[normalize_peer_username(peer)],
-            &sender,
-            crate::allowlist::Match::Sensitive,
-        )
-    });
+    let identities = sender_role_identities(msg);
+    let identities: Vec<&str> = identities.iter().map(String::as_str).collect();
+    let resolved = ctx.live_config.read().channel_sender_role(
+        channel_type,
+        channel_alias,
+        agent_alias,
+        |peer| {
+            crate::allowlist::is_identity_allowed(
+                &[normalize_peer_username(peer)],
+                &identities,
+                crate::allowlist::Match::Sensitive,
+            )
+        },
+    );
     let role = match resolved {
         Ok(None) => return SenderRoleOutcome::AgentProfile,
         Ok(Some(role)) => role,
@@ -3276,6 +3310,19 @@ fn resolve_sender_role_turn(
             risk_profiles: vec![role.risk_profile],
         };
     };
+    // Narrowing copies every other field from the agent's profile, so a role
+    // that sets one differently would run with the agent's value. An unreadable
+    // comparison is refused the same way.
+    if !agent_profile
+        .sender_role_fixed_field_mismatches(role_profile)
+        .is_ok_and(|mismatched| mismatched.is_empty())
+    {
+        return SenderRoleOutcome::Refused {
+            reason: "sender role profile differs from the agent's in fields a role cannot change",
+            groups: vec![role.group],
+            risk_profiles: vec![role.risk_profile],
+        };
+    }
     let registry: &[Box<dyn Tool>] = &ctx.tools_registry[..];
     let mut narrowed = agent_profile.narrowed_for_sender_role(role_profile);
     // Wrappers are matched against the role's approval gate itself, so an
@@ -13755,10 +13802,12 @@ fn send_message_to_peer_tool_available(
     ctx: &ChannelRuntimeContext,
     excluded_tools: &[String],
 ) -> bool {
-    if excluded_tools
-        .iter()
-        .any(|tool_name| tool_name == "send_message_to_peer")
-    {
+    // Matched as the execution gate matches, so an exclusion that blocks the
+    // call also keeps the peer roster out of the prompt.
+    if zeroclaw_runtime::agent::tool_execution::is_excluded_tool(
+        "send_message_to_peer",
+        excluded_tools,
+    ) {
         return false;
     }
 
@@ -28906,6 +28955,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
         );
+        ctx.live_config = Arc::new(RwLock::new(config.clone()));
         ctx.prompt_config = Arc::new(config);
         // Someone answered "Always" for `other_tool` under the agent's policy.
         ctx.approval_manager.record_decision(
@@ -28950,11 +29000,330 @@ BTC is currently around $65,000 based on latest tool output."#
             },
         );
         config.risk_profiles.remove("guest");
+        ctx.live_config = Arc::new(RwLock::new(config.clone()));
         ctx.prompt_config = Arc::new(config);
         assert!(matches!(
             resolve_sender_role_turn(&ctx, &sender_role_msg("mallory")),
             SenderRoleOutcome::Refused { .. }
         ));
+    }
+
+    /// A message whose sender has both a username and a platform-assigned id,
+    /// as Telegram reports it.
+    fn sender_role_msg_with_id(
+        sender: &str,
+        platform_sender_id: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            platform_sender_id: Some(platform_sender_id.to_string()),
+            ..sender_role_msg(sender)
+        }
+    }
+
+    /// A role group on `test-channel` naming `peers` under `risk_profile`.
+    fn sender_role_group(
+        peers: &[&str],
+        risk_profile: &str,
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            channel: zeroclaw_config::providers::ChannelRef("test-channel".into()),
+            external_peers: peers
+                .iter()
+                .map(|peer| zeroclaw_config::multi_agent::PeerUsername((*peer).into()))
+                .collect(),
+            risk_profile: Some(risk_profile.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A guest role that removes `mock_price`, the tool the owner profile
+    /// auto-approves: a guest turn runs it zero times, an owner turn once.
+    fn guest_without_mock_price() -> zeroclaw_config::schema::RiskProfileConfig {
+        zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["mock_price".into()],
+            excluded_tools: vec!["mock_price".into()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_role_guest_listed_by_platform_id_is_narrowed_despite_a_username() {
+        // No `"*"` role group: the numeric id is all that places this sender,
+        // and the channel reports their username as `sender`.
+        for (platform_sender_id, expected) in [("555", 0), ("777", 1)] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+            let mut config = sender_role_prompt_config(guest_without_mock_price());
+            config.peer_groups.remove("everyone");
+            config
+                .peer_groups
+                .insert("guests".into(), sender_role_group(&["555"], "guest"));
+            let ctx = sender_role_runtime_ctx(
+                config,
+                vec![room as Arc<dyn Channel>],
+                Arc::clone(&executions),
+            );
+
+            process_channel_message(
+                ctx,
+                sender_role_msg_with_id("mallory", platform_sender_id),
+                CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                expected,
+                "sender `mallory` with platform id {platform_sender_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_role_owner_listed_by_platform_id_outranks_the_wildcard() {
+        for (platform_sender_id, expected) in [("111", 1), ("112", 0)] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+            let mut config = sender_role_prompt_config(guest_without_mock_price());
+            config
+                .peer_groups
+                .insert("owners".into(), sender_role_group(&["111"], "owner"));
+            let ctx = sender_role_runtime_ctx(
+                config,
+                vec![room as Arc<dyn Channel>],
+                Arc::clone(&executions),
+            );
+
+            process_channel_message(
+                ctx,
+                sender_role_msg_with_id("some_username", platform_sender_id),
+                CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                expected,
+                "sender `some_username` with platform id {platform_sender_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_role_reached_by_id_and_by_name_under_different_profiles_refuses() {
+        // `alice` is an owner by name; the id 555 is a guest. An account that
+        // is both is not placed by guessing which identity wins.
+        for (platform_sender_id, expected_runs, refused) in [("555", 0, true), ("556", 1, false)] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+            let mut config = sender_role_prompt_config(guest_without_mock_price());
+            config
+                .peer_groups
+                .insert("guests_by_id".into(), sender_role_group(&["555"], "guest"));
+            let ctx = sender_role_runtime_ctx(
+                config,
+                vec![room.clone() as Arc<dyn Channel>],
+                Arc::clone(&executions),
+            );
+
+            process_channel_message(
+                ctx,
+                sender_role_msg_with_id("alice", platform_sender_id),
+                CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                expected_runs,
+                "sender `alice` with platform id {platform_sender_id}"
+            );
+            let sent = room.sent.lock().await;
+            assert_eq!(
+                sent.iter()
+                    .any(|message| message.contains("single sender role")),
+                refused,
+                "platform id {platform_sender_id}, got: {sent:?}"
+            );
+            if refused {
+                assert_eq!(sent.len(), 1, "only the refusal is sent: {sent:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_role_membership_added_at_runtime_narrows_the_next_turn() {
+        // The runtime starts with `mallory` in no role group. A pairing or a
+        // config edit then adds them to the guest group: admission reads that
+        // write at once, so role lookup has to as well.
+        for (added_at_runtime, expected) in [(false, 1), (true, 0)] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+            let mut config = sender_role_prompt_config(guest_without_mock_price());
+            config.peer_groups.remove("everyone");
+            config
+                .peer_groups
+                .insert("guests".into(), sender_role_group(&["bob"], "guest"));
+            let ctx = sender_role_runtime_ctx(
+                config,
+                vec![room as Arc<dyn Channel>],
+                Arc::clone(&executions),
+            );
+            if added_at_runtime {
+                ctx.live_config
+                    .write()
+                    .peer_groups
+                    .get_mut("guests")
+                    .expect("the fixture's guest group")
+                    .external_peers
+                    .push(zeroclaw_config::multi_agent::PeerUsername("mallory".into()));
+            }
+
+            process_channel_message(ctx, sender_role_msg("mallory"), CancellationToken::new())
+                .await;
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                expected,
+                "added at runtime: {added_at_runtime}"
+            );
+        }
+    }
+
+    #[test]
+    fn sender_role_resolution_reads_groups_live_and_profiles_from_the_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_with_peer_groups(tmp.path(), HashMap::new());
+        let mut config =
+            sender_role_prompt_config(zeroclaw_config::schema::RiskProfileConfig::default());
+        config.agents.insert(
+            "agentX".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "owner".into(),
+                ..Default::default()
+            },
+        );
+        ctx.live_config = Arc::new(RwLock::new(config.clone()));
+        ctx.prompt_config = Arc::new(config);
+        let resolve = |sender: &str| resolve_sender_role_turn(&ctx, &sender_role_msg(sender));
+        let is_guest = |outcome: SenderRoleOutcome| match outcome {
+            SenderRoleOutcome::Role(role) => role.risk_profile == "guest",
+            _ => false,
+        };
+
+        assert!(matches!(resolve("alice"), SenderRoleOutcome::AgentProfile));
+        assert!(is_guest(resolve("mallory")));
+
+        // An owner removed from the owners group at runtime is a guest on
+        // their next turn.
+        ctx.live_config
+            .write()
+            .peer_groups
+            .get_mut("owners")
+            .expect("the fixture's owners group")
+            .external_peers
+            .clear();
+        assert!(is_guest(resolve("alice")));
+
+        // Without the `"*"` group nobody is capped; adding one caps everyone.
+        let everyone = ctx.live_config.write().peer_groups.remove("everyone");
+        assert!(matches!(
+            resolve("mallory"),
+            SenderRoleOutcome::AgentProfile
+        ));
+        ctx.live_config
+            .write()
+            .peer_groups
+            .insert("everyone".into(), everyone.expect("the fixture's group"));
+        assert!(is_guest(resolve("mallory")));
+
+        // A group edited to name a profile the running snapshot does not hold
+        // cannot be applied, so the turn is refused, not run uncapped.
+        {
+            let mut live = ctx.live_config.write();
+            live.risk_profiles.insert(
+                "added_later".into(),
+                zeroclaw_config::schema::RiskProfileConfig::default(),
+            );
+            live.peer_groups
+                .get_mut("everyone")
+                .expect("the fixture's group")
+                .risk_profile = Some("added_later".into());
+        }
+        assert!(matches!(
+            resolve("mallory"),
+            SenderRoleOutcome::Refused { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sender_role_that_changes_a_fixed_field_refuses_the_turn() {
+        // Validation reports this role, but startup only warns about it.
+        // Narrowing would copy `level` from the agent, so the guest would run
+        // supervised where the operator wrote read-only.
+        for (sender, expected_runs, refused) in [("mallory", 0, true), ("alice", 1, false)] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+            let guest = zeroclaw_config::schema::RiskProfileConfig {
+                level: AutonomyLevel::ReadOnly,
+                auto_approve: vec!["mock_price".into()],
+                ..Default::default()
+            };
+            let ctx = sender_role_runtime_ctx(
+                sender_role_prompt_config(guest),
+                vec![room.clone() as Arc<dyn Channel>],
+                Arc::clone(&executions),
+            );
+
+            process_channel_message(ctx, sender_role_msg(sender), CancellationToken::new()).await;
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                expected_runs,
+                "sender {sender}"
+            );
+            let sent = room.sent.lock().await;
+            assert_eq!(
+                sent.iter()
+                    .any(|message| message.contains("single sender role")),
+                refused,
+                "sender {sender}, got: {sent:?}"
+            );
+            if refused {
+                assert_eq!(sent.len(), 1, "only the refusal is sent: {sent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn peer_roster_is_withheld_however_the_exclusion_is_spelled() {
+        let ctx = sender_role_runtime_ctx_with(
+            sender_role_prompt_config(zeroclaw_config::schema::RiskProfileConfig::default()),
+            Vec::new(),
+            vec![Box::new(CountingNamedTool {
+                name: "send_message_to_peer".to_string(),
+                launcher: false,
+                executions: Arc::new(AtomicUsize::new(0)),
+            })],
+            Arc::new(ToolCallingModelProvider),
+        );
+        assert!(send_message_to_peer_tool_available(&ctx, &[]));
+        assert!(send_message_to_peer_tool_available(
+            &ctx,
+            &["send_message".to_string()]
+        ));
+        // Each of these blocks the call at the execution gate, so none may
+        // leave the roster in the prompt.
+        for spelling in [
+            "send_message_to_peer",
+            " Send_Message_To_Peer ",
+            "SEND_MESSAGE_TO_PEER",
+        ] {
+            assert!(
+                !send_message_to_peer_tool_available(&ctx, &[spelling.to_string()]),
+                "exclusion {spelling:?}"
+            );
+        }
     }
 
     #[tokio::test]

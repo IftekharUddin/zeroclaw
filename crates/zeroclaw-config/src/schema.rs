@@ -13736,6 +13736,20 @@ fn default_always_ask() -> Vec<String> {
     vec![]
 }
 
+/// A profile's serialized fields, for comparing a sender role with its agent's
+/// profile field by field. Anything that does not serialize to a table is an
+/// error, so the comparison cannot pass on two profiles it never read.
+fn sender_role_profile_fields<T: Serialize>(
+    profile: &T,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, serde_json::Error> {
+    match serde_json::to_value(profile)? {
+        serde_json::Value::Object(fields) => Ok(fields),
+        _ => Err(serde::ser::Error::custom(
+            "risk profile did not serialize to a table of fields",
+        )),
+    }
+}
+
 impl RiskProfileConfig {
     /// Fields a sender role (`[peer_groups.<name>] risk_profile`) may set
     /// differently from its agent's own profile. The channel orchestrator
@@ -13751,22 +13765,27 @@ impl RiskProfileConfig {
     /// Fields where `role` differs from this (agent) profile outside
     /// [`Self::SENDER_ROLE_TURN_FIELDS`], sorted. Non-empty means `role`
     /// cannot be applied per turn as written.
-    #[must_use]
-    pub fn sender_role_fixed_field_mismatches(&self, role: &RiskProfileConfig) -> Vec<String> {
-        let fields = |profile: &RiskProfileConfig| match serde_json::to_value(profile) {
-            Ok(serde_json::Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
-        };
-        let agent = fields(self);
-        let role = fields(role);
+    ///
+    /// # Errors
+    ///
+    /// Fails when either profile cannot be read as a table of fields. That
+    /// is never "no mismatch": callers refuse the role instead of applying
+    /// one they could not compare.
+    pub fn sender_role_fixed_field_mismatches(
+        &self,
+        role: &RiskProfileConfig,
+    ) -> std::result::Result<Vec<String>, serde_json::Error> {
+        let agent = sender_role_profile_fields(self)?;
+        let role = sender_role_profile_fields(role)?;
         let mut keys: Vec<&String> = agent.keys().chain(role.keys()).collect();
         keys.sort();
         keys.dedup();
-        keys.into_iter()
+        Ok(keys
+            .into_iter()
             .filter(|key| !Self::SENDER_ROLE_TURN_FIELDS.contains(&key.as_str()))
             .filter(|key| agent.get(*key) != role.get(*key))
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// This (agent) profile narrowed by a sender role's profile, for one turn.
@@ -25545,7 +25564,16 @@ impl Config {
                     let Some(agent_profile) = self.risk_profile_for_agent(agent_alias) else {
                         continue;
                     };
-                    let mismatched = agent_profile.sender_role_fixed_field_mismatches(role_profile);
+                    let mismatched = match agent_profile
+                        .sender_role_fixed_field_mismatches(role_profile)
+                    {
+                        Ok(mismatched) => mismatched,
+                        Err(error) => validation_bail!(
+                            InvalidFormat,
+                            format!("peer_groups.{group_name}.risk_profile"),
+                            "peer_groups.{group_name}.risk_profile = {role_alias:?} could not be compared with agents.{agent_alias}'s profile, so it cannot be used as a sender role: {error}",
+                        ),
+                    };
                     if !mismatched.is_empty() {
                         let agent_profile_alias = self
                             .agents
@@ -28151,6 +28179,7 @@ mod tests {
         assert!(
             agent
                 .sender_role_fixed_field_mismatches(&narrowing)
+                .expect("profiles compare")
                 .is_empty()
         );
 
@@ -28160,9 +28189,27 @@ mod tests {
             ..narrowing
         };
         assert_eq!(
-            agent.sender_role_fixed_field_mismatches(&widening),
+            agent
+                .sender_role_fixed_field_mismatches(&widening)
+                .expect("profiles compare"),
             vec!["allowed_commands".to_string(), "level".to_string()]
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn sender_role_profile_fields_refuses_what_it_cannot_read_as_a_table() {
+        // A comparison over two unreadable profiles would find no differing
+        // field, so an unreadable profile has to be an error, not an empty map.
+        assert!(super::sender_role_profile_fields(&"guest").is_err());
+        assert!(super::sender_role_profile_fields(&vec!["level"]).is_err());
+        let unserializable: std::collections::HashMap<(u8, u8), u8> =
+            std::iter::once(((1, 2), 3)).collect();
+        assert!(super::sender_role_profile_fields(&unserializable).is_err());
+
+        let fields = super::sender_role_profile_fields(&super::RiskProfileConfig::default())
+            .expect("a risk profile is a table");
+        assert!(fields.contains_key("level"));
+        assert!(fields.contains_key("excluded_tools"));
     }
 
     #[::core::prelude::v1::test]
