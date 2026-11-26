@@ -1290,7 +1290,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let cutoff = (Utc::now() - Duration::hours(i64::from(ttl_hours))).to_rfc3339();
 
         // Find stale sessions
@@ -1306,18 +1306,26 @@ impl SessionBackend for SqliteSessionBackend {
 
         let count = stale_keys.len();
         for key in &stale_keys {
-            conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+            // One transaction per session: its transcript, metadata and
+            // messages go together or not at all. A failed or interrupted
+            // delete leaves the session whole for the next cleanup instead
+            // of leaving messages that a reused session ID would inherit.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(std::io::Error::other)?;
-            conn.execute(
+            tx.execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+                .map_err(std::io::Error::other)?;
+            tx.execute(
                 "DELETE FROM session_metadata WHERE session_key = ?1",
                 params![key],
             )
             .map_err(std::io::Error::other)?;
-            conn.execute(
+            tx.execute(
                 "DELETE FROM session_messages WHERE target_session_key = ?1",
                 params![key],
             )
             .map_err(std::io::Error::other)?;
+            tx.commit().map_err(std::io::Error::other)?;
         }
 
         Ok(count)
@@ -1348,10 +1356,16 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        // The transcript, metadata and messages go in one transaction, so a
+        // failed or interrupted delete cannot leave messages behind for a
+        // reused session ID to inherit.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
 
         // Check if session exists
-        let exists: bool = conn
+        let exists: bool = tx
             .query_row(
                 "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
                 params![session_key],
@@ -1364,26 +1378,27 @@ impl SessionBackend for SqliteSessionBackend {
         }
 
         // Delete messages (FTS5 trigger handles sessions_fts cleanup)
-        conn.execute(
+        tx.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
 
         // Delete metadata
-        conn.execute(
+        tx.execute(
             "DELETE FROM session_metadata WHERE session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
 
         // A deleted session keeps none of its messages, received or pending.
-        conn.execute(
+        tx.execute(
             "DELETE FROM session_messages WHERE target_session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
 
+        tx.commit().map_err(std::io::Error::other)?;
         Ok(true)
     }
 
@@ -1483,10 +1498,16 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         owner_principal_id: &str,
     ) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        // One transaction: if a later delete fails or is interrupted, the
+        // metadata delete is undone with it, so the session stays whole and
+        // owned instead of leaving messages behind for a reused session ID.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
         // The predicated metadata delete IS the ownership check: zero rows
         // means not-owned (or missing) and nothing else is touched.
-        let owned_rows = conn
+        let owned_rows = tx
             .execute(
                 "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id = ?2",
                 params![session_key, owner_principal_id],
@@ -1497,16 +1518,17 @@ impl SessionBackend for SqliteSessionBackend {
         }
         // Ownership proven and consumed; clean up the message rows (the
         // FTS5 trigger handles sessions_fts).
-        conn.execute(
+        tx.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM session_messages WHERE target_session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
         Ok(true)
     }
 
@@ -2354,6 +2376,117 @@ mod tests {
             backend.cleanup_stale(48).is_err(),
             "a delete that fails is reported, not counted as cleaned"
         );
+    }
+
+    /// Make every delete from `session_messages` fail, as an I/O error or a
+    /// lost lock would, until [`allow_message_deletes`] lifts it.
+    fn refuse_message_deletes(backend: &SqliteSessionBackend) {
+        backend
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER refuse_message_deletes BEFORE DELETE ON session_messages \
+                 BEGIN SELECT RAISE(ABORT, 'message delete refused'); END;",
+            )
+            .unwrap();
+    }
+
+    fn allow_message_deletes(backend: &SqliteSessionBackend) {
+        backend
+            .conn
+            .lock()
+            .execute_batch("DROP TRIGGER refuse_message_deletes;")
+            .unwrap();
+    }
+
+    /// After a delete that failed part-way, `target` is still the session
+    /// [`session_with_received_and_pending_messages`] built: same owner,
+    /// same transcript, same inbox.
+    fn assert_session_is_whole(backend: &SqliteSessionBackend) {
+        let metadata = backend
+            .get_session_metadata("target")
+            .expect("the session's metadata is kept");
+        assert_eq!(metadata.principal_id.as_deref(), Some("user:alice"));
+        assert_eq!(backend.load("target").len(), 1, "the transcript is kept");
+        assert_eq!(stored_message_rows(backend, "target"), 2);
+        assert_eq!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .expect("the unread message is still pending")
+                .delivery_id,
+            "d-new"
+        );
+    }
+
+    fn assert_session_is_gone(backend: &SqliteSessionBackend) {
+        assert!(backend.get_session_metadata("target").is_none());
+        assert!(backend.load("target").is_empty());
+        assert_eq!(stored_message_rows(backend, "target"), 0);
+    }
+
+    #[test]
+    fn delete_session_that_cannot_remove_messages_removes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        refuse_message_deletes(&backend);
+        assert!(backend.delete_session("target").is_err());
+        assert_session_is_whole(&backend);
+
+        allow_message_deletes(&backend);
+        assert!(backend.delete_session("target").unwrap());
+        assert_session_is_gone(&backend);
+    }
+
+    #[test]
+    fn owned_delete_that_cannot_remove_messages_removes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        refuse_message_deletes(&backend);
+        assert!(
+            backend
+                .delete_session_owned("target", "user:alice")
+                .is_err()
+        );
+        assert_session_is_whole(&backend);
+
+        allow_message_deletes(&backend);
+        assert!(
+            backend
+                .delete_session_owned("target", "user:alice")
+                .unwrap(),
+            "the owner can still delete the session once the delete can finish"
+        );
+        assert_session_is_gone(&backend);
+    }
+
+    #[test]
+    fn stale_cleanup_that_cannot_remove_messages_keeps_the_session_for_a_retry() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        {
+            let conn = backend.conn.lock();
+            let old_time = (Utc::now() - Duration::hours(100)).to_rfc3339();
+            conn.execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = 'target'",
+                params![old_time],
+            )
+            .unwrap();
+        }
+        refuse_message_deletes(&backend);
+        assert!(backend.cleanup_stale(48).is_err());
+        assert_session_is_whole(&backend);
+
+        allow_message_deletes(&backend);
+        assert_eq!(
+            backend.cleanup_stale(48).unwrap(),
+            1,
+            "the next cleanup still finds the expired session"
+        );
+        assert_session_is_gone(&backend);
     }
 
     #[test]
