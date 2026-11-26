@@ -171,6 +171,20 @@ impl BlockingCancellation {
     }
 }
 
+/// Closes the event boundary when the awaiting caller goes away.
+///
+/// Stopping a turn drops the tool future without reaching the deadline arm,
+/// and dropping a `JoinHandle` only detaches its worker. Cancelling here stops
+/// effects the worker has not started yet. Releases stay exempt and the worker
+/// keeps its lease, so input that was already submitted is still cleaned up.
+struct CancelOnCallerDrop(BlockingCancellation);
+
+impl Drop for CancelOnCallerDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BlockingOperation {
     Read,
@@ -189,6 +203,7 @@ where
     check_deadline(deadline)?;
     let lease = LinuxDesktopWorkerLease::acquire()?;
     let cancellation = BlockingCancellation::new();
+    let _cancel_on_caller_drop = CancelOnCallerDrop(cancellation.clone());
     let task_cancellation = cancellation.clone();
     let handle = tokio::task::spawn_blocking(move || {
         let _lease = lease;
@@ -688,91 +703,110 @@ async fn run_ax_action_until_resolved(
     selector: String,
     deadline: tokio::time::Instant,
 ) -> Result<(), ProtocolError> {
+    run_ax_worker_until_resolved(deadline, move |task_cancellation| async move {
+        let ax = AxContext { connection };
+        let proxy = reference
+            .as_accessible_proxy(ax.connection.connection())
+            .await
+            .map_err(|error| ax_worker_error("resolve Linux accessibility element", error))?;
+        let state = proxy.get_state().await.map_err(|error| {
+            ax_worker_error("revalidate Linux accessibility element state", error)
+        })?;
+        if !state.contains(State::Enabled) || !state.contains(State::Sensitive) {
+            return Err(ProtocolError::new(
+                ErrorCode::ElementNotFound,
+                "Linux accessibility element is not enabled and sensitive",
+                true,
+            ));
+        }
+        let role = proxy.get_role().await.map_err(|error| {
+            ax_worker_error("revalidate Linux accessibility element role", error)
+        })?;
+        let title = proxy.name().await.map_err(|error| {
+            ax_worker_error("revalidate Linux accessibility element name", error)
+        })?;
+        if role == Role::PasswordText
+            || role.name() != expected_role
+            || exact_ax_selector_value(title.as_str()) != Some(expected_title.as_str())
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::ApplicationMismatch,
+                "Linux accessibility element identity changed at the action boundary",
+                true,
+            ));
+        }
+        let proxies = proxy
+            .proxies()
+            .await
+            .map_err(|error| ax_worker_error("revalidate Linux accessibility interfaces", error))?;
+        let action = proxies
+            .action()
+            .await
+            .map_err(|error| ax_worker_error("resolve Linux accessibility action", error))?;
+        let actions = action
+            .get_actions()
+            .await
+            .map_err(|error| ax_worker_error("revalidate Linux accessibility actions", error))?;
+        if actions.is_empty() {
+            return Err(ProtocolError::new(
+                ErrorCode::ElementNotFound,
+                "Linux accessibility element exposes no action",
+                true,
+            ));
+        }
+
+        revalidate_action_application(
+            &ax,
+            &expected_application,
+            &policy,
+            &selector,
+            deadline,
+            task_cancellation.clone(),
+        )
+        .await?;
+
+        // AT-SPI specifies action zero as the default when an object exposes
+        // one or more actions. This future is intentionally not cancelled on
+        // the caller deadline: its occupancy lease survives until D-Bus
+        // reports the actual mutation outcome.
+        check_deadline(deadline)?;
+        let _event_permit = task_cancellation.begin_event()?;
+        let invoked = action.do_action(0).await.map_err(|error| {
+            ax_worker_error("invoke Linux accessibility action", error).with_unknown_outcome()
+        })?;
+        if !invoked {
+            return Err(ProtocolError::new(
+                ErrorCode::EventCreationFailed,
+                "Linux accessibility action reported failure",
+                false,
+            )
+            .with_unknown_outcome());
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Runs one accessibility mutation on a detached worker that owns the desktop
+/// lease until the mutation outcome resolves, whether or not the caller is
+/// still waiting for it.
+async fn run_ax_worker_until_resolved<F, W>(
+    deadline: tokio::time::Instant,
+    worker: F,
+) -> Result<(), ProtocolError>
+where
+    F: FnOnce(BlockingCancellation) -> W,
+    W: Future<Output = Result<(), ProtocolError>> + Send + 'static,
+{
     check_deadline(deadline)?;
     let lease = LinuxDesktopWorkerLease::acquire()?;
     let cancellation = BlockingCancellation::new();
-    let task_cancellation = cancellation.clone();
-    let handle =
-        zeroclaw_spawn::spawn!(async move {
-            let _lease = lease;
-            let ax = AxContext { connection };
-            let proxy = reference
-                .as_accessible_proxy(ax.connection.connection())
-                .await
-                .map_err(|error| ax_worker_error("resolve Linux accessibility element", error))?;
-            let state = proxy.get_state().await.map_err(|error| {
-                ax_worker_error("revalidate Linux accessibility element state", error)
-            })?;
-            if !state.contains(State::Enabled) || !state.contains(State::Sensitive) {
-                return Err(ProtocolError::new(
-                    ErrorCode::ElementNotFound,
-                    "Linux accessibility element is not enabled and sensitive",
-                    true,
-                ));
-            }
-            let role = proxy.get_role().await.map_err(|error| {
-                ax_worker_error("revalidate Linux accessibility element role", error)
-            })?;
-            let title = proxy.name().await.map_err(|error| {
-                ax_worker_error("revalidate Linux accessibility element name", error)
-            })?;
-            if role == Role::PasswordText
-                || role.name() != expected_role
-                || exact_ax_selector_value(title.as_str()) != Some(expected_title.as_str())
-            {
-                return Err(ProtocolError::new(
-                    ErrorCode::ApplicationMismatch,
-                    "Linux accessibility element identity changed at the action boundary",
-                    true,
-                ));
-            }
-            let proxies = proxy.proxies().await.map_err(|error| {
-                ax_worker_error("revalidate Linux accessibility interfaces", error)
-            })?;
-            let action = proxies
-                .action()
-                .await
-                .map_err(|error| ax_worker_error("resolve Linux accessibility action", error))?;
-            let actions = action.get_actions().await.map_err(|error| {
-                ax_worker_error("revalidate Linux accessibility actions", error)
-            })?;
-            if actions.is_empty() {
-                return Err(ProtocolError::new(
-                    ErrorCode::ElementNotFound,
-                    "Linux accessibility element exposes no action",
-                    true,
-                ));
-            }
-
-            revalidate_action_application(
-                &ax,
-                &expected_application,
-                &policy,
-                &selector,
-                deadline,
-                task_cancellation.clone(),
-            )
-            .await?;
-
-            // AT-SPI specifies action zero as the default when an object exposes
-            // one or more actions. This future is intentionally not cancelled on
-            // the caller deadline: its occupancy lease survives until D-Bus
-            // reports the actual mutation outcome.
-            check_deadline(deadline)?;
-            let _event_permit = task_cancellation.begin_event()?;
-            let invoked = action.do_action(0).await.map_err(|error| {
-                ax_worker_error("invoke Linux accessibility action", error).with_unknown_outcome()
-            })?;
-            if !invoked {
-                return Err(ProtocolError::new(
-                    ErrorCode::EventCreationFailed,
-                    "Linux accessibility action reported failure",
-                    false,
-                )
-                .with_unknown_outcome());
-            }
-            Ok(())
-        });
+    let _cancel_on_caller_drop = CancelOnCallerDrop(cancellation.clone());
+    let worker = worker(cancellation.clone());
+    let handle = zeroclaw_spawn::spawn!(async move {
+        let _lease = lease;
+        worker.await
+    });
 
     match tokio::time::timeout_at(deadline, handle).await {
         Ok(Ok(result)) => result,
@@ -3588,6 +3622,19 @@ fn protocol_violation(message: impl Into<String>) -> ProtocolError {
 mod tests {
     use super::*;
 
+    /// Serializes tests that occupy the process-wide desktop worker lease.
+    static WORKER_LEASE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn wait_for_worker_lease_release() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while LINUX_DESKTOP_WORKER_ACTIVE.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("detached Linux desktop worker releases its lease");
+    }
+
     #[test]
     fn session_detection_never_falls_back_from_explicit_wayland() {
         use std::ffi::OsStr;
@@ -3616,6 +3663,7 @@ mod tests {
 
     #[test]
     fn desktop_worker_lease_remains_exclusive_until_owner_drops() {
+        let _serial = WORKER_LEASE_TESTS.blocking_lock();
         let lease = LinuxDesktopWorkerLease::acquire().unwrap();
         assert!(LinuxDesktopWorkerLease::acquire().is_err());
         drop(lease);
@@ -3630,6 +3678,109 @@ mod tests {
         assert!(cancellation.begin_event().is_err());
         drop(event);
         assert!(cancellation.check().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_x11_caller_cancels_unsent_events_and_keeps_the_lease() {
+        let _serial = WORKER_LEASE_TESTS.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(run_x11_blocking(
+            deadline,
+            BlockingOperation::Mutation,
+            move |cancellation| {
+                // One event is already submitted when the caller goes away.
+                let submitted = cancellation.begin_event()?;
+                let _ = submitted_tx.send(());
+                let _ = resume_rx.recv();
+                drop(submitted);
+                let _ = observed_tx.send((
+                    cancellation.begin_event().is_err(),
+                    cancellation.check().is_err(),
+                ));
+                Ok(())
+            },
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut caller => panic!("X11 caller resolved before its worker"),
+            submitted = submitted_rx => submitted.expect("X11 worker submits its first event"),
+        }
+
+        // Stopping a turn drops the awaiting tool future the same way.
+        drop(caller);
+        assert!(
+            LinuxDesktopWorkerLease::acquire().is_err(),
+            "the detached X11 worker keeps the desktop lease"
+        );
+        resume_tx.send(()).expect("resume the detached X11 worker");
+        let (next_event_refused, next_request_refused) = observed_rx
+            .await
+            .expect("detached X11 worker reports its event boundary");
+        assert!(next_event_refused);
+        assert!(next_request_refused);
+        wait_for_worker_lease_release().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_accessibility_caller_cancels_the_unsent_action_and_keeps_the_lease() {
+        let _serial = WORKER_LEASE_TESTS.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (revalidating_tx, revalidating_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(run_ax_worker_until_resolved(
+            deadline,
+            move |cancellation| async move {
+                // The worker is still revalidating; no action has been sent.
+                let _ = revalidating_tx.send(());
+                let _ = resume_rx.await;
+                let _ = observed_tx.send(cancellation.begin_event().is_err());
+                Ok(())
+            },
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut caller => panic!("accessibility caller resolved before its worker"),
+            revalidating = revalidating_rx => {
+                revalidating.expect("accessibility worker starts revalidating");
+            }
+        }
+
+        drop(caller);
+        assert!(
+            LinuxDesktopWorkerLease::acquire().is_err(),
+            "the detached accessibility worker keeps the desktop lease"
+        );
+        resume_tx
+            .send(())
+            .expect("resume the detached accessibility worker");
+        assert!(
+            observed_rx
+                .await
+                .expect("detached accessibility worker reports its action boundary")
+        );
+        wait_for_worker_lease_release().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn awaited_workers_keep_their_event_boundary_open() {
+        let _serial = WORKER_LEASE_TESTS.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        run_x11_blocking(deadline, BlockingOperation::Mutation, |cancellation| {
+            cancellation.begin_event().map(drop)
+        })
+        .await
+        .expect("an awaited X11 worker reaches its event boundary");
+        wait_for_worker_lease_release().await;
+        run_ax_worker_until_resolved(deadline, |cancellation| async move {
+            cancellation.begin_event().map(drop)
+        })
+        .await
+        .expect("an awaited accessibility worker reaches its action boundary");
+        wait_for_worker_lease_release().await;
     }
 
     #[test]
