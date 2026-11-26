@@ -2326,6 +2326,83 @@ mod tests {
         server_handle.abort();
     }
 
+    /// Default-endpoint side of the branch the two tests above pin for custom
+    /// endpoints: a stream decode failure must surface as itself, with no
+    /// `stream: false` retry.
+    ///
+    /// The mock binds a local port, so the provider is flipped to the default
+    /// endpoint classification after construction. That also moves credential
+    /// resolution onto the OAuth profile path, so a profile is seeded in the
+    /// mock's state dir; without it the provider returns before sending
+    /// anything. The second queued reply is what the ChatGPT Codex backend
+    /// answers to a non-streaming body, so a regression fails here the way it
+    /// fails in production.
+    #[tokio::test]
+    async fn codex_default_endpoint_surfaces_stream_decode_error_without_non_streaming_retry() {
+        let (mut provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![
+                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::Status(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    r#"{"detail":"Stream must be set to true"}"#,
+                ),
+            ])
+            .await;
+
+        provider
+            .auth
+            .store_openai_tokens(
+                "default",
+                crate::auth::profiles::TokenSet {
+                    access_token: "test-access-token".to_string(),
+                    refresh_token: None,
+                    id_token: None,
+                    expires_at: None,
+                    token_type: Some("Bearer".to_string()),
+                    scope: None,
+                },
+                Some("test-account".to_string()),
+                true,
+            )
+            .await
+            .expect("seeding the mock OAuth profile should succeed");
+        provider.custom_endpoint = false;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("a stream decode failure on the default endpoint must be returned");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("OpenAI Codex SSE data parse failed"),
+            "the original stream decode error must surface: {message}"
+        );
+        assert!(
+            !message.contains("Stream must be set to true") && !message.contains("400"),
+            "the decode error must not be replaced by the non-streaming retry's 400: {message}"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the default endpoint must not be retried without streaming"
+        );
+        assert_eq!(requests[0]["stream"], true);
+
+        server_handle.abort();
+    }
+
     #[tokio::test]
     async fn codex_does_not_retry_stream_api_error_events() {
         let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
