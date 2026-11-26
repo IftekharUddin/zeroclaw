@@ -908,7 +908,8 @@ impl Chat {
         max_tracked_sessions_per_pane: usize,
     ) -> Self {
         assert!(
-            (1..=crate::config::MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE)
+            (crate::config::MIN_CONFIGURED_TRACKED_SESSIONS_PER_PANE
+                ..=crate::config::MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE)
                 .contains(&max_tracked_sessions_per_pane)
         );
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);

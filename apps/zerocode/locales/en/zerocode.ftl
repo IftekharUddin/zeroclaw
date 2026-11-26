@@ -927,3 +927,8 @@ zc-config-save-lock-timeout = Another process is saving { $config } and still ho
 zc-config-invalid-saved-login = Saved login configuration is invalid. Zerocode will not use a different login's credentials.
 zc-config-migration-lock-skipped = Could not lock { $path } to update saved keybindings ({ $error }). The loaded configuration was kept and the file was not changed. Zerocode will try the update again the next time it can lock the file.
 zc-config-lock-not-regular = { $path } is not a regular file, so it cannot be used as the config lock.
+
+# apps/zerocode/src/config/mod.rs. `[sessions]` values that stop startup.
+zc-config-sessions-max-tracked-range = max_tracked_per_pane must be between { $min } and { $max }
+zc-config-sessions-invalid = [sessions] is invalid: { $error }
+zc-config-sessions-malformed = [sessions] in { $path } is malformed

@@ -2781,6 +2781,94 @@ mod connection_tests {
         );
     }
 
+    /// An invalid `[sessions]` value stops startup after `i18n::init`. The
+    /// line `main` prints must come from the saved language's catalogue, with
+    /// the limits and the config path filled in. A fresh process keeps this
+    /// test's language out of the shared translation cache.
+    #[test]
+    fn sessions_startup_errors_use_the_saved_language() {
+        if std::env::var_os("ZEROCODE_SESSIONS_LOCALE_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("ZEROCODE_SESSIONS_LOCALE_DIR").expect("child config dir"),
+            );
+            let config = crate::config::config_path(&dir);
+            let loaded = crate::config::ensure_and_load(&dir).expect("startup load");
+            let locale = loaded
+                .resolve_locale()
+                .unwrap_or_else(crate::i18n::detect_locale);
+            crate::i18n::init(&locale, &dir);
+
+            let out_of_range = crate::config::resolve_max_tracked_sessions_per_pane_checked(&dir)
+                .expect_err("a limit of 0 must stop startup");
+            println!("RANGE<{}>", format_startup_error(&out_of_range));
+
+            std::fs::write(
+                &config,
+                "locale = \"fr\"\n\n[sessions]\nmax_tracked_per_pane = \"many\"\n",
+            )
+            .unwrap();
+            let malformed = crate::config::resolve_max_tracked_sessions_per_pane_checked(&dir)
+                .expect_err("a non-integer limit must stop startup");
+            println!("MALFORMED<{}>", format_startup_error(&malformed));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::config_path(dir.path());
+        std::fs::write(
+            &config,
+            "locale = \"fr\"\n\n[sessions]\nmax_tracked_per_pane = 0\n",
+        )
+        .unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            "zc-config-sessions-max-tracked-range = SAVED-RANGE-MARKER { $min }..{ $max }\nzc-config-sessions-invalid = SAVED-INVALID-MARKER ({ $error })\nzc-config-sessions-malformed = SAVED-MALFORMED-MARKER { $path }\n",
+        )
+        .unwrap();
+
+        // Other tests set `ZEROCODE_*` overrides under this lock. Holding it
+        // while the child starts keeps them out of the child's environment.
+        let output = {
+            let _env = crate::test_support::env_test_lock();
+            std::process::Command::new(
+                std::env::current_exe().expect("current zerocode test binary path"),
+            )
+            .args([
+                "connection_tests::sessions_startup_errors_use_the_saved_language",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ZEROCODE_SESSIONS_LOCALE_CHILD", "1")
+            .env("ZEROCODE_SESSIONS_LOCALE_DIR", dir.path())
+            .env_remove("ZEROCLAW_CONFIG_DIR")
+            .env_remove("ZEROCODE_LOCALE_DIR")
+            .env_remove("ZEROCODE_locale")
+            .env_remove("ZEROCODE_sessions__max_tracked_per_pane")
+            .output()
+            .expect("spawn sessions locale child")
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed: {stderr}\n{stdout}");
+        assert!(
+            stdout.contains("RANGE<SAVED-INVALID-MARKER (SAVED-RANGE-MARKER 1..32)>"),
+            "the out-of-range error must use the saved language and both limits, got: {stdout}{stderr}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "MALFORMED<SAVED-MALFORMED-MARKER {}: ",
+                config.display()
+            )),
+            "the malformed-section error must use the saved language and the config path, got: {stdout}{stderr}"
+        );
+        assert!(
+            !stdout.contains("must be between") && !stdout.contains("is malformed"),
+            "the English text must not replace the saved language: {stdout}"
+        );
+    }
+
     #[test]
     fn explicit_relay_enroll_uses_relay_route() {
         let cli = Cli::parse_from([
