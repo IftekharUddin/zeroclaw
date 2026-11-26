@@ -62,6 +62,47 @@ importantly, what changes for existing remote connections.
    the session's queue, so a request queued before its principal was
    narrowed or its credential expired is refused when its turn comes.
 
+   The workspace, canvas, pairing, channel, and system methods compose
+   these rules on top of their grants:
+   - `workspace/list`, `fs/mkdir`, `fs/rmdir`, `fs/read`, `fs/delete`, and
+     `fs/move` check the agent selector on top of the `files` grant. A
+     request that names an agent works in that agent's workspace and needs
+     that agent, and a principal that is not an administrator may name only
+     an agent the configuration defines. A request that names no agent
+     works in the shared area every agent reads, so it needs every agent
+     (`allowed_agents = ["*"]` or `admin = true`). The check runs before
+     the filesystem is touched and again, on current grants, where the
+     operation takes effect;
+   - `canvas/*` needs the `canvas` grant (`read` for `canvas/list`,
+     `canvas/get`, and `canvas/history`, `update` for `canvas/render`,
+     `delete` for `canvas/clear`) and every agent, because the daemon keeps
+     one canvas store for all agents. The `canvas` tool of a session created
+     over RPC is confined differently: it draws into that store only under
+     its agent's namespace, stored as `<agent>/<id>`, and cannot name a
+     canvas outside it, whatever its principal's grants are. One namespace
+     holds at most 16 canvases;
+   - `pairing/list`, `pairing/revoke`, `pairing/revoke-all`, and
+     `pairing/new-code` are for administrators only (`admin = true`),
+     because a pairing code yields a bearer credential; no `system` grant
+     is enough. `pairing/new-code` and `pairing/revoke-all` are also
+     refused on every transport except the local socket or pipe. The
+     methods that revoke a device or issue a code take the config write
+     lock and check `admin` again on current grants before they act;
+   - `channels/relink` and `channels/bind` need the agent that owns the
+     channel, on top of `channels = ["update"]`. A channel with no owning
+     agent, or a name that matches no channel, needs every agent.
+     `channels/bind` also writes `peer_groups.<group>.external_peers`, so it
+     needs the `config` grant for that write (`create` when the peer group
+     is new, `update` otherwise) and a `config_write_paths` entry that
+     covers the path. It checks all of this again, on current grants, under
+     the config write lock. `channels/list` is not scoped by agent: it
+     lists every configured channel, with its owning agent, to any
+     principal holding `channels = ["read"]`;
+   - `system/upgrade` and `system/restart` are for administrators only, on
+     any transport. `system/upgrade` also requires
+     `gateway.allow_self_upgrade = true`. `system/upgrade-status` and
+     `metrics/scrape` need only `system = ["read"]`.
+
 Authorization is **live** for edits made through the daemon's RPC config
 methods, which is what zerocode's config editor uses: editing
 `[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
@@ -346,9 +387,9 @@ held in memory for that session only.
 Profiles are deny-by-default: an unlisted resource is refused, an empty
 selector list grants no instances, and broad access requires the explicit
 `"*"` selector or `admin = true`. Multiple profiles merge by union. For
-cron jobs, attachments, personality files, per-agent cost queries, and SOP
-authoring, `allowed_agents = ["*"]` covers only the agents the
-configuration defines, not any alias a request names.
+cron jobs, attachments, personality files, per-agent cost queries, SOP
+authoring, and workspace file operations, `allowed_agents = ["*"]` covers
+only the agents the configuration defines, not any alias a request names.
 
 Tool selectors compose by intersection at agent assembly, on top of the
 coarse grant: model-facing tool execution is `tools = ["execute"]`, and a
