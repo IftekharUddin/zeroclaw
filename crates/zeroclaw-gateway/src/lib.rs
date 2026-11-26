@@ -164,6 +164,7 @@ use zeroclaw_providers::{self, ModelProvider};
 use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
+use zeroclaw_runtime::observability::PROMETHEUS_CONTENT_TYPE;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{
     GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, constant_time_eq,
@@ -2569,9 +2570,6 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     });
     Json(body)
 }
-
-/// Prometheus content type for text exposition format.
-const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 fn prometheus_disabled_hint() -> String {
     zeroclaw_runtime::observability::PROMETHEUS_DISABLED_HINT.to_string()
